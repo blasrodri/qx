@@ -1,0 +1,2073 @@
+//! Static execution-plan primitives for QX Runtime V2.
+//!
+//! V1 remains the correctness oracle. V2 deliberately owns only the fixed
+//! Granite decode topology and arena accounting here; Metal graph encoding is
+//! added behind this boundary as each GPU-resident kernel is validated.
+
+use qx_model::{ATTENTION_HEADS, EXPERTS, HIDDEN, KV_HEADS, LAYERS, TOP_K, VOCAB};
+
+#[cfg(target_os = "macos")]
+use std::rc::Rc;
+
+pub const DEFAULT_CONTEXT: usize = 512;
+pub const HEAD_DIM: usize = HIDDEN / ATTENTION_HEADS;
+pub const INTERMEDIATE: usize = 512;
+
+#[cfg(target_os = "macos")]
+pub struct PreparedAttentionLayer {
+    pub input_norm: qx_metal::platform::RuntimeBuffer,
+    pub post_attention_norm: qx_metal::platform::RuntimeBuffer,
+    pub q_proj: qx_metal::platform::PreparedQuantizedDense,
+    pub k_proj: qx_metal::platform::PreparedQuantizedDense,
+    pub v_proj: qx_metal::platform::PreparedQuantizedDense,
+    pub qkv: qx_metal::platform::PreparedQuantizedQkv,
+    pub o_proj: qx_metal::platform::PreparedQuantizedDense,
+    pub router: qx_metal::platform::PreparedQuantizedDense,
+}
+
+#[cfg(target_os = "macos")]
+pub struct PreparedAttentionStack {
+    pub layers: Vec<PreparedAttentionLayer>,
+    pub final_norm: qx_metal::platform::RuntimeBuffer,
+    pub embedding: qx_metal::platform::PreparedQuantizedDense,
+    pub embedding_lookup: qx_metal::platform::PreparedQ4Embedding,
+}
+
+#[cfg(target_os = "macos")]
+impl PreparedAttentionStack {
+    pub fn load(
+        context: &qx_metal::platform::MetalContext,
+        model_dir: impl AsRef<std::path::Path>,
+    ) -> Result<Self, String> {
+        let model_dir: &std::path::Path = model_dir.as_ref();
+        Self::load_internal(context, Some(model_dir.to_path_buf()), None)
+    }
+
+    /// Load the large dense matrices and exact FP32 RMSNorm vectors from the
+    /// compiled artifact without opening the safetensors checkpoint.
+    pub fn load_from_artifact(
+        context: &qx_metal::platform::MetalContext,
+        artifact_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, String> {
+        let artifact_path: &std::path::Path = artifact_path.as_ref();
+        Self::load_internal(context, None, Some(artifact_path.to_path_buf()))
+    }
+
+    fn load_internal(
+        context: &qx_metal::platform::MetalContext,
+        model_dir: Option<std::path::PathBuf>,
+        artifact_path: Option<std::path::PathBuf>,
+    ) -> Result<Self, String> {
+        let checkpoint = model_dir
+            .map(qx_safetensors::Checkpoint::open)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let artifact = artifact_path
+            .map(|path| qx_format::MappedArtifact::open(path).map_err(|error| error.to_string()))
+            .transpose()?;
+        let mut layers = Vec::with_capacity(LAYERS);
+        for layer in 0..LAYERS {
+            let prefix = format!("model.layers.{layer}");
+            let norm = prepare_norm(
+                context,
+                checkpoint.as_ref(),
+                artifact.as_ref(),
+                layer as u16,
+                qx_format::TensorKind::InputNorm,
+                &format!("{prefix}.input_layernorm.weight"),
+            )?;
+            let post_norm = prepare_norm(
+                context,
+                checkpoint.as_ref(),
+                artifact.as_ref(),
+                layer as u16,
+                qx_format::TensorKind::PostAttentionNorm,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+            )?;
+
+            let q_proj = prepare_matrix(
+                context,
+                checkpoint.as_ref(),
+                artifact.as_ref(),
+                layer as u16,
+                qx_format::TensorKind::QProj,
+                &format!("{prefix}.self_attn.q_proj.weight"),
+                HIDDEN,
+                HIDDEN,
+            )?;
+            let k_proj = prepare_matrix(
+                context,
+                checkpoint.as_ref(),
+                artifact.as_ref(),
+                layer as u16,
+                qx_format::TensorKind::KProj,
+                &format!("{prefix}.self_attn.k_proj.weight"),
+                KV_HEADS * (HIDDEN / ATTENTION_HEADS),
+                HIDDEN,
+            )?;
+            let v_proj = prepare_matrix(
+                context,
+                checkpoint.as_ref(),
+                artifact.as_ref(),
+                layer as u16,
+                qx_format::TensorKind::VProj,
+                &format!("{prefix}.self_attn.v_proj.weight"),
+                KV_HEADS * (HIDDEN / ATTENTION_HEADS),
+                HIDDEN,
+            )?;
+            let o_proj = prepare_matrix(
+                context,
+                checkpoint.as_ref(),
+                artifact.as_ref(),
+                layer as u16,
+                qx_format::TensorKind::OProj,
+                &format!("{prefix}.self_attn.o_proj.weight"),
+                HIDDEN,
+                HIDDEN,
+            )?;
+            let qkv = context.prepare_q4_qkv(&q_proj, &k_proj, &v_proj)?;
+            let router = prepare_matrix(
+                context,
+                checkpoint.as_ref(),
+                artifact.as_ref(),
+                layer as u16,
+                qx_format::TensorKind::Router,
+                &format!("{prefix}.block_sparse_moe.router.layer.weight"),
+                EXPERTS,
+                HIDDEN,
+            )?;
+            layers.push(PreparedAttentionLayer {
+                input_norm: norm,
+                post_attention_norm: post_norm,
+                q_proj,
+                k_proj,
+                v_proj,
+                qkv,
+                o_proj,
+                router,
+            });
+        }
+        let final_norm = prepare_norm(
+            context,
+            checkpoint.as_ref(),
+            artifact.as_ref(),
+            u16::MAX,
+            qx_format::TensorKind::FinalNorm,
+            "model.norm.weight",
+        )?;
+        let embedding = if let Some(artifact) = artifact.as_ref() {
+            let index = artifact
+                .info()
+                .entries
+                .iter()
+                .position(|entry| {
+                    entry.layer == u16::MAX
+                        && entry.expert == u8::MAX
+                        && entry.kind == qx_format::TensorKind::Embedding
+                })
+                .ok_or_else(|| "dense Q4 artifact is missing the embedding tensor".to_owned())?;
+            let entry = &artifact.info().entries[index];
+            if entry.quant_type != qx_quant::QuantType::Q4
+                || entry.layout != qx_quant::PackingLayout::RowMajor
+                || entry.rows as usize != VOCAB
+                || entry.cols as usize != HIDDEN
+            {
+                return Err("artifact embedding is not row-major Q4 [VOCAB, HIDDEN]".to_owned());
+            }
+            let quantized = artifact
+                .quantized_tensor(index)
+                .map_err(|error| error.to_string())?;
+            context.prepare_q4_dense(&quantized)?
+        } else {
+            let checkpoint = checkpoint.as_ref().ok_or_else(|| {
+                "dense Q4 artifact is missing the embedding tensor and no checkpoint was supplied"
+                    .to_owned()
+            })?;
+            let (embedding_shape, embedding_values) = checkpoint
+                .tensor_f32("model.embed_tokens.weight")
+                .map_err(|error| error.to_string())?;
+            if embedding_shape != [VOCAB, HIDDEN] {
+                return Err(format!(
+                    "embedding shape {embedding_shape:?}, expected [{VOCAB}, {HIDDEN}]"
+                ));
+            }
+            let embedding_quantized = qx_quant::QuantizedTensor::quantize(
+                &embedding_values,
+                VOCAB,
+                HIDDEN,
+                qx_quant::QuantType::Q4,
+                32,
+            );
+            context.prepare_q4_dense(&embedding_quantized)?
+        };
+        let embedding_lookup = context.prepare_q4_embedding_from_dense(&embedding)?;
+        Ok(Self {
+            layers,
+            final_norm,
+            embedding,
+            embedding_lookup,
+        })
+    }
+
+    pub fn encode(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        buffers: &GpuRuntimeBuffers,
+        position: usize,
+    ) -> Result<(), String> {
+        for (layer, weights) in self.layers.iter().enumerate() {
+            buffers.encode_attention_layer(
+                graph,
+                layer,
+                if layer.is_multiple_of(2) {
+                    BufferId::HiddenA
+                } else {
+                    BufferId::HiddenB
+                },
+                if layer.is_multiple_of(2) {
+                    BufferId::HiddenB
+                } else {
+                    BufferId::HiddenA
+                },
+                &weights.input_norm,
+                &weights.qkv,
+                &weights.o_proj,
+                position,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn encode_full(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        buffers: &GpuRuntimeBuffers,
+        moe: &PreparedMoeStack,
+        position: usize,
+    ) -> Result<(), String> {
+        self.encode_full_layers(graph, buffers, moe, position, LAYERS)
+    }
+
+    /// Encode a fixed prefix of transformer layers without committing or
+    /// waiting. This is used by the layer-block topology benchmark.
+    pub fn encode_full_layers(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        buffers: &GpuRuntimeBuffers,
+        moe: &PreparedMoeStack,
+        position: usize,
+        layer_count: usize,
+    ) -> Result<(), String> {
+        if layer_count > LAYERS {
+            return Err(format!("layer block {layer_count} exceeds {LAYERS} layers"));
+        }
+        for (layer, weights) in self.layers.iter().take(layer_count).enumerate() {
+            let input = if layer.is_multiple_of(2) {
+                BufferId::HiddenA
+            } else {
+                BufferId::HiddenB
+            };
+            let output = if layer.is_multiple_of(2) {
+                BufferId::HiddenB
+            } else {
+                BufferId::HiddenA
+            };
+            buffers.encode_attention_layer(
+                graph,
+                layer,
+                input,
+                output,
+                &weights.input_norm,
+                &weights.qkv,
+                &weights.o_proj,
+                position,
+            )?;
+            let context = buffers.context().as_ref();
+            if qx_metal::platform::rms_scalar_router_enabled() {
+                let inverse_rms = buffers
+                    .buffer(BufferId::MoeScratch)
+                    .subregion(81_916, std::mem::size_of::<f32>())?;
+                graph.encode_rmsnorm_scalar(
+                    context,
+                    buffers.buffer(output),
+                    &weights.post_attention_norm,
+                    &inverse_rms,
+                )?;
+                graph.encode_prepared_q4_dense_simd_normalized(
+                    &weights.router,
+                    buffers.buffer(output),
+                    &weights.post_attention_norm,
+                    &inverse_rms,
+                    buffers.buffer(BufferId::RouterScores),
+                )?;
+            } else {
+                graph.encode_rmsnorm(
+                    context,
+                    buffers.buffer(output),
+                    &weights.post_attention_norm,
+                    buffers.buffer(BufferId::MoeInput),
+                )?;
+            }
+            graph.encode_topk(
+                context,
+                buffers.buffer(BufferId::RouterScores),
+                buffers.buffer(BufferId::TopKIds),
+                buffers.buffer(BufferId::TopKWeights),
+            )?;
+            if let Some(active_k) = active_k_for_layer(layer).filter(|&active_k| active_k < TOP_K) {
+                graph.encode_topk_mask(
+                    context,
+                    buffers.buffer(BufferId::TopKIds),
+                    buffers.buffer(BufferId::TopKWeights),
+                    active_k as u32,
+                )?;
+            }
+            if qx_metal::platform::rms_scalar_router_enabled() {
+                graph.encode_dynamic_q4_moe_batched_simd_normalized(
+                    &moe.layers[layer],
+                    buffers.buffer(output),
+                    &weights.post_attention_norm,
+                    &buffers
+                        .buffer(BufferId::MoeScratch)
+                        .subregion(81_916, std::mem::size_of::<f32>())?,
+                    buffers.buffer(BufferId::TopKIds),
+                    buffers.buffer(BufferId::TopKWeights),
+                    buffers.buffer(BufferId::MoeScratch),
+                    buffers.buffer(BufferId::MoeOutput),
+                )?;
+            } else {
+                graph.encode_dynamic_q4_moe_batched_simd(
+                    &moe.layers[layer],
+                    buffers.buffer(BufferId::MoeInput),
+                    buffers.buffer(BufferId::TopKIds),
+                    buffers.buffer(BufferId::TopKWeights),
+                    buffers.buffer(BufferId::MoeScratch),
+                    buffers.buffer(BufferId::MoeOutput),
+                )?;
+            }
+            graph.encode_residual(
+                context,
+                buffers.buffer(output),
+                buffers.buffer(BufferId::MoeOutput),
+                buffers.buffer(output),
+                qx_model::RESIDUAL_MULTIPLIER,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn encode_token(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        buffers: &GpuRuntimeBuffers,
+        moe: &PreparedMoeStack,
+        position: usize,
+    ) -> Result<(), String> {
+        let context = buffers.context().as_ref();
+        graph.encode_q4_embedding_lookup(
+            &self.embedding_lookup,
+            buffers.buffer(BufferId::TokenOutput),
+            buffers.buffer(BufferId::HiddenA),
+            qx_model::EMBEDDING_MULTIPLIER,
+        )?;
+        self.encode_full(graph, buffers, moe, position)?;
+        let final_hidden = if LAYERS.is_multiple_of(2) {
+            BufferId::HiddenA
+        } else {
+            BufferId::HiddenB
+        };
+        graph.encode_rmsnorm(
+            context,
+            buffers.buffer(final_hidden),
+            &self.final_norm,
+            buffers.buffer(BufferId::MoeInput),
+        )?;
+        graph.encode_prepared_q4_dense_simd_scaled(
+            &self.embedding,
+            buffers.buffer(BufferId::MoeInput),
+            buffers.buffer(BufferId::Logits),
+            1.0 / qx_model::LOGITS_SCALING,
+        )?;
+        graph.encode_argmax(
+            context,
+            buffers.buffer(BufferId::Logits),
+            buffers.buffer(BufferId::MoeScratch),
+            buffers.buffer(BufferId::TokenOutput),
+            VOCAB,
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub struct PreparedMoeStack {
+    pub layers: Vec<qx_metal::platform::PreparedDynamicQ4Moe>,
+}
+
+/// Canonical artifact-only Runtime V2 generator.
+///
+/// The tokenizer deliberately remains outside this type: callers provide
+/// integer prompt tokens, while V2 owns the persistent Metal weights, arena,
+/// KV cache, and the single-command-buffer token graph.
+#[cfg(target_os = "macos")]
+pub struct GraniteV2Generator {
+    context: Rc<qx_metal::platform::MetalContext>,
+    buffers: GpuRuntimeBuffers,
+    stack: PreparedAttentionStack,
+    moe: PreparedMoeStack,
+    position: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl GraniteV2Generator {
+    pub fn load(
+        artifact_path: impl AsRef<std::path::Path>,
+        context_length: usize,
+    ) -> Result<Self, String> {
+        let context = Rc::new(
+            qx_metal::platform::MetalContext::system_default()
+                .ok_or_else(|| "no Metal device is available".to_owned())?,
+        );
+        let plan = ExecutionPlan::granite(context_length)?;
+        let buffers = GpuRuntimeBuffers::new(context.clone(), plan)?;
+        let stack = PreparedAttentionStack::load_from_artifact(&context, &artifact_path)?;
+        let moe = PreparedMoeStack::load(&context, artifact_path)?;
+        Ok(Self {
+            context,
+            buffers,
+            stack,
+            moe,
+            position: 0,
+        })
+    }
+
+    pub fn reset(&mut self) {
+        self.position = 0;
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    pub fn context_length(&self) -> usize {
+        self.buffers.plan.context
+    }
+
+    pub fn metrics(&self) -> Result<qx_metal::platform::MetalMetrics, String> {
+        self.context.metrics()
+    }
+
+    /// Evaluate one input token at the current sequential position and return
+    /// the GPU-selected next token.
+    pub fn step(&mut self, token: u32) -> Result<u32, String> {
+        if token as usize >= VOCAB {
+            return Err(format!("token {token} is outside vocabulary"));
+        }
+        if self.position >= self.context_length() {
+            return Err(format!(
+                "generation position {} exceeds context {}",
+                self.position,
+                self.context_length()
+            ));
+        }
+        self.context.write_runtime_buffer(
+            self.buffers.buffer(BufferId::TokenOutput),
+            &token.to_le_bytes(),
+        )?;
+        let mut graph = self.buffers.begin_token()?;
+        self.stack
+            .encode_token(&mut graph, &self.buffers, &self.moe, self.position)?;
+        self.buffers.finish_token(graph)?;
+        self.position += 1;
+        self.context
+            .read_runtime_u32(self.buffers.buffer(BufferId::TokenOutput))
+    }
+
+    /// Prefill the prompt and greedily generate up to `max_new_tokens`.
+    /// The prediction produced by the final prompt token is the first emitted
+    /// token; it is not evaluated a second time before being returned.
+    pub fn generate_tokens(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        eos_token: Option<u32>,
+    ) -> Result<Vec<u32>, String> {
+        if prompt_tokens.is_empty() {
+            return Err("prompt produced no tokens".to_owned());
+        }
+        if max_new_tokens == 0 {
+            return Err("max_new_tokens must be positive".to_owned());
+        }
+        if prompt_tokens.len().saturating_add(max_new_tokens) > self.context_length() {
+            return Err(format!(
+                "prompt plus generation exceeds context {}",
+                self.context_length()
+            ));
+        }
+        self.reset();
+        let mut next = 0_u32;
+        for &token in prompt_tokens {
+            next = self.step(token)?;
+        }
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        for index in 0..max_new_tokens {
+            generated.push(next);
+            if Some(next) == eos_token || index + 1 == max_new_tokens {
+                break;
+            }
+            next = self.step(next)?;
+        }
+        Ok(generated)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn moe_requested_layout() -> Option<qx_quant::PackingLayout> {
+    match std::env::var("QX_V2_MOE_LAYOUT")
+        .ok()
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("row") | Some("rowmajor") | Some("current") => Some(qx_quant::PackingLayout::RowMajor),
+        Some("tile") | Some("tile32") | Some("lane") | Some("lane-native") => {
+            Some(qx_quant::PackingLayout::MetalTile32)
+        }
+        Some("mixed") | Some("tile32-gate-row-down") => None,
+        Some("paired") | Some("gate-up-paired") | Some("paired-gate-up") => {
+            Some(qx_quant::PackingLayout::MetalTile32Paired)
+        }
+        Some(other) => panic!("unsupported QX_V2_MOE_LAYOUT={other}"),
+        None => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn moe_mixed_layout_requested() -> bool {
+    matches!(
+        std::env::var("QX_V2_MOE_LAYOUT")
+            .ok()
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("mixed") | Some("tile32-gate-row-down")
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn moe_split_gate_up_requested() -> bool {
+    matches!(
+        std::env::var("QX_V2_MOE_SPLIT_GATE_UP")
+            .ok()
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn moe_q3_gate_up_requested() -> Option<(std::path::PathBuf, usize)> {
+    let path = std::env::var_os("QX_V2_MOE_Q3_ARTIFACT")?;
+    let block_bytes = match std::env::var("QX_V2_MOE_Q3_LAYOUT")
+        .ok()
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("dense") | Some("q3") | None => 12,
+        Some("native") | Some("padded") | Some("transaction") => 16,
+        Some(other) => panic!("unsupported QX_V2_MOE_Q3_LAYOUT={other}"),
+    };
+    Some((std::path::PathBuf::from(path), block_bytes))
+}
+
+fn active_k_for_layer(layer: usize) -> Option<usize> {
+    if let Ok(value) = std::env::var("QX_V2_MOE_ACTIVE_K_BY_LAYER") {
+        let values = value
+            .split(',')
+            .map(|item| {
+                item.trim().parse::<usize>().unwrap_or_else(|_| {
+                    panic!("invalid active-k layer entry {item:?} in QX_V2_MOE_ACTIVE_K_BY_LAYER")
+                })
+            })
+            .collect::<Vec<_>>();
+        if values.len() != LAYERS {
+            panic!(
+                "QX_V2_MOE_ACTIVE_K_BY_LAYER requires {LAYERS} comma-separated values, got {}",
+                values.len()
+            );
+        }
+        let active_k = values[layer];
+        if !(1..=TOP_K).contains(&active_k) {
+            panic!("active-k layer value must be in 1..={TOP_K}, got {active_k}");
+        }
+        return Some(active_k);
+    }
+    let value = std::env::var("QX_V2_MOE_ACTIVE_K").ok()?;
+    let active_k = value
+        .parse::<usize>()
+        .unwrap_or_else(|_| panic!("invalid QX_V2_MOE_ACTIVE_K={value}"));
+    if !(1..=TOP_K).contains(&active_k) {
+        panic!("QX_V2_MOE_ACTIVE_K must be in 1..={TOP_K}, got {active_k}");
+    }
+    Some(active_k)
+}
+
+#[cfg(target_os = "macos")]
+fn q3_gate_up_bytes(
+    source: &qx_quant::QuantizedTensor,
+    block_bytes: usize,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    if source.quant_type != qx_quant::QuantType::Q3
+        || source.rows != HIDDEN
+        || source.cols != HIDDEN
+        || source.group_size != 32
+        || !matches!(block_bytes, 12 | 16)
+    {
+        return Err("Q3 gate/up source must be Q3 [1024,1024] group-32".to_owned());
+    }
+    let mut tensor = source.clone();
+    tensor.repack(qx_quant::PackingLayout::RowMajor)?;
+    let scales = tensor
+        .scales
+        .iter()
+        .flat_map(|scale| scale.to_bits().to_le_bytes())
+        .collect::<Vec<_>>();
+    let mut packed = Vec::with_capacity(HIDDEN * 32 * block_bytes);
+    for row in 0..HIDDEN {
+        for group in 0..32 {
+            let offset = (row * 32 + group) * 12;
+            packed.extend_from_slice(&tensor.data[offset..offset + 12]);
+            if block_bytes == 16 {
+                packed.extend_from_slice(&[0; 4]);
+            }
+        }
+    }
+    Ok((scales, packed))
+}
+
+#[cfg(target_os = "macos")]
+fn quantized_bytes_for_layout(
+    artifact: &qx_format::MappedArtifact,
+    index: usize,
+    layout: qx_quant::PackingLayout,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut tensor = artifact
+        .quantized_tensor(index)
+        .map_err(|error| error.to_string())?;
+    tensor.repack(layout)?;
+    let scales = unsafe {
+        std::slice::from_raw_parts(
+            tensor.scales.as_ptr() as *const u8,
+            std::mem::size_of_val(tensor.scales.as_slice()),
+        )
+    };
+    Ok((scales.to_vec(), tensor.data))
+}
+
+#[cfg(target_os = "macos")]
+fn quantized_row_range_bytes_for_layout(
+    artifact: &qx_format::MappedArtifact,
+    index: usize,
+    start: usize,
+    count: usize,
+    layout: qx_quant::PackingLayout,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut tensor = artifact
+        .quantized_tensor(index)
+        .map_err(|error| error.to_string())?
+        .row_range(start, count)?;
+    tensor.repack(layout)?;
+    let scales = unsafe {
+        std::slice::from_raw_parts(
+            tensor.scales.as_ptr() as *const u8,
+            std::mem::size_of_val(tensor.scales.as_slice()),
+        )
+    };
+    Ok((scales.to_vec(), tensor.data))
+}
+
+#[cfg(target_os = "macos")]
+fn quantized_gate_up_paired_bytes(
+    artifact: &qx_format::MappedArtifact,
+    index: usize,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let tensor = artifact
+        .quantized_tensor(index)
+        .map_err(|error| error.to_string())?;
+    let (scales, packed) = tensor.repack_gate_up_paired()?;
+    let scales = unsafe {
+        std::slice::from_raw_parts(
+            scales.as_ptr() as *const u8,
+            std::mem::size_of_val(scales.as_slice()),
+        )
+    };
+    Ok((scales.to_vec(), packed))
+}
+
+/// CPU oracle for the exact weights and quantization stored in a complete QX
+/// artifact. It is intentionally simple and slow: its purpose is to compare
+/// V2 GPU logits without mixing in the FP32 dense checkpoint path used by V1.
+pub struct CpuQ4Reference {
+    artifact: qx_format::MappedArtifact,
+    embedding: qx_quant::QuantizedTensor,
+    final_norm: Vec<f32>,
+    layers: Vec<CpuQ4Layer>,
+    caches: Vec<CpuQ4Cache>,
+    last_attention: Vec<f32>,
+}
+
+struct CpuQ4Layer {
+    input_norm: Vec<f32>,
+    post_attention_norm: Vec<f32>,
+    q_proj: qx_quant::QuantizedTensor,
+    k_proj: qx_quant::QuantizedTensor,
+    v_proj: qx_quant::QuantizedTensor,
+    o_proj: qx_quant::QuantizedTensor,
+    router: qx_quant::QuantizedTensor,
+}
+
+struct CpuQ4Cache {
+    context: usize,
+    length: usize,
+    keys: Vec<f32>,
+    values: Vec<f32>,
+}
+
+impl CpuQ4Reference {
+    pub fn load(artifact_path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        let artifact =
+            qx_format::MappedArtifact::open(artifact_path).map_err(|error| error.to_string())?;
+        let embedding = artifact_quantized(
+            &artifact,
+            u16::MAX,
+            qx_format::TensorKind::Embedding,
+            VOCAB,
+            HIDDEN,
+        )?;
+        let final_norm = artifact_raw_norm(&artifact, u16::MAX, qx_format::TensorKind::FinalNorm)?;
+        let mut layers = Vec::with_capacity(LAYERS);
+        for layer in 0..LAYERS {
+            layers.push(CpuQ4Layer {
+                input_norm: artifact_raw_norm(
+                    &artifact,
+                    layer as u16,
+                    qx_format::TensorKind::InputNorm,
+                )?,
+                post_attention_norm: artifact_raw_norm(
+                    &artifact,
+                    layer as u16,
+                    qx_format::TensorKind::PostAttentionNorm,
+                )?,
+                q_proj: artifact_quantized(
+                    &artifact,
+                    layer as u16,
+                    qx_format::TensorKind::QProj,
+                    HIDDEN,
+                    HIDDEN,
+                )?,
+                k_proj: artifact_quantized(
+                    &artifact,
+                    layer as u16,
+                    qx_format::TensorKind::KProj,
+                    KV_HEADS * HEAD_DIM,
+                    HIDDEN,
+                )?,
+                v_proj: artifact_quantized(
+                    &artifact,
+                    layer as u16,
+                    qx_format::TensorKind::VProj,
+                    KV_HEADS * HEAD_DIM,
+                    HIDDEN,
+                )?,
+                o_proj: artifact_quantized(
+                    &artifact,
+                    layer as u16,
+                    qx_format::TensorKind::OProj,
+                    HIDDEN,
+                    HIDDEN,
+                )?,
+                router: artifact_quantized(
+                    &artifact,
+                    layer as u16,
+                    qx_format::TensorKind::Router,
+                    EXPERTS,
+                    HIDDEN,
+                )?,
+            });
+        }
+        let context = artifact.info().header.context_limit as usize;
+        let caches = (0..LAYERS).map(|_| CpuQ4Cache::new(context)).collect();
+        Ok(Self {
+            artifact,
+            embedding,
+            final_norm,
+            layers,
+            caches,
+            last_attention: vec![0.0; HIDDEN],
+        })
+    }
+
+    pub fn step(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
+        if token as usize >= VOCAB {
+            return Err(format!("token {token} is outside vocabulary"));
+        }
+        let mut hidden = self.embedding.row(token as usize);
+        for value in &mut hidden {
+            *value *= qx_model::EMBEDDING_MULTIPLIER;
+        }
+        for layer in 0..LAYERS {
+            let weights = &self.layers[layer];
+            let normalized = cpu_rms_norm(&hidden, &weights.input_norm);
+            let mut query = weights.q_proj.mat_vec(&normalized);
+            let mut key = weights.k_proj.mat_vec(&normalized);
+            let value = weights.v_proj.mat_vec(&normalized);
+            cpu_rotate_heads(&mut query, ATTENTION_HEADS, position);
+            cpu_rotate_heads(&mut key, KV_HEADS, position);
+            let attention = self.caches[layer].attend(position, &key, &value, &query)?;
+            if layer + 1 == LAYERS {
+                self.last_attention.copy_from_slice(&attention);
+            }
+            let projection = weights.o_proj.mat_vec(&attention);
+            let after_attention = hidden
+                .iter()
+                .zip(projection)
+                .map(|(left, right)| left + qx_model::RESIDUAL_MULTIPLIER * right)
+                .collect::<Vec<_>>();
+            let moe_input = cpu_rms_norm(&after_attention, &weights.post_attention_norm);
+            let router_logits = weights.router.mat_vec(&moe_input);
+            let routed = cpu_topk_with_active_k(&router_logits, layer);
+            let mut moe_output = vec![0.0; HIDDEN];
+            for (expert, route_weight) in routed {
+                let gate_up = artifact_quantized_expert(
+                    &self.artifact,
+                    layer as u16,
+                    expert,
+                    qx_format::TensorKind::GateUp,
+                )?;
+                let down = artifact_quantized_expert(
+                    &self.artifact,
+                    layer as u16,
+                    expert,
+                    qx_format::TensorKind::Down,
+                )?;
+                let gate_up_values = gate_up.mat_vec(&moe_input);
+                let activated = (0..INTERMEDIATE)
+                    .map(|index| {
+                        let gate = gate_up_values[index];
+                        let up = gate_up_values[INTERMEDIATE + index];
+                        (gate / (1.0 + (-gate).exp())) * up
+                    })
+                    .collect::<Vec<_>>();
+                let expert_output = down.mat_vec(&activated);
+                for (destination, value) in moe_output.iter_mut().zip(expert_output) {
+                    *destination += route_weight * value;
+                }
+            }
+            hidden = after_attention
+                .into_iter()
+                .zip(moe_output)
+                .map(|(left, right)| left + qx_model::RESIDUAL_MULTIPLIER * right)
+                .collect();
+        }
+        let hidden = cpu_rms_norm(&hidden, &self.final_norm);
+        Ok(self
+            .embedding
+            .mat_vec(&hidden)
+            .into_iter()
+            .map(|value| value / qx_model::LOGITS_SCALING)
+            .collect())
+    }
+
+    /// Return the final layer's attention output from the most recent step.
+    /// This is a validation trace, not a runtime dependency.
+    pub fn last_attention(&self) -> &[f32] {
+        &self.last_attention
+    }
+
+    /// Return one layer's CPU RoPE/KV slot from the most recent sequential
+    /// decode. This lets the V2 parity harness distinguish a bad cache write
+    /// from a later attention or projection error.
+    pub fn cache_at(&self, layer: usize, position: usize) -> Result<(&[f32], &[f32]), String> {
+        let cache = self
+            .caches
+            .get(layer)
+            .ok_or_else(|| format!("cache layer {layer} is outside the Granite plan"))?;
+        if position >= cache.length {
+            return Err(format!(
+                "cache position {position} has not been written (length {})",
+                cache.length
+            ));
+        }
+        let width = KV_HEADS * HEAD_DIM;
+        let start = position * width;
+        Ok((
+            &cache.keys[start..start + width],
+            &cache.values[start..start + width],
+        ))
+    }
+}
+
+impl CpuQ4Cache {
+    fn new(context: usize) -> Self {
+        Self {
+            context,
+            length: 0,
+            keys: vec![0.0; context * KV_HEADS * HEAD_DIM],
+            values: vec![0.0; context * KV_HEADS * HEAD_DIM],
+        }
+    }
+
+    fn attend(
+        &mut self,
+        position: usize,
+        key: &[f32],
+        value: &[f32],
+        query: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        if position != self.length || position >= self.context {
+            return Err(format!("invalid CPU Q4 KV position {position}"));
+        }
+        let stride = KV_HEADS * HEAD_DIM;
+        let start = position * stride;
+        self.keys[start..start + stride].copy_from_slice(key);
+        self.values[start..start + stride].copy_from_slice(value);
+        self.length += 1;
+        let mut output = vec![0.0; HIDDEN];
+        let groups = ATTENTION_HEADS / KV_HEADS;
+        for head in 0..ATTENTION_HEADS {
+            let kv_head = head / groups;
+            let query_start = head * HEAD_DIM;
+            let scores = (0..self.length)
+                .map(|cached| {
+                    let key_start = (cached * KV_HEADS + kv_head) * HEAD_DIM;
+                    query[query_start..query_start + HEAD_DIM]
+                        .iter()
+                        .zip(&self.keys[key_start..key_start + HEAD_DIM])
+                        .map(|(left, right)| left * right)
+                        .sum::<f32>()
+                        * qx_model::ATTENTION_MULTIPLIER
+                })
+                .collect::<Vec<_>>();
+            let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let denominator = scores
+                .iter()
+                .map(|score| (*score - maximum).exp())
+                .sum::<f32>();
+            for (cached, score) in scores.into_iter().enumerate() {
+                let key_start = (cached * KV_HEADS + kv_head) * HEAD_DIM;
+                let weight = (score - maximum).exp() / denominator;
+                let value_start = key_start;
+                for index in 0..HEAD_DIM {
+                    output[query_start + index] += weight * self.values[value_start + index];
+                }
+            }
+        }
+        Ok(output)
+    }
+}
+
+fn artifact_entry(
+    artifact: &qx_format::MappedArtifact,
+    layer: u16,
+    expert: u8,
+    kind: qx_format::TensorKind,
+) -> Result<usize, String> {
+    artifact
+        .info()
+        .entries
+        .iter()
+        .position(|entry| entry.layer == layer && entry.expert == expert && entry.kind == kind)
+        .ok_or_else(|| format!("artifact is missing layer {layer} expert {expert} {kind:?}"))
+}
+
+fn artifact_quantized(
+    artifact: &qx_format::MappedArtifact,
+    layer: u16,
+    kind: qx_format::TensorKind,
+    rows: usize,
+    cols: usize,
+) -> Result<qx_quant::QuantizedTensor, String> {
+    let index = artifact_entry(artifact, layer, u8::MAX, kind)?;
+    let tensor = artifact
+        .quantized_tensor(index)
+        .map_err(|error| error.to_string())?;
+    if tensor.rows != rows || tensor.cols != cols {
+        return Err(format!(
+            "artifact {kind:?} has shape [{}, {}]",
+            tensor.rows, tensor.cols
+        ));
+    }
+    Ok(tensor)
+}
+
+fn artifact_quantized_expert(
+    artifact: &qx_format::MappedArtifact,
+    layer: u16,
+    expert: u8,
+    kind: qx_format::TensorKind,
+) -> Result<qx_quant::QuantizedTensor, String> {
+    let index = artifact_entry(artifact, layer, expert, kind)?;
+    artifact
+        .quantized_tensor(index)
+        .map_err(|error| error.to_string())
+}
+
+fn artifact_raw_norm(
+    artifact: &qx_format::MappedArtifact,
+    layer: u16,
+    kind: qx_format::TensorKind,
+) -> Result<Vec<f32>, String> {
+    let index = artifact_entry(artifact, layer, u8::MAX, kind)?;
+    artifact
+        .raw_tensor_f32(index)
+        .map_err(|error| error.to_string())
+}
+
+fn cpu_rms_norm(input: &[f32], weight: &[f32]) -> Vec<f32> {
+    let mean_square = input.iter().map(|value| value * value).sum::<f32>() / HIDDEN as f32;
+    let scale = (mean_square + qx_model::RMS_EPSILON).sqrt().recip();
+    input
+        .iter()
+        .zip(weight)
+        .map(|(value, weight)| value * scale * weight)
+        .collect()
+}
+
+fn cpu_rotate_heads(values: &mut [f32], heads: usize, position: usize) {
+    for head in 0..heads {
+        let start = head * HEAD_DIM;
+        for pair in 0..HEAD_DIM / 2 {
+            let angle =
+                position as f32 * qx_model::ROPE_THETA.powf(-((2 * pair) as f32) / HEAD_DIM as f32);
+            let (sin, cos) = angle.sin_cos();
+            let left = values[start + pair];
+            let right = values[start + HEAD_DIM / 2 + pair];
+            values[start + pair] = left * cos - right * sin;
+            values[start + HEAD_DIM / 2 + pair] = left * sin + right * cos;
+        }
+    }
+}
+
+fn cpu_topk(logits: &[f32]) -> Vec<(u8, f32)> {
+    let mut used = [false; EXPERTS];
+    let mut selected = Vec::with_capacity(TOP_K);
+    let mut maximum = f32::NEG_INFINITY;
+    for _ in 0..TOP_K {
+        let mut best = 0;
+        let mut best_value = f32::NEG_INFINITY;
+        for index in 0..EXPERTS {
+            if !used[index] && logits[index] > best_value {
+                best = index;
+                best_value = logits[index];
+            }
+        }
+        used[best] = true;
+        maximum = maximum.max(best_value);
+        selected.push((best as u8, best_value));
+    }
+    let denominator = selected
+        .iter()
+        .map(|(_, value)| (*value - maximum).exp())
+        .sum::<f32>();
+    selected
+        .into_iter()
+        .map(|(expert, value)| (expert, (value - maximum).exp() / denominator))
+        .collect()
+}
+
+fn cpu_topk_with_active_k(logits: &[f32], layer: usize) -> Vec<(u8, f32)> {
+    let mut routed = cpu_topk(logits);
+    let Some(active_k) = active_k_for_layer(layer).filter(|&active_k| active_k < TOP_K) else {
+        return routed;
+    };
+    routed.truncate(active_k);
+    let normalization = routed.iter().map(|(_, weight)| *weight).sum::<f32>();
+    for (_, weight) in &mut routed {
+        *weight /= normalization;
+    }
+    routed
+}
+
+#[cfg(target_os = "macos")]
+impl PreparedMoeStack {
+    pub fn load(
+        context: &qx_metal::platform::MetalContext,
+        artifact_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, String> {
+        let mut identity = [[0_u8; 32]; LAYERS];
+        for layer in &mut identity {
+            for (expert, slot) in layer.iter_mut().enumerate() {
+                *slot = expert as u8;
+            }
+        }
+        Self::load_with_permutation(context, artifact_path, &identity)
+    }
+
+    /// Load MoE tensors into physical expert slots selected by a per-layer
+    /// permutation. `permutation[layer][slot]` is the logical expert stored in
+    /// that physical slot. Router IDs must be remapped to the inverse mapping
+    /// by the caller before execution.
+    pub fn load_with_permutation(
+        context: &qx_metal::platform::MetalContext,
+        artifact_path: impl AsRef<std::path::Path>,
+        permutation: &[[u8; 32]; LAYERS],
+    ) -> Result<Self, String> {
+        let artifact =
+            qx_format::MappedArtifact::open(artifact_path).map_err(|error| error.to_string())?;
+        let requested_layout = moe_requested_layout();
+        let mixed_layout = moe_mixed_layout_requested();
+        let split_gate_up = moe_split_gate_up_requested();
+        let q3_request = moe_q3_gate_up_requested();
+        if q3_request.is_some() && split_gate_up {
+            return Err("Q3 gate/up is currently incompatible with split gate/up".to_owned());
+        }
+        let q3_artifact = q3_request
+            .as_ref()
+            .map(|(path, _)| {
+                qx_format::MappedArtifact::open(path).map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        let mut layers = Vec::with_capacity(LAYERS);
+        for (layer, layer_permutation) in permutation.iter().enumerate() {
+            let mut gate_up_packed = Vec::new();
+            let mut gate_up_scales = Vec::new();
+            let mut q3_gate_up_packed = Vec::new();
+            let mut q3_gate_up_scales = Vec::new();
+            let mut split_gate_packed = Vec::new();
+            let mut split_gate_scales = Vec::new();
+            let mut split_up_packed = Vec::new();
+            let mut split_up_scales = Vec::new();
+            let mut down_packed = Vec::new();
+            let mut down_scales = Vec::new();
+            let mut layout = None;
+            for &logical_expert in layer_permutation.iter().take(EXPERTS) {
+                let expert = logical_expert as usize;
+                if expert >= EXPERTS {
+                    return Err(format!(
+                        "layer {layer} permutation contains expert {expert} outside the model"
+                    ));
+                }
+                let gate_index = artifact
+                    .info()
+                    .entries
+                    .iter()
+                    .position(|entry| {
+                        entry.layer == layer as u16
+                            && entry.expert == expert as u8
+                            && entry.kind == qx_format::TensorKind::GateUp
+                    })
+                    .ok_or_else(|| format!("missing layer {layer} expert {expert} gate/up"))?;
+                let down_index = artifact
+                    .info()
+                    .entries
+                    .iter()
+                    .position(|entry| {
+                        entry.layer == layer as u16
+                            && entry.expert == expert as u8
+                            && entry.kind == qx_format::TensorKind::Down
+                    })
+                    .ok_or_else(|| format!("missing layer {layer} expert {expert} down"))?;
+                let gate_entry = &artifact.info().entries[gate_index];
+                let down_entry = &artifact.info().entries[down_index];
+                if gate_entry.quant_type != qx_quant::QuantType::Q4
+                    || down_entry.quant_type != qx_quant::QuantType::Q4
+                    || gate_entry.layout != down_entry.layout
+                {
+                    return Err(format!("layer {layer} expert {expert} is not uniform Q4"));
+                }
+                if let Some(expected) = layout {
+                    if expected != gate_entry.layout {
+                        return Err(format!("layer {layer} has mixed packing layouts"));
+                    }
+                } else {
+                    layout = Some(gate_entry.layout);
+                }
+                let target_layout = if mixed_layout {
+                    qx_quant::PackingLayout::MetalTile32
+                } else {
+                    requested_layout.unwrap_or(gate_entry.layout)
+                };
+                let (gate_scales, gate_packed) =
+                    if target_layout == qx_quant::PackingLayout::MetalTile32Paired {
+                        quantized_gate_up_paired_bytes(&artifact, gate_index)?
+                    } else {
+                        quantized_bytes_for_layout(&artifact, gate_index, target_layout)?
+                    };
+                let down_layout = if mixed_layout {
+                    qx_quant::PackingLayout::RowMajor
+                } else if target_layout == qx_quant::PackingLayout::MetalTile32Paired {
+                    qx_quant::PackingLayout::MetalTile32
+                } else {
+                    target_layout
+                };
+                let (down_scales_bytes, down_packed_bytes) =
+                    quantized_bytes_for_layout(&artifact, down_index, down_layout)?;
+                gate_up_scales.extend_from_slice(&gate_scales);
+                gate_up_packed.extend_from_slice(&gate_packed);
+                if let Some(q3_artifact) = q3_artifact.as_ref() {
+                    let q3_index = q3_artifact
+                        .info()
+                        .entries
+                        .iter()
+                        .position(|entry| {
+                            entry.layer == layer as u16
+                                && entry.expert == expert as u8
+                                && entry.kind == qx_format::TensorKind::GateUp
+                        })
+                        .ok_or_else(|| {
+                            format!("missing Q3 layer {layer} expert {expert} gate/up")
+                        })?;
+                    let q3_entry = &q3_artifact.info().entries[q3_index];
+                    if q3_entry.rows as usize != HIDDEN
+                        || q3_entry.cols as usize != HIDDEN
+                        || q3_entry.group_size as usize != 32
+                    {
+                        return Err(format!(
+                            "Q3 layer {layer} expert {expert} gate/up is not Q3 [1024,1024] group-32"
+                        ));
+                    }
+                    let mut q3_tensor = q3_artifact
+                        .quantized_tensor(q3_index)
+                        .map_err(|error| error.to_string())?;
+                    if q3_tensor.quant_type != qx_quant::QuantType::Q3 {
+                        // The mixed source artifact keeps a small number of
+                        // sensitive experts at Q4.  Re-quantize those source
+                        // tensors to Q3 so this experiment has a uniform
+                        // gate/up representation while retaining the source
+                        // artifact's original values as its starting point.
+                        let values = q3_tensor.dequantize();
+                        q3_tensor = qx_quant::QuantizedTensor::quantize(
+                            &values,
+                            HIDDEN,
+                            HIDDEN,
+                            qx_quant::QuantType::Q3,
+                            32,
+                        );
+                    }
+                    let block_bytes = q3_request.as_ref().map(|(_, bytes)| *bytes).unwrap_or(12);
+                    let (scales, packed) = q3_gate_up_bytes(&q3_tensor, block_bytes)?;
+                    q3_gate_up_scales.extend_from_slice(&scales);
+                    q3_gate_up_packed.extend_from_slice(&packed);
+                }
+                if split_gate_up {
+                    let (gate_scales, gate_packed) = quantized_row_range_bytes_for_layout(
+                        &artifact,
+                        gate_index,
+                        0,
+                        512,
+                        target_layout,
+                    )?;
+                    let (up_scales, up_packed) = quantized_row_range_bytes_for_layout(
+                        &artifact,
+                        gate_index,
+                        512,
+                        512,
+                        target_layout,
+                    )?;
+                    split_gate_scales.extend_from_slice(&gate_scales);
+                    split_gate_packed.extend_from_slice(&gate_packed);
+                    split_up_scales.extend_from_slice(&up_scales);
+                    split_up_packed.extend_from_slice(&up_packed);
+                }
+                down_scales.extend_from_slice(&down_scales_bytes);
+                down_packed.extend_from_slice(&down_packed_bytes);
+            }
+            let gate_layout = if mixed_layout {
+                qx_quant::PackingLayout::MetalTile32
+            } else {
+                requested_layout.unwrap_or(layout.expect("at least one expert"))
+            };
+            let down_layout = if mixed_layout {
+                qx_quant::PackingLayout::RowMajor
+            } else if gate_layout == qx_quant::PackingLayout::MetalTile32Paired {
+                qx_quant::PackingLayout::MetalTile32
+            } else {
+                gate_layout
+            };
+            let prepared = if split_gate_up {
+                context.prepare_dynamic_q4_moe_with_split_layouts(
+                    &gate_up_packed,
+                    &gate_up_scales,
+                    &split_gate_packed,
+                    &split_gate_scales,
+                    &split_up_packed,
+                    &split_up_scales,
+                    &down_packed,
+                    &down_scales,
+                    gate_layout,
+                    down_layout,
+                )?
+            } else if let Some((_, block_bytes)) = q3_request.as_ref() {
+                context.prepare_dynamic_q4_moe_with_q3_gate_up(
+                    &q3_gate_up_packed,
+                    &q3_gate_up_scales,
+                    *block_bytes,
+                    &gate_up_packed,
+                    &gate_up_scales,
+                    &down_packed,
+                    &down_scales,
+                    down_layout,
+                )?
+            } else {
+                context.prepare_dynamic_q4_moe_with_layouts(
+                    &gate_up_packed,
+                    &gate_up_scales,
+                    &down_packed,
+                    &down_scales,
+                    gate_layout,
+                    down_layout,
+                )?
+            };
+            layers.push(prepared);
+            artifact
+                .discard_resident_pages()
+                .map_err(|error| error.to_string())?;
+            if let Some(q3_artifact) = q3_artifact.as_ref() {
+                q3_artifact
+                    .discard_resident_pages()
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(Self { layers })
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn prepare_matrix(
+    context: &qx_metal::platform::MetalContext,
+    checkpoint: Option<&qx_safetensors::Checkpoint>,
+    artifact: Option<&qx_format::MappedArtifact>,
+    layer: u16,
+    kind: qx_format::TensorKind,
+    name: &str,
+    rows: usize,
+    columns: usize,
+) -> Result<qx_metal::platform::PreparedQuantizedDense, String> {
+    if let Some(artifact) = artifact {
+        let index = artifact
+            .info()
+            .entries
+            .iter()
+            .position(|entry| entry.layer == layer && entry.expert == u8::MAX && entry.kind == kind)
+            .ok_or_else(|| format!("dense Q4 artifact is missing {kind:?} for layer {layer}"))?;
+        let entry = &artifact.info().entries[index];
+        if entry.quant_type != qx_quant::QuantType::Q4
+            || entry.layout != qx_quant::PackingLayout::RowMajor
+            || entry.rows as usize != rows
+            || entry.cols as usize != columns
+        {
+            return Err(format!(
+                "artifact tensor {kind:?} layer {layer} is not row-major Q4 [{rows}, {columns}]"
+            ));
+        }
+        let quantized = artifact
+            .quantized_tensor(index)
+            .map_err(|error| error.to_string())?;
+        return context.prepare_q4_dense(&quantized);
+    }
+    let checkpoint = checkpoint.ok_or_else(|| {
+        format!("no artifact tensor {kind:?} for layer {layer}, and no checkpoint was supplied")
+    })?;
+    let (shape, values) = checkpoint
+        .tensor_f32(name)
+        .map_err(|error| error.to_string())?;
+    if shape != [rows, columns] {
+        return Err(format!(
+            "tensor {name} has shape {shape:?}, expected [{rows}, {columns}]"
+        ));
+    }
+    let quantized =
+        qx_quant::QuantizedTensor::quantize(&values, rows, columns, qx_quant::QuantType::Q4, 32);
+    context.prepare_q4_dense(&quantized)
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_norm(
+    context: &qx_metal::platform::MetalContext,
+    checkpoint: Option<&qx_safetensors::Checkpoint>,
+    artifact: Option<&qx_format::MappedArtifact>,
+    layer: u16,
+    kind: qx_format::TensorKind,
+    name: &str,
+) -> Result<qx_metal::platform::RuntimeBuffer, String> {
+    let values = if let Some(artifact) = artifact {
+        let index = artifact
+            .info()
+            .entries
+            .iter()
+            .position(|entry| entry.layer == layer && entry.expert == u8::MAX && entry.kind == kind)
+            .ok_or_else(|| format!("artifact is missing {kind:?} for layer {layer}"))?;
+        let entry = &artifact.info().entries[index];
+        if entry.rows as usize != HIDDEN || entry.cols != 1 {
+            return Err(format!("artifact norm {kind:?} has invalid shape"));
+        }
+        artifact
+            .raw_tensor_f32(index)
+            .map_err(|error| error.to_string())?
+    } else {
+        let checkpoint = checkpoint.ok_or_else(|| {
+            format!("no artifact norm {kind:?} for layer {layer}, and no checkpoint was supplied")
+        })?;
+        let (shape, values) = checkpoint
+            .tensor_f32(name)
+            .map_err(|error| error.to_string())?;
+        if shape != [HIDDEN] {
+            return Err(format!(
+                "norm {name} has shape {shape:?}, expected [{HIDDEN}]"
+            ));
+        }
+        values
+    };
+    let buffer = context.allocate_runtime_buffer(HIDDEN * std::mem::size_of::<f32>())?;
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            values.as_ptr() as *const u8,
+            std::mem::size_of_val(values.as_slice()),
+        )
+    };
+    context.write_runtime_buffer(&buffer, bytes)?;
+    Ok(buffer)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BufferId {
+    HiddenA,
+    HiddenB,
+    Query,
+    Key,
+    Value,
+    Attention,
+    AttentionScratch,
+    MoeInput,
+    RouterScores,
+    TopKIds,
+    TopKWeights,
+    MoeScratch,
+    MoeOutput,
+    Logits,
+    TokenOutput,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelVariant {
+    FusedRmsNormQkv,
+    RopeKvWrite,
+    DecodeAttention,
+    OutputResidual,
+    RouterTopK,
+    FusedQ4Moe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BufferRegion {
+    pub id: BufferId,
+    pub offset: usize,
+    pub length: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LayerPlan {
+    pub layer: usize,
+    pub input: BufferId,
+    pub output: BufferId,
+    pub norm_qkv: KernelVariant,
+    pub rope_kv: KernelVariant,
+    pub attention: KernelVariant,
+    pub output_residual: KernelVariant,
+    pub router_topk: KernelVariant,
+    pub moe: KernelVariant,
+    pub expected_dispatches: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionPlan {
+    pub context: usize,
+    pub arena_bytes: usize,
+    pub kv_bytes: usize,
+    pub regions: Vec<BufferRegion>,
+    pub layers: [LayerPlan; LAYERS],
+    pub command_buffers_per_token: usize,
+    pub encoders_per_token: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryAudit {
+    pub expert_artifact_bytes: usize,
+    pub dense_artifact_bytes: usize,
+    pub dense_fp32_reference_bytes: usize,
+    pub dense_q4_full_bytes: usize,
+    pub attention_q4_bytes: usize,
+    pub arena_bytes: usize,
+    pub kv_bytes: usize,
+    pub estimated_fp32_reference_bytes: usize,
+    pub estimated_q4_full_resident_bytes: usize,
+}
+
+impl MemoryAudit {
+    pub fn estimated_q4_full_resident_mib(self) -> f64 {
+        self.estimated_q4_full_resident_bytes as f64 / (1024.0 * 1024.0)
+    }
+}
+
+/// Dense checkpoint bytes that the current V1 loader keeps in FP32. V2 will
+/// eventually move these into the compiled artifact; exposing the estimate
+/// makes the current memory gap explicit instead of hiding it in RSS.
+pub const fn granite_dense_fp32_bytes() -> usize {
+    let embedding = VOCAB * HIDDEN;
+    let attention = LAYERS
+        * (HIDDEN * HIDDEN + 2 * KV_HEADS * (HIDDEN / ATTENTION_HEADS) * HIDDEN + HIDDEN * HIDDEN);
+    let router = LAYERS * EXPERTS * HIDDEN;
+    let norms = LAYERS * 2 * HIDDEN + HIDDEN;
+    (embedding + attention + router + norms) * std::mem::size_of::<f32>()
+}
+
+const fn q4_matrix_bytes(rows: usize, columns: usize) -> usize {
+    rows * (columns / 2) + rows * (columns / 32) * 2
+}
+
+pub const fn granite_attention_q4_bytes() -> usize {
+    LAYERS
+        * (q4_matrix_bytes(HIDDEN, HIDDEN)
+            + 2 * q4_matrix_bytes(KV_HEADS * (HIDDEN / ATTENTION_HEADS), HIDDEN)
+            + q4_matrix_bytes(HIDDEN, HIDDEN))
+        + LAYERS * HIDDEN * std::mem::size_of::<f32>()
+}
+
+pub const fn granite_dense_q4_bytes() -> usize {
+    q4_matrix_bytes(VOCAB, HIDDEN)
+        + granite_attention_q4_bytes()
+        + LAYERS * q4_matrix_bytes(EXPERTS, HIDDEN)
+        + (LAYERS * HIDDEN * 2 + HIDDEN) * std::mem::size_of::<f32>()
+}
+
+impl ExecutionPlan {
+    pub fn granite(context: usize) -> Result<Self, String> {
+        if context == 0 || context > 4096 {
+            return Err(format!("context {context} must be in 1..=4096"));
+        }
+        let mut offset = 0;
+        let mut regions = Vec::new();
+        let mut add = |id: BufferId, length: usize| {
+            offset = align(offset, 256);
+            let region = BufferRegion { id, offset, length };
+            offset += length;
+            regions.push(region);
+        };
+        let hidden_bytes = HIDDEN * std::mem::size_of::<f32>();
+        add(BufferId::HiddenA, hidden_bytes);
+        add(BufferId::HiddenB, hidden_bytes);
+        add(BufferId::Query, ATTENTION_HEADS * HEAD_DIM * 4);
+        add(BufferId::Key, KV_HEADS * HEAD_DIM * 4);
+        add(BufferId::Value, KV_HEADS * HEAD_DIM * 4);
+        add(BufferId::Attention, hidden_bytes);
+        add(BufferId::AttentionScratch, ATTENTION_HEADS * context * 4);
+        add(BufferId::MoeInput, hidden_bytes);
+        add(BufferId::RouterScores, 32 * 4);
+        add(BufferId::TopKIds, TOP_K * std::mem::size_of::<u32>());
+        add(BufferId::TopKWeights, TOP_K * 4);
+        add(
+            BufferId::MoeScratch,
+            TOP_K * (2 * HIDDEN + INTERMEDIATE) * 4 + ATTENTION_HEADS * 512 * 8,
+        );
+        add(BufferId::MoeOutput, hidden_bytes);
+        add(BufferId::Logits, 49155 * 4);
+        add(BufferId::TokenOutput, std::mem::size_of::<u32>());
+
+        // V2's first decode kernels use FP32 activations and KV for validated
+        // numerical parity. The storage type can be lowered to FP16 after the
+        // fused path has a regression fixture.
+        let kv_bytes = LAYERS * context * KV_HEADS * HEAD_DIM * 2 * std::mem::size_of::<f32>();
+        let layers = std::array::from_fn(|layer| LayerPlan {
+            layer,
+            input: if layer.is_multiple_of(2) {
+                BufferId::HiddenA
+            } else {
+                BufferId::HiddenB
+            },
+            output: if layer.is_multiple_of(2) {
+                BufferId::HiddenB
+            } else {
+                BufferId::HiddenA
+            },
+            norm_qkv: KernelVariant::FusedRmsNormQkv,
+            rope_kv: KernelVariant::RopeKvWrite,
+            attention: KernelVariant::DecodeAttention,
+            output_residual: KernelVariant::OutputResidual,
+            router_topk: KernelVariant::RouterTopK,
+            moe: KernelVariant::FusedQ4Moe,
+            // norm, fused QKV, RoPE/KV, hierarchical three-stage attention,
+            // GQA-aware V partial/reduce, O, residual, post norm, router,
+            // top-k, MoE, and residual.
+            expected_dispatches: 19,
+        });
+        Ok(Self {
+            context,
+            arena_bytes: align(offset, 256),
+            kv_bytes,
+            regions,
+            layers,
+            command_buffers_per_token: 1,
+            encoders_per_token: 1,
+        })
+    }
+
+    pub fn region(&self, id: BufferId) -> BufferRegion {
+        self.regions
+            .iter()
+            .find(|region| region.id == id)
+            .copied()
+            .expect("static V2 region")
+    }
+
+    pub fn expected_dispatches_per_token(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| layer.expected_dispatches)
+            .sum::<usize>()
+            + 5 // embedding lookup, final norm, LM head, argmax partial/reduce
+    }
+
+    pub fn memory_audit(&self, expert_artifact_bytes: usize) -> MemoryAudit {
+        self.memory_audit_with_dense_artifact(expert_artifact_bytes, 0)
+    }
+
+    pub fn memory_audit_with_dense_artifact(
+        &self,
+        expert_artifact_bytes: usize,
+        dense_artifact_bytes: usize,
+    ) -> MemoryAudit {
+        let dense_fp32_reference_bytes = granite_dense_fp32_bytes();
+        let dense_q4_full_bytes = granite_dense_q4_bytes();
+        let attention_q4_bytes = granite_attention_q4_bytes();
+        let resident_dense_bytes = if dense_artifact_bytes == 0 {
+            dense_q4_full_bytes
+        } else {
+            dense_artifact_bytes + (LAYERS * HIDDEN * 2 + HIDDEN) * std::mem::size_of::<f32>()
+        };
+        MemoryAudit {
+            expert_artifact_bytes,
+            dense_artifact_bytes,
+            dense_fp32_reference_bytes,
+            dense_q4_full_bytes,
+            attention_q4_bytes,
+            arena_bytes: self.arena_bytes,
+            kv_bytes: self.kv_bytes,
+            estimated_fp32_reference_bytes: expert_artifact_bytes
+                + dense_fp32_reference_bytes
+                + self.arena_bytes
+                + self.kv_bytes,
+            estimated_q4_full_resident_bytes: expert_artifact_bytes
+                + resident_dense_bytes
+                + self.arena_bytes
+                + self.kv_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExecutionCounters {
+    pub command_buffers: u64,
+    pub encoders: u64,
+    pub dispatches: u64,
+    pub internal_waits: u64,
+    pub selected_tokens: u64,
+}
+
+impl ExecutionCounters {
+    pub fn record_token(&mut self, dispatches: u64) {
+        self.command_buffers += 1;
+        self.encoders += 1;
+        self.dispatches += dispatches;
+        self.selected_tokens += 1;
+    }
+}
+
+/// GPU storage owned by a V2 runtime instance. Allocation happens once, before
+/// token generation; each logical plan region is a view into the single arena.
+#[cfg(target_os = "macos")]
+pub struct GpuRuntimeBuffers {
+    context: Rc<qx_metal::platform::MetalContext>,
+    pub plan: ExecutionPlan,
+    arena: qx_metal::platform::RuntimeBuffer,
+    kv: qx_metal::platform::RuntimeBuffer,
+    regions: Vec<(BufferId, qx_metal::platform::RuntimeBuffer)>,
+}
+
+#[cfg(target_os = "macos")]
+impl GpuRuntimeBuffers {
+    pub fn new(
+        context: Rc<qx_metal::platform::MetalContext>,
+        plan: ExecutionPlan,
+    ) -> Result<Self, String> {
+        let arena = context.allocate_runtime_buffer(plan.arena_bytes)?;
+        let kv_bytes: usize = (0..LAYERS)
+            .map(|layer| {
+                Self::key_layer_bytes(&plan, layer) + Self::value_layer_bytes(&plan, layer)
+            })
+            .sum();
+        let kv = context.allocate_runtime_buffer(kv_bytes.max(1))?;
+        let regions = plan
+            .regions
+            .iter()
+            .map(|region| {
+                arena
+                    .subregion(region.offset, region.length)
+                    .map(|view| (region.id, view))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            context,
+            plan,
+            arena,
+            kv,
+            regions,
+        })
+    }
+
+    pub fn context(&self) -> &Rc<qx_metal::platform::MetalContext> {
+        &self.context
+    }
+
+    pub fn buffer(&self, id: BufferId) -> &qx_metal::platform::RuntimeBuffer {
+        self.regions
+            .iter()
+            .find(|(region_id, _)| *region_id == id)
+            .map(|(_, buffer)| buffer)
+            .expect("static V2 buffer region")
+    }
+
+    pub fn kv_buffer(&self) -> &qx_metal::platform::RuntimeBuffer {
+        &self.kv
+    }
+
+    fn key_layer_bytes(plan: &ExecutionPlan, layer: usize) -> usize {
+        let element_bytes = if qx_metal::platform::kv_key_fp16_for_layer(layer) {
+            std::mem::size_of::<u16>()
+        } else {
+            std::mem::size_of::<f32>()
+        };
+        plan.context * KV_HEADS * HEAD_DIM * element_bytes
+    }
+
+    fn value_layer_bytes(plan: &ExecutionPlan, layer: usize) -> usize {
+        let element_bytes = if qx_metal::platform::kv_value_fp16_for_layer(layer) {
+            std::mem::size_of::<u16>()
+        } else {
+            std::mem::size_of::<f32>()
+        };
+        plan.context * KV_HEADS * HEAD_DIM * element_bytes
+    }
+
+    fn kv_layer_offset(&self, layer: usize) -> usize {
+        (0..layer)
+            .map(|previous| {
+                Self::key_layer_bytes(&self.plan, previous)
+                    + Self::value_layer_bytes(&self.plan, previous)
+            })
+            .sum()
+    }
+
+    pub fn kv_key_buffer(&self, layer: usize) -> Result<qx_metal::platform::RuntimeBuffer, String> {
+        if layer >= LAYERS {
+            return Err(format!("KV layer {layer} is outside the Granite plan"));
+        }
+        let key_layer_bytes = Self::key_layer_bytes(&self.plan, layer);
+        self.kv
+            .subregion(self.kv_layer_offset(layer), key_layer_bytes)
+    }
+
+    pub fn kv_value_buffer(
+        &self,
+        layer: usize,
+    ) -> Result<qx_metal::platform::RuntimeBuffer, String> {
+        if layer >= LAYERS {
+            return Err(format!("KV layer {layer} is outside the Granite plan"));
+        }
+        let key_layer_bytes = Self::key_layer_bytes(&self.plan, layer);
+        let layer_bytes = Self::value_layer_bytes(&self.plan, layer);
+        self.kv
+            .subregion(self.kv_layer_offset(layer) + key_layer_bytes, layer_bytes)
+    }
+
+    /// Encode the complete attention half of one fixed Granite layer. The
+    /// caller supplies the already-prepared checkpoint projections and RMSNorm
+    /// weights; every intermediate remains inside the arena/KV allocation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_attention_layer(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        layer: usize,
+        input: BufferId,
+        output: BufferId,
+        input_norm: &qx_metal::platform::RuntimeBuffer,
+        qkv: &qx_metal::platform::PreparedQuantizedQkv,
+        o_proj: &qx_metal::platform::PreparedQuantizedDense,
+        position: usize,
+    ) -> Result<(), String> {
+        if layer >= LAYERS {
+            return Err(format!("layer {layer} is outside the Granite plan"));
+        }
+        let context = self.context.as_ref();
+        let normalized = self.buffer(BufferId::MoeInput);
+        let query = self.buffer(BufferId::Query);
+        let key = self.buffer(BufferId::Key);
+        let value = self.buffer(BufferId::Value);
+        let attention = self.buffer(BufferId::Attention);
+        let projection = self.buffer(BufferId::MoeOutput);
+        let key_cache = self.kv_key_buffer(layer)?;
+        let value_cache = self.kv_value_buffer(layer)?;
+
+        if qx_metal::platform::rms_scalar_qkv_enabled() {
+            let inverse_rms = self.buffer(BufferId::MoeScratch);
+            graph.encode_rmsnorm_scalar(context, self.buffer(input), input_norm, inverse_rms)?;
+            graph.encode_prepared_q4_qkv_simd_normalized(
+                qkv,
+                self.buffer(input),
+                input_norm,
+                inverse_rms,
+                query,
+                key,
+                value,
+            )?;
+        } else {
+            graph.encode_rmsnorm(context, self.buffer(input), input_norm, normalized)?;
+            graph.encode_prepared_q4_qkv_simd(qkv, normalized, query, key, value)?;
+        }
+        graph.encode_rope_kv_for_layer(
+            context,
+            query,
+            key,
+            value,
+            query,
+            &key_cache,
+            &value_cache,
+            layer,
+            position,
+        )?;
+        if qx_metal::platform::three_stage_attention_enabled() {
+            graph.encode_attention_three_stage_for_layer(
+                context,
+                query,
+                &key_cache,
+                &value_cache,
+                self.buffer(BufferId::MoeScratch),
+                attention,
+                layer,
+                position + 1,
+            )?;
+        } else {
+            graph.encode_attention(
+                context,
+                query,
+                &key_cache,
+                &value_cache,
+                attention,
+                position + 1,
+            )?;
+        }
+        graph.encode_prepared_q4_dense_simd(o_proj, attention, projection)?;
+        graph.encode_residual(
+            context,
+            self.buffer(input),
+            projection,
+            self.buffer(output),
+            qx_model::RESIDUAL_MULTIPLIER,
+        )?;
+        Ok(())
+    }
+
+    pub fn arena_buffer(&self) -> &qx_metal::platform::RuntimeBuffer {
+        &self.arena
+    }
+
+    pub fn begin_token(&self) -> Result<qx_metal::platform::DecodeGraph, String> {
+        self.context.begin_decode()
+    }
+
+    pub fn finish_token(&self, graph: qx_metal::platform::DecodeGraph) -> Result<(), String> {
+        graph.finish(&self.context)
+    }
+}
+
+const fn align(value: usize, alignment: usize) -> usize {
+    value.div_ceil(alignment) * alignment
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_is_fixed_and_ping_pongs_hidden_buffers() {
+        let plan = ExecutionPlan::granite(512).unwrap();
+        assert_eq!(plan.command_buffers_per_token, 1);
+        assert_eq!(plan.encoders_per_token, 1);
+        assert_eq!(plan.layers[0].input, BufferId::HiddenA);
+        assert_eq!(plan.layers[1].input, BufferId::HiddenB);
+        assert_eq!(plan.expected_dispatches_per_token(), 461);
+    }
+
+    #[test]
+    fn regions_are_aligned_and_non_overlapping() {
+        let plan = ExecutionPlan::granite(512).unwrap();
+        for pair in plan.regions.windows(2) {
+            assert_eq!(pair[0].offset % 256, 0);
+            assert!(pair[1].offset >= pair[0].offset + pair[0].length);
+        }
+    }
+
+    #[test]
+    fn memory_audit_exposes_dense_and_runtime_costs() {
+        let plan = ExecutionPlan::granite(512).unwrap();
+        let audit = plan.memory_audit(679_477_248);
+        assert!(audit.dense_fp32_reference_bytes > 500_000_000);
+        assert!(audit.dense_q4_full_bytes < 100_000_000);
+        assert!(audit.kv_bytes > 20_000_000);
+        assert_eq!(
+            audit.estimated_fp32_reference_bytes,
+            audit.expert_artifact_bytes
+                + audit.dense_fp32_reference_bytes
+                + audit.arena_bytes
+                + audit.kv_bytes
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn q3_gate_up_physical_forms_match_cpu_reference() {
+        let values = (0..HIDDEN * HIDDEN)
+            .map(|index| ((index % 257) as f32 - 128.0) / 31.0)
+            .collect::<Vec<_>>();
+        let source = qx_quant::QuantizedTensor::quantize(
+            &values,
+            HIDDEN,
+            HIDDEN,
+            qx_quant::QuantType::Q3,
+            32,
+        );
+        let (_, dense) = q3_gate_up_bytes(&source, 12).unwrap();
+        assert_eq!(dense, source.data);
+        let (_, padded) = q3_gate_up_bytes(&source, 16).unwrap();
+        let mut unpadded = Vec::with_capacity(source.data.len());
+        for group in padded.chunks_exact(16) {
+            unpadded.extend_from_slice(&group[..12]);
+        }
+        assert_eq!(unpadded, source.data);
+        let input = (0..HIDDEN)
+            .map(|index| (index as f32 - 512.0) / 97.0)
+            .collect::<Vec<_>>();
+        let reference = source.mat_vec(&input);
+        let rebuilt = qx_quant::QuantizedTensor {
+            quant_type: qx_quant::QuantType::Q3,
+            layout: qx_quant::PackingLayout::RowMajor,
+            rows: HIDDEN,
+            cols: HIDDEN,
+            group_size: 32,
+            scales: source.scales.clone(),
+            data: unpadded,
+        };
+        assert_eq!(rebuilt.mat_vec(&input), reference);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gpu_buffers_use_one_arena_and_one_token_graph() {
+        let context = std::rc::Rc::new(
+            qx_metal::platform::MetalContext::system_default().expect("Metal device"),
+        );
+        let plan = ExecutionPlan::granite(512).unwrap();
+        let buffers = GpuRuntimeBuffers::new(context.clone(), plan).unwrap();
+        let logits = vec![0.0_f32; qx_model::VOCAB];
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                logits.as_ptr() as *const u8,
+                std::mem::size_of_val(logits.as_slice()),
+            )
+        };
+        context
+            .write_runtime_buffer(buffers.buffer(BufferId::Logits), bytes)
+            .unwrap();
+        let before = context.metrics().unwrap();
+        let mut graph = buffers.begin_token().unwrap();
+        graph
+            .encode_argmax(
+                &context,
+                buffers.buffer(BufferId::Logits),
+                buffers.buffer(BufferId::MoeScratch),
+                buffers.buffer(BufferId::TokenOutput),
+                qx_model::VOCAB,
+            )
+            .unwrap();
+        buffers.finish_token(graph).unwrap();
+        let after = context.metrics().unwrap();
+        assert_eq!(
+            context
+                .read_runtime_u32(buffers.buffer(BufferId::TokenOutput))
+                .unwrap(),
+            0
+        );
+        assert_eq!(after.command_buffers - before.command_buffers, 1);
+        assert_eq!(after.encoders - before.encoders, 1);
+        assert_eq!(after.dispatches - before.dispatches, 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_layer_composes_without_intermediate_readback() {
+        let context = std::rc::Rc::new(
+            qx_metal::platform::MetalContext::system_default().expect("Metal device"),
+        );
+        let plan = ExecutionPlan::granite(4).unwrap();
+        let buffers = GpuRuntimeBuffers::new(context.clone(), plan).unwrap();
+        let norm = context.allocate_runtime_buffer(HIDDEN * 4).unwrap();
+        let identity = (0..HIDDEN)
+            .flat_map(|row| (0..HIDDEN).map(move |column| if row == column { 1.0 } else { 0.0 }))
+            .collect::<Vec<_>>();
+        let kv = vec![0.0_f32; KV_HEADS * HEAD_DIM * HIDDEN];
+        let q4 = |values: &[f32], rows: usize, columns: usize| {
+            let weights = qx_quant::QuantizedTensor::quantize(
+                values,
+                rows,
+                columns,
+                qx_quant::QuantType::Q4,
+                32,
+            );
+            context.prepare_q4_dense(&weights).unwrap()
+        };
+        let q_proj = q4(&identity, HIDDEN, HIDDEN);
+        let k_proj = q4(&kv, KV_HEADS * HEAD_DIM, HIDDEN);
+        let v_proj = q4(&kv, KV_HEADS * HEAD_DIM, HIDDEN);
+        let qkv = context.prepare_q4_qkv(&q_proj, &k_proj, &v_proj).unwrap();
+        let o_proj = q4(&identity, HIDDEN, HIDDEN);
+        let ones = vec![1.0_f32; HIDDEN];
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                ones.as_ptr() as *const u8,
+                std::mem::size_of_val(ones.as_slice()),
+            )
+        };
+        context.write_runtime_buffer(&norm, bytes).unwrap();
+        context
+            .write_runtime_buffer(buffers.buffer(BufferId::HiddenA), bytes)
+            .unwrap();
+
+        let before = context.metrics().unwrap();
+        let mut graph = buffers.begin_token().unwrap();
+        buffers
+            .encode_attention_layer(
+                &mut graph,
+                0,
+                BufferId::HiddenA,
+                BufferId::HiddenB,
+                &norm,
+                &qkv,
+                &o_proj,
+                0,
+            )
+            .unwrap();
+        buffers.finish_token(graph).unwrap();
+        let after = context.metrics().unwrap();
+        assert_eq!(after.command_buffers - before.command_buffers, 1);
+        assert_eq!(after.encoders - before.encoders, 1);
+        assert_eq!(after.dispatches - before.dispatches, 11);
+    }
+}

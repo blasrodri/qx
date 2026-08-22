@@ -1,0 +1,13 @@
+[package]
+name = "qx-inspect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+qx-model.workspace = true
+qx-quant.workspace = true
+qx-safetensors = { path = "../../crates/qx-safetensors" }
+serde_json.workspace = true

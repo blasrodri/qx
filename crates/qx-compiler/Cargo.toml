@@ -1,0 +1,12 @@
+[package]
+name = "qx-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+qx-format.workspace = true
+qx-model.workspace = true
+qx-quant.workspace = true
+rayon.workspace = true

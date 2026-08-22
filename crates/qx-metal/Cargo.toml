@@ -1,0 +1,29 @@
+[package]
+name = "qx-metal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qx-quant.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", features = ["NSString"] }
+objc2-metal = { version = "0.3.2", features = [
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLDevice",
+    "MTLResource",
+    "MTLTypes",
+    "MTLLibrary",
+    "objc2-core-foundation",
+] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+half.workspace = true

@@ -1,0 +1,10 @@
+{
+  "name": "granite_decode_512",
+  "model": "ibm-granite-3.0-1b-a400m-instruct",
+  "target": "apple-m5-pro",
+  "tokens": [8279],
+  "context": 512,
+  "generation": 128,
+  "batch": 1,
+  "sampling": "greedy"
+}
