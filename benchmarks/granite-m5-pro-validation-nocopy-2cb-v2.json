@@ -11,13 +11,13 @@
     "fixtures/chat.json"
   ],
   "provenance": {
-    "qx_revision": "25e11eebf486aae8eb06a53f9a1b72d80445c7b7",
+    "qx_revision": "15133fbcacb353cdccbd7aa5f73256bc6158a7e3",
     "llama_revision": "17197474510622a3b4ea7d0909d70b606f542b96",
-    "artifact_sha256": "c99635c176191349e9222eea0d3dbe37aefefec1621f52395375947aa148077b",
+    "artifact_sha256": "90cc995e4578bf231f92e84df0c9c9d1fd15d0d708205ec8e115b669d4523d0f",
     "gguf_sha256": "46a2a757a579446d95d900085a5daaf59d78bb753302f656ec01a7192b4928a6",
     "tokenizer_sha256": "ed944c0b3d71e2d651a5ba0f8e7b350faff30031c8e3353de70b12b9c1bf5654",
     "reference_model_manifest_sha256": "3c5037e9d67f1cd7667816182f840532143771e60992a7cade2d984671272b34",
-    "metal_sources_sha256": "b0afad9b4a500853685e7feefb468fa940dbe7469909a9b9c2ac841356db68cb",
+    "metal_sources_sha256": "a67f1ec46f876dad63005dd6449b96e462ae9c54a05a8955bf8d825c72289d08",
     "llama_patch_sha256": "607abe180bc9f17bbac01259e36b596d65c84a3c2e665228ac78a88e5e427e04",
     "workload_contract_sha256": "7ca84dd6e2113e1f3828d2dde69f66060f4c87a65b3d125ae4e8b3e2f7ab318c",
     "os_build": "25F84",
