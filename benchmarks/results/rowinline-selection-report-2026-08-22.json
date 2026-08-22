@@ -1,23 +1,23 @@
 {
   "selected_plan_id": "granite-m5-top8-rowinline-nocopy-2cb-candidate",
-  "selected_complete_model_wall_ms_per_token": 4.540366859374999,
-  "selected_reason": "lowest measured complete-model wall latency after semantic, quality, memory, and promotion-tier gates",
+  "selected_complete_model_wall_ms_per_token": 4.536928390625,
+  "selected_reason": "lowest measured complete-model wall latency after semantic-equivalence or quality, memory, and promotion-tier gates",
   "candidates": [
     {
       "plan_id": "granite-m5-top8-rowmajor-nocopy-2cb-v2",
       "exact_semantics_verified": true,
-      "complete_model_wall_ms_per_token": 4.8592223359375,
-      "complete_model_gpu_ms_per_token": 4.569098632146051,
-      "peak_physical_footprint_bytes": 111559280,
-      "quality_accepted": true
+      "complete_model_wall_ms_per_token": 4.852781898437501,
+      "complete_model_gpu_ms_per_token": 4.561442707426977,
+      "peak_physical_footprint_bytes": 111592048,
+      "quality_accepted": false
     },
     {
       "plan_id": "granite-m5-top8-rowinline-nocopy-2cb-candidate",
       "exact_semantics_verified": true,
-      "complete_model_wall_ms_per_token": 4.540366859374999,
-      "complete_model_gpu_ms_per_token": 4.252022787568421,
-      "peak_physical_footprint_bytes": 111592072,
-      "quality_accepted": true
+      "complete_model_wall_ms_per_token": 4.536928390625,
+      "complete_model_gpu_ms_per_token": 4.245879235668326,
+      "peak_physical_footprint_bytes": 111575664,
+      "quality_accepted": false
     }
   ],
   "rejected": []

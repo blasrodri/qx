@@ -164,8 +164,7 @@ fn main() -> Result<()> {
                     complete_model_wall_ms_per_token: complete.wall_ms_per_token,
                     complete_model_gpu_ms_per_token: complete.gpu_ms_per_token,
                     peak_physical_footprint_bytes: candidate.memory.peak_physical_footprint_bytes,
-                    quality_accepted: candidate.quality.accepted
-                        || candidate.exact_semantics_verified,
+                    quality_accepted: candidate.quality.accepted,
                 }
             })
             .collect();
@@ -185,7 +184,7 @@ fn main() -> Result<()> {
             serde_json::to_vec_pretty(&SelectionReport {
                 selected_plan_id: &selection.selected.plan_id,
                 selected_complete_model_wall_ms_per_token,
-                selected_reason: "lowest measured complete-model wall latency after semantic, quality, memory, and promotion-tier gates",
+                selected_reason: "lowest measured complete-model wall latency after semantic-equivalence or quality, memory, and promotion-tier gates",
                 candidates: candidates_report,
                 rejected: &selection.rejected,
             })?,
@@ -341,7 +340,7 @@ fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
                 worst_domain_relative_ppl_delta: 0.0,
                 human_eval_delta_points_vs_llama: Some(0.0),
                 gsm8k_delta_points_vs_llama: Some(0.0),
-                accepted: true,
+                accepted: false,
             });
             Ok(PlanCandidateEvidence {
                 plan,
