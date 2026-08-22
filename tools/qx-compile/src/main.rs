@@ -1,10 +1,13 @@
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use qx_compiler::{
     ExpertSensitivity, ExpertWeights, QxTrace, allocate_with_minimum_options, granite_memory_plan,
     measure_sensitivity,
 };
-use qx_format::{CompiledTensor, RawTensor, TensorKind, write_artifact_with_raw};
+use qx_format::{
+    CompiledTensor, ExecutionPlanManifest, ExpertRepresentation, RawTensor, TensorKind,
+    WeightStorage, write_artifact_with_raw_and_plan,
+};
 use qx_model::{EXPERTS, Granite3A400M, GraniteConfig, LAYERS, MAX_CONTEXT, TOP_K};
 use qx_quant::{PackingLayout, QuantType, QuantizedTensor};
 use qx_safetensors::Checkpoint;
@@ -32,8 +35,37 @@ struct Args {
     disable_q3: bool,
     #[arg(long, default_value_t = 32)]
     group_size: usize,
+    /// Expert-only scientific control; dense tensors remain QX group-32 Q4.
+    #[arg(long, value_enum, default_value_t = ExpertFormat::QxQ4)]
+    expert_format: ExpertFormat,
+    /// Physical expert layout candidate. Whole-model evidence currently makes
+    /// row-major the Granite/M5 control even though Tile32 wins in isolation.
+    #[arg(long, value_enum, default_value_t = ExpertLayout::RowMajor)]
+    expert_layout: ExpertLayout,
     #[arg(long, default_value_t = MAX_CONTEXT)]
     context: usize,
+    /// Stable identifier embedded in artifact v2 for compiler/autotuner provenance.
+    #[arg(long, default_value = "granite-m5-top8-canonical")]
+    plan_id: String,
+    /// Matched-quality aggregate PPL budget carried by the compiled plan.
+    #[arg(long, default_value_t = 0.01)]
+    max_relative_ppl_delta: f64,
+    /// Per-domain matched-quality PPL budget carried by the compiled plan.
+    #[arg(long, default_value_t = 0.02)]
+    max_domain_relative_ppl_delta: f64,
+    #[arg(long, default_value = "")]
+    calibration_hash: String,
+    #[arg(long, default_value = "")]
+    evaluation_hash: String,
+    #[arg(long, default_value = "")]
+    benchmark_contract_hash: String,
+    /// Static-weight ownership plan embedded into artifact v2.
+    #[arg(long, value_enum, default_value_t = WeightStorageArg::CopiedShared)]
+    weight_storage: WeightStorageArg,
+    /// GPU-ordered command buffers per decode token. No intermediate CPU wait
+    /// is permitted; layer boundaries are divided evenly between buffers.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=24))]
+    command_buffers_per_token: u16,
     /// QXTRACE produced by the llama.cpp calibration bridge. Without this,
     /// compilation is conservative and emits uniform Q4 experts.
     #[arg(long)]
@@ -48,6 +80,44 @@ struct Args {
     experts_only: bool,
     #[arg(short = 'o', long)]
     output: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ExpertFormat {
+    QxQ4,
+    Q4K,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ExpertLayout {
+    RowMajor,
+    Tile32,
+}
+
+impl From<ExpertLayout> for PackingLayout {
+    fn from(value: ExpertLayout) -> Self {
+        match value {
+            ExpertLayout::RowMajor => Self::RowMajor,
+            ExpertLayout::Tile32 => Self::MetalTile32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum WeightStorageArg {
+    CopiedShared,
+    MmapNoCopy,
+    Hybrid,
+}
+
+impl From<WeightStorageArg> for WeightStorage {
+    fn from(value: WeightStorageArg) -> Self {
+        match value {
+            WeightStorageArg::CopiedShared => Self::CopiedShared,
+            WeightStorageArg::MmapNoCopy => Self::MmapNoCopy,
+            WeightStorageArg::Hybrid => Self::Hybrid,
+        }
+    }
 }
 
 fn parse_budget(value: &str) -> Result<usize, String> {
@@ -76,6 +146,26 @@ fn main() -> Result<()> {
     if args.group_size == 0 || args.context == 0 {
         bail!("group size and context must be positive");
     }
+    let runtime_plan =
+        qx_runtime_v2::ExecutionPlan::granite(args.context).map_err(anyhow::Error::msg)?;
+    let fixed_dense_bytes = if args.experts_only {
+        0
+    } else {
+        qx_runtime_v2::granite_dense_q4_bytes()
+    };
+    let fixed_plan_bytes = fixed_dense_bytes
+        .saturating_add(runtime_plan.kv_bytes)
+        .saturating_add(runtime_plan.arena_bytes);
+    let expert_memory_budget = args
+        .memory_budget
+        .checked_sub(fixed_plan_bytes)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "memory budget {} cannot hold {} bytes of fixed dense/runtime state",
+                args.memory_budget,
+                fixed_plan_bytes
+            )
+        })?;
     let config_path = args.model.join("config.json");
     let config = serde_json::from_slice::<GraniteConfig>(
         &fs::read(&config_path).with_context(|| format!("read {}", config_path.display()))?,
@@ -92,7 +182,10 @@ fn main() -> Result<()> {
             );
         }
     } else {
-        eprintln!("warning: no --trace supplied; emitting uniform Q4 without quality claims");
+        eprintln!(
+            "warning: no --trace supplied; emitting uniform {:?} experts without quality claims",
+            args.expert_format
+        );
     }
 
     let grouped = trace.as_ref().map(QxTrace::samples).unwrap_or_default();
@@ -191,15 +284,17 @@ fn main() -> Result<()> {
     let plan = if trace.is_some() {
         allocate_with_minimum_options(
             &sensitivities,
-            args.memory_budget,
+            expert_memory_budget,
             args.quality_loss,
             args.group_size,
             args.minimum_bits,
             !args.disable_q3,
         )
     } else {
-        if args.memory_budget < q4_bytes {
-            bail!("uniform Q4 needs {q4_bytes} bytes; provide --trace for mixed allocation");
+        if expert_memory_budget < q4_bytes {
+            bail!(
+                "uniform Q4 experts need {q4_bytes} bytes after reserving {fixed_plan_bytes} bytes for dense/runtime state; provide --trace or a larger budget"
+            );
         }
         allocate_with_minimum_options(
             &sensitivities
@@ -211,14 +306,14 @@ fn main() -> Result<()> {
                     ..item.clone()
                 })
                 .collect::<Vec<_>>(),
-            args.memory_budget,
+            expert_memory_budget,
             f32::NEG_INFINITY,
             args.group_size,
             args.minimum_bits,
             !args.disable_q3,
         )
     };
-    if trace.is_some() && plan.total_bytes > args.memory_budget {
+    if trace.is_some() && plan.total_bytes > expert_memory_budget {
         bail!("allocator exceeded memory budget");
     }
     let mut selected = plan
@@ -238,10 +333,10 @@ fn main() -> Result<()> {
             .iter()
             .map(|item| item.bytes_for(selected[&(item.layer, item.expert)], args.group_size))
             .sum::<usize>();
-        if selected_bytes > args.memory_budget {
+        if selected_bytes > expert_memory_budget {
             bail!(
                 "conservative Q4 fallback for unmeasured experts needs {selected_bytes} bytes, over --memory-budget {}",
-                args.memory_budget
+                expert_memory_budget
             );
         }
         let total_importance = sensitivities
@@ -265,32 +360,40 @@ fn main() -> Result<()> {
                 "no allocation satisfies weighted --quality-loss {} (measured {}) within --memory-budget {}",
                 args.quality_loss,
                 weighted_error,
-                args.memory_budget
+                expert_memory_budget
             );
         }
     }
     let mut compiled = Vec::with_capacity(tensors.len() * 2 + LAYERS * 5 + 1);
     let mut raw_tensors = Vec::with_capacity(LAYERS * 2 + 1);
     let mut actual_weight_bytes = 0usize;
-    let packing_layout = if args.target.starts_with("apple-") {
-        PackingLayout::MetalTile32
-    } else {
-        PackingLayout::RowMajor
-    };
+    let packing_layout: PackingLayout = args.expert_layout.into();
     for (layer, expert, input, output, input_rows, input_cols, output_rows, output_cols) in tensors
     {
-        let quant_type = if trace.is_some() {
+        let quant_type = if args.expert_format == ExpertFormat::Q4K {
+            QuantType::Q4K
+        } else if trace.is_some() {
             selected[&(layer, expert)]
         } else {
             QuantType::Q4
+        };
+        let expert_group_size = if quant_type == QuantType::Q4K {
+            256
+        } else {
+            args.group_size
+        };
+        let expert_layout = if quant_type == QuantType::Q4K {
+            PackingLayout::RowMajor
+        } else {
+            packing_layout
         };
         let gate_up = QuantizedTensor::quantize_for_layout(
             &input,
             input_rows,
             input_cols,
             quant_type,
-            args.group_size,
-            packing_layout,
+            expert_group_size,
+            expert_layout,
         )
         .map_err(anyhow::Error::msg)?;
         let down = QuantizedTensor::quantize_for_layout(
@@ -298,8 +401,8 @@ fn main() -> Result<()> {
             output_rows,
             output_cols,
             quant_type,
-            args.group_size,
-            packing_layout,
+            expert_group_size,
+            expert_layout,
         )
         .map_err(anyhow::Error::msg)?;
         actual_weight_bytes += gate_up.bytes() + down.bytes();
@@ -443,8 +546,85 @@ fn main() -> Result<()> {
             values,
         });
     }
-    let memory_plan = granite_memory_plan(actual_weight_bytes, args.context);
-    write_artifact_with_raw(
+    let mut memory_plan = granite_memory_plan(actual_weight_bytes, args.context);
+    memory_plan.kv_cache_bytes = runtime_plan.kv_bytes as u64;
+    memory_plan.total_bytes =
+        memory_plan.weights_bytes + runtime_plan.kv_bytes as u64 + runtime_plan.arena_bytes as u64;
+    if memory_plan.total_bytes > args.memory_budget as u64 {
+        bail!(
+            "compiled plan predicts {} bytes at decode, exceeding the {}-byte memory budget",
+            memory_plan.total_bytes,
+            args.memory_budget
+        );
+    }
+    let mut execution_plan = ExecutionPlanManifest::granite_m5_canonical(
+        Granite3A400M::MODEL_ID,
+        &args.target,
+        args.context as u32,
+        memory_plan,
+    );
+    execution_plan.plan_id.clone_from(&args.plan_id);
+    execution_plan.memory.budget_bytes = args.memory_budget as u64;
+    execution_plan.memory.weight_storage = args.weight_storage.into();
+    execution_plan.schedule.command_buffers_per_token = args.command_buffers_per_token;
+    execution_plan.schedule.encoders_per_token = args.command_buffers_per_token;
+    let last_dispatch = execution_plan
+        .schedule
+        .expected_dispatches_per_token
+        .saturating_sub(1);
+    execution_plan.arena = qx_format::ArenaPlan {
+        arena_bytes: runtime_plan.arena_bytes as u64,
+        kv_bytes: runtime_plan.kv_bytes as u64,
+        no_decode_allocations: true,
+        regions: runtime_plan
+            .regions
+            .iter()
+            .map(|region| {
+                let (live_from_dispatch, live_through_dispatch) = match region.id {
+                    qx_runtime_v2::BufferId::HiddenA
+                    | qx_runtime_v2::BufferId::HiddenB
+                    | qx_runtime_v2::BufferId::TokenOutput => (0, last_dispatch),
+                    qx_runtime_v2::BufferId::Logits => {
+                        (last_dispatch.saturating_sub(2), last_dispatch)
+                    }
+                    _ => (1, last_dispatch.saturating_sub(3)),
+                };
+                qx_format::PlannedBufferRegion {
+                    name: format!("{:?}", region.id),
+                    offset: region.offset as u64,
+                    length: region.length as u64,
+                    live_from_dispatch,
+                    live_through_dispatch,
+                }
+            })
+            .collect(),
+    };
+    execution_plan.quality_budget.max_relative_ppl_delta = args.max_relative_ppl_delta;
+    execution_plan.quality_budget.max_domain_relative_ppl_delta =
+        args.max_domain_relative_ppl_delta;
+    execution_plan.provenance.compiler_revision = option_env!("QX_GIT_REVISION")
+        .unwrap_or("unknown")
+        .to_owned();
+    execution_plan
+        .provenance
+        .calibration_hash
+        .clone_from(&args.calibration_hash);
+    execution_plan
+        .provenance
+        .evaluation_hash
+        .clone_from(&args.evaluation_hash);
+    execution_plan
+        .provenance
+        .benchmark_contract_hash
+        .clone_from(&args.benchmark_contract_hash);
+    execution_plan.representations.gate_up = representation_for(&compiled, TensorKind::GateUp);
+    execution_plan.representations.down = representation_for(&compiled, TensorKind::Down);
+    execution_plan.representations.dense = if args.experts_only {
+        ExpertRepresentation::MixedQ2Q3Q4
+    } else {
+        ExpertRepresentation::Group32Q4RowMajor
+    };
+    write_artifact_with_raw_and_plan(
         &args.output,
         Granite3A400M::MODEL_ID,
         &args.target,
@@ -452,6 +632,7 @@ fn main() -> Result<()> {
         memory_plan,
         &compiled,
         &raw_tensors,
+        &execution_plan,
     )
     .with_context(|| format!("write {}", args.output.display()))?;
     if let Some(report) = &args.report {
@@ -464,6 +645,8 @@ fn main() -> Result<()> {
     println!("QX compilation complete");
     println!("model:              {}", Granite3A400M::MODEL_ID);
     println!("target:             {}", args.target);
+    println!("plan id:            {}", execution_plan.plan_id);
+    println!("artifact version:   {}", qx_format::VERSION);
     println!("compiled tensors:   {}", compiled.len());
     println!(
         "dense weights:      {}",
@@ -473,16 +656,41 @@ fn main() -> Result<()> {
     println!("compiled weights:   {actual_weight_bytes}");
     println!("memory plan total:  {}", memory_plan.total_bytes);
     println!(
-        "precision tensors:  Q2={} Q3={} Q4={}",
+        "precision tensors:  Q2={} Q3={} Q4={} Q4_K={}",
         counts.get(&QuantType::Q2).copied().unwrap_or(0),
         counts.get(&QuantType::Q3).copied().unwrap_or(0),
-        counts.get(&QuantType::Q4).copied().unwrap_or(0)
+        counts.get(&QuantType::Q4).copied().unwrap_or(0),
+        counts.get(&QuantType::Q4K).copied().unwrap_or(0)
     );
     println!("artifact:            {}", args.output.display());
     if let Some(report) = &args.report {
         println!("report:              {}", report.display());
     }
     Ok(())
+}
+
+fn representation_for(tensors: &[CompiledTensor], kind: TensorKind) -> ExpertRepresentation {
+    let matching = tensors
+        .iter()
+        .filter(|tensor| tensor.kind == kind)
+        .collect::<Vec<_>>();
+    if matching
+        .iter()
+        .all(|tensor| tensor.tensor.quant_type == QuantType::Q4K)
+    {
+        ExpertRepresentation::Q4K
+    } else if matching.iter().all(|tensor| {
+        tensor.tensor.quant_type == QuantType::Q4 && tensor.tensor.layout == PackingLayout::RowMajor
+    }) {
+        ExpertRepresentation::Group32Q4RowMajor
+    } else if matching.iter().all(|tensor| {
+        tensor.tensor.quant_type == QuantType::Q4
+            && tensor.tensor.layout == PackingLayout::MetalTile32
+    }) {
+        ExpertRepresentation::Group32Q4MetalTile32
+    } else {
+        ExpertRepresentation::MixedQ2Q3Q4
+    }
 }
 
 fn write_sensitivity_report(

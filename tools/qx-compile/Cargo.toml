@@ -11,5 +11,6 @@ qx-compiler.workspace = true
 qx-format.workspace = true
 qx-model.workspace = true
 qx-quant.workspace = true
+qx-runtime-v2.workspace = true
 qx-safetensors = { path = "../../crates/qx-safetensors" }
 serde_json.workspace = true

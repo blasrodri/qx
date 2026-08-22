@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "name": "granite-3.0-1b-a400m-m5-pro-context512",
+  "pairs": 20,
+  "warmup": 3,
+  "fixtures": [
+    "fixtures/general.json",
+    "fixtures/instruction.json",
+    "fixtures/code.json",
+    "fixtures/reasoning.json",
+    "fixtures/chat.json"
+  ],
+  "provenance": {
+    "qx_revision": "eecbf6dd288580d845156bc629255a57d0536612",
+    "llama_revision": "17197474510622a3b4ea7d0909d70b606f542b96",
+    "artifact_sha256": "9a5c650fecc85f56e969c684efb02d4f7faf2a6c3b54f9faf2d41ee3f9953eb4",
+    "gguf_sha256": "46a2a757a579446d95d900085a5daaf59d78bb753302f656ec01a7192b4928a6",
+    "tokenizer_sha256": "ed944c0b3d71e2d651a5ba0f8e7b350faff30031c8e3353de70b12b9c1bf5654",
+    "reference_model_manifest_sha256": "3c5037e9d67f1cd7667816182f840532143771e60992a7cade2d984671272b34",
+    "metal_sources_sha256": "b0afad9b4a500853685e7feefb468fa940dbe7469909a9b9c2ac841356db68cb",
+    "llama_patch_sha256": "607abe180bc9f17bbac01259e36b596d65c84a3c2e665228ac78a88e5e427e04",
+    "workload_contract_sha256": "7ca84dd6e2113e1f3828d2dde69f66060f4c87a65b3d125ae4e8b3e2f7ab318c",
+    "os_build": "25F84",
+    "hardware": "Apple M5 Pro"
+  }
+}

@@ -11,6 +11,7 @@ half.workspace = true
 libc.workspace = true
 qx-compiler.workspace = true
 qx-format.workspace = true
+qx-eval.workspace = true
 qx-model.workspace = true
 qx-metal.workspace = true
 qx-quant.workspace = true

@@ -24,6 +24,7 @@ pub fn kernel_source(quant_type: QuantType) -> &'static str {
         QuantType::Q2 => Q2_KERNEL_SOURCE,
         QuantType::Q3 => Q3_KERNEL_SOURCE,
         QuantType::Q4 => Q4_KERNEL_SOURCE,
+        QuantType::Q4K => Q4_KERNEL_SOURCE,
     }
 }
 
@@ -54,11 +55,13 @@ impl GemvGeometry {
 
 #[cfg(target_os = "macos")]
 pub mod platform {
+    use std::collections::HashMap;
     use std::ffi::c_void;
     use std::ptr::NonNull;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
+    use block2::RcBlock;
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2_foundation::NSString;
@@ -312,6 +315,7 @@ pub mod platform {
             QuantType::Q2 => 8,
             QuantType::Q3 => 12,
             QuantType::Q4 => 16,
+            QuantType::Q4K => 140,
         }
     }
 
@@ -330,10 +334,10 @@ pub mod platform {
         pipeline: Pipeline,
         aggregate_pipeline: Pipeline,
         layout: PackingLayout,
-        gate_up_packed: Retained<ProtocolObject<dyn MTLBuffer>>,
-        gate_up_scales: Retained<ProtocolObject<dyn MTLBuffer>>,
-        down_packed: Retained<ProtocolObject<dyn MTLBuffer>>,
-        down_scales: Retained<ProtocolObject<dyn MTLBuffer>>,
+        gate_up_packed: RuntimeBuffer,
+        gate_up_scales: RuntimeBuffer,
+        down_packed: RuntimeBuffer,
+        down_scales: RuntimeBuffer,
     }
 
     /// A single Q4 matrix stage used by the kernel microbenchmarks. It keeps
@@ -341,8 +345,8 @@ pub mod platform {
     /// can be measured independently.
     pub struct PreparedQ4Stage {
         pipeline: Pipeline,
-        packed: Retained<ProtocolObject<dyn MTLBuffer>>,
-        scales: Retained<ProtocolObject<dyn MTLBuffer>>,
+        packed: RuntimeBuffer,
+        scales: RuntimeBuffer,
         rows: usize,
         columns: usize,
         layout: PackingLayout,
@@ -404,8 +408,8 @@ pub mod platform {
         pipeline: Pipeline,
         simd_pipeline: Pipeline,
         simd_norm_pipeline: Pipeline,
-        packed: Retained<ProtocolObject<dyn MTLBuffer>>,
-        scales: Retained<ProtocolObject<dyn MTLBuffer>>,
+        packed: RuntimeBuffer,
+        scales: RuntimeBuffer,
         rows: usize,
         columns: usize,
     }
@@ -449,12 +453,12 @@ pub mod platform {
         split_simd_pipeline: Pipeline,
         split_simd_norm_pipeline: Pipeline,
         sweep_pipeline: Pipeline,
-        q_packed: Retained<ProtocolObject<dyn MTLBuffer>>,
-        q_scales: Retained<ProtocolObject<dyn MTLBuffer>>,
-        k_packed: Retained<ProtocolObject<dyn MTLBuffer>>,
-        k_scales: Retained<ProtocolObject<dyn MTLBuffer>>,
-        v_packed: Retained<ProtocolObject<dyn MTLBuffer>>,
-        v_scales: Retained<ProtocolObject<dyn MTLBuffer>>,
+        q_packed: RuntimeBuffer,
+        q_scales: RuntimeBuffer,
+        k_packed: RuntimeBuffer,
+        k_scales: RuntimeBuffer,
+        v_packed: RuntimeBuffer,
+        v_scales: RuntimeBuffer,
         columns: usize,
     }
 
@@ -481,15 +485,15 @@ pub mod platform {
         batched_silu_pipeline: Pipeline,
         batched_down_pipeline: Pipeline,
         batched_accumulate_pipeline: Pipeline,
-        gate_up_packed: Retained<ProtocolObject<dyn MTLBuffer>>,
-        gate_up_scales: Retained<ProtocolObject<dyn MTLBuffer>>,
+        gate_up_packed: RuntimeBuffer,
+        gate_up_scales: RuntimeBuffer,
         split_gate_packed: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
         split_gate_scales: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
         split_up_packed: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
         split_up_scales: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
         split_gate_up: bool,
-        down_packed: Retained<ProtocolObject<dyn MTLBuffer>>,
-        down_scales: Retained<ProtocolObject<dyn MTLBuffer>>,
+        down_packed: RuntimeBuffer,
+        down_scales: RuntimeBuffer,
         layout: PackingLayout,
         gate_up_layout: PackingLayout,
         down_layout: PackingLayout,
@@ -497,8 +501,8 @@ pub mod platform {
 
     pub struct PreparedQ4Embedding {
         pipeline: Pipeline,
-        packed: Retained<ProtocolObject<dyn MTLBuffer>>,
-        scales: Retained<ProtocolObject<dyn MTLBuffer>>,
+        packed: RuntimeBuffer,
+        scales: RuntimeBuffer,
         rows: usize,
         columns: usize,
     }
@@ -624,6 +628,7 @@ pub mod platform {
         v2_pipelines: Mutex<[Option<Pipeline>; 27]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
+        no_copy_buffers: Mutex<HashMap<(usize, usize), RuntimeBuffer>>,
     }
 
     /// Token-level command stream for Runtime V2. Operators may encode fixed
@@ -633,6 +638,8 @@ pub mod platform {
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         dispatches: u64,
+        committed: Vec<(Retained<ProtocolObject<dyn MTLCommandBuffer>>, u64)>,
+        encode_started_at: Instant,
     }
 
     impl DecodeGraph {
@@ -667,12 +674,12 @@ pub mod platform {
                 );
             }
             self.encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
+                objc2_metal::MTLSize {
                     width: prepared.rows,
                     height: 1,
                     depth: 1,
                 },
-                MTLSize {
+                objc2_metal::MTLSize {
                     width: 256,
                     height: 1,
                     depth: 1,
@@ -706,10 +713,16 @@ pub mod platform {
             self.encoder.setComputePipelineState(&prepared.pipeline);
             let columns = prepared.columns as u32;
             unsafe {
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.packed), 0, 0);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.scales), 0, 1);
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.packed.buffer),
+                    prepared.packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.scales.buffer),
+                    prepared.scales.offset,
+                    1,
+                );
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 2);
                 self.encoder
@@ -726,12 +739,12 @@ pub mod platform {
                 );
             }
             self.encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
+                objc2_metal::MTLSize {
                     width: prepared.rows,
                     height: 1,
                     depth: 1,
                 },
-                MTLSize {
+                objc2_metal::MTLSize {
                     width: 256,
                     height: 1,
                     depth: 1,
@@ -767,10 +780,16 @@ pub mod platform {
             let columns = prepared.columns as u32;
             let rows = prepared.rows as u32;
             unsafe {
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.packed), 0, 0);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.scales), 0, 1);
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.packed.buffer),
+                    prepared.packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.scales.buffer),
+                    prepared.scales.offset,
+                    1,
+                );
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 2);
                 self.encoder
@@ -831,10 +850,16 @@ pub mod platform {
             let multiplier = 1.0_f32;
             let rows = prepared.rows as u32;
             unsafe {
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.packed), 0, 0);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.scales), 0, 1);
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.packed.buffer),
+                    prepared.packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.scales.buffer),
+                    prepared.scales.offset,
+                    1,
+                );
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 2);
                 self.encoder
@@ -900,18 +925,36 @@ pub mod platform {
             let columns = prepared.columns as u32;
             let multiplier = 1.0_f32;
             unsafe {
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.q_packed), 0, 0);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.q_scales), 0, 1);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.k_packed), 0, 2);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.k_scales), 0, 3);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.v_packed), 0, 4);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.v_scales), 0, 5);
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.q_packed.buffer),
+                    prepared.q_packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.q_scales.buffer),
+                    prepared.q_scales.offset,
+                    1,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.k_packed.buffer),
+                    prepared.k_packed.offset,
+                    2,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.k_scales.buffer),
+                    prepared.k_scales.offset,
+                    3,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.v_packed.buffer),
+                    prepared.v_packed.offset,
+                    4,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.v_scales.buffer),
+                    prepared.v_scales.offset,
+                    5,
+                );
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 6);
                 self.encoder
@@ -980,8 +1023,11 @@ pub mod platform {
                     (&prepared.v_packed, 4),
                     (&prepared.v_scales, 5),
                 ] {
-                    self.encoder
-                        .setBuffer_offset_atIndex(Some(buffer), 0, index);
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
                 }
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 6);
@@ -1046,8 +1092,10 @@ pub mod platform {
                 self.encoder
                     .setComputePipelineState(&prepared.split_simd_pipeline);
                 unsafe {
-                    self.encoder.setBuffer_offset_atIndex(Some(packed), 0, 0);
-                    self.encoder.setBuffer_offset_atIndex(Some(scales), 0, 1);
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(&packed.buffer), packed.offset, 0);
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(&scales.buffer), scales.offset, 1);
                     self.encoder
                         .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 2);
                     self.encoder
@@ -1144,8 +1192,11 @@ pub mod platform {
                     (&prepared.v_packed, 4),
                     (&prepared.v_scales, 5),
                 ] {
-                    self.encoder
-                        .setBuffer_offset_atIndex(Some(buffer), 0, index);
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
                 }
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 6);
@@ -1230,8 +1281,11 @@ pub mod platform {
                     (&prepared.v_packed, 4),
                     (&prepared.v_scales, 5),
                 ] {
-                    self.encoder
-                        .setBuffer_offset_atIndex(Some(buffer), 0, index);
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
                 }
                 for (buffer, offset, index) in [
                     (&input.buffer, input.offset, 6),
@@ -1309,8 +1363,10 @@ pub mod platform {
                 self.encoder
                     .setComputePipelineState(&prepared.split_simd_norm_pipeline);
                 unsafe {
-                    self.encoder.setBuffer_offset_atIndex(Some(packed), 0, 0);
-                    self.encoder.setBuffer_offset_atIndex(Some(scales), 0, 1);
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(&packed.buffer), packed.offset, 0);
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(&scales.buffer), scales.offset, 1);
                     self.encoder
                         .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 2);
                     self.encoder
@@ -1377,14 +1433,26 @@ pub mod platform {
             self.encoder.setComputePipelineState(&prepared.pipeline);
             let layout = prepared.layout as u32;
             unsafe {
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.gate_up_packed), 0, 0);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.gate_up_scales), 0, 1);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.down_packed), 0, 2);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.down_scales), 0, 3);
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.gate_up_packed.buffer),
+                    prepared.gate_up_packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.gate_up_scales.buffer),
+                    prepared.gate_up_scales.offset,
+                    1,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.down_packed.buffer),
+                    prepared.down_packed.offset,
+                    2,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.down_scales.buffer),
+                    prepared.down_scales.offset,
+                    3,
+                );
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 4);
                 self.encoder.setBuffer_offset_atIndex(
@@ -1440,14 +1508,26 @@ pub mod platform {
                 .setComputePipelineState(&prepared.simd_pipeline);
             let layout = prepared.layout as u32;
             unsafe {
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.gate_up_packed), 0, 0);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.gate_up_scales), 0, 1);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.down_packed), 0, 2);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.down_scales), 0, 3);
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.gate_up_packed.buffer),
+                    prepared.gate_up_packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.gate_up_scales.buffer),
+                    prepared.gate_up_scales.offset,
+                    1,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.down_packed.buffer),
+                    prepared.down_packed.offset,
+                    2,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.down_scales.buffer),
+                    prepared.down_scales.offset,
+                    3,
+                );
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 4);
                 self.encoder.setBuffer_offset_atIndex(
@@ -1615,10 +1695,16 @@ pub mod platform {
                         7,
                     );
                 } else {
-                    self.encoder
-                        .setBuffer_offset_atIndex(Some(&prepared.gate_up_packed), 0, 0);
-                    self.encoder
-                        .setBuffer_offset_atIndex(Some(&prepared.gate_up_scales), 0, 1);
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&prepared.gate_up_packed.buffer),
+                        prepared.gate_up_packed.offset,
+                        0,
+                    );
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&prepared.gate_up_scales.buffer),
+                        prepared.gate_up_scales.offset,
+                        1,
+                    );
                     self.encoder.setBytes_length_atIndex(
                         NonNull::from(&gate_up_layout).cast(),
                         std::mem::size_of_val(&gate_up_layout),
@@ -1672,10 +1758,16 @@ pub mod platform {
             self.encoder
                 .setComputePipelineState(&prepared.batched_down_pipeline);
             unsafe {
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.down_packed), 0, 0);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.down_scales), 0, 1);
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.down_packed.buffer),
+                    prepared.down_packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.down_scales.buffer),
+                    prepared.down_scales.offset,
+                    1,
+                );
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&activated.buffer), activated.offset, 4);
                 self.encoder.setBuffer_offset_atIndex(
@@ -1874,10 +1966,16 @@ pub mod platform {
             self.encoder
                 .setComputePipelineState(&prepared.batched_down_pipeline);
             unsafe {
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.down_packed), 0, 0);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.down_scales), 0, 1);
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.down_packed.buffer),
+                    prepared.down_packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.down_scales.buffer),
+                    prepared.down_scales.offset,
+                    1,
+                );
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&activated.buffer), activated.offset, 4);
                 self.encoder.setBuffer_offset_atIndex(
@@ -2010,10 +2108,16 @@ pub mod platform {
                     .setComputePipelineState(&prepared.batched_gate_up_touch_pipeline);
             }
             unsafe {
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.gate_up_packed), 0, 0);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.gate_up_scales), 0, 1);
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.gate_up_packed.buffer),
+                    prepared.gate_up_packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.gate_up_scales.buffer),
+                    prepared.gate_up_scales.offset,
+                    1,
+                );
                 self.encoder.setBuffer_offset_atIndex(
                     Some(&contiguous.buffer),
                     contiguous.offset,
@@ -2080,13 +2184,13 @@ pub mod platform {
                         );
                     }
                     self.encoder.setBuffer_offset_atIndex(
-                        Some(&prepared.gate_up_packed),
-                        expert * PACKED_STRIDE,
+                        Some(&prepared.gate_up_packed.buffer),
+                        prepared.gate_up_packed.offset + expert * PACKED_STRIDE,
                         2 * region,
                     );
                     self.encoder.setBuffer_offset_atIndex(
-                        Some(&prepared.gate_up_scales),
-                        expert * SCALE_STRIDE,
+                        Some(&prepared.gate_up_scales.buffer),
+                        prepared.gate_up_scales.offset + expert * SCALE_STRIDE,
                         2 * region + 1,
                     );
                 }
@@ -2278,13 +2382,13 @@ pub mod platform {
                             );
                         } else {
                             self.encoder.setBuffer_offset_atIndex(
-                                Some(&prepared.gate_up_packed),
-                                0,
+                                Some(&prepared.gate_up_packed.buffer),
+                                prepared.gate_up_packed.offset,
                                 0,
                             );
                             self.encoder.setBuffer_offset_atIndex(
-                                Some(&prepared.gate_up_scales),
-                                0,
+                                Some(&prepared.gate_up_scales.buffer),
+                                prepared.gate_up_scales.offset,
                                 1,
                             );
                             self.encoder.setBytes_length_atIndex(
@@ -2351,10 +2455,16 @@ pub mod platform {
                     self.encoder
                         .setComputePipelineState(&prepared.batched_down_pipeline);
                     unsafe {
-                        self.encoder
-                            .setBuffer_offset_atIndex(Some(&prepared.down_packed), 0, 0);
-                        self.encoder
-                            .setBuffer_offset_atIndex(Some(&prepared.down_scales), 0, 1);
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&prepared.down_packed.buffer),
+                            prepared.down_packed.offset,
+                            0,
+                        );
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&prepared.down_scales.buffer),
+                            prepared.down_scales.offset,
+                            1,
+                        );
                         self.encoder.setBuffer_offset_atIndex(
                             Some(&activated.buffer),
                             activated.offset,
@@ -2566,10 +2676,16 @@ pub mod platform {
                         .setComputePipelineState(&prepared.batched_down_pipeline);
                     let layout = prepared.down_layout as u32;
                     unsafe {
-                        self.encoder
-                            .setBuffer_offset_atIndex(Some(&prepared.down_packed), 0, 0);
-                        self.encoder
-                            .setBuffer_offset_atIndex(Some(&prepared.down_scales), 0, 1);
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&prepared.down_packed.buffer),
+                            prepared.down_packed.offset,
+                            0,
+                        );
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&prepared.down_scales.buffer),
+                            prepared.down_scales.offset,
+                            1,
+                        );
                         self.encoder.setBuffer_offset_atIndex(
                             Some(&activated.buffer),
                             activated.offset,
@@ -2656,10 +2772,16 @@ pub mod platform {
             let rows = prepared.rows as u32;
             let columns = prepared.columns as u32;
             unsafe {
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.packed), 0, 0);
-                self.encoder
-                    .setBuffer_offset_atIndex(Some(&prepared.scales), 0, 1);
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.packed.buffer),
+                    prepared.packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.scales.buffer),
+                    prepared.scales.offset,
+                    1,
+                );
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&token.buffer), token.offset, 2);
                 self.encoder
@@ -3612,21 +3734,64 @@ pub mod platform {
             Ok(())
         }
 
-        pub fn finish(self, context: &MetalContext) -> Result<(), String> {
+        /// End and commit the current command buffer, then continue encoding
+        /// on the same queue without waiting on the CPU. Metal command queues
+        /// preserve submission order, so the next segment observes all writes
+        /// from the previous segment while GPU-resident state remains live.
+        pub fn begin_next_command_buffer(&mut self, context: &MetalContext) -> Result<(), String> {
+            let next_command_buffer = context
+                .queue
+                .commandBuffer()
+                .ok_or_else(|| "Runtime V2 command buffer allocation failed".to_owned())?;
+            let next_encoder = next_command_buffer
+                .computeCommandEncoder()
+                .ok_or_else(|| "Runtime V2 encoder allocation failed".to_owned())?;
+            let previous_encoder = std::mem::replace(&mut self.encoder, next_encoder);
+            previous_encoder.endEncoding();
+            let previous_command_buffer =
+                std::mem::replace(&mut self.command_buffer, next_command_buffer);
+            previous_command_buffer.commit();
+            self.committed
+                .push((previous_command_buffer, self.dispatches));
+            self.dispatches = 0;
+            Ok(())
+        }
+
+        pub fn finish(mut self, context: &MetalContext) -> Result<(), String> {
             self.encoder.endEncoding();
-            let encode_start = Instant::now();
             self.command_buffer.commit();
             let wait_start = Instant::now();
             self.command_buffer.waitUntilCompleted();
-            if self.command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
-                return Err("Runtime V2 command buffer execution failed".to_owned());
+            self.committed.push((self.command_buffer, self.dispatches));
+            for (command_buffer, _) in &self.committed {
+                if command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
+                    return Err("Runtime V2 command buffer execution failed".to_owned());
+                }
             }
-            context.record_command(
-                &self.command_buffer,
-                self.dispatches,
-                encode_start,
-                wait_start,
-            )
+            let mut metrics = context
+                .metrics
+                .lock()
+                .map_err(|_| "Metal metrics cache is poisoned".to_owned())?;
+            metrics.command_buffers += self.committed.len() as u64;
+            metrics.encoders += self.committed.len() as u64;
+            metrics.dispatches += self
+                .committed
+                .iter()
+                .map(|(_, dispatches)| *dispatches)
+                .sum::<u64>();
+            metrics.gpu_time_seconds += self
+                .committed
+                .iter()
+                .map(|(command_buffer, _)| {
+                    (command_buffer.GPUEndTime() - command_buffer.GPUStartTime()).max(0.0)
+                })
+                .sum::<f64>();
+            metrics.cpu_encode_seconds += wait_start
+                .duration_since(self.encode_started_at)
+                .as_secs_f64();
+            // There is exactly one CPU wait, on the final command buffer.
+            metrics.cpu_wait_seconds += wait_start.elapsed().as_secs_f64();
+            Ok(())
         }
     }
 
@@ -3673,6 +3838,7 @@ pub mod platform {
                     logits_output: None,
                 }),
                 metrics: Mutex::new(MetalMetricsState::default()),
+                no_copy_buffers: Mutex::new(HashMap::new()),
             })
         }
 
@@ -3691,6 +3857,14 @@ pub mod platform {
             })
         }
 
+        pub fn current_allocated_bytes(&self) -> u64 {
+            self.device.currentAllocatedSize() as u64
+        }
+
+        pub fn recommended_working_set_bytes(&self) -> u64 {
+            self.device.recommendedMaxWorkingSetSize()
+        }
+
         pub fn begin_decode(&self) -> Result<DecodeGraph, String> {
             let command_buffer = self
                 .queue
@@ -3703,6 +3877,8 @@ pub mod platform {
                 command_buffer,
                 encoder,
                 dispatches: 0,
+                committed: Vec::new(),
+                encode_started_at: Instant::now(),
             })
         }
 
@@ -3719,6 +3895,64 @@ pub mod platform {
                 offset: 0,
                 length,
             })
+        }
+
+        /// Wrap a page-aligned immutable mapped slab without copying it. The
+        /// captured owner keeps the mapping alive until Metal releases the
+        /// buffer. Tensor views should be expressed as `RuntimeBuffer`
+        /// subregions of this single slab.
+        ///
+        /// # Safety
+        /// `pointer..pointer + length` must remain valid and immutable for the
+        /// lifetime of `owner`, and must satisfy Metal's no-copy alignment
+        /// requirements.
+        pub unsafe fn input_buffer_no_copy<T>(
+            &self,
+            pointer: NonNull<c_void>,
+            length: usize,
+            owner: Arc<T>,
+        ) -> Result<RuntimeBuffer, String>
+        where
+            T: Send + Sync + 'static,
+        {
+            if length == 0 {
+                return Err("no-copy Metal buffer cannot be empty".to_owned());
+            }
+            let key = (pointer.as_ptr() as usize, length);
+            if let Some(existing) = self
+                .no_copy_buffers
+                .lock()
+                .map_err(|_| "Metal no-copy slab cache is poisoned".to_owned())?
+                .get(&key)
+                .cloned()
+            {
+                return Ok(existing);
+            }
+            let deallocator = RcBlock::new(move |_pointer: NonNull<c_void>, _length: usize| {
+                // Capturing the owner is the lifetime mechanism. Metal
+                // invokes this callback before releasing its copied block.
+                let _ = &owner;
+            });
+            let buffer = unsafe {
+                self.device
+                    .newBufferWithBytesNoCopy_length_options_deallocator(
+                        pointer,
+                        length,
+                        MTLResourceOptions::StorageModeShared,
+                        Some(&deallocator),
+                    )
+            }
+            .ok_or_else(|| "Metal no-copy mapped-slab allocation failed".to_owned())?;
+            let runtime = RuntimeBuffer {
+                buffer,
+                offset: 0,
+                length,
+            };
+            self.no_copy_buffers
+                .lock()
+                .map_err(|_| "Metal no-copy slab cache is poisoned".to_owned())?
+                .insert(key, runtime.clone());
+            Ok(runtime)
         }
 
         pub fn write_runtime_buffer(
@@ -3822,6 +4056,7 @@ pub mod platform {
                 QuantType::Q2 => 0,
                 QuantType::Q3 => 1,
                 QuantType::Q4 => 2,
+                QuantType::Q4K => panic!("Q4_K uses the dedicated dynamic MoE pipeline"),
             }
         }
 
@@ -4007,6 +4242,14 @@ pub mod platform {
                 return Err("Metal private input copy failed".to_owned());
             }
             Ok(private)
+        }
+
+        fn input_runtime_buffer(&self, bytes: &[u8]) -> Result<RuntimeBuffer, String> {
+            Ok(RuntimeBuffer {
+                buffer: self.input_buffer(bytes)?,
+                offset: 0,
+                length: bytes.len(),
+            })
         }
 
         fn logits_pipeline(&self) -> Result<Pipeline, String> {
@@ -4608,12 +4851,12 @@ pub mod platform {
                     "V2 Q4 dense requires row-major Q4 weights with group size 32".to_owned(),
                 );
             }
-            let packed = self.input_buffer(&weights.data)?;
+            let packed = self.input_runtime_buffer(&weights.data)?;
             let mut scale_bytes = Vec::with_capacity(weights.scales.len() * 2);
             for scale in &weights.scales {
                 scale_bytes.extend_from_slice(&scale.to_bits().to_le_bytes());
             }
-            let scales = self.input_buffer(&scale_bytes)?;
+            let scales = self.input_runtime_buffer(&scale_bytes)?;
             Ok(PreparedQuantizedDense {
                 pipeline: self.q4_dense_pipeline()?,
                 simd_pipeline: self.q4_dense_simd_pipeline()?,
@@ -4622,6 +4865,37 @@ pub mod platform {
                 scales,
                 rows: weights.rows,
                 columns: weights.cols,
+            })
+        }
+
+        /// Prepare a row-major group-32 Q4 dense matrix from views into a
+        /// static artifact slab without reconstructing a QuantizedTensor.
+        pub fn prepare_q4_dense_runtime_views(
+            &self,
+            packed: RuntimeBuffer,
+            scales: RuntimeBuffer,
+            rows: usize,
+            columns: usize,
+        ) -> Result<PreparedQuantizedDense, String> {
+            if rows == 0 || columns == 0 || columns % 32 != 0 {
+                return Err("no-copy Q4 dense has an invalid shape".to_owned());
+            }
+            let expected_packed = rows * columns / 2;
+            let expected_scales = rows * (columns / 32) * 2;
+            if packed.length != expected_packed || scales.length != expected_scales {
+                return Err(format!(
+                    "no-copy Q4 dense byte lengths are {}/{}, expected {expected_packed}/{expected_scales}",
+                    packed.length, scales.length
+                ));
+            }
+            Ok(PreparedQuantizedDense {
+                pipeline: self.q4_dense_pipeline()?,
+                simd_pipeline: self.q4_dense_simd_pipeline()?,
+                simd_norm_pipeline: self.q4_simd_norm_gemv_pipeline()?,
+                packed,
+                scales,
+                rows,
+                columns,
             })
         }
 
@@ -4918,6 +5192,10 @@ pub mod platform {
                     (&prepared.k_scales, 3),
                     (&prepared.v_packed, 4),
                     (&prepared.v_scales, 5),
+                ] {
+                    encoder.setBuffer_offset_atIndex(Some(&buffer.buffer), buffer.offset, index);
+                }
+                for (buffer, index) in [
                     (&input_buffer, 6),
                     (&query_buffer, 7),
                     (&key_buffer, 8),
@@ -5046,20 +5324,42 @@ pub mod platform {
             const GATE_UP_SCALES: usize = 1024 * 32 * 2;
             const DOWN_PACKED: usize = 1024 * 512 / 2;
             const DOWN_SCALES: usize = 1024 * 16 * 2;
-            if gate_up_packed.len() != EXPERTS * GATE_UP_PACKED
-                || gate_up_scales.len() != EXPERTS * GATE_UP_SCALES
-                || down_packed.len() != EXPERTS * DOWN_PACKED
-                || down_scales.len() != EXPERTS * DOWN_SCALES
-            {
+            const Q4K_GATE_UP_PACKED: usize = 1024 * 4 * 140;
+            const Q4K_GATE_UP_SCALES: usize = 1024 * 4 * 2 * 2;
+            const Q4K_DOWN_PACKED: usize = 1024 * 2 * 140;
+            const Q4K_DOWN_SCALES: usize = 1024 * 2 * 2 * 2;
+            let is_q4 = gate_up_packed.len() == EXPERTS * GATE_UP_PACKED
+                && gate_up_scales.len() == EXPERTS * GATE_UP_SCALES
+                && down_packed.len() == EXPERTS * DOWN_PACKED
+                && down_scales.len() == EXPERTS * DOWN_SCALES;
+            let is_q4k = gate_up_packed.len() == EXPERTS * Q4K_GATE_UP_PACKED
+                && gate_up_scales.len() == EXPERTS * Q4K_GATE_UP_SCALES
+                && down_packed.len() == EXPERTS * Q4K_DOWN_PACKED
+                && down_scales.len() == EXPERTS * Q4K_DOWN_SCALES;
+            if !is_q4 && !is_q4k {
                 return Err("dynamic Q4 MoE buffers have an invalid Granite shape".to_owned());
             }
+            let gate_up_pipeline = if is_q4k {
+                "qx_dynamic_q4k_moe_gate_up_simd"
+            } else {
+                "qx_dynamic_q4_moe_gate_up_simd"
+            };
+            let gate_up_norm_pipeline = if is_q4k {
+                "qx_dynamic_q4k_moe_gate_up_norm_simd"
+            } else {
+                "qx_dynamic_q4_moe_gate_up_norm_simd"
+            };
+            let down_pipeline = if is_q4k {
+                "qx_dynamic_q4k_moe_down_simd"
+            } else {
+                "qx_dynamic_q4_moe_down_simd"
+            };
             Ok(PreparedDynamicQ4Moe {
                 pipeline: self.dynamic_moe_pipeline()?,
                 simd_pipeline: self.dynamic_moe_simd_pipeline()?,
-                batched_gate_up_pipeline: self
-                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_simd")?,
+                batched_gate_up_pipeline: self.dynamic_moe_named_pipeline(gate_up_pipeline)?,
                 batched_gate_up_norm_pipeline: self
-                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_norm_simd")?,
+                    .dynamic_moe_named_pipeline(gate_up_norm_pipeline)?,
                 q3_gate_up_pipeline: None,
                 q3_gate_up_norm_pipeline: None,
                 q3_gate_up_packed: None,
@@ -5086,19 +5386,114 @@ pub mod platform {
                 batched_projection_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_projection_norm_simd")?,
                 batched_silu_pipeline: self.dynamic_moe_named_pipeline("qx_dynamic_q4_moe_silu")?,
-                batched_down_pipeline: self
-                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_simd")?,
+                batched_down_pipeline: self.dynamic_moe_named_pipeline(down_pipeline)?,
                 batched_accumulate_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_accumulate")?,
-                gate_up_packed: self.input_buffer(gate_up_packed)?,
-                gate_up_scales: self.input_buffer(gate_up_scales)?,
+                gate_up_packed: self.input_runtime_buffer(gate_up_packed)?,
+                gate_up_scales: self.input_runtime_buffer(gate_up_scales)?,
                 split_gate_packed: None,
                 split_gate_scales: None,
                 split_up_packed: None,
                 split_up_scales: None,
                 split_gate_up: false,
-                down_packed: self.input_buffer(down_packed)?,
-                down_scales: self.input_buffer(down_scales)?,
+                down_packed: self.input_runtime_buffer(down_packed)?,
+                down_scales: self.input_runtime_buffer(down_scales)?,
+                layout: gate_up_layout,
+                gate_up_layout,
+                down_layout,
+            })
+        }
+
+        /// Prepare a dynamic MoE directly from offset-bearing views into a
+        /// static weight slab. No tensor payload is copied or reconstructed.
+        pub fn prepare_dynamic_q4_moe_runtime_views(
+            &self,
+            gate_up_packed: RuntimeBuffer,
+            gate_up_scales: RuntimeBuffer,
+            down_packed: RuntimeBuffer,
+            down_scales: RuntimeBuffer,
+            gate_up_layout: PackingLayout,
+            down_layout: PackingLayout,
+        ) -> Result<PreparedDynamicQ4Moe, String> {
+            const EXPERTS: usize = 32;
+            const Q4_GATE_UP_PACKED: usize = 1024 * 1024 / 2;
+            const Q4_GATE_UP_SCALES: usize = 1024 * 32 * 2;
+            const Q4_DOWN_PACKED: usize = 1024 * 512 / 2;
+            const Q4_DOWN_SCALES: usize = 1024 * 16 * 2;
+            const Q4K_GATE_UP_PACKED: usize = 1024 * 4 * 140;
+            const Q4K_GATE_UP_SCALES: usize = 1024 * 4 * 2 * 2;
+            const Q4K_DOWN_PACKED: usize = 1024 * 2 * 140;
+            const Q4K_DOWN_SCALES: usize = 1024 * 2 * 2 * 2;
+            let is_q4 = gate_up_packed.length == EXPERTS * Q4_GATE_UP_PACKED
+                && gate_up_scales.length == EXPERTS * Q4_GATE_UP_SCALES
+                && down_packed.length == EXPERTS * Q4_DOWN_PACKED
+                && down_scales.length == EXPERTS * Q4_DOWN_SCALES;
+            let is_q4k = gate_up_packed.length == EXPERTS * Q4K_GATE_UP_PACKED
+                && gate_up_scales.length == EXPERTS * Q4K_GATE_UP_SCALES
+                && down_packed.length == EXPERTS * Q4K_DOWN_PACKED
+                && down_scales.length == EXPERTS * Q4K_DOWN_SCALES;
+            if !is_q4 && !is_q4k {
+                return Err("dynamic Q4 MoE slab views have an invalid Granite shape".to_owned());
+            }
+            let gate_up_pipeline = if is_q4k {
+                "qx_dynamic_q4k_moe_gate_up_simd"
+            } else {
+                "qx_dynamic_q4_moe_gate_up_simd"
+            };
+            let gate_up_norm_pipeline = if is_q4k {
+                "qx_dynamic_q4k_moe_gate_up_norm_simd"
+            } else {
+                "qx_dynamic_q4_moe_gate_up_norm_simd"
+            };
+            let down_pipeline = if is_q4k {
+                "qx_dynamic_q4k_moe_down_simd"
+            } else {
+                "qx_dynamic_q4_moe_down_simd"
+            };
+            Ok(PreparedDynamicQ4Moe {
+                pipeline: self.dynamic_moe_pipeline()?,
+                simd_pipeline: self.dynamic_moe_simd_pipeline()?,
+                batched_gate_up_pipeline: self.dynamic_moe_named_pipeline(gate_up_pipeline)?,
+                batched_gate_up_norm_pipeline: self
+                    .dynamic_moe_named_pipeline(gate_up_norm_pipeline)?,
+                q3_gate_up_pipeline: None,
+                q3_gate_up_norm_pipeline: None,
+                q3_gate_up_packed: None,
+                q3_gate_up_scales: None,
+                q3_gate_up_block_bytes: None,
+                batched_gate_up_touch_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_touch")?,
+                batched_gate_up_touch_full_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_touch_full")?,
+                batched_gate_up_touch_direct_1_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_touch_direct_1")?,
+                batched_gate_up_touch_direct_2_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_touch_direct_2")?,
+                batched_gate_up_touch_direct_4_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_touch_direct_4")?,
+                batched_gate_up_touch_direct_8_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_touch_direct_8")?,
+                batched_gate_up_synthetic_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_synthetic")?,
+                batched_gate_up_synthetic_norm_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_synthetic_norm")?,
+                batched_projection_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_projection_simd")?,
+                batched_projection_norm_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_projection_norm_simd")?,
+                batched_silu_pipeline: self.dynamic_moe_named_pipeline("qx_dynamic_q4_moe_silu")?,
+                batched_down_pipeline: self.dynamic_moe_named_pipeline(down_pipeline)?,
+                batched_accumulate_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_accumulate")?,
+                gate_up_packed,
+                gate_up_scales,
+                split_gate_packed: None,
+                split_gate_scales: None,
+                split_up_packed: None,
+                split_up_scales: None,
+                split_gate_up: false,
+                down_packed,
+                down_scales,
                 layout: gate_up_layout,
                 gate_up_layout,
                 down_layout,
@@ -5227,15 +5622,15 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_simd")?,
                 batched_accumulate_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_accumulate")?,
-                gate_up_packed: self.input_buffer(gate_up_packed)?,
-                gate_up_scales: self.input_buffer(gate_up_scales)?,
+                gate_up_packed: self.input_runtime_buffer(gate_up_packed)?,
+                gate_up_scales: self.input_runtime_buffer(gate_up_scales)?,
                 split_gate_packed: Some(self.input_buffer(split_gate_packed)?),
                 split_gate_scales: Some(self.input_buffer(split_gate_scales)?),
                 split_up_packed: Some(self.input_buffer(split_up_packed)?),
                 split_up_scales: Some(self.input_buffer(split_up_scales)?),
                 split_gate_up: true,
-                down_packed: self.input_buffer(down_packed)?,
-                down_scales: self.input_buffer(down_scales)?,
+                down_packed: self.input_runtime_buffer(down_packed)?,
+                down_scales: self.input_runtime_buffer(down_scales)?,
                 layout: gate_up_layout,
                 gate_up_layout,
                 down_layout,
@@ -5252,12 +5647,12 @@ pub mod platform {
             {
                 return Err("V2 Q4 embedding requires row-major Q4 group-32 weights".to_owned());
             }
-            let packed = self.input_buffer(&weights.data)?;
+            let packed = self.input_runtime_buffer(&weights.data)?;
             let mut scale_bytes = Vec::with_capacity(weights.scales.len() * 2);
             for scale in &weights.scales {
                 scale_bytes.extend_from_slice(&scale.to_bits().to_le_bytes());
             }
-            let scales = self.input_buffer(&scale_bytes)?;
+            let scales = self.input_runtime_buffer(&scale_bytes)?;
             Ok(PreparedQ4Embedding {
                 pipeline: self.q4_embedding_pipeline()?,
                 packed,
@@ -5590,8 +5985,8 @@ pub mod platform {
                 .collect::<Vec<_>>();
             Ok(PreparedQ4Stage {
                 pipeline: self.q4_gemv_pipeline()?,
-                packed: self.input_buffer(&weights.data)?,
-                scales: self.input_buffer(&scale_bytes)?,
+                packed: self.input_runtime_buffer(&weights.data)?,
+                scales: self.input_runtime_buffer(&scale_bytes)?,
                 rows: weights.rows,
                 columns: weights.cols,
                 layout: weights.layout,
@@ -5663,8 +6058,16 @@ pub mod platform {
             let columns = prepared.columns as u32;
             let layout = prepared.layout as u32;
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(&prepared.packed), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(&prepared.scales), 0, 1);
+                encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.packed.buffer),
+                    prepared.packed.offset,
+                    0,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.scales.buffer),
+                    prepared.scales.offset,
+                    1,
+                );
                 encoder.setBuffer_offset_atIndex(Some(&input_buffer), 0, 2);
                 encoder.setBuffer_offset_atIndex(Some(&output_buffer), 0, 3);
                 encoder.setBytes_length_atIndex(
@@ -5818,10 +6221,10 @@ pub mod platform {
                 pipeline: self.fused_pipeline(quant_type)?,
                 aggregate_pipeline: self.aggregate_pipeline(quant_type)?,
                 layout,
-                gate_up_packed: self.input_buffer(gate_up_packed)?,
-                gate_up_scales: self.input_buffer(gate_up_scales)?,
-                down_packed: self.input_buffer(down_packed)?,
-                down_scales: self.input_buffer(down_scales)?,
+                gate_up_packed: self.input_runtime_buffer(gate_up_packed)?,
+                gate_up_scales: self.input_runtime_buffer(gate_up_scales)?,
+                down_packed: self.input_runtime_buffer(down_packed)?,
+                down_scales: self.input_runtime_buffer(down_scales)?,
             })
         }
 
@@ -5904,10 +6307,26 @@ pub mod platform {
             for (prepared, output) in prepared.iter().zip(outputs) {
                 encoder.setComputePipelineState(&prepared.pipeline);
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&prepared.gate_up_packed), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&prepared.gate_up_scales), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&prepared.down_packed), 0, 2);
-                    encoder.setBuffer_offset_atIndex(Some(&prepared.down_scales), 0, 3);
+                    encoder.setBuffer_offset_atIndex(
+                        Some(&prepared.gate_up_packed.buffer),
+                        prepared.gate_up_packed.offset,
+                        0,
+                    );
+                    encoder.setBuffer_offset_atIndex(
+                        Some(&prepared.gate_up_scales.buffer),
+                        prepared.gate_up_scales.offset,
+                        1,
+                    );
+                    encoder.setBuffer_offset_atIndex(
+                        Some(&prepared.down_packed.buffer),
+                        prepared.down_packed.offset,
+                        2,
+                    );
+                    encoder.setBuffer_offset_atIndex(
+                        Some(&prepared.down_scales.buffer),
+                        prepared.down_scales.offset,
+                        3,
+                    );
                     encoder.setBuffer_offset_atIndex(Some(input_buffer), 0, 4);
                     encoder.setBuffer_offset_atIndex(Some(output), 0, 5);
                     let layout = prepared.layout as u32;
@@ -6035,10 +6454,26 @@ pub mod platform {
             for (prepared, output) in prepared.iter().zip(outputs) {
                 encoder.setComputePipelineState(&prepared.pipeline);
                 unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(&prepared.gate_up_packed), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(&prepared.gate_up_scales), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(&prepared.down_packed), 0, 2);
-                    encoder.setBuffer_offset_atIndex(Some(&prepared.down_scales), 0, 3);
+                    encoder.setBuffer_offset_atIndex(
+                        Some(&prepared.gate_up_packed.buffer),
+                        prepared.gate_up_packed.offset,
+                        0,
+                    );
+                    encoder.setBuffer_offset_atIndex(
+                        Some(&prepared.gate_up_scales.buffer),
+                        prepared.gate_up_scales.offset,
+                        1,
+                    );
+                    encoder.setBuffer_offset_atIndex(
+                        Some(&prepared.down_packed.buffer),
+                        prepared.down_packed.offset,
+                        2,
+                    );
+                    encoder.setBuffer_offset_atIndex(
+                        Some(&prepared.down_scales.buffer),
+                        prepared.down_scales.offset,
+                        3,
+                    );
                     encoder.setBuffer_offset_atIndex(Some(input_buffer), 0, 4);
                     encoder.setBuffer_offset_atIndex(Some(output), 0, 5);
                     let layout = prepared.layout as u32;
@@ -6331,6 +6766,50 @@ mod tests {
         assert_eq!(after.command_buffers - before.command_buffers, 1);
         assert_eq!(after.dispatches - before.dispatches, 2);
         assert!(after.cpu_wait_seconds >= before.cpu_wait_seconds);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn v2_graph_can_submit_two_gpu_ordered_command_buffers_with_one_final_wait() {
+        let context = platform::MetalContext::system_default().expect("Metal device");
+        let before = context.metrics().unwrap();
+        let mut graph = context.begin_decode().unwrap();
+        graph
+            .encode_noop(
+                &context,
+                platform::MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+                platform::MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+            .unwrap();
+        graph.begin_next_command_buffer(&context).unwrap();
+        graph
+            .encode_noop(
+                &context,
+                platform::MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+                platform::MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+            .unwrap();
+        graph.finish(&context).unwrap();
+        let after = context.metrics().unwrap();
+        assert_eq!(after.command_buffers - before.command_buffers, 2);
+        assert_eq!(after.encoders - before.encoders, 2);
+        assert_eq!(after.dispatches - before.dispatches, 2);
     }
 
     #[cfg(target_os = "macos")]

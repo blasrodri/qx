@@ -1,0 +1,1143 @@
+diff --git a/examples/simple/simple.cpp b/examples/simple/simple.cpp
+index 9f0a25d..613c6c7 100644
+--- a/examples/simple/simple.cpp
++++ b/examples/simple/simple.cpp
+@@ -1,10 +1,178 @@
+ #include "llama.h"
++#include <algorithm>
++#include <cmath>
+ #include <clocale>
++#include <cstdint>
+ #include <cstdio>
+ #include <cstring>
++#include <cstdlib>
++#include <fstream>
+ #include <string>
++#include <sys/resource.h>
+ #include <vector>
+ 
++struct qx_quality_block {
++    uint64_t start_position;
++    uint32_t positions;
++    double nll_sum;
++};
++
++struct qx_quality_sample {
++    uint64_t position;
++    uint32_t target;
++    double nll;
++    std::vector<float> logits;
++};
++
++template <typename T>
++static bool qx_read(std::ifstream & file, T & value) {
++    return static_cast<bool>(file.read(reinterpret_cast<char *>(&value), sizeof(value)));
++}
++
++static bool qx_skip_string(std::ifstream & file) {
++    uint32_t size = 0;
++    if (!qx_read(file, size)) {
++        return false;
++    }
++    file.seekg(size, std::ios::cur);
++    return static_cast<bool>(file);
++}
++
++static bool qx_read_quality_tokens(const char * path, std::vector<llama_token> & tokens) {
++    std::ifstream file(path, std::ios::binary);
++    char magic[8] = {};
++    uint32_t version = 0;
++    uint64_t count = 0;
++    if (!file.read(magic, sizeof(magic)) || std::memcmp(magic, "QXTOKN\0\0", 8) != 0 ||
++            !qx_read(file, version) || version != 1 || !qx_skip_string(file) ||
++            !qx_skip_string(file) || !qx_skip_string(file) || !qx_skip_string(file) ||
++            !qx_read(file, count)) {
++        return false;
++    }
++    tokens.resize(static_cast<size_t>(count));
++    for (auto & token : tokens) {
++        uint32_t value = 0;
++        if (!qx_read(file, value)) {
++            return false;
++        }
++        token = static_cast<llama_token>(value);
++    }
++    return tokens.size() >= 2 && file.peek() == std::ifstream::traits_type::eof();
++}
++
++template <typename T>
++static void qx_write(std::ofstream & file, const T & value) {
++    file.write(reinterpret_cast<const char *>(&value), sizeof(value));
++}
++
++static double qx_token_nll(const float * logits, int32_t vocab, llama_token target) {
++    float maximum = logits[0];
++    for (int32_t index = 1; index < vocab; ++index) {
++        maximum = std::max(maximum, logits[index]);
++    }
++    double sum = 0.0;
++    for (int32_t index = 0; index < vocab; ++index) {
++        sum += std::exp(static_cast<double>(logits[index] - maximum));
++    }
++    return std::log(sum) + maximum - logits[target];
++}
++
++static int qx_run_quality(
++        llama_context * ctx,
++        const llama_vocab * vocab,
++        const char * token_path,
++        const char * trace_path,
++        uint32_t block_tokens,
++        uint32_t sample_stride) {
++    std::vector<llama_token> tokens;
++    if (!qx_read_quality_tokens(token_path, tokens) || sample_stride == 0 || block_tokens < 2) {
++        fprintf(stderr, "invalid QX quality corpus or settings\n");
++        return 1;
++    }
++    const int32_t vocab_size = llama_vocab_n_tokens(vocab);
++    std::vector<qx_quality_block> blocks;
++    std::vector<qx_quality_sample> samples;
++    size_t start = 0;
++    while (start + 1 < tokens.size()) {
++        const size_t end = std::min(start + block_tokens, tokens.size());
++        llama_memory_clear(llama_get_memory(ctx), true);
++        qx_quality_block block {
++            static_cast<uint64_t>(start),
++            static_cast<uint32_t>(end - start - 1),
++            0.0,
++        };
++        for (size_t local = 0; local + 1 < end - start; ++local) {
++            llama_token input = tokens[start + local];
++            llama_batch batch = llama_batch_get_one(&input, 1);
++            if (llama_decode(ctx, batch) != 0) {
++                fprintf(stderr, "llama quality decode failed at position %zu\n", start + local);
++                return 1;
++            }
++            const float * logits = llama_get_logits(ctx);
++            const llama_token target = tokens[start + local + 1];
++            if (logits == nullptr || target < 0 || target >= vocab_size) {
++                fprintf(stderr, "invalid llama quality logits or target\n");
++                return 1;
++            }
++            const double nll = qx_token_nll(logits, vocab_size, target);
++            block.nll_sum += nll;
++            const size_t position = start + local;
++            if (position % sample_stride == 0) {
++                qx_quality_sample sample;
++                sample.position = static_cast<uint64_t>(position);
++                sample.target = static_cast<uint32_t>(target);
++                sample.nll = nll;
++                sample.logits.assign(logits, logits + vocab_size);
++                samples.push_back(std::move(sample));
++            }
++        }
++        blocks.push_back(block);
++        if (end == tokens.size()) {
++            break;
++        }
++        start = end - 1;
++    }
++    std::ofstream file(trace_path, std::ios::binary | std::ios::trunc);
++    const char magic[8] = {'Q', 'X', 'Q', 'U', 'A', 'L', '\0', '\0'};
++    const uint32_t version = 1;
++    const uint64_t positions = tokens.size() - 1;
++    const uint32_t block_count = static_cast<uint32_t>(blocks.size());
++    const uint32_t sample_count = static_cast<uint32_t>(samples.size());
++    file.write(magic, sizeof(magic));
++    qx_write(file, version);
++    qx_write(file, static_cast<uint32_t>(vocab_size));
++    qx_write(file, positions);
++    qx_write(file, block_tokens);
++    qx_write(file, sample_stride);
++    qx_write(file, block_count);
++    qx_write(file, sample_count);
++    for (const auto & block : blocks) {
++        qx_write(file, block.start_position);
++        qx_write(file, block.positions);
++        qx_write(file, block.nll_sum);
++    }
++    for (const auto & sample : samples) {
++        qx_write(file, sample.position);
++        qx_write(file, sample.target);
++        qx_write(file, sample.nll);
++        file.write(reinterpret_cast<const char *>(sample.logits.data()),
++                static_cast<std::streamsize>(sample.logits.size() * sizeof(float)));
++    }
++    if (!file) {
++        fprintf(stderr, "failed to write QX quality trace %s\n", trace_path);
++        return 1;
++    }
++    double nll_sum = 0.0;
++    for (const auto & block : blocks) {
++        nll_sum += block.nll_sum;
++    }
++    const double nll = nll_sum / positions;
++    fprintf(stderr,
++            "QX quality trace: %llu positions, NLL %.6f, PPL %.6f, %u samples -> %s\n",
++            static_cast<unsigned long long>(positions), nll, std::exp(nll), sample_count, trace_path);
++    return 0;
++}
++
+ static void print_usage(int, char ** argv) {
+     printf("\nexample usage:\n");
+     printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [prompt]\n", argv[0]);
+@@ -22,6 +190,8 @@ int main(int argc, char ** argv) {
+     int ngl = 99;
+     // number of tokens to predict
+     int n_predict = 32;
++    // context size; zero means the minimum required by the request
++    int n_ctx = 0;
+ 
+     // parse command line arguments
+ 
+@@ -59,6 +229,18 @@ int main(int argc, char ** argv) {
+                     print_usage(argc, argv);
+                     return 1;
+                 }
++            } else if (strcmp(argv[i], "-c") == 0) {
++                if (i + 1 < argc) {
++                    try {
++                        n_ctx = std::stoi(argv[++i]);
++                    } catch (...) {
++                        print_usage(argc, argv);
++                        return 1;
++                    }
++                } else {
++                    print_usage(argc, argv);
++                    return 1;
++                }
+             } else {
+                 // prompt starts here
+                 break;
+@@ -97,7 +279,7 @@ int main(int argc, char ** argv) {
+     // tokenize the prompt
+ 
+     // find the number of tokens in the prompt
+-    const int n_prompt = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, true, true);
++    int n_prompt = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, true, true);
+ 
+     // allocate space for the tokens and tokenize the prompt
+     std::vector<llama_token> prompt_tokens(n_prompt);
+@@ -106,13 +288,52 @@ int main(int argc, char ** argv) {
+         return 1;
+     }
+ 
++    // Iteration-2 parity mode bypasses text tokenization so llama.cpp and QX
++    // consume exactly the same canonical token fixture. The normal example
++    // behavior remains unchanged when QX_TOKEN_IDS is unset.
++    if (const char * token_spec = std::getenv("QX_TOKEN_IDS")) {
++        prompt_tokens.clear();
++        const char * cursor = token_spec;
++        while (*cursor != '\0') {
++            char * end = nullptr;
++            const long value = std::strtol(cursor, &end, 10);
++            if (end == cursor || value < 0 || value > 0x7fffffffL) {
++                fprintf(stderr, "%s: invalid QX_TOKEN_IDS=%s\n", __func__, token_spec);
++                return 1;
++            }
++            prompt_tokens.push_back(static_cast<llama_token>(value));
++            cursor = end;
++            if (*cursor == ',') {
++                ++cursor;
++            } else if (*cursor != '\0') {
++                fprintf(stderr, "%s: invalid QX_TOKEN_IDS=%s\n", __func__, token_spec);
++                return 1;
++            }
++        }
++        if (prompt_tokens.empty()) {
++            fprintf(stderr, "%s: QX_TOKEN_IDS is empty\n", __func__);
++            return 1;
++        }
++        n_prompt = static_cast<int>(prompt_tokens.size());
++    }
++
+     // initialize the context
+ 
+     llama_context_params ctx_params = llama_context_default_params();
+     // n_ctx is the context size
+-    ctx_params.n_ctx = n_prompt + n_predict - 1;
++    ctx_params.n_ctx = std::max(n_ctx, n_prompt + n_predict - 1);
+     // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
+     ctx_params.n_batch = n_prompt;
++    const char * qx_quality_tokens = std::getenv("QX_QUALITY_TOKENS");
++    const char * qx_quality_trace = std::getenv("QX_QUALITY_TRACE");
++    if (qx_quality_tokens != nullptr || qx_quality_trace != nullptr) {
++        if (qx_quality_tokens == nullptr || qx_quality_trace == nullptr) {
++            fprintf(stderr, "QX_QUALITY_TOKENS and QX_QUALITY_TRACE must be set together\n");
++            return 1;
++        }
++        ctx_params.n_ctx = n_ctx > 0 ? n_ctx : 512;
++        ctx_params.n_batch = 1;
++    }
+     // enable performance counters
+     ctx_params.no_perf = false;
+ 
+@@ -123,6 +344,24 @@ int main(int argc, char ** argv) {
+         return 1;
+     }
+ 
++    if (std::getenv("QX_REPORT_MEMORY") != nullptr) {
++        fprintf(stderr, "QX llama model tensor bytes: %llu\n",
++                static_cast<unsigned long long>(llama_model_size(model)));
++    }
++
++    if (qx_quality_tokens != nullptr) {
++        uint32_t stride = 256;
++        if (const char * value = std::getenv("QX_QUALITY_SAMPLE_STRIDE")) {
++            stride = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
++        }
++        const int status = qx_run_quality(
++                ctx, vocab, qx_quality_tokens, qx_quality_trace,
++                static_cast<uint32_t>(ctx_params.n_ctx), stride);
++        llama_free(ctx);
++        llama_model_free(model);
++        return status;
++    }
++
+     // initialize the sampler
+ 
+     auto sparams = llama_sampler_chain_default_params();
+@@ -131,9 +370,16 @@ int main(int argc, char ** argv) {
+ 
+     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+ 
++    const bool qx_bench_silent = std::getenv("QX_BENCH_SILENT") != nullptr;
++    const bool qx_measure_post_prefill = std::getenv("QX_MEASURE_POST_PREFILL") != nullptr;
++    const bool qx_ignore_eog = std::getenv("QX_IGNORE_EOG") != nullptr;
++
+     // print the prompt token-by-token
+ 
+     for (auto id : prompt_tokens) {
++        if (qx_bench_silent) {
++            break;
++        }
+         char buf[128];
+         int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
+         if (n < 0) {
+@@ -165,15 +411,45 @@ int main(int argc, char ** argv) {
+     // main loop
+ 
+     const auto t_main_start = ggml_time_us();
++    int64_t t_first_decode_us = 0;
+     int n_decode = 0;
++    int qx_measured_decode = 0;
++    int64_t qx_measured_start_us = 0;
+     llama_token new_token_id;
++    bool dumped_qx_logits = false;
+ 
+     for (int n_pos = 0; n_pos + batch.n_tokens < n_prompt + n_predict; ) {
++        const bool qx_is_prompt_eval = n_pos == 0;
+         // evaluate the current batch with the transformer model
++        const auto t_decode_start = ggml_time_us();
++        if (qx_measure_post_prefill && !qx_is_prompt_eval && qx_measured_start_us == 0) {
++            qx_measured_start_us = t_decode_start;
++        }
+         if (llama_decode(ctx, batch)) {
+             fprintf(stderr, "%s : failed to eval, return code %d\n", __func__, 1);
+             return 1;
+         }
++        if (n_decode == 0) {
++            t_first_decode_us = ggml_time_us() - t_decode_start;
++        }
++
++        if (!dumped_qx_logits) {
++            if (const char * logits_path = std::getenv("QX_LOGITS_PATH")) {
++                const float * logits = llama_get_logits(ctx);
++                const int32_t vocab_size = llama_vocab_n_tokens(vocab);
++                std::ofstream file(logits_path, std::ios::binary | std::ios::trunc);
++                if (!file || logits == nullptr) {
++                    fprintf(stderr, "%s: failed to write QX_LOGITS_PATH\n", __func__);
++                    return 1;
++                }
++                const char magic[8] = {'Q', 'X', 'L', 'O', 'G', 'I', 'T', '\0'};
++                file.write(magic, sizeof(magic));
++                file.write(reinterpret_cast<const char *>(&vocab_size), sizeof(vocab_size));
++                file.write(reinterpret_cast<const char *>(logits),
++                        static_cast<std::streamsize>(vocab_size * sizeof(float)));
++                dumped_qx_logits = true;
++            }
++        }
+ 
+         n_pos += batch.n_tokens;
+ 
+@@ -182,7 +458,7 @@ int main(int argc, char ** argv) {
+             new_token_id = llama_sampler_sample(smpl, ctx, -1);
+ 
+             // is it an end of generation?
+-            if (llama_vocab_is_eog(vocab, new_token_id)) {
++            if (!qx_ignore_eog && llama_vocab_is_eog(vocab, new_token_id)) {
+                 break;
+             }
+ 
+@@ -193,13 +469,18 @@ int main(int argc, char ** argv) {
+                 return 1;
+             }
+             std::string s(buf, n);
+-            printf("%s", s.c_str());
+-            fflush(stdout);
++            if (!qx_bench_silent) {
++                printf("%s", s.c_str());
++                fflush(stdout);
++            }
+ 
+             // prepare the next batch with the sampled token
+             batch = llama_batch_get_one(&new_token_id, 1);
+ 
+             n_decode += 1;
++            if (!qx_is_prompt_eval) {
++                qx_measured_decode += 1;
++            }
+         }
+     }
+ 
+@@ -207,12 +488,31 @@ int main(int argc, char ** argv) {
+ 
+     const auto t_main_end = ggml_time_us();
+ 
++    if (qx_measure_post_prefill) {
++        const int64_t elapsed = qx_measured_start_us == 0 ? 0 : t_main_end - qx_measured_start_us;
++        const double speed = elapsed > 0 ? qx_measured_decode / (elapsed / 1000000.0) : 0.0;
++        fprintf(stderr,
++                "QX measured post-prefill: %d tokens in %.3f ms, speed: %.3f t/s\n",
++                qx_measured_decode, elapsed / 1000.0, speed);
++    }
++
+     fprintf(stderr, "%s: decoded %d tokens in %.2f s, speed: %.2f t/s\n",
+             __func__, n_decode, (t_main_end - t_main_start) / 1000000.0f, n_decode / ((t_main_end - t_main_start) / 1000000.0f));
++    fprintf(stderr, "%s: TTFT %.2f ms\n", __func__, t_first_decode_us / 1000.0);
+ 
+     fprintf(stderr, "\n");
+     llama_perf_sampler_print(smpl);
+     llama_perf_context_print(ctx);
++    struct rusage usage {};
++    if (getrusage(RUSAGE_SELF, &usage) == 0) {
++        const uint64_t peak_rss = static_cast<uint64_t>(usage.ru_maxrss)
++#if !defined(__APPLE__)
++            * 1024ULL
++#endif
++            ;
++        fprintf(stderr, "llama peak RSS bytes: %llu\n",
++                static_cast<unsigned long long>(peak_rss));
++    }
+     fprintf(stderr, "\n");
+ 
+     llama_sampler_free(smpl);
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 32d97cd..2356507 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -11,6 +11,9 @@
+ 
+ #import <Metal/Metal.h>
+ 
++#include <stdlib.h>
++#include <string.h>
++
+ #undef MIN
+ #undef MAX
+ #define MIN(a, b) ((a) < (b) ? (a) : (b))
+@@ -23,6 +26,10 @@
+     id<MTLCommandBuffer> obj;
+ };
+ 
++static void ggml_metal_profile_moe_ops(ggml_metal_t ctx);
++static void ggml_metal_dump_profile_graph(ggml_metal_t ctx);
++static void ggml_metal_profile_decode_ops(ggml_metal_t ctx);
++
+ struct ggml_metal {
+     char name[128];
+ 
+@@ -81,6 +88,323 @@
+     bool has_error;
+ };
+ 
++static void ggml_metal_profile_moe_ops(ggml_metal_t ctx) {
++    const char * enabled = getenv("GGML_METAL_PROFILE_MOE");
++    const bool active = enabled && atoi(enabled) != 0;
++    if (!active || !ctx->gf) {
++        return;
++    }
++
++    // The normal graph must finish first: the replayed MUL_MAT_ID nodes read
++    // activations and GPU-produced expert IDs from the completed decode.
++    for (int i = 0; i <= ctx->n_cb; ++i) {
++        if (ctx->cmd_bufs[i].obj) {
++            [ctx->cmd_bufs[i].obj waitUntilCompleted];
++        }
++    }
++
++    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
++    double gate_up_us = 0.0;
++    double down_us = 0.0;
++    double other_us = 0.0;
++    double moe_block_us = 0.0;
++    int gate_up_count = 0;
++    int down_count = 0;
++    int mul_mat_id_nodes = 0;
++    int moe_block_nodes = 0;
++
++    for (int node_index = 0; node_index < ctx->gf->n_nodes; ++node_index) {
++        struct ggml_tensor * node = ctx->gf->nodes[node_index];
++        const bool is_mul_mat_id = node && node->op == GGML_OP_MUL_MAT_ID && node->src[0];
++        const bool is_moe_node = node && strncmp(node->name, "ffn_moe_", 8) == 0;
++        if (!is_mul_mat_id && !is_moe_node) {
++            continue;
++        }
++        if (is_mul_mat_id) {
++            mul_mat_id_nodes++;
++        }
++        if (getenv("GGML_METAL_PROFILE_MOE_VERBOSE")) {
++            fprintf(stderr,
++                "MOE_PROFILE node=%d name=%s op=%s input=%lld next=%s next2=%s\n",
++                node_index,
++                node->name,
++                ggml_op_name(node->op),
++                (long long) node->src[0]->ne[0],
++                node_index + 1 < ctx->gf->n_nodes ? ggml_op_name(ctx->gf->nodes[node_index + 1]->op) : "none",
++                node_index + 2 < ctx->gf->n_nodes ? ggml_op_name(ctx->gf->nodes[node_index + 2]->op) : "none");
++        }
++
++        // Granite's active expert matrices are [1024, 1024] gate/up and
++        // [512, 1024] down in ggml's column-major tensor convention.
++        const int64_t input_width = is_mul_mat_id ? node->src[0]->ne[0] : 0;
++        const char * label = input_width == 1024 ? "gate/up" :
++                             input_width == 512  ? "down" : "other";
++        id<MTLCommandBuffer> command_buffer = [queue commandBufferWithUnretainedReferences];
++        [command_buffer enqueue];
++        ggml_metal_op_t op = ggml_metal_op_init(
++            ctx->dev,
++            (ggml_metal_cmd_buf_t) command_buffer,
++            ctx->gf,
++            node_index,
++            node_index + 1,
++            false,
++            false,
++            false,
++            0,
++            0);
++        if (ggml_metal_op_n_nodes(op) != 1 || ggml_metal_op_encode(op, 0) == 0) {
++            ggml_metal_op_free(op);
++            [command_buffer commit];
++            [command_buffer waitUntilCompleted];
++            continue;
++        }
++        ggml_metal_op_free(op);
++        [command_buffer commit];
++        [command_buffer waitUntilCompleted];
++
++        const double gpu_us = (command_buffer.GPUEndTime - command_buffer.GPUStartTime) * 1.0e6;
++        if (is_moe_node) {
++            moe_block_us += gpu_us;
++            moe_block_nodes++;
++        }
++        if (is_mul_mat_id) {
++            if (strcmp(label, "gate/up") == 0) {
++                gate_up_us += gpu_us;
++                gate_up_count++;
++            } else if (strcmp(label, "down") == 0) {
++                down_us += gpu_us;
++                down_count++;
++            } else {
++                other_us += gpu_us;
++            }
++        }
++    }
++
++    const double gate_up_avg = gate_up_count ? gate_up_us / gate_up_count : 0.0;
++    const double down_avg = down_count ? down_us / down_count : 0.0;
++    const double matrix_total = gate_up_us + down_us + other_us;
++    fprintf(stderr, "MOE_PROFILE matched_mul_mat_id=%d moe_nodes=%d\n", mul_mat_id_nodes, moe_block_nodes);
++    fprintf(stderr,
++        "MOE_PROFILE gate/up=%.2f us (%d) down=%.2f us (%d) "
++        "matrix_total=%.2f us full_moe_nodes=%.2f us\n",
++        gate_up_avg,
++        gate_up_count,
++        down_avg,
++        down_count,
++        matrix_total,
++        moe_block_us);
++}
++
++// One-shot graph inventory for designing the opt-in competitive profiler.
++// This does not replay or alter any operation; it only records the concrete
++// Granite node names and tensor shapes emitted by llama.cpp.
++static void ggml_metal_dump_profile_graph(ggml_metal_t ctx) {
++    static int graph_count = 0;
++    const char * enabled = getenv("GGML_METAL_PROFILE_GRAPH");
++    if (!enabled || atoi(enabled) == 0 || !ctx->gf) {
++        return;
++    }
++    graph_count++;
++    if (graph_count != atoi(enabled)) {
++        return;
++    }
++    for (int node_index = 0; node_index < ctx->gf->n_nodes; ++node_index) {
++        struct ggml_tensor * node = ctx->gf->nodes[node_index];
++        if (!node) {
++            continue;
++        }
++        fprintf(stderr,
++            "GRAPH_PROFILE node=%d name=%s op=%s dst=%lldx%lld src0=%lldx%lld src1=%lldx%lld\n",
++            node_index,
++            node->name,
++            ggml_op_name(node->op),
++            (long long) node->ne[0],
++            (long long) node->ne[1],
++            node->src[0] ? (long long) node->src[0]->ne[0] : 0,
++            node->src[0] ? (long long) node->src[0]->ne[1] : 0,
++            node->src[1] ? (long long) node->src[1]->ne[0] : 0,
++            node->src[1] ? (long long) node->src[1]->ne[1] : 0);
++    }
++}
++
++// Replay the fixed-shape decode primitives on the completed graph so their
++// GPU timestamps can be compared with QX's isolated per-layer measurements.
++// This is intentionally opt-in: replaying nodes adds synchronization and is
++// never part of the normal llama.cpp execution path.
++static void ggml_metal_profile_decode_ops(ggml_metal_t ctx) {
++    const char * enabled = getenv("GGML_METAL_PROFILE_DECODE");
++    if (!enabled || atoi(enabled) == 0 || !ctx->gf) {
++        return;
++    }
++
++    bool is_decode_graph = false;
++    for (int node_index = 0; node_index < ctx->gf->n_nodes; ++node_index) {
++        struct ggml_tensor * node = ctx->gf->nodes[node_index];
++        if (node && node->op == GGML_OP_FLASH_ATTN_EXT && node->src[0] && node->src[1]
++            && node->src[0]->ne[1] == 1 && node->src[1]->ne[1] >= 256) {
++            is_decode_graph = true;
++            break;
++        }
++    }
++    if (!is_decode_graph) {
++        return;
++    }
++
++    for (int i = 0; i <= ctx->n_cb; ++i) {
++        if (ctx->cmd_bufs[i].obj) {
++            [ctx->cmd_bufs[i].obj waitUntilCompleted];
++        }
++    }
++
++    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
++    double qkv_us = 0.0;
++    double rope_kv_us = 0.0;
++    double attention_us = 0.0;
++    double o_us = 0.0;
++    int qkv_count = 0;
++    int rope_kv_count = 0;
++    int attention_count = 0;
++    int o_count = 0;
++    int layer_starts[24];
++    for (int layer = 0; layer < 24; ++layer) {
++        layer_starts[layer] = -1;
++    }
++
++    for (int node_index = 0; node_index < ctx->gf->n_nodes; ++node_index) {
++        struct ggml_tensor * node = ctx->gf->nodes[node_index];
++        if (!node) {
++            continue;
++        }
++        int norm_layer = -1;
++        if (sscanf(node->name, "norm-%d", &norm_layer) == 1
++            && norm_layer >= 0 && norm_layer < 24 && layer_starts[norm_layer] < 0) {
++            layer_starts[norm_layer] = node_index;
++        }
++        const bool qkv = node->op == GGML_OP_MUL_MAT
++            && (strncmp(node->name, "Qcur-", 5) == 0
++                || strncmp(node->name, "Kcur-", 5) == 0
++                || strncmp(node->name, "Vcur-", 5) == 0);
++        const bool rope = node->op == GGML_OP_ROPE;
++        const bool kv_write = node->op == GGML_OP_SET_ROWS
++            && (strncmp(node->name, "cache_k_", 8) == 0
++                || strncmp(node->name, "cache_v_", 8) == 0);
++        const bool attention = node->op == GGML_OP_FLASH_ATTN_EXT;
++        const bool output = node->op == GGML_OP_MUL_MAT
++            && strncmp(node->name, "attn_out-", 9) == 0;
++        if (!qkv && !rope && !kv_write && !attention && !output) {
++            continue;
++        }
++
++        id<MTLCommandBuffer> command_buffer = [queue commandBufferWithUnretainedReferences];
++        [command_buffer enqueue];
++        ggml_metal_op_t op = ggml_metal_op_init(
++            ctx->dev,
++            (ggml_metal_cmd_buf_t) command_buffer,
++            ctx->gf,
++            node_index,
++            node_index + 1,
++            false,
++            false,
++            false,
++            0,
++            0);
++        if (ggml_metal_op_n_nodes(op) != 1 || ggml_metal_op_encode(op, 0) == 0) {
++            ggml_metal_op_free(op);
++            [command_buffer commit];
++            [command_buffer waitUntilCompleted];
++            continue;
++        }
++        ggml_metal_op_free(op);
++        [command_buffer commit];
++        [command_buffer waitUntilCompleted];
++        const double gpu_us = (command_buffer.GPUEndTime - command_buffer.GPUStartTime) * 1.0e6;
++        if (qkv) {
++            qkv_us += gpu_us;
++            qkv_count++;
++        } else if (rope || kv_write) {
++            rope_kv_us += gpu_us;
++            rope_kv_count++;
++        } else if (attention) {
++            attention_us += gpu_us;
++            attention_count++;
++        } else if (output) {
++            o_us += gpu_us;
++            o_count++;
++        }
++    }
++
++    // Replay each complete transformer layer as one command buffer. This is
++    // a diagnostic whole-block timing, not the normal llama.cpp submission
++    // topology; it provides the missing composition reference for QX's layer
++    // total without pretending isolated node sums are additive.
++    double block_us = 0.0;
++    int block_count = 0;
++    for (int layer = 0; layer < 24; ++layer) {
++        if (layer_starts[layer] < 0) {
++            continue;
++        }
++        int end = ctx->gf->n_nodes;
++        if (layer < 23 && layer_starts[layer + 1] >= 0) {
++            end = layer_starts[layer + 1];
++        } else if (layer == 23) {
++            for (int node_index = layer_starts[layer] + 1;
++                 node_index < ctx->gf->n_nodes;
++                 ++node_index) {
++                struct ggml_tensor * node = ctx->gf->nodes[node_index];
++                if (node && node->op == GGML_OP_RMS_NORM
++                    && strncmp(node->name, "norm-", 5) != 0) {
++                    end = node_index;
++                    break;
++                }
++            }
++        }
++        if (end <= layer_starts[layer]) {
++            continue;
++        }
++        id<MTLCommandBuffer> command_buffer = [queue commandBufferWithUnretainedReferences];
++        [command_buffer enqueue];
++        ggml_metal_op_t op = ggml_metal_op_init(
++            ctx->dev,
++            (ggml_metal_cmd_buf_t) command_buffer,
++            ctx->gf,
++            layer_starts[layer],
++            end,
++            false,
++            false,
++            false,
++            0,
++            0);
++        const int n_nodes = ggml_metal_op_n_nodes(op);
++        bool encoded = n_nodes > 0;
++        for (int node = 0; encoded && node < n_nodes; ++node) {
++            encoded = ggml_metal_op_encode(op, node) != 0;
++        }
++        ggml_metal_op_free(op);
++        if (!encoded) {
++            [command_buffer commit];
++            [command_buffer waitUntilCompleted];
++            continue;
++        }
++        [command_buffer commit];
++        [command_buffer waitUntilCompleted];
++        block_us += (command_buffer.GPUEndTime - command_buffer.GPUStartTime) * 1.0e6;
++        block_count++;
++    }
++
++    fprintf(stderr,
++        "DECODE_PROFILE qkv=%.2f us (%d, %.2f/layer) "
++        "rope_kv=%.2f us (%d, %.2f/layer) "
++        "attention=%.2f us (%d, %.2f/layer) "
++        "o=%.2f us (%d, %.2f/layer) core=%.2f us "
++        "block=%.2f us (%d, %.2f/layer)\n",
++        qkv_us, qkv_count, qkv_us / 24.0,
++        rope_kv_us, rope_kv_count, rope_kv_us / 24.0,
++        attention_us, attention_count, attention_us / 24.0,
++        o_us, o_count, o_us / 24.0,
++        qkv_us + rope_kv_us + attention_us + o_us,
++        block_us, block_count, block_us / (block_count ? block_count : 1));
++}
++
+ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+     GGML_LOG_INFO("%s: allocating\n", __func__);
+ 
+@@ -609,6 +933,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+ 
+             ctx->capture_started = false;
+         }
++
++        ggml_metal_profile_moe_ops(ctx);
++        ggml_metal_dump_profile_graph(ctx);
++        ggml_metal_profile_decode_ops(ctx);
+     }
+ 
+     return GGML_STATUS_SUCCESS;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 52f8d53..bf2f658 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -12,13 +12,19 @@
+ #include "llama-ext.h"
+ #include "llama-sampler.h"
+ #include "llama.h"
++#include "../ggml/src/ggml-impl.h"
+ 
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <fstream>
+ #include <limits>
++#include <map>
+ #include <stdexcept>
+ #include <string>
++#include <vector>
+ 
+ //
+ // llama_context
+@@ -80,6 +86,157 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+     /*.n_tokens_per_seq =*/ 1,
+ };
+ 
++// Minimal bridge format shared with qx-compiler::QxTrace. This is deliberately
++// local to the calibration build: it does not change llama.cpp's public API.
++struct qx_trace_writer {
++    std::ofstream file;
++    uint64_t records = 0;
++
++    qx_trace_writer(const char * path, uint32_t hidden_size) :
++        file(path, std::ios::binary | std::ios::trunc) {
++        if (!file) {
++            LLAMA_LOG_ERROR("QX trace: failed to open %s\n", path);
++            return;
++        }
++        const char magic[8] = {'Q', 'X', 'T', 'R', 'A', 'C', 'E', '\0'};
++        file.write(magic, sizeof(magic));
++        write_u32(2);
++        write_u32(hidden_size);
++        write_u64(0); // patched by the destructor
++    }
++
++    ~qx_trace_writer() {
++        if (!file) {
++            return;
++        }
++        file.flush();
++        file.seekp(16, std::ios::beg);
++        write_u64(records);
++        file.flush();
++    }
++
++    bool good() const {
++        return file.good();
++    }
++
++    void append(uint16_t layer, uint8_t expert, float router_weight, uint16_t token,
++            const float * hidden, size_t hidden_size) {
++        write_u16(layer);
++        file.put(static_cast<char>(expert));
++        file.put(0);
++        write_f32(router_weight);
++        write_u16(token);
++        for (size_t i = 0; i < hidden_size; ++i) {
++            write_f32(hidden[i]);
++        }
++        ++records;
++    }
++
++private:
++    void write_u16(uint16_t value) {
++        const uint8_t bytes[] = {
++            static_cast<uint8_t>(value),
++            static_cast<uint8_t>(value >> 8),
++        };
++        file.write(reinterpret_cast<const char *>(bytes), sizeof(bytes));
++    }
++
++    void write_u32(uint32_t value) {
++        const uint8_t bytes[] = {
++            static_cast<uint8_t>(value),
++            static_cast<uint8_t>(value >> 8),
++            static_cast<uint8_t>(value >> 16),
++            static_cast<uint8_t>(value >> 24),
++        };
++        file.write(reinterpret_cast<const char *>(bytes), sizeof(bytes));
++    }
++
++    void write_u64(uint64_t value) {
++        const uint8_t bytes[] = {
++            static_cast<uint8_t>(value),
++            static_cast<uint8_t>(value >> 8),
++            static_cast<uint8_t>(value >> 16),
++            static_cast<uint8_t>(value >> 24),
++            static_cast<uint8_t>(value >> 32),
++            static_cast<uint8_t>(value >> 40),
++            static_cast<uint8_t>(value >> 48),
++            static_cast<uint8_t>(value >> 56),
++        };
++        file.write(reinterpret_cast<const char *>(bytes), sizeof(bytes));
++    }
++
++    void write_f32(float value) {
++        uint32_t bits = 0;
++        std::memcpy(&bits, &value, sizeof(bits));
++        write_u32(bits);
++    }
++};
++
++static bool qx_read_tensor_f32(const ggml_tensor * tensor, std::vector<float> & values) {
++    if (!tensor || (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_BF16)) {
++        return false;
++    }
++
++    std::vector<uint8_t> raw(ggml_nbytes(tensor));
++    ggml_backend_tensor_get(tensor, raw.data(), 0, raw.size());
++    values.resize(static_cast<size_t>(ggml_nelements(tensor)));
++
++    size_t index = 0;
++    for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
++        for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
++            for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
++                for (int64_t i0 = 0; i0 < tensor->ne[0]; ++i0, ++index) {
++                    const uint8_t * ptr = raw.data() + i3 * tensor->nb[3] + i2 * tensor->nb[2] + i1 * tensor->nb[1] + i0 * tensor->nb[0];
++                    if (tensor->type == GGML_TYPE_F32) {
++                        std::memcpy(&values[index], ptr, sizeof(float));
++                    } else if (tensor->type == GGML_TYPE_F16) {
++                        ggml_fp16_t value;
++                        std::memcpy(&value, ptr, sizeof(value));
++                        values[index] = ggml_fp16_to_fp32(value);
++                    } else {
++                        ggml_bf16_t value;
++                        std::memcpy(&value, ptr, sizeof(value));
++                        values[index] = ggml_bf16_to_fp32(value);
++                    }
++                }
++            }
++        }
++    }
++    return true;
++}
++
++static bool qx_read_tensor_i32(const ggml_tensor * tensor, std::vector<int32_t> & values) {
++    if (!tensor || tensor->type != GGML_TYPE_I32) {
++        return false;
++    }
++
++    std::vector<uint8_t> raw(ggml_nbytes(tensor));
++    ggml_backend_tensor_get(tensor, raw.data(), 0, raw.size());
++    values.resize(static_cast<size_t>(ggml_nelements(tensor)));
++
++    size_t index = 0;
++    for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
++        for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
++            for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
++                for (int64_t i0 = 0; i0 < tensor->ne[0]; ++i0, ++index) {
++                    const uint8_t * ptr = raw.data() + i3 * tensor->nb[3] + i2 * tensor->nb[2] + i1 * tensor->nb[1] + i0 * tensor->nb[0];
++                    std::memcpy(&values[index], ptr, sizeof(int32_t));
++                }
++            }
++        }
++    }
++    return true;
++}
++
++static bool qx_match_layer_name(const char * name, const char * prefix, int & layer) {
++    const std::string format = std::string(prefix) + "-%d%n";
++    int consumed = -1;
++    if (std::sscanf(name, format.c_str(), &layer, &consumed) != 1 || consumed < 0) {
++        return false;
++    }
++    return name[consumed] == '\0';
++}
++
+ llama_context::llama_context(
+         const llama_model & model,
+               llama_context_params params) :
+@@ -2494,6 +2651,27 @@ ggml_status llama_context::graph_compute(
+     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
++    } else if (std::getenv("QX_TRACE_PATH") != nullptr) {
++        // Calibration is intentionally synchronous. This keeps the trace
++        // collector simple and avoids reading device tensors while a graph is
++        // still in flight. Normal inference never takes this branch.
++        ggml_backend_sched_synchronize(sched.get());
++        if (const char * names_path = std::getenv("QX_NODE_NAMES")) {
++            static bool dumped_node_names = false;
++            if (!dumped_node_names) {
++                std::ofstream names(names_path, std::ios::out | std::ios::trunc);
++                if (names) {
++                    for (int i = 0; i < gf->n_nodes; ++i) {
++                        ggml_tensor * tensor = gf->nodes[i];
++                        names << (ggml_get_name(tensor) ? ggml_get_name(tensor) : "")
++                              << " ne=" << tensor->ne[0] << "," << tensor->ne[1]
++                              << "," << tensor->ne[2] << "," << tensor->ne[3] << "\n";
++                    }
++                }
++                dumped_node_names = true;
++            }
++        }
++        qx_trace_capture(gf);
+     }
+ 
+     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+@@ -2501,6 +2679,85 @@ ggml_status llama_context::graph_compute(
+     return status;
+ }
+ 
++void llama_context::qx_trace_capture(ggml_cgraph * gf) {
++    const char * path = std::getenv("QX_TRACE_PATH");
++    if (!path || !*path) {
++        return;
++    }
++    if (std::getenv("QX_TRACE_ONCE") != nullptr && qx_trace_captured) {
++        return;
++    }
++
++    if (!qx_trace) {
++        qx_trace = std::make_unique<qx_trace_writer>(path, static_cast<uint32_t>(model.hparams.n_embd));
++    }
++    if (!qx_trace->good()) {
++        return;
++    }
++
++    std::map<int, ggml_tensor *> inputs;
++    std::map<int, ggml_tensor *> topk;
++    std::map<int, ggml_tensor *> weights;
++
++    for (int i = 0; i < gf->n_nodes; ++i) {
++        ggml_tensor * tensor = gf->nodes[i];
++        const char * name = ggml_get_name(tensor);
++        int layer = -1;
++        if (qx_match_layer_name(name, "ffn_moe_input", layer)) {
++            inputs[layer] = tensor;
++        } else if (qx_match_layer_name(name, "ffn_moe_topk", layer)) {
++            topk[layer] = tensor;
++        } else if (qx_match_layer_name(name, "ffn_moe_weights_norm", layer)) {
++            weights[layer] = tensor;
++        }
++    }
++
++    for (const auto & [layer, input_tensor] : inputs) {
++        const auto topk_it = topk.find(layer);
++        const auto weights_it = weights.find(layer);
++        if (topk_it == topk.end() || weights_it == weights.end()) {
++            continue;
++        }
++
++        std::vector<float> input_values;
++        std::vector<int32_t> topk_values;
++        std::vector<float> weight_values;
++        if (!qx_read_tensor_f32(input_tensor, input_values) ||
++                !qx_read_tensor_i32(topk_it->second, topk_values) ||
++                !qx_read_tensor_f32(weights_it->second, weight_values)) {
++            LLAMA_LOG_WARN("QX trace: unsupported tensor type at layer %d\n", layer);
++            continue;
++        }
++
++        const int64_t hidden = input_tensor->ne[0];
++        const int64_t n_tokens = input_tensor->ne[1];
++        const int64_t n_selected = topk_it->second->ne[0];
++        const int64_t weight_stride = weights_it->second->ne[0];
++        if (hidden != model.hparams.n_embd || n_selected <= 0 ||
++                input_values.size() < static_cast<size_t>(hidden * n_tokens) ||
++                topk_values.size() < static_cast<size_t>(n_selected * n_tokens) ||
++                weight_values.size() < static_cast<size_t>(weight_stride * n_tokens)) {
++            LLAMA_LOG_WARN("QX trace: unexpected MoE shape at layer %d\n", layer);
++            continue;
++        }
++
++        for (int64_t token = 0; token < n_tokens; ++token) {
++            const float * hidden_state = input_values.data() + token * hidden;
++            for (int64_t slot = 0; slot < n_selected; ++slot) {
++                const int32_t expert = topk_values[token * n_selected + slot];
++                const size_t weight_index = static_cast<size_t>(token * weight_stride + slot);
++                if (expert < 0 || expert > 255 || weight_index >= weight_values.size()) {
++                    continue;
++                }
++                qx_trace->append(static_cast<uint16_t>(layer), static_cast<uint8_t>(expert),
++                        weight_values[weight_index], static_cast<uint16_t>(token), hidden_state,
++                        static_cast<size_t>(hidden));
++            }
++        }
++    }
++    qx_trace_captured = true;
++}
++
+ llm_graph_cb llama_context::graph_get_cb() const {
+     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+         if (il >= 0) {
+@@ -2509,6 +2766,16 @@ llm_graph_cb llama_context::graph_get_cb() const {
+             ggml_set_name(cur, name);
+         }
+ 
++        if (std::getenv("QX_TRACE_PATH") != nullptr &&
++                (std::strcmp(name, "ffn_moe_input") == 0 ||
++                 std::strcmp(name, "ffn_moe_topk") == 0 ||
++                 std::strcmp(name, "ffn_moe_weights_norm") == 0)) {
++            // Keep calibration values alive until graph_compute() can copy
++            // them back from the device. Without this, the allocator may
++            // reuse an intermediate buffer before the trace reader runs.
++            ggml_set_output(cur);
++        }
++
+         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
+         // FIXME: fix in ggml_backend_sched
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa..b25c277 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -16,6 +16,7 @@
+ 
+ struct llama_model;
+ class llama_batch_allocr;
++struct qx_trace_writer;
+ 
+ class llama_io_read_i;
+ class llama_io_write_i;
+@@ -262,6 +263,8 @@ private:
+ 
+     llm_graph_cb graph_get_cb() const;
+ 
++    void qx_trace_capture(ggml_cgraph * gf);
++
+     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
+     // that differs from the layer it belongs to (usually due to missing backend support)
+     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
+@@ -370,6 +373,11 @@ private:
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+ 
++    // Optional calibration sink enabled by QX_TRACE_PATH. It is intentionally
++    // kept out of the public llama API; the bridge is a local PoC instrument.
++    std::unique_ptr<qx_trace_writer> qx_trace;
++    bool qx_trace_captured = false;
++
+     // keep copies of the per-sequence memory on the device
+     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+ 
+diff --git a/src/models/granite.cpp b/src/models/granite.cpp
+index 9e9f97e..58d4300 100644
+--- a/src/models/granite.cpp
++++ b/src/models/granite.cpp
+@@ -266,6 +266,7 @@ ggml_tensor * llama_model_granite::graph::build_layer_ffn(
+                 model.layers[il].ffn_norm, NULL,
+                 LLM_NORM_RMS, il);
+                 cb(cur, "ffn_norm", il);
++                cb(cur, "ffn_moe_input", il);
+ 
+         ggml_tensor * moe_out = build_moe_ffn(cur,
+                 model.layers[il].ffn_gate_inp,
+

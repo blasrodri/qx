@@ -6,8 +6,147 @@
 
 use qx_model::{ATTENTION_HEADS, EXPERTS, HIDDEN, KV_HEADS, LAYERS, TOP_K, VOCAB};
 
+pub fn activate_artifact_execution_plan(
+    artifact_path: impl AsRef<std::path::Path>,
+) -> Result<Option<qx_format::ExecutionPlanManifest>, String> {
+    let artifact =
+        qx_format::MappedArtifact::open(artifact_path).map_err(|error| error.to_string())?;
+    let Some(plan) = artifact.info().execution_plan.clone() else {
+        return Ok(None);
+    };
+    if plan.schema_version != 1 {
+        return Err(format!(
+            "unsupported execution-plan schema {}",
+            plan.schema_version
+        ));
+    }
+    if plan.schedule.internal_cpu_waits != 0 {
+        return Err("compiled plan requests internal CPU waits".to_owned());
+    }
+    if plan.schedule.command_buffers_per_token == 0
+        || plan.schedule.command_buffers_per_token as usize > LAYERS
+    {
+        return Err(format!(
+            "compiled plan requests {} command buffers/token; supported range is 1..={LAYERS}",
+            plan.schedule.command_buffers_per_token
+        ));
+    }
+    set_plan_env(
+        "QX_V2_COMMAND_BUFFERS",
+        &plan.schedule.command_buffers_per_token.to_string(),
+    );
+    set_plan_env(
+        "QX_V2_QKV_TOPOLOGY",
+        match plan.topology.qkv {
+            qx_format::QkvTopology::Fused => "fused",
+            qx_format::QkvTopology::Split => "split",
+            qx_format::QkvTopology::FusedExperimental => "fused-experimental",
+        },
+    );
+    set_plan_bool_env(
+        "QX_V2_RMS_SCALAR_QKV",
+        plan.topology.input_rms == qx_format::RmsTopology::ScalarConsumer,
+    );
+    set_plan_bool_env(
+        "QX_V2_RMS_SCALAR_ROUTER",
+        plan.topology.post_attention_rms == qx_format::RmsTopology::ScalarConsumer,
+    );
+    set_plan_env(
+        "QX_V2_ROPE_KV_TOPOLOGY",
+        match plan.topology.rope_kv {
+            qx_format::RopeKvTopology::Canonical => "legacy",
+            qx_format::RopeKvTopology::SplitDirect => "split",
+        },
+    );
+    match plan.topology.attention {
+        qx_format::AttentionTopology::SingleDispatch => {
+            set_plan_bool_env("QX_V2_ATTENTION_3_STAGE", false);
+        }
+        qx_format::AttentionTopology::ThreeStage => {
+            set_plan_bool_env("QX_V2_ATTENTION_3_STAGE", true);
+            set_plan_bool_env("QX_V2_ATTENTION_SOFTMAX_SIMD", false);
+            set_plan_bool_env("QX_V2_ATTENTION_V_SIMD", false);
+        }
+        qx_format::AttentionTopology::HierarchicalGqa => {
+            set_plan_bool_env("QX_V2_ATTENTION_3_STAGE", true);
+            set_plan_bool_env("QX_V2_ATTENTION_SOFTMAX_SIMD", true);
+            set_plan_bool_env("QX_V2_ATTENTION_V_SIMD", true);
+        }
+    }
+    match plan.topology.moe {
+        qx_format::MoeTopology::FourStage => set_plan_bool_env("QX_V2_MOE_SPLIT_GATE_UP", false),
+        qx_format::MoeTopology::SplitGateUp => set_plan_bool_env("QX_V2_MOE_SPLIT_GATE_UP", true),
+        qx_format::MoeTopology::SingleDispatch => {
+            return Err("single-dispatch MoE is diagnostic-only and cannot be sealed".to_owned());
+        }
+    }
+    match plan.representations.gate_up {
+        qx_format::ExpertRepresentation::Group32Q4RowMajor => {
+            set_plan_env("QX_V2_MOE_LAYOUT", "rowmajor")
+        }
+        qx_format::ExpertRepresentation::Group32Q4MetalTile32 => {
+            set_plan_env("QX_V2_MOE_LAYOUT", "tile32")
+        }
+        qx_format::ExpertRepresentation::MixedQ2Q3Q4 => set_plan_env("QX_V2_MOE_LAYOUT", "mixed"),
+        qx_format::ExpertRepresentation::Q4K => set_plan_env("QX_V2_MOE_LAYOUT", "rowmajor"),
+        qx_format::ExpertRepresentation::DenseQ3 | qx_format::ExpertRepresentation::PaddedQ3 => {
+            return Err(format!(
+                "expert representation {:?} is not executable yet",
+                plan.representations.gate_up
+            ));
+        }
+    }
+    set_plan_bool_env("QX_V2_KV_FP16", false);
+    set_plan_bool_env("QX_V2_KV_K_FP16", false);
+    set_plan_bool_env("QX_V2_KV_V_FP16", false);
+    match plan.topology.kv_precision {
+        qx_format::KvPrecision::Fp32 => {}
+        qx_format::KvPrecision::Fp32KFp16V => set_plan_bool_env("QX_V2_KV_V_FP16", true),
+        qx_format::KvPrecision::Fp16KFp32V => set_plan_bool_env("QX_V2_KV_K_FP16", true),
+        qx_format::KvPrecision::Fp16 => set_plan_bool_env("QX_V2_KV_FP16", true),
+    }
+    clear_plan_env("QX_V2_MOE_ACTIVE_K");
+    clear_plan_env("QX_V2_MOE_ACTIVE_K_BY_LAYER");
+    match &plan.sparse_experts {
+        qx_format::SparseExpertPolicy::Top8 => {}
+        qx_format::SparseExpertPolicy::FixedK { active_k, .. } => {
+            set_plan_env("QX_V2_MOE_ACTIVE_K", &active_k.to_string())
+        }
+        qx_format::SparseExpertPolicy::PerLayer { active_k, .. } => set_plan_env(
+            "QX_V2_MOE_ACTIVE_K_BY_LAYER",
+            &active_k
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        qx_format::SparseExpertPolicy::CumulativeMass { .. } => {
+            return Err("cumulative-mass sparse plans are not executable yet".to_owned());
+        }
+    }
+    Ok(Some(plan))
+}
+
+fn set_plan_bool_env(name: &str, value: bool) {
+    set_plan_env(name, if value { "1" } else { "0" });
+}
+
+fn set_plan_env(name: &str, value: &str) {
+    // SAFETY: Runtime V2 activates one sealed plan before creating Metal
+    // pipelines or worker threads. Diagnostic processes still use one plan.
+    unsafe { std::env::set_var(name, value) };
+}
+
+fn clear_plan_env(name: &str) {
+    // SAFETY: See set_plan_env; plan activation happens during single-threaded
+    // model construction.
+    unsafe { std::env::remove_var(name) };
+}
+
 #[cfg(target_os = "macos")]
 use std::rc::Rc;
+#[cfg(target_os = "macos")]
+use std::{ffi::c_void, ptr::NonNull, sync::Arc};
 
 pub const DEFAULT_CONTEXT: usize = 512;
 pub const HEAD_DIM: usize = HIDDEN / ATTENTION_HEADS;
@@ -50,20 +189,32 @@ impl PreparedAttentionStack {
         artifact_path: impl AsRef<std::path::Path>,
     ) -> Result<Self, String> {
         let artifact_path: &std::path::Path = artifact_path.as_ref();
-        Self::load_internal(context, None, Some(artifact_path.to_path_buf()))
+        let artifact = Arc::new(
+            qx_format::MappedArtifact::open(artifact_path).map_err(|error| error.to_string())?,
+        );
+        Self::load_internal(context, None, Some(artifact))
+    }
+
+    pub fn load_from_mapped_artifact(
+        context: &qx_metal::platform::MetalContext,
+        artifact: Arc<qx_format::MappedArtifact>,
+    ) -> Result<Self, String> {
+        Self::load_internal(context, None, Some(artifact))
     }
 
     fn load_internal(
         context: &qx_metal::platform::MetalContext,
         model_dir: Option<std::path::PathBuf>,
-        artifact_path: Option<std::path::PathBuf>,
+        artifact: Option<Arc<qx_format::MappedArtifact>>,
     ) -> Result<Self, String> {
         let checkpoint = model_dir
             .map(qx_safetensors::Checkpoint::open)
             .transpose()
             .map_err(|error| error.to_string())?;
-        let artifact = artifact_path
-            .map(|path| qx_format::MappedArtifact::open(path).map_err(|error| error.to_string()))
+        let artifact_slab = artifact
+            .as_ref()
+            .filter(|artifact| artifact_uses_no_copy(artifact))
+            .map(|artifact| map_artifact_weight_slab(context, artifact.clone()))
             .transpose()?;
         let mut layers = Vec::with_capacity(LAYERS);
         for layer in 0..LAYERS {
@@ -71,7 +222,8 @@ impl PreparedAttentionStack {
             let norm = prepare_norm(
                 context,
                 checkpoint.as_ref(),
-                artifact.as_ref(),
+                artifact.as_deref(),
+                artifact_slab.as_ref(),
                 layer as u16,
                 qx_format::TensorKind::InputNorm,
                 &format!("{prefix}.input_layernorm.weight"),
@@ -79,7 +231,8 @@ impl PreparedAttentionStack {
             let post_norm = prepare_norm(
                 context,
                 checkpoint.as_ref(),
-                artifact.as_ref(),
+                artifact.as_deref(),
+                artifact_slab.as_ref(),
                 layer as u16,
                 qx_format::TensorKind::PostAttentionNorm,
                 &format!("{prefix}.post_attention_layernorm.weight"),
@@ -88,7 +241,8 @@ impl PreparedAttentionStack {
             let q_proj = prepare_matrix(
                 context,
                 checkpoint.as_ref(),
-                artifact.as_ref(),
+                artifact.as_deref(),
+                artifact_slab.as_ref(),
                 layer as u16,
                 qx_format::TensorKind::QProj,
                 &format!("{prefix}.self_attn.q_proj.weight"),
@@ -98,7 +252,8 @@ impl PreparedAttentionStack {
             let k_proj = prepare_matrix(
                 context,
                 checkpoint.as_ref(),
-                artifact.as_ref(),
+                artifact.as_deref(),
+                artifact_slab.as_ref(),
                 layer as u16,
                 qx_format::TensorKind::KProj,
                 &format!("{prefix}.self_attn.k_proj.weight"),
@@ -108,7 +263,8 @@ impl PreparedAttentionStack {
             let v_proj = prepare_matrix(
                 context,
                 checkpoint.as_ref(),
-                artifact.as_ref(),
+                artifact.as_deref(),
+                artifact_slab.as_ref(),
                 layer as u16,
                 qx_format::TensorKind::VProj,
                 &format!("{prefix}.self_attn.v_proj.weight"),
@@ -118,7 +274,8 @@ impl PreparedAttentionStack {
             let o_proj = prepare_matrix(
                 context,
                 checkpoint.as_ref(),
-                artifact.as_ref(),
+                artifact.as_deref(),
+                artifact_slab.as_ref(),
                 layer as u16,
                 qx_format::TensorKind::OProj,
                 &format!("{prefix}.self_attn.o_proj.weight"),
@@ -129,7 +286,8 @@ impl PreparedAttentionStack {
             let router = prepare_matrix(
                 context,
                 checkpoint.as_ref(),
-                artifact.as_ref(),
+                artifact.as_deref(),
+                artifact_slab.as_ref(),
                 layer as u16,
                 qx_format::TensorKind::Router,
                 &format!("{prefix}.block_sparse_moe.router.layer.weight"),
@@ -150,56 +308,23 @@ impl PreparedAttentionStack {
         let final_norm = prepare_norm(
             context,
             checkpoint.as_ref(),
-            artifact.as_ref(),
+            artifact.as_deref(),
+            artifact_slab.as_ref(),
             u16::MAX,
             qx_format::TensorKind::FinalNorm,
             "model.norm.weight",
         )?;
-        let embedding = if let Some(artifact) = artifact.as_ref() {
-            let index = artifact
-                .info()
-                .entries
-                .iter()
-                .position(|entry| {
-                    entry.layer == u16::MAX
-                        && entry.expert == u8::MAX
-                        && entry.kind == qx_format::TensorKind::Embedding
-                })
-                .ok_or_else(|| "dense Q4 artifact is missing the embedding tensor".to_owned())?;
-            let entry = &artifact.info().entries[index];
-            if entry.quant_type != qx_quant::QuantType::Q4
-                || entry.layout != qx_quant::PackingLayout::RowMajor
-                || entry.rows as usize != VOCAB
-                || entry.cols as usize != HIDDEN
-            {
-                return Err("artifact embedding is not row-major Q4 [VOCAB, HIDDEN]".to_owned());
-            }
-            let quantized = artifact
-                .quantized_tensor(index)
-                .map_err(|error| error.to_string())?;
-            context.prepare_q4_dense(&quantized)?
-        } else {
-            let checkpoint = checkpoint.as_ref().ok_or_else(|| {
-                "dense Q4 artifact is missing the embedding tensor and no checkpoint was supplied"
-                    .to_owned()
-            })?;
-            let (embedding_shape, embedding_values) = checkpoint
-                .tensor_f32("model.embed_tokens.weight")
-                .map_err(|error| error.to_string())?;
-            if embedding_shape != [VOCAB, HIDDEN] {
-                return Err(format!(
-                    "embedding shape {embedding_shape:?}, expected [{VOCAB}, {HIDDEN}]"
-                ));
-            }
-            let embedding_quantized = qx_quant::QuantizedTensor::quantize(
-                &embedding_values,
-                VOCAB,
-                HIDDEN,
-                qx_quant::QuantType::Q4,
-                32,
-            );
-            context.prepare_q4_dense(&embedding_quantized)?
-        };
+        let embedding = prepare_matrix(
+            context,
+            checkpoint.as_ref(),
+            artifact.as_deref(),
+            artifact_slab.as_ref(),
+            u16::MAX,
+            qx_format::TensorKind::Embedding,
+            "model.embed_tokens.weight",
+            VOCAB,
+            HIDDEN,
+        )?;
         let embedding_lookup = context.prepare_q4_embedding_from_dense(&embedding)?;
         Ok(Self {
             layers,
@@ -258,10 +383,30 @@ impl PreparedAttentionStack {
         position: usize,
         layer_count: usize,
     ) -> Result<(), String> {
-        if layer_count > LAYERS {
-            return Err(format!("layer block {layer_count} exceeds {LAYERS} layers"));
+        self.encode_full_layer_range(graph, buffers, moe, position, 0, layer_count)
+    }
+
+    fn encode_full_layer_range(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        buffers: &GpuRuntimeBuffers,
+        moe: &PreparedMoeStack,
+        position: usize,
+        start_layer: usize,
+        end_layer: usize,
+    ) -> Result<(), String> {
+        if start_layer > end_layer || end_layer > LAYERS {
+            return Err(format!(
+                "layer range {start_layer}..{end_layer} is outside 0..{LAYERS}"
+            ));
         }
-        for (layer, weights) in self.layers.iter().take(layer_count).enumerate() {
+        for (layer, weights) in self
+            .layers
+            .iter()
+            .enumerate()
+            .take(end_layer)
+            .skip(start_layer)
+        {
             let input = if layer.is_multiple_of(2) {
                 BufferId::HiddenA
             } else {
@@ -370,7 +515,15 @@ impl PreparedAttentionStack {
             buffers.buffer(BufferId::HiddenA),
             qx_model::EMBEDDING_MULTIPLIER,
         )?;
-        self.encode_full(graph, buffers, moe, position)?;
+        let command_buffers = command_buffers_per_token();
+        for segment in 0..command_buffers {
+            let start = segment * LAYERS / command_buffers;
+            let end = (segment + 1) * LAYERS / command_buffers;
+            self.encode_full_layer_range(graph, buffers, moe, position, start, end)?;
+            if segment + 1 < command_buffers {
+                graph.begin_next_command_buffer(context)?;
+            }
+        }
         let final_hidden = if LAYERS.is_multiple_of(2) {
             BufferId::HiddenA
         } else {
@@ -424,14 +577,26 @@ impl GraniteV2Generator {
         artifact_path: impl AsRef<std::path::Path>,
         context_length: usize,
     ) -> Result<Self, String> {
+        let sealed_plan = activate_artifact_execution_plan(&artifact_path)?;
+        if let Some(plan) = &sealed_plan {
+            if plan.workload.context_limit as usize != context_length {
+                return Err(format!(
+                    "requested context {context_length} does not match sealed plan context {}",
+                    plan.workload.context_limit
+                ));
+            }
+        }
         let context = Rc::new(
             qx_metal::platform::MetalContext::system_default()
                 .ok_or_else(|| "no Metal device is available".to_owned())?,
         );
         let plan = ExecutionPlan::granite(context_length)?;
         let buffers = GpuRuntimeBuffers::new(context.clone(), plan)?;
-        let stack = PreparedAttentionStack::load_from_artifact(&context, &artifact_path)?;
-        let moe = PreparedMoeStack::load(&context, artifact_path)?;
+        let artifact = Arc::new(
+            qx_format::MappedArtifact::open(&artifact_path).map_err(|error| error.to_string())?,
+        );
+        let stack = PreparedAttentionStack::load_from_mapped_artifact(&context, artifact.clone())?;
+        let moe = PreparedMoeStack::load_from_mapped_artifact(&context, artifact)?;
         Ok(Self {
             context,
             buffers,
@@ -460,6 +625,20 @@ impl GraniteV2Generator {
     /// Evaluate one input token at the current sequential position and return
     /// the GPU-selected next token.
     pub fn step(&mut self, token: u32) -> Result<u32, String> {
+        self.evaluate_token(token)?;
+        self.context
+            .read_runtime_u32(self.buffers.buffer(BufferId::TokenOutput))
+    }
+
+    /// Evaluate one teacher-forced token and return its complete next-token
+    /// logits. This is an evaluation-only readback and is not used by decode.
+    pub fn step_logits(&mut self, token: u32) -> Result<Vec<f32>, String> {
+        self.evaluate_token(token)?;
+        self.context
+            .read_runtime_f32(self.buffers.buffer(BufferId::Logits), VOCAB)
+    }
+
+    fn evaluate_token(&mut self, token: u32) -> Result<(), String> {
         if token as usize >= VOCAB {
             return Err(format!("token {token} is outside vocabulary"));
         }
@@ -479,8 +658,7 @@ impl GraniteV2Generator {
             .encode_token(&mut graph, &self.buffers, &self.moe, self.position)?;
         self.buffers.finish_token(graph)?;
         self.position += 1;
-        self.context
-            .read_runtime_u32(self.buffers.buffer(BufferId::TokenOutput))
+        Ok(())
     }
 
     /// Prefill the prompt and greedily generate up to `max_new_tokens`.
@@ -1098,7 +1276,23 @@ impl PreparedMoeStack {
                 *slot = expert as u8;
             }
         }
-        Self::load_with_permutation(context, artifact_path, &identity)
+        let artifact = Arc::new(
+            qx_format::MappedArtifact::open(artifact_path).map_err(|error| error.to_string())?,
+        );
+        Self::load_mapped_with_permutation(context, artifact, &identity)
+    }
+
+    pub fn load_from_mapped_artifact(
+        context: &qx_metal::platform::MetalContext,
+        artifact: Arc<qx_format::MappedArtifact>,
+    ) -> Result<Self, String> {
+        let mut identity = [[0_u8; 32]; LAYERS];
+        for layer in &mut identity {
+            for (expert, slot) in layer.iter_mut().enumerate() {
+                *slot = expert as u8;
+            }
+        }
+        Self::load_mapped_with_permutation(context, artifact, &identity)
     }
 
     /// Load MoE tensors into physical expert slots selected by a per-layer
@@ -1110,8 +1304,17 @@ impl PreparedMoeStack {
         artifact_path: impl AsRef<std::path::Path>,
         permutation: &[[u8; 32]; LAYERS],
     ) -> Result<Self, String> {
-        let artifact =
-            qx_format::MappedArtifact::open(artifact_path).map_err(|error| error.to_string())?;
+        let artifact = Arc::new(
+            qx_format::MappedArtifact::open(artifact_path).map_err(|error| error.to_string())?,
+        );
+        Self::load_mapped_with_permutation(context, artifact, permutation)
+    }
+
+    fn load_mapped_with_permutation(
+        context: &qx_metal::platform::MetalContext,
+        artifact: Arc<qx_format::MappedArtifact>,
+        permutation: &[[u8; 32]; LAYERS],
+    ) -> Result<Self, String> {
         let requested_layout = moe_requested_layout();
         let mixed_layout = moe_mixed_layout_requested();
         let split_gate_up = moe_split_gate_up_requested();
@@ -1125,6 +1328,32 @@ impl PreparedMoeStack {
                 qx_format::MappedArtifact::open(path).map_err(|error| error.to_string())
             })
             .transpose()?;
+        let no_copy_storage = artifact.info().execution_plan.as_ref().is_some_and(|plan| {
+            matches!(
+                plan.memory.weight_storage,
+                qx_format::WeightStorage::MmapNoCopy | qx_format::WeightStorage::Hybrid
+            )
+        });
+        let identity_permutation = permutation.iter().all(|layer| {
+            layer
+                .iter()
+                .enumerate()
+                .all(|(expert, logical)| *logical as usize == expert)
+        });
+        if no_copy_storage {
+            if !identity_permutation
+                || mixed_layout
+                || split_gate_up
+                || q3_request.is_some()
+                || q3_artifact.is_some()
+            {
+                return Err(
+                    "mmap/no-copy MoE requires identity expert placement and a sealed native representation"
+                        .to_owned(),
+                );
+            }
+            return load_no_copy_moe_stack(context, artifact, requested_layout);
+        }
         let mut layers = Vec::with_capacity(LAYERS);
         for (layer, layer_permutation) in permutation.iter().enumerate() {
             let mut gate_up_packed = Vec::new();
@@ -1138,6 +1367,7 @@ impl PreparedMoeStack {
             let mut down_packed = Vec::new();
             let mut down_scales = Vec::new();
             let mut layout = None;
+            let mut layer_quant_type = None;
             for &logical_expert in layer_permutation.iter().take(EXPERTS) {
                 let expert = logical_expert as usize;
                 if expert >= EXPERTS {
@@ -1167,11 +1397,23 @@ impl PreparedMoeStack {
                     .ok_or_else(|| format!("missing layer {layer} expert {expert} down"))?;
                 let gate_entry = &artifact.info().entries[gate_index];
                 let down_entry = &artifact.info().entries[down_index];
-                if gate_entry.quant_type != qx_quant::QuantType::Q4
-                    || down_entry.quant_type != qx_quant::QuantType::Q4
+                if gate_entry.quant_type != down_entry.quant_type
+                    || !matches!(
+                        gate_entry.quant_type,
+                        qx_quant::QuantType::Q4 | qx_quant::QuantType::Q4K
+                    )
                     || gate_entry.layout != down_entry.layout
                 {
-                    return Err(format!("layer {layer} expert {expert} is not uniform Q4"));
+                    return Err(format!(
+                        "layer {layer} expert {expert} is not uniform executable Q4/Q4_K"
+                    ));
+                }
+                if let Some(expected) = layer_quant_type {
+                    if expected != gate_entry.quant_type {
+                        return Err(format!("layer {layer} has mixed expert quantization"));
+                    }
+                } else {
+                    layer_quant_type = Some(gate_entry.quant_type);
                 }
                 if let Some(expected) = layout {
                     if expected != gate_entry.layout {
@@ -1180,7 +1422,21 @@ impl PreparedMoeStack {
                 } else {
                     layout = Some(gate_entry.layout);
                 }
-                let target_layout = if mixed_layout {
+                let q4k = gate_entry.quant_type == qx_quant::QuantType::Q4K;
+                if q4k
+                    && (mixed_layout
+                        || split_gate_up
+                        || q3_request.is_some()
+                        || requested_layout != Some(qx_quant::PackingLayout::RowMajor))
+                {
+                    return Err(
+                        "Q4_K control requires row-major four-stage MoE without Q3/split overrides"
+                            .to_owned(),
+                    );
+                }
+                let target_layout = if q4k {
+                    qx_quant::PackingLayout::RowMajor
+                } else if mixed_layout {
                     qx_quant::PackingLayout::MetalTile32
                 } else {
                     requested_layout.unwrap_or(gate_entry.layout)
@@ -1331,11 +1587,183 @@ impl PreparedMoeStack {
 }
 
 #[cfg(target_os = "macos")]
+fn load_no_copy_moe_stack(
+    context: &qx_metal::platform::MetalContext,
+    artifact: Arc<qx_format::MappedArtifact>,
+    requested_layout: Option<qx_quant::PackingLayout>,
+) -> Result<PreparedMoeStack, String> {
+    if artifact.info().header.version != qx_format::VERSION {
+        return Err("mmap/no-copy weights require a QX artifact-v2 slab".to_owned());
+    }
+    let (slab_pointer, slab_length) = {
+        let bytes = artifact.weight_slab().map_err(|error| error.to_string())?;
+        let pointer = NonNull::new(bytes.as_ptr().cast_mut().cast::<c_void>())
+            .ok_or_else(|| "artifact weight slab has a null address".to_owned())?;
+        (pointer, bytes.len())
+    };
+    // SAFETY: `MappedArtifact` owns an immutable read-only mmap. The captured
+    // Arc keeps it alive until Metal releases the no-copy buffer.
+    let slab =
+        unsafe { context.input_buffer_no_copy(slab_pointer, slab_length, artifact.clone())? };
+    let mut layers = Vec::with_capacity(LAYERS);
+    for layer in 0..LAYERS {
+        let (gate_scales, gate_packed, gate_quant, gate_layout) =
+            expert_group_slab_ranges(&artifact, layer as u16, qx_format::TensorKind::GateUp)?;
+        let (down_scales, down_packed, down_quant, down_layout) =
+            expert_group_slab_ranges(&artifact, layer as u16, qx_format::TensorKind::Down)?;
+        if gate_quant != down_quant || gate_layout != down_layout {
+            return Err(format!(
+                "layer {layer} no-copy expert tensors do not share one representation"
+            ));
+        }
+        if let Some(requested) = requested_layout {
+            if requested != gate_layout {
+                return Err(format!(
+                    "layer {layer} sealed layout {requested:?} requires repacking from artifact layout {gate_layout:?}"
+                ));
+            }
+        }
+        let prepared = context.prepare_dynamic_q4_moe_runtime_views(
+            slab.subregion(gate_packed.start, gate_packed.len())?,
+            slab.subregion(gate_scales.start, gate_scales.len())?,
+            slab.subregion(down_packed.start, down_packed.len())?,
+            slab.subregion(down_scales.start, down_scales.len())?,
+            gate_layout,
+            down_layout,
+        )?;
+        layers.push(prepared);
+    }
+    Ok(PreparedMoeStack { layers })
+}
+
+#[cfg(target_os = "macos")]
+fn expert_group_slab_ranges(
+    artifact: &qx_format::MappedArtifact,
+    layer: u16,
+    kind: qx_format::TensorKind,
+) -> Result<
+    (
+        std::ops::Range<usize>,
+        std::ops::Range<usize>,
+        qx_quant::QuantType,
+        qx_quant::PackingLayout,
+    ),
+    String,
+> {
+    let mut scale_ranges = Vec::with_capacity(EXPERTS);
+    let mut data_ranges = Vec::with_capacity(EXPERTS);
+    let mut quant_type = None;
+    let mut layout = None;
+    for expert in 0..EXPERTS {
+        let index = artifact
+            .info()
+            .entries
+            .iter()
+            .position(|entry| {
+                entry.layer == layer && entry.expert == expert as u8 && entry.kind == kind
+            })
+            .ok_or_else(|| format!("missing layer {layer} expert {expert} {kind:?}"))?;
+        let entry = &artifact.info().entries[index];
+        if !matches!(
+            entry.quant_type,
+            qx_quant::QuantType::Q4 | qx_quant::QuantType::Q4K
+        ) {
+            return Err(format!(
+                "layer {layer} expert {expert} {kind:?} is not executable Q4/Q4_K"
+            ));
+        }
+        if quant_type
+            .replace(entry.quant_type)
+            .is_some_and(|value| value != entry.quant_type)
+            || layout
+                .replace(entry.layout)
+                .is_some_and(|value| value != entry.layout)
+        {
+            return Err(format!(
+                "layer {layer} {kind:?} no-copy group has mixed representations"
+            ));
+        }
+        let (scales, data) = artifact
+            .tensor_slab_ranges(index)
+            .map_err(|error| error.to_string())?;
+        scale_ranges.push(scales);
+        data_ranges.push(data);
+    }
+    let scales = contiguous_slab_range(&scale_ranges, layer, kind, "scale")?;
+    let data = contiguous_slab_range(&data_ranges, layer, kind, "payload")?;
+    Ok((
+        scales,
+        data,
+        quant_type.expect("expert group is non-empty"),
+        layout.expect("expert group is non-empty"),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn contiguous_slab_range(
+    ranges: &[std::ops::Range<usize>],
+    layer: u16,
+    kind: qx_format::TensorKind,
+    section: &str,
+) -> Result<std::ops::Range<usize>, String> {
+    let first = ranges
+        .first()
+        .ok_or_else(|| "empty expert slab group".to_owned())?;
+    let mut end = first.end;
+    for range in &ranges[1..] {
+        if range.start != end {
+            return Err(format!(
+                "layer {layer} {kind:?} {section} bytes are not contiguous in artifact-v2"
+            ));
+        }
+        end = range.end;
+    }
+    Ok(first.start..end)
+}
+
+#[cfg(target_os = "macos")]
+fn artifact_uses_no_copy(artifact: &qx_format::MappedArtifact) -> bool {
+    artifact
+        .info()
+        .execution_plan
+        .as_ref()
+        .is_some_and(|plan| plan.memory.weight_storage == qx_format::WeightStorage::MmapNoCopy)
+}
+
+#[cfg(target_os = "macos")]
+fn command_buffers_per_token() -> usize {
+    std::env::var("QX_V2_COMMAND_BUFFERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&count| (1..=LAYERS).contains(&count))
+        .unwrap_or(1)
+}
+
+#[cfg(target_os = "macos")]
+fn map_artifact_weight_slab(
+    context: &qx_metal::platform::MetalContext,
+    artifact: Arc<qx_format::MappedArtifact>,
+) -> Result<qx_metal::platform::RuntimeBuffer, String> {
+    if artifact.info().header.version != qx_format::VERSION {
+        return Err("mmap/no-copy weights require artifact v2".to_owned());
+    }
+    let (pointer, length) = {
+        let bytes = artifact.weight_slab().map_err(|error| error.to_string())?;
+        let pointer = NonNull::new(bytes.as_ptr().cast_mut().cast::<c_void>())
+            .ok_or_else(|| "artifact weight slab has a null address".to_owned())?;
+        (pointer, bytes.len())
+    };
+    // SAFETY: the read-only mmap is owned by the Arc captured by Metal.
+    unsafe { context.input_buffer_no_copy(pointer, length, artifact) }
+}
+
+#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn prepare_matrix(
     context: &qx_metal::platform::MetalContext,
     checkpoint: Option<&qx_safetensors::Checkpoint>,
     artifact: Option<&qx_format::MappedArtifact>,
+    artifact_slab: Option<&qx_metal::platform::RuntimeBuffer>,
     layer: u16,
     kind: qx_format::TensorKind,
     name: &str,
@@ -1358,6 +1786,17 @@ fn prepare_matrix(
             return Err(format!(
                 "artifact tensor {kind:?} layer {layer} is not row-major Q4 [{rows}, {columns}]"
             ));
+        }
+        if let Some(slab) = artifact_slab {
+            let (scales, packed) = artifact
+                .tensor_slab_ranges(index)
+                .map_err(|error| error.to_string())?;
+            return context.prepare_q4_dense_runtime_views(
+                slab.subregion(packed.start, packed.len())?,
+                slab.subregion(scales.start, scales.len())?,
+                rows,
+                columns,
+            );
         }
         let quantized = artifact
             .quantized_tensor(index)
@@ -1385,10 +1824,27 @@ fn prepare_norm(
     context: &qx_metal::platform::MetalContext,
     checkpoint: Option<&qx_safetensors::Checkpoint>,
     artifact: Option<&qx_format::MappedArtifact>,
+    artifact_slab: Option<&qx_metal::platform::RuntimeBuffer>,
     layer: u16,
     kind: qx_format::TensorKind,
     name: &str,
 ) -> Result<qx_metal::platform::RuntimeBuffer, String> {
+    if let (Some(artifact), Some(slab)) = (artifact, artifact_slab) {
+        let index = artifact
+            .info()
+            .entries
+            .iter()
+            .position(|entry| entry.layer == layer && entry.expert == u8::MAX && entry.kind == kind)
+            .ok_or_else(|| format!("artifact is missing {kind:?} for layer {layer}"))?;
+        let entry = &artifact.info().entries[index];
+        if entry.rows as usize != HIDDEN || entry.cols != 1 {
+            return Err(format!("artifact norm {kind:?} has invalid shape"));
+        }
+        let (_, data) = artifact
+            .tensor_slab_ranges(index)
+            .map_err(|error| error.to_string())?;
+        return slab.subregion(data.start, data.len());
+    }
     let values = if let Some(artifact) = artifact {
         let index = artifact
             .info()

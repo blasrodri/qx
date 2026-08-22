@@ -4,9 +4,10 @@
 
 use anyhow::{Result, bail};
 use qx_format::MemoryPlan;
-use qx_model::{EXPERTS, HEAD_DIM, HIDDEN, KV_HEADS, LAYERS, VOCAB};
+use qx_model::{ATTENTION_HEADS, EXPERTS, HEAD_DIM, HIDDEN, KV_HEADS, LAYERS, TOP_K, VOCAB};
 use qx_quant::{QuantType, QuantizedTensor};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
 #[derive(Clone, Debug)]
@@ -156,6 +157,7 @@ impl ExpertSensitivity {
             QuantType::Q2 => self.q2_error,
             QuantType::Q3 => self.q3_error,
             QuantType::Q4 => self.q4_error,
+            QuantType::Q4K => self.q4_error,
         }
     }
 }
@@ -323,6 +325,7 @@ pub fn allocate_with_minimum_options(
             QuantType::Q2 if item.q2_error.is_finite() => QuantType::Q2,
             QuantType::Q2 | QuantType::Q3 if allow_q3 && item.q3_error.is_finite() => QuantType::Q3,
             QuantType::Q4 | QuantType::Q3 | QuantType::Q2 => QuantType::Q4,
+            QuantType::Q4K => QuantType::Q4,
         })
         .collect::<Vec<_>>();
     let mut total_bytes = sensitivities
@@ -345,6 +348,7 @@ pub fn allocate_with_minimum_options(
                     QuantType::Q3 if allow_q3 => QuantType::Q4,
                     QuantType::Q3 => return None,
                     QuantType::Q4 => return None,
+                    QuantType::Q4K => return None,
                 };
                 let old_bytes = item.bytes_for(selected[index], group_size);
                 let new_bytes = item.bytes_for(next, group_size);
@@ -439,11 +443,16 @@ pub fn quantized_bytes(
 }
 
 pub fn granite_memory_plan(weights_bytes: usize, context_limit: usize) -> MemoryPlan {
-    let kv_cache_bytes = LAYERS * 2 * KV_HEADS * HEAD_DIM * context_limit * 2;
-    let hidden_bytes = HIDDEN * 2;
-    let attention_scratch_bytes = HIDDEN * HIDDEN * 2;
-    let moe_scratch_bytes = EXPERTS.max(8) * HIDDEN * 2;
-    let logits_bytes = VOCAB * 2;
+    // The quality-neutral canonical control uses FP32 K/V and FP32 runtime
+    // intermediates. Lower-precision plans must supply their own measured
+    // memory candidate rather than inheriting an optimistic FP16 estimate.
+    let kv_cache_bytes = LAYERS * 2 * KV_HEADS * HEAD_DIM * context_limit * 4;
+    let hidden_bytes = HIDDEN * 4;
+    let attention_scratch_bytes =
+        (HIDDEN + 2 * KV_HEADS * HEAD_DIM + HIDDEN + ATTENTION_HEADS * context_limit) * 4;
+    let moe_scratch_bytes =
+        (HIDDEN + EXPERTS + 2 * TOP_K + TOP_K * (2 * HIDDEN + 512) + HIDDEN) * 4;
+    let logits_bytes = VOCAB * 4;
     let total_bytes = weights_bytes
         + kv_cache_bytes
         + hidden_bytes * 2
@@ -460,6 +469,166 @@ pub fn granite_memory_plan(weights_bytes: usize, context_limit: usize) -> Memory
         logits_bytes: logits_bytes as u64,
         total_bytes: total_bytes as u64,
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionTier {
+    Kernel,
+    ProducerConsumer,
+    MultiLayer,
+    CompleteModel,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TierMeasurement {
+    pub tier: PromotionTier,
+    pub wall_ms_per_token: f64,
+    pub gpu_ms_per_token: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct QualityMeasurement {
+    /// True only when the complete triangular quality gate, confidence-width
+    /// requirement, and paired task gates passed. Numeric deltas alone are
+    /// insufficient because an underpowered evaluation can look acceptable.
+    #[serde(default)]
+    pub accepted: bool,
+    pub aggregate_relative_ppl_delta_vs_llama: f64,
+    pub maximum_domain_relative_ppl_delta_vs_llama: f64,
+    pub human_eval_delta_points_vs_llama: Option<f64>,
+    pub gsm8k_delta_points_vs_llama: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ResidentMemoryMeasurement {
+    pub current_rss_bytes: u64,
+    pub peak_rss_bytes: u64,
+    pub current_physical_footprint_bytes: u64,
+    pub peak_physical_footprint_bytes: u64,
+    pub known_metal_bytes: u64,
+    pub mapped_model_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PlanCandidateEvidence {
+    pub plan: qx_format::ExecutionPlanManifest,
+    pub tiers: Vec<TierMeasurement>,
+    pub quality: QualityMeasurement,
+    pub memory: ResidentMemoryMeasurement,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PlanSelectionConstraints {
+    pub max_aggregate_relative_ppl_delta: f64,
+    pub max_domain_relative_ppl_delta: f64,
+    pub max_task_delta_points: f64,
+    pub max_peak_physical_footprint_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CandidateRejection {
+    MissingTier(PromotionTier),
+    MissingQuality,
+    Quality,
+    Memory,
+    NonFiniteLatency,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlanSelection {
+    pub selected: qx_format::ExecutionPlanManifest,
+    pub rejected: Vec<(String, CandidateRejection)>,
+}
+
+pub fn select_execution_plan(
+    candidates: &[PlanCandidateEvidence],
+    constraints: PlanSelectionConstraints,
+) -> Result<PlanSelection> {
+    let required_tiers = [
+        PromotionTier::Kernel,
+        PromotionTier::ProducerConsumer,
+        PromotionTier::MultiLayer,
+        PromotionTier::CompleteModel,
+    ];
+    let mut eligible = Vec::<(&PlanCandidateEvidence, f64)>::new();
+    let mut rejected = Vec::new();
+    for candidate in candidates {
+        if let Some(missing) = required_tiers.iter().copied().find(|tier| {
+            !candidate
+                .tiers
+                .iter()
+                .any(|measurement| measurement.tier == *tier)
+        }) {
+            rejected.push((
+                candidate.plan.plan_id.clone(),
+                CandidateRejection::MissingTier(missing),
+            ));
+            continue;
+        }
+        if candidate.tiers.iter().any(|measurement| {
+            !measurement.wall_ms_per_token.is_finite()
+                || measurement.wall_ms_per_token <= 0.0
+                || !measurement.gpu_ms_per_token.is_finite()
+                || measurement.gpu_ms_per_token <= 0.0
+        }) {
+            rejected.push((
+                candidate.plan.plan_id.clone(),
+                CandidateRejection::NonFiniteLatency,
+            ));
+            continue;
+        }
+        let (Some(human_eval_delta), Some(gsm8k_delta)) = (
+            candidate.quality.human_eval_delta_points_vs_llama,
+            candidate.quality.gsm8k_delta_points_vs_llama,
+        ) else {
+            rejected.push((
+                candidate.plan.plan_id.clone(),
+                CandidateRejection::MissingQuality,
+            ));
+            continue;
+        };
+        if !candidate.quality.accepted
+            || candidate.quality.aggregate_relative_ppl_delta_vs_llama
+                > constraints.max_aggregate_relative_ppl_delta
+            || candidate.quality.maximum_domain_relative_ppl_delta_vs_llama
+                > constraints.max_domain_relative_ppl_delta
+            || human_eval_delta < -constraints.max_task_delta_points
+            || gsm8k_delta < -constraints.max_task_delta_points
+        {
+            rejected.push((candidate.plan.plan_id.clone(), CandidateRejection::Quality));
+            continue;
+        }
+        if constraints.max_peak_physical_footprint_bytes > 0
+            && candidate.memory.peak_physical_footprint_bytes
+                > constraints.max_peak_physical_footprint_bytes
+        {
+            rejected.push((candidate.plan.plan_id.clone(), CandidateRejection::Memory));
+            continue;
+        }
+        let full_model = candidate
+            .tiers
+            .iter()
+            .find(|measurement| measurement.tier == PromotionTier::CompleteModel)
+            .expect("required tier checked above")
+            .wall_ms_per_token;
+        eligible.push((candidate, full_model));
+    }
+    eligible.sort_by(|(left, left_wall), (right, right_wall)| {
+        left_wall
+            .total_cmp(right_wall)
+            .then_with(|| {
+                left.memory
+                    .peak_physical_footprint_bytes
+                    .cmp(&right.memory.peak_physical_footprint_bytes)
+            })
+            .then_with(|| left.plan.plan_id.cmp(&right.plan.plan_id))
+    });
+    let selected = eligible
+        .first()
+        .map(|(candidate, _)| candidate.plan.clone())
+        .ok_or_else(|| anyhow::anyhow!("no candidate satisfies all promotion tiers and gates"))?;
+    Ok(PlanSelection { selected, rejected })
 }
 
 /// A compact, versioned binary trace. The llama.cpp instrumentation bridge can
@@ -639,5 +808,83 @@ mod tests {
         let decoded = QxTrace::read(&path).unwrap();
         fs::remove_file(path).unwrap();
         assert_eq!(decoded.records[0].hidden, vec![1.0, -2.0]);
+    }
+
+    fn plan_candidate(id: &str, wall_ms: f64, ppl_delta: f64) -> PlanCandidateEvidence {
+        let memory_plan = MemoryPlan {
+            total_bytes: 800_000_000,
+            ..Default::default()
+        };
+        let mut plan = qx_format::ExecutionPlanManifest::granite_m5_canonical(
+            "granite",
+            "apple-m5-pro",
+            512,
+            memory_plan,
+        );
+        plan.plan_id = id.to_owned();
+        PlanCandidateEvidence {
+            plan,
+            tiers: [
+                PromotionTier::Kernel,
+                PromotionTier::ProducerConsumer,
+                PromotionTier::MultiLayer,
+                PromotionTier::CompleteModel,
+            ]
+            .into_iter()
+            .map(|tier| TierMeasurement {
+                tier,
+                wall_ms_per_token: wall_ms,
+                gpu_ms_per_token: wall_ms - 0.1,
+            })
+            .collect(),
+            quality: QualityMeasurement {
+                accepted: true,
+                aggregate_relative_ppl_delta_vs_llama: ppl_delta,
+                maximum_domain_relative_ppl_delta_vs_llama: ppl_delta,
+                human_eval_delta_points_vs_llama: Some(0.0),
+                gsm8k_delta_points_vs_llama: Some(0.0),
+            },
+            memory: ResidentMemoryMeasurement {
+                current_rss_bytes: 800_000_000,
+                peak_rss_bytes: 850_000_000,
+                current_physical_footprint_bytes: 800_000_000,
+                peak_physical_footprint_bytes: 850_000_000,
+                known_metal_bytes: 760_000_000,
+                mapped_model_bytes: 750_000_000,
+            },
+        }
+    }
+
+    #[test]
+    fn plan_selector_uses_full_model_latency_and_quality_gate() {
+        let mut underpowered = plan_candidate("underpowered-quality", 2.5, 0.0);
+        underpowered.quality.accepted = false;
+        let candidates = [
+            plan_candidate("canonical", 5.4, 0.0),
+            plan_candidate("fast-quality-loss", 3.0, 0.08),
+            underpowered,
+            plan_candidate("whole-program-winner", 4.8, 0.005),
+        ];
+        let result = select_execution_plan(
+            &candidates,
+            PlanSelectionConstraints {
+                max_aggregate_relative_ppl_delta: 0.01,
+                max_domain_relative_ppl_delta: 0.02,
+                max_task_delta_points: 2.0,
+                max_peak_physical_footprint_bytes: 900_000_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.selected.plan_id, "whole-program-winner");
+        assert_eq!(
+            result.rejected,
+            vec![
+                ("fast-quality-loss".to_owned(), CandidateRejection::Quality),
+                (
+                    "underpowered-quality".to_owned(),
+                    CandidateRejection::Quality
+                ),
+            ]
+        );
     }
 }

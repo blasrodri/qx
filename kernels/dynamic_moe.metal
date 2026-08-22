@@ -305,6 +305,116 @@ kernel void qx_dynamic_q4_moe_gate_up_norm_simd(
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
+inline void qx_q4k_scale_min(device const uchar* metadata, uint sub, thread uint& scale, thread uint& minimum) {
+    if (sub < 4) {
+        scale = uint(metadata[sub]) & 63;
+        minimum = uint(metadata[sub + 4]) & 63;
+    } else {
+        scale = (uint(metadata[sub + 4]) & 15) | ((uint(metadata[sub - 4]) >> 6) << 4);
+        minimum = (uint(metadata[sub + 4]) >> 4) | ((uint(metadata[sub]) >> 6) << 4);
+    }
+}
+
+inline float qx_q4k_weight(
+    device const uchar* packed,
+    device const half* scales,
+    uint packed_base,
+    uint scale_base,
+    uint row,
+    uint blocks,
+    uint column) {
+    constexpr uint block_bytes = 140;
+    uint block = column / 256;
+    uint within = column % 256;
+    uint sub = within / 32;
+    uint local = within % 32;
+    uint base = packed_base + (row * blocks + block) * block_bytes;
+    device const uchar* metadata = packed + base;
+    uchar byte = packed[base + 12 + (sub / 2) * 32 + local];
+    uint code = (sub & 1) == 0 ? uint(byte & 15) : uint(byte >> 4);
+    uint scale_code;
+    uint min_code;
+    qx_q4k_scale_min(metadata, sub, scale_code, min_code);
+    uint dm = scale_base + (row * blocks + block) * 2;
+    return float(scales[dm]) * float(scale_code * code)
+        - float(scales[dm + 1]) * float(min_code);
+}
+
+kernel void qx_dynamic_q4k_moe_gate_up_simd(
+    device const uchar* packed [[buffer(0)]],
+    device const half* scales [[buffer(1)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint blocks = 4;
+    constexpr uint packed_stride = hidden * blocks * 140;
+    constexpr uint scale_stride = hidden * blocks * 2;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+    threadgroup float cached_input[hidden];
+    for (uint column = thread_index; column < hidden; column += 256) cached_input[column] = input[column];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint row = (threadgroup_id % threadgroups_per_expert) * rows_per_threadgroup + simdgroup;
+    uint expert = expert_ids[slot];
+    float sum = 0.0f;
+    if (expert < 32) {
+        uint packed_base = expert * packed_stride;
+        uint scale_base = expert * scale_stride;
+        for (uint column = lane; column < hidden; column += 32) {
+            sum += qx_q4k_weight(packed, scales, packed_base, scale_base, row, blocks, column)
+                * cached_input[column];
+        }
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) output[slot * hidden + row] = sum;
+}
+
+kernel void qx_dynamic_q4k_moe_gate_up_norm_simd(
+    device const uchar* packed [[buffer(0)]],
+    device const half* scales [[buffer(1)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]],
+    device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint blocks = 4;
+    constexpr uint packed_stride = hidden * blocks * 140;
+    constexpr uint scale_stride = hidden * blocks * 2;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+    threadgroup float cached_input[hidden];
+    float inverse = inverse_rms[0];
+    for (uint column = thread_index; column < hidden; column += 256) {
+        cached_input[column] = input[column] * inverse * norm_weights[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint row = (threadgroup_id % threadgroups_per_expert) * rows_per_threadgroup + simdgroup;
+    uint expert = expert_ids[slot];
+    float sum = 0.0f;
+    if (expert < 32) {
+        uint packed_base = expert * packed_stride;
+        uint scale_base = expert * scale_stride;
+        for (uint column = lane; column < hidden; column += 32) {
+            sum += qx_q4k_weight(packed, scales, packed_base, scale_base, row, blocks, column)
+                * cached_input[column];
+        }
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) output[slot * hidden + row] = sum;
+}
+
 // Experimental Granite gate/up Q3 path.  The logical format is row-major,
 // group-32: twelve bytes of packed 3-bit codes followed by an FP16 scale in
 // the separate scale buffer.  `block_bytes` is either 12 (dense) or 16
@@ -825,6 +935,38 @@ kernel void qx_dynamic_q4_moe_down_simd(
             uint code = (byte >> ((local % 2) * 4)) & 0xf;
             uint scale = scale_base + qx_dynamic_scale_offset(row, group, groups, layout);
             sum += float(int(code) - 7) * float(scales[scale]) * activated[slot * intermediate + column];
+        }
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) output[slot * hidden + row] = sum;
+}
+
+kernel void qx_dynamic_q4k_moe_down_simd(
+    device const uchar* packed [[buffer(0)]],
+    device const half* scales [[buffer(1)]],
+    device const float* activated [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint intermediate = 512;
+    constexpr uint blocks = 2;
+    constexpr uint packed_stride = hidden * blocks * 140;
+    constexpr uint scale_stride = hidden * blocks * 2;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint row = (threadgroup_id % threadgroups_per_expert) * rows_per_threadgroup + simdgroup;
+    uint expert = expert_ids[slot];
+    float sum = 0.0f;
+    if (expert < 32) {
+        uint packed_base = expert * packed_stride;
+        uint scale_base = expert * scale_stride;
+        for (uint column = lane; column < intermediate; column += 32) {
+            sum += qx_q4k_weight(packed, scales, packed_base, scale_base, row, blocks, column)
+                * activated[slot * intermediate + column];
         }
     }
     sum = simd_sum(sum);

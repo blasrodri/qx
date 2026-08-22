@@ -1,0 +1,19 @@
+User: I installed the update and the application opens, but the first request takes almost a minute. After that it responds quickly. Is the network broken?
+
+Assistant: The pattern sounds more like one-time initialization than a network failure. Does the delay return after you quit the application completely, or only after restarting the computer?
+
+User: It returns whenever I quit and reopen it. During the delay, memory usage climbs and the fan starts. Once the first answer appears, later answers are fast.
+
+Assistant: That points to model loading, shader compilation, or creation of device buffers. We can distinguish them without changing anything. First record the time from launch to the interface becoming ready. Then record the time from submitting the first request to the first token. Repeat once with the network disconnected. Also check whether the application writes a cache after the first run.
+
+User: Offline behavior is the same. Launch takes four seconds. The first response takes fifty-three seconds. Later responses begin in under one second. There is a new cache directory containing several binary files.
+
+Assistant: Good, so the network is not the primary cause. The next question is whether the cache survives a clean exit. Note the directory size and modification times, quit normally, reopen, and check whether the files are reused or rewritten. If they are rewritten every time, the cache key may include unstable data such as a temporary path or process-specific identifier.
+
+User: The files are rewritten. The directory name contains a hash that changes on every launch.
+
+Assistant: That is likely the defect. Capture two directory names and the relevant launch log, but remove personal paths or tokens before sharing them. The fix should make the cache key depend only on stable inputs: application version, model hash, target device, operating-system compatibility level, and compiler options. Until then, leaving the application open avoids the repeated setup cost, but it is only a workaround.
+
+User: How should I verify the fix?
+
+Assistant: Test a cold launch after deleting the cache, then a warm launch using the generated cache, then another warm launch after reboot. Confirm that the stable key remains identical, the binary files are not rewritten, and the first-request latency drops on both warm launches. Also confirm that changing the model or application version creates a new key rather than reusing incompatible files. Record the timings and exact versions so the result is reproducible.

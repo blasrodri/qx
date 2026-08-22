@@ -11,6 +11,7 @@ pub enum QuantType {
     Q2,
     Q3,
     Q4,
+    Q4K,
 }
 
 /// Physical layout of packed quantized matrix data.
@@ -43,6 +44,7 @@ impl QuantType {
             Self::Q2 => 2,
             Self::Q3 => 3,
             Self::Q4 => 4,
+            Self::Q4K => 4,
         }
     }
 
@@ -55,6 +57,7 @@ impl QuantType {
             "q2" => Some(Self::Q2),
             "q3" => Some(Self::Q3),
             "q4" => Some(Self::Q4),
+            "q4_k" | "q4k" => Some(Self::Q4K),
             _ => None,
         }
     }
@@ -62,7 +65,10 @@ impl QuantType {
 
 impl std::fmt::Display for QuantType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "q{}", self.bits())
+        match self {
+            Self::Q4K => f.write_str("q4_k"),
+            _ => write!(f, "q{}", self.bits()),
+        }
     }
 }
 
@@ -104,6 +110,11 @@ impl QuantizedTensor {
     ) -> Self {
         assert!(rows > 0 && cols > 0 && group_size > 0);
         assert_eq!(src.len(), rows * cols);
+        if quant_type == QuantType::Q4K {
+            assert_eq!(group_size, 256);
+            assert!(cols.is_multiple_of(256));
+            return quantize_q4k(src, rows, cols);
+        }
         let groups_per_row = cols.div_ceil(group_size);
         let mut scales = Vec::with_capacity(rows * groups_per_row);
         let mut data = Vec::new();
@@ -152,6 +163,11 @@ impl QuantizedTensor {
     pub fn repack(&mut self, layout: PackingLayout) -> Result<(), String> {
         if self.layout == layout {
             return Ok(());
+        }
+        if self.quant_type == QuantType::Q4K {
+            return Err(
+                "Q4_K currently supports only its canonical row-major block layout".to_owned(),
+            );
         }
         match layout {
             PackingLayout::RowMajor => {
@@ -311,6 +327,9 @@ impl QuantizedTensor {
     }
 
     pub fn dequantize(&self) -> Vec<f32> {
+        if self.quant_type == QuantType::Q4K {
+            return dequantize_q4k(self);
+        }
         let groups_per_row = self.cols.div_ceil(self.group_size);
         let mut output = Vec::with_capacity(self.rows * self.cols);
         for row in 0..self.rows {
@@ -341,6 +360,9 @@ impl QuantizedTensor {
     /// This is the CPU reference for the eventual Metal GEMV kernels.
     pub fn mat_vec(&self, input: &[f32]) -> Vec<f32> {
         assert_eq!(input.len(), self.cols);
+        if self.quant_type == QuantType::Q4K {
+            return mat_vec_q4k(self, input);
+        }
         let groups_per_row = self.cols.div_ceil(self.group_size);
         let mut output = Vec::with_capacity(self.rows);
         for row in 0..self.rows {
@@ -373,6 +395,10 @@ impl QuantizedTensor {
     /// Decode one logical row without materializing the complete matrix.
     pub fn row(&self, row: usize) -> Vec<f32> {
         assert!(row < self.rows);
+        if self.quant_type == QuantType::Q4K {
+            let all = dequantize_q4k(self);
+            return all[row * self.cols..(row + 1) * self.cols].to_vec();
+        }
         let mut output = Vec::with_capacity(self.cols);
         let mut remaining = self.cols;
         let mut group = 0;
@@ -505,7 +531,224 @@ impl QuantizedTensor {
 }
 
 fn packed_len(values: usize, quant_type: QuantType) -> usize {
+    if quant_type == QuantType::Q4K {
+        return values.div_ceil(256) * 140;
+    }
     (values * quant_type.bits()).div_ceil(8)
+}
+
+fn quantize_q4k(src: &[f32], rows: usize, cols: usize) -> QuantizedTensor {
+    let blocks_per_row = cols / 256;
+    let mut scales = Vec::with_capacity(rows * blocks_per_row * 2);
+    let mut data = Vec::with_capacity(rows * blocks_per_row * 140);
+    for row in src.chunks_exact(cols) {
+        for block in row.chunks_exact(256) {
+            let mut levels = [0_u8; 256];
+            let mut aux = [0_u8; 32];
+            let mut sub_scales = [0.0_f32; 8];
+            let mut sub_mins = [0.0_f32; 8];
+            for sub in 0..8 {
+                let values = &block[sub * 32..(sub + 1) * 32];
+                let average = (values.iter().map(|value| value * value).sum::<f32>() / 32.0).sqrt();
+                let mut weights = [0.0_f32; 32];
+                for index in 0..32 {
+                    weights[index] = average + values[index].abs();
+                }
+                sub_scales[sub] = make_qkx2_quants(
+                    values,
+                    &weights,
+                    &mut levels[sub * 32..(sub + 1) * 32],
+                    &mut sub_mins[sub],
+                    &mut aux,
+                );
+            }
+            let max_scale = sub_scales.iter().copied().fold(0.0_f32, f32::max);
+            let max_min = sub_mins.iter().copied().fold(0.0_f32, f32::max);
+            let mut metadata = [0_u8; 12];
+            for sub in 0..8 {
+                let scale = if max_scale > 0.0 {
+                    (63.0 * sub_scales[sub] / max_scale)
+                        .round()
+                        .clamp(0.0, 63.0) as u8
+                } else {
+                    0
+                };
+                let minimum = if max_min > 0.0 {
+                    (63.0 * sub_mins[sub] / max_min).round().clamp(0.0, 63.0) as u8
+                } else {
+                    0
+                };
+                if sub < 4 {
+                    metadata[sub] = scale;
+                    metadata[sub + 4] = minimum;
+                } else {
+                    metadata[sub + 4] = (scale & 0x0f) | ((minimum & 0x0f) << 4);
+                    metadata[sub - 4] |= (scale >> 4) << 6;
+                    metadata[sub] |= (minimum >> 4) << 6;
+                }
+            }
+            let d = f16::from_f32(max_scale / 63.0);
+            let dmin = f16::from_f32(max_min / 63.0);
+            scales.push(d);
+            scales.push(dmin);
+            for sub in 0..8 {
+                let (scale_code, min_code) = q4k_scale_min(&metadata, sub);
+                let step = d.to_f32() * scale_code as f32;
+                let minimum = dmin.to_f32() * min_code as f32;
+                if step != 0.0 {
+                    for index in 0..32 {
+                        levels[sub * 32 + index] = ((block[sub * 32 + index] + minimum) / step)
+                            .round()
+                            .clamp(0.0, 15.0)
+                            as u8;
+                    }
+                }
+            }
+            data.extend_from_slice(&metadata);
+            for pair in 0..4 {
+                for index in 0..32 {
+                    data.push(levels[pair * 64 + index] | (levels[pair * 64 + 32 + index] << 4));
+                }
+            }
+        }
+    }
+    QuantizedTensor {
+        quant_type: QuantType::Q4K,
+        layout: PackingLayout::RowMajor,
+        rows,
+        cols,
+        group_size: 256,
+        scales,
+        data,
+    }
+}
+
+fn make_qkx2_quants(
+    values: &[f32],
+    weights: &[f32],
+    levels: &mut [u8],
+    minimum_out: &mut f32,
+    aux: &mut [u8],
+) -> f32 {
+    let mut minimum = values
+        .iter()
+        .copied()
+        .fold(f32::INFINITY, f32::min)
+        .min(0.0);
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum_weight = weights.iter().sum::<f32>();
+    let sum_x = values.iter().zip(weights).map(|(x, w)| x * w).sum::<f32>();
+    if maximum == minimum {
+        levels.fill(0);
+        *minimum_out = -minimum;
+        return 0.0;
+    }
+    let mut inverse = 15.0 / (maximum - minimum);
+    let mut scale = 1.0 / inverse;
+    let mut best_error = 0.0;
+    for index in 0..values.len() {
+        levels[index] = (inverse * (values[index] - minimum))
+            .round()
+            .clamp(0.0, 15.0) as u8;
+        let difference = scale * levels[index] as f32 + minimum - values[index];
+        best_error += weights[index] * difference * difference;
+    }
+    for step in 0..=20 {
+        inverse = (-1.0 + 0.1 * step as f32 + 15.0) / (maximum - minimum);
+        let mut sum_l = 0.0;
+        let mut sum_l2 = 0.0;
+        let mut sum_xl = 0.0;
+        for index in 0..values.len() {
+            let level = (inverse * (values[index] - minimum))
+                .round()
+                .clamp(0.0, 15.0) as u8;
+            aux[index] = level;
+            let weighted = weights[index];
+            sum_l += weighted * level as f32;
+            sum_l2 += weighted * (level as f32) * (level as f32);
+            sum_xl += weighted * level as f32 * values[index];
+        }
+        let determinant = sum_weight * sum_l2 - sum_l * sum_l;
+        if determinant > 0.0 {
+            let mut candidate_scale = (sum_weight * sum_xl - sum_x * sum_l) / determinant;
+            let mut candidate_minimum = (sum_l2 * sum_x - sum_l * sum_xl) / determinant;
+            if candidate_minimum > 0.0 {
+                candidate_minimum = 0.0;
+                candidate_scale = sum_xl / sum_l2;
+            }
+            let error = values
+                .iter()
+                .zip(weights)
+                .zip(aux.iter())
+                .map(|((value, weight), level)| {
+                    let difference = candidate_scale * *level as f32 + candidate_minimum - value;
+                    weight * difference * difference
+                })
+                .sum::<f32>();
+            if error < best_error {
+                levels.copy_from_slice(&aux[..levels.len()]);
+                best_error = error;
+                scale = candidate_scale;
+                minimum = candidate_minimum;
+            }
+        }
+    }
+    *minimum_out = -minimum;
+    scale
+}
+
+fn q4k_scale_min(metadata: &[u8], sub: usize) -> (u8, u8) {
+    if sub < 4 {
+        (metadata[sub] & 63, metadata[sub + 4] & 63)
+    } else {
+        (
+            (metadata[sub + 4] & 0x0f) | ((metadata[sub - 4] >> 6) << 4),
+            (metadata[sub + 4] >> 4) | ((metadata[sub] >> 6) << 4),
+        )
+    }
+}
+
+fn q4k_value(tensor: &QuantizedTensor, row: usize, column: usize) -> f32 {
+    let blocks_per_row = tensor.cols / 256;
+    let block = column / 256;
+    let within = column % 256;
+    let sub = within / 32;
+    let local = within % 32;
+    let block_index = row * blocks_per_row + block;
+    let data_base = block_index * 140;
+    let metadata = &tensor.data[data_base..data_base + 12];
+    let packed = tensor.data[data_base + 12 + (sub / 2) * 32 + local];
+    let code = if sub.is_multiple_of(2) {
+        packed & 0x0f
+    } else {
+        packed >> 4
+    };
+    let (scale_code, min_code) = q4k_scale_min(metadata, sub);
+    let d = tensor.scales[block_index * 2].to_f32();
+    let dmin = tensor.scales[block_index * 2 + 1].to_f32();
+    d * scale_code as f32 * code as f32 - dmin * min_code as f32
+}
+
+fn dequantize_q4k(tensor: &QuantizedTensor) -> Vec<f32> {
+    let mut values = Vec::with_capacity(tensor.rows * tensor.cols);
+    for row in 0..tensor.rows {
+        for column in 0..tensor.cols {
+            values.push(q4k_value(tensor, row, column));
+        }
+    }
+    values
+}
+
+fn mat_vec_q4k(tensor: &QuantizedTensor, input: &[f32]) -> Vec<f32> {
+    (0..tensor.rows)
+        .map(|row| {
+            input
+                .iter()
+                .enumerate()
+                .map(|(column, value)| q4k_value(tensor, row, column) * value)
+                .sum()
+        })
+        .collect()
 }
 
 fn pack_values(values: &[f32], dst: &mut [u8], bits: QuantType) {
@@ -581,6 +824,7 @@ mod tests {
                     QuantType::Q2 => 8,
                     QuantType::Q3 => 12,
                     QuantType::Q4 => 16,
+                    QuantType::Q4K => unreachable!(),
                 }
             );
             assert!(
@@ -597,6 +841,27 @@ mod tests {
         let q = QuantizedTensor::quantize(&values, 1, 8, QuantType::Q3, 8);
         assert_eq!(q.data.len(), 3);
         assert!(q.dequantize().iter().all(|v| (*v - 1.0).abs() < 0.01));
+    }
+
+    #[test]
+    fn q4k_matches_pinned_llama_reference_block() {
+        let values = (0..256)
+            .map(|index| 0.6 * (index as f32 * 0.17).sin() + 0.2 * (index as f32 * 0.031).cos())
+            .collect::<Vec<_>>();
+        let tensor = QuantizedTensor::quantize(&values, 1, 256, QuantType::Q4K, 256);
+        let mut actual = Vec::with_capacity(144);
+        for scale in &tensor.scales {
+            actual.extend_from_slice(&scale.to_bits().to_le_bytes());
+        }
+        actual.extend_from_slice(&tensor.data);
+        let expected_hex = "ca157522fefff5f9e4b2b6bf5d471ccd37495a6b7c8d9daebecededeededecebead9d8c6b5a4837261514030201000013020101001020304151627394a5b6c8d9eaebfcfdfeefefdfcfbfae8e7d6c4b3d8d7c6b4a392726150403020100101020304151628394a6b7c8daebecfdfefffbecedeeeeefdfdfcfbeae9d8c6b5a49382615140302010110102030405161728";
+        let expected = expected_hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(tensor.relative_l2(&values) < 0.1);
     }
 
     #[test]

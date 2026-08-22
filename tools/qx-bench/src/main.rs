@@ -6,7 +6,7 @@ use qx_format::{MappedArtifact, TensorKind};
 use qx_model::{EMBEDDING_MULTIPLIER, HIDDEN, LAYERS, LOGITS_SCALING, RESIDUAL_MULTIPLIER, VOCAB};
 use qx_runtime::{GenerationStats, GenerationTrace, GraniteModel, RuntimeProfile};
 use qx_runtime_v2::ExecutionPlan;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,9 @@ struct Args {
     /// JSON fixture containing canonical prompt token IDs and benchmark settings.
     #[arg(long)]
     fixture: Option<PathBuf>,
+    /// Write a machine-readable benchmark record (currently supported by --v2-token).
+    #[arg(long)]
+    result_json: Option<PathBuf>,
     #[arg(long, default_value_t = 512)]
     quality_tokens: usize,
     /// Print per-layer/component timing for one warmed generation.
@@ -126,6 +129,18 @@ struct Args {
     /// Split attention into benchmark-only QK, softmax, and V stages.
     #[arg(long)]
     v2_attention_stages: bool,
+    /// Emit an all-token NLL plus sampled-logit quality trace from V2.
+    #[arg(long)]
+    v2_quality_trace: bool,
+    /// Exact QXTOKN token corpus consumed by --v2-quality-trace.
+    #[arg(long, requires = "v2_quality_trace")]
+    quality_token_file: Option<PathBuf>,
+    /// Binary QXQUAL output produced by --v2-quality-trace.
+    #[arg(long, requires = "v2_quality_trace")]
+    quality_trace: Option<PathBuf>,
+    /// Keep full logits at every Nth position; NLL is computed at every position.
+    #[arg(long, default_value_t = 256)]
+    quality_sample_stride: u32,
 }
 
 #[cfg(target_os = "macos")]
@@ -151,17 +166,56 @@ struct RuntimeOptions<'a> {
     ignore_eos: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MeasurementMode {
+    #[default]
+    SeedInclusive,
+    PostPrefill,
+}
+
 #[derive(Debug, Deserialize)]
 struct BenchmarkFixture {
+    #[serde(default = "unnamed_fixture")]
+    name: String,
+    #[serde(default = "unknown_domain")]
+    domain: String,
     tokens: Vec<u32>,
     context: Option<usize>,
     generation: Option<usize>,
+    #[serde(default)]
+    measurement: MeasurementMode,
+}
+
+fn unnamed_fixture() -> String {
+    "unnamed".to_owned()
+}
+
+fn unknown_domain() -> String {
+    "unknown".to_owned()
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.iterations == 0 || args.max_new_tokens == 0 {
         bail!("iterations must be positive");
+    }
+    if args.v2_quality_trace {
+        let artifact = args
+            .artifact
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--v2-quality-trace requires an artifact"))?;
+        return emit_v2_quality_trace(
+            artifact,
+            args.quality_token_file
+                .as_deref()
+                .expect("clap quality token requirement"),
+            args.quality_trace
+                .as_deref()
+                .expect("clap quality trace requirement"),
+            args.context,
+            args.quality_sample_stride,
+        );
     }
     if args.v2_full_stack {
         let artifact = args
@@ -176,12 +230,6 @@ fn main() -> Result<()> {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--v2-token requires an artifact path"))?;
         let fixture = args.fixture.as_deref().map(load_fixture).transpose()?;
-        if fixture
-            .as_ref()
-            .is_some_and(|fixture| fixture.tokens.len() != 1)
-        {
-            bail!("--v2-token currently requires a fixture with exactly one seed token");
-        }
         let context = fixture
             .as_ref()
             .and_then(|fixture| fixture.context)
@@ -190,11 +238,14 @@ fn main() -> Result<()> {
             .as_ref()
             .and_then(|fixture| fixture.generation)
             .unwrap_or(args.iterations);
-        let initial_token = fixture
-            .as_ref()
-            .map(|fixture| fixture.tokens[0])
-            .unwrap_or(0);
-        return benchmark_v2_token(artifact, context, args.warmup, iterations, initial_token);
+        return benchmark_v2_token(
+            artifact,
+            context,
+            args.warmup,
+            iterations,
+            fixture.as_ref(),
+            args.result_json.as_deref(),
+        );
     }
     if args.v2_generate {
         let model = args
@@ -299,22 +350,36 @@ fn main() -> Result<()> {
         let artifact = args.artifact.as_deref().ok_or_else(|| {
             anyhow::anyhow!("--v2-differential-profile requires an artifact path")
         })?;
+        let fixture = args.fixture.as_deref().map(load_fixture).transpose()?;
+        let context = fixture
+            .as_ref()
+            .and_then(|fixture| fixture.context)
+            .unwrap_or(args.context);
         return benchmark_v2_differential_profile(
             artifact,
-            args.context,
+            context,
             args.warmup,
             args.iterations,
+            fixture.as_ref(),
+            args.result_json.as_deref(),
         );
     }
     if args.v2_moe_differential_profile {
         let artifact = args.artifact.as_deref().ok_or_else(|| {
             anyhow::anyhow!("--v2-moe-differential-profile requires an artifact path")
         })?;
+        let fixture = args.fixture.as_deref().map(load_fixture).transpose()?;
+        let context = fixture
+            .as_ref()
+            .and_then(|fixture| fixture.context)
+            .unwrap_or(args.context);
         return benchmark_v2_moe_differential_profile(
             artifact,
-            args.context,
+            context,
             args.warmup,
             args.iterations,
+            fixture.as_ref(),
+            args.result_json.as_deref(),
         );
     }
     if args.v2_route_overlap {
@@ -1883,6 +1948,8 @@ fn benchmark_v2_differential_profile(
     context_length: usize,
     warmup: usize,
     iterations: usize,
+    fixture: Option<&BenchmarkFixture>,
+    result_json: Option<&std::path::Path>,
 ) -> Result<()> {
     use std::rc::Rc;
 
@@ -1898,7 +1965,30 @@ fn benchmark_v2_differential_profile(
             .map_err(anyhow::Error::msg)?;
     let moe = qx_runtime_v2::PreparedMoeStack::load(context.as_ref(), artifact_path)
         .map_err(anyhow::Error::msg)?;
-    let position = context_length.saturating_sub(1);
+    let position = if let Some(fixture) = fixture {
+        if fixture.measurement != MeasurementMode::PostPrefill {
+            bail!("differential fixtures must use post_prefill measurement");
+        }
+        if fixture.tokens.len() >= context_length {
+            bail!("differential fixture prefill must leave one decode position");
+        }
+        for (position, token) in fixture.tokens.iter().enumerate() {
+            context
+                .write_runtime_buffer(
+                    buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+                    &token.to_le_bytes(),
+                )
+                .map_err(anyhow::Error::msg)?;
+            let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+            stack
+                .encode_token(&mut graph, &buffers, &moe, position)
+                .map_err(anyhow::Error::msg)?;
+            buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+        }
+        fixture.tokens.len()
+    } else {
+        context_length.saturating_sub(1)
+    };
     let warmup = warmup.min(iterations);
     let variants = [
         ("baseline", None),
@@ -1919,35 +2009,65 @@ fn benchmark_v2_differential_profile(
     println!("context/position:  {context_length}/{position}");
     println!("iterations:        {iterations} (warmup {warmup})");
     println!(
-        "baseline is the complete canonical token graph; ablations retain no-op dispatch shape where possible"
+        "baseline and ablations replay one frozen canonical top-8 route trace; no-op dispatch shape is retained where possible"
     );
+    let route_trace = capture_route_trace(context.as_ref(), &buffers, &stack, &moe, position)?;
     println!("variant                       GPU us/token   dispatches   marginal saved us");
     let mut baseline_gpu = 0.0;
     let mut results = Vec::with_capacity(variants.len());
     for (name, skip) in variants {
         let detailed =
             profile_graph_stage_detailed(context.as_ref(), warmup, iterations, |graph| {
-                if skip.is_none() {
-                    stack
-                        .encode_token(graph, &buffers, &moe, position)
-                        .map_err(anyhow::Error::msg)
-                } else {
-                    encode_differential_token(
-                        graph, &buffers, &stack, &moe, position, skip, None, None, None, None,
-                        None, None,
-                    )
-                }
+                encode_differential_token(
+                    graph,
+                    &buffers,
+                    &stack,
+                    &moe,
+                    position,
+                    skip,
+                    Some(&route_trace),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
             })?;
         if skip.is_none() {
             baseline_gpu = detailed.0;
         }
         results.push((name, detailed));
     }
-    for (name, (gpu, dispatches)) in results {
+    let report_rows = results
+        .iter()
+        .map(|(name, (gpu, dispatches))| DifferentialProfileRow {
+            name: (*name).to_owned(),
+            gpu_us_per_token: *gpu,
+            dispatches: *dispatches,
+            marginal_saved_us: baseline_gpu - *gpu,
+        })
+        .collect::<Vec<_>>();
+    for row in &report_rows {
         println!(
-            "{name:<30} {gpu:>13.2}  {dispatches:>11}  {:>18.2}",
-            baseline_gpu - gpu
+            "{:<30} {:>13.2}  {:>11}  {:>18.2}",
+            row.name, row.gpu_us_per_token, row.dispatches, row.marginal_saved_us
         );
+    }
+    if let Some(path) = result_json {
+        let report = DifferentialProfileReport {
+            schema_version: 2,
+            artifact: artifact_path.display().to_string(),
+            fixture_name: fixture.map(|value| value.name.clone()),
+            fixture_domain: fixture.map(|value| value.domain.clone()),
+            context: context_length,
+            position,
+            routes_frozen: true,
+            iterations,
+            warmup,
+            rows: report_rows,
+        };
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
+        println!("result JSON:       {}", path.display());
     }
     println!();
     println!(
@@ -1957,6 +2077,30 @@ fn benchmark_v2_differential_profile(
         "Ablations can change cache residency and dependency scheduling; use them to rank targets, then validate any replacement on the complete graph and parity gate."
     );
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Serialize)]
+struct DifferentialProfileRow {
+    name: String,
+    gpu_us_per_token: f64,
+    dispatches: u64,
+    marginal_saved_us: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Serialize)]
+struct DifferentialProfileReport {
+    schema_version: u32,
+    artifact: String,
+    fixture_name: Option<String>,
+    fixture_domain: Option<String>,
+    context: usize,
+    position: usize,
+    routes_frozen: bool,
+    iterations: usize,
+    warmup: usize,
+    rows: Vec<DifferentialProfileRow>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1984,6 +2128,8 @@ fn benchmark_v2_moe_differential_profile(
     context_length: usize,
     warmup: usize,
     iterations: usize,
+    fixture: Option<&BenchmarkFixture>,
+    result_json: Option<&std::path::Path>,
 ) -> Result<()> {
     use std::rc::Rc;
 
@@ -1999,7 +2145,30 @@ fn benchmark_v2_moe_differential_profile(
             .map_err(anyhow::Error::msg)?;
     let moe = qx_runtime_v2::PreparedMoeStack::load(context.as_ref(), artifact_path)
         .map_err(anyhow::Error::msg)?;
-    let position = context_length.saturating_sub(1);
+    let position = if let Some(fixture) = fixture {
+        if fixture.measurement != MeasurementMode::PostPrefill {
+            bail!("MoE differential fixtures must use post_prefill measurement");
+        }
+        if fixture.tokens.len() >= context_length {
+            bail!("MoE differential fixture prefill must leave one decode position");
+        }
+        for (position, token) in fixture.tokens.iter().enumerate() {
+            context
+                .write_runtime_buffer(
+                    buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+                    &token.to_le_bytes(),
+                )
+                .map_err(anyhow::Error::msg)?;
+            let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+            stack
+                .encode_token(&mut graph, &buffers, &moe, position)
+                .map_err(anyhow::Error::msg)?;
+            buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+        }
+        fixture.tokens.len()
+    } else {
+        context_length.saturating_sub(1)
+    };
     let (artifact_bytes, artifact_hash) = artifact_fingerprint(artifact_path)?;
 
     println!("QX V2 live MoE differential profile");
@@ -2094,11 +2263,36 @@ fn benchmark_v2_moe_differential_profile(
         }
         results.push((name, detailed));
     }
-    for (name, (gpu, dispatches)) in results {
+    let stage_rows = results
+        .iter()
+        .map(|(name, (gpu, dispatches))| DifferentialProfileRow {
+            name: (*name).to_owned(),
+            gpu_us_per_token: *gpu,
+            dispatches: *dispatches,
+            marginal_saved_us: baseline_gpu - *gpu,
+        })
+        .collect::<Vec<_>>();
+    for row in &stage_rows {
         println!(
-            "{name:<30} {gpu:>13.2}  {dispatches:>11}  {:>18.2}",
-            baseline_gpu - gpu
+            "{:<30} {:>13.2}  {:>11}  {:>18.2}",
+            row.name, row.gpu_us_per_token, row.dispatches, row.marginal_saved_us
         );
+    }
+    if let Some(path) = result_json {
+        let report = DifferentialProfileReport {
+            schema_version: 2,
+            artifact: artifact_path.display().to_string(),
+            fixture_name: fixture.map(|value| value.name.clone()),
+            fixture_domain: fixture.map(|value| value.domain.clone()),
+            context: context_length,
+            position,
+            routes_frozen: true,
+            iterations,
+            warmup,
+            rows: stage_rows,
+        };
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
+        println!("MoE stage result JSON: {}", path.display());
     }
     let controls = [
         ("canonical gate/up", None, None),
@@ -2963,6 +3157,8 @@ fn benchmark_v2_differential_profile(
     _context_length: usize,
     _warmup: usize,
     _iterations: usize,
+    _fixture: Option<&BenchmarkFixture>,
+    _result_json: Option<&std::path::Path>,
 ) -> Result<()> {
     bail!("--v2-differential-profile requires macOS Metal")
 }
@@ -2973,6 +3169,8 @@ fn benchmark_v2_moe_differential_profile(
     _context_length: usize,
     _warmup: usize,
     _iterations: usize,
+    _fixture: Option<&BenchmarkFixture>,
+    _result_json: Option<&std::path::Path>,
 ) -> Result<()> {
     bail!("--v2-moe-differential-profile requires macOS Metal")
 }
@@ -3610,6 +3808,7 @@ fn benchmark_v2_kernel_profile(
     iterations: usize,
 ) -> Result<()> {
     use std::rc::Rc;
+    use std::sync::Arc;
 
     if iterations == 0 {
         bail!("kernel profile iterations must be positive");
@@ -3621,10 +3820,15 @@ fn benchmark_v2_kernel_profile(
     let plan = ExecutionPlan::granite(context_length).map_err(anyhow::Error::msg)?;
     let buffers =
         qx_runtime_v2::GpuRuntimeBuffers::new(metal.clone(), plan).map_err(anyhow::Error::msg)?;
-    let stack = qx_runtime_v2::PreparedAttentionStack::load_from_artifact(&metal, artifact_path)
-        .map_err(anyhow::Error::msg)?;
+    let mapped_artifact = Arc::new(MappedArtifact::open(artifact_path)?);
+    let stack = qx_runtime_v2::PreparedAttentionStack::load_from_mapped_artifact(
+        &metal,
+        mapped_artifact.clone(),
+    )
+    .map_err(anyhow::Error::msg)?;
     let moe =
-        qx_runtime_v2::PreparedMoeStack::load(&metal, artifact_path).map_err(anyhow::Error::msg)?;
+        qx_runtime_v2::PreparedMoeStack::load_from_mapped_artifact(&metal, mapped_artifact.clone())
+            .map_err(anyhow::Error::msg)?;
     let token = 0_u32.to_le_bytes();
     metal
         .write_runtime_buffer(buffers.buffer(qx_runtime_v2::BufferId::TokenOutput), &token)
@@ -4833,14 +5037,87 @@ fn benchmark_v2_full_stack(
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Serialize)]
+struct V2TokenBenchmarkRecord {
+    schema_version: u32,
+    implementation: &'static str,
+    qx_revision: &'static str,
+    artifact: String,
+    artifact_bytes: u64,
+    artifact_hash: String,
+    artifact_version: u32,
+    plan_id: String,
+    target_id: String,
+    fixture_name: String,
+    fixture_domain: String,
+    fixture_token_hash: String,
+    measurement: MeasurementMode,
+    context: usize,
+    prefill_tokens: usize,
+    measured_position_start: usize,
+    measured_tokens: usize,
+    warmup: usize,
+    wall_ms_per_token: f64,
+    gpu_ms_per_token: f64,
+    tokens_per_second: f64,
+    command_buffers_per_token: f64,
+    encoders_per_token: f64,
+    dispatches_per_token: f64,
+    internal_cpu_waits: u64,
+    current_rss_bytes: u64,
+    peak_rss_bytes: u64,
+    current_physical_footprint_bytes: u64,
+    peak_physical_footprint_bytes: u64,
+    mapped_artifact_bytes: u64,
+    known_metal_allocated_bytes: u64,
+    recommended_metal_working_set_bytes: u64,
+    os_version: String,
+    power_state: String,
+    thermal_state: String,
+    memory_pressure: String,
+    last_token_id: u32,
+}
+
+#[cfg(target_os = "macos")]
 fn benchmark_v2_token(
     artifact_path: &std::path::Path,
     context_length: usize,
     warmup: usize,
     iterations: usize,
-    initial_token: u32,
+    fixture: Option<&BenchmarkFixture>,
+    result_json: Option<&std::path::Path>,
 ) -> Result<()> {
     use std::rc::Rc;
+    use std::sync::Arc;
+    let default_tokens = [0_u32];
+    let tokens = fixture
+        .map(|fixture| fixture.tokens.as_slice())
+        .unwrap_or(default_tokens.as_slice());
+    let measurement = fixture
+        .map(|fixture| fixture.measurement)
+        .unwrap_or_default();
+    if measurement == MeasurementMode::SeedInclusive && tokens.len() != 1 {
+        bail!("seed_inclusive fixtures require exactly one seed token");
+    }
+    let prefill_tokens = if measurement == MeasurementMode::PostPrefill {
+        tokens.len()
+    } else {
+        0
+    };
+    if prefill_tokens.saturating_add(iterations) > context_length {
+        bail!("prefill plus measured positions must fit within the V2 context");
+    }
+    let initial_token = tokens[0];
+    let sealed_plan = qx_runtime_v2::activate_artifact_execution_plan(artifact_path)
+        .map_err(anyhow::Error::msg)?;
+    if let Some(plan) = &sealed_plan {
+        if plan.workload.context_limit as usize != context_length {
+            bail!(
+                "fixture context {context_length} does not match sealed plan context {}",
+                plan.workload.context_limit
+            );
+        }
+    }
     let metal = Rc::new(
         qx_metal::platform::MetalContext::system_default()
             .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
@@ -4848,10 +5125,15 @@ fn benchmark_v2_token(
     let plan = ExecutionPlan::granite(context_length).map_err(anyhow::Error::msg)?;
     let buffers =
         qx_runtime_v2::GpuRuntimeBuffers::new(metal.clone(), plan).map_err(anyhow::Error::msg)?;
-    let stack = qx_runtime_v2::PreparedAttentionStack::load_from_artifact(&metal, artifact_path)
-        .map_err(anyhow::Error::msg)?;
+    let mapped_artifact = Arc::new(MappedArtifact::open(artifact_path)?);
+    let stack = qx_runtime_v2::PreparedAttentionStack::load_from_mapped_artifact(
+        &metal,
+        mapped_artifact.clone(),
+    )
+    .map_err(anyhow::Error::msg)?;
     let moe =
-        qx_runtime_v2::PreparedMoeStack::load(&metal, artifact_path).map_err(anyhow::Error::msg)?;
+        qx_runtime_v2::PreparedMoeStack::load_from_mapped_artifact(&metal, mapped_artifact.clone())
+            .map_err(anyhow::Error::msg)?;
     let initial_token_bytes = initial_token.to_le_bytes();
     if iterations > context_length {
         bail!("iterations must fit within the V2 context");
@@ -4871,15 +5153,32 @@ fn benchmark_v2_token(
             .map_err(anyhow::Error::msg)?;
         buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
     }
-    metal
-        .write_runtime_buffer(
-            buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
-            &initial_token_bytes,
-        )
-        .map_err(anyhow::Error::msg)?;
+    if measurement == MeasurementMode::PostPrefill {
+        for (position, token) in tokens.iter().enumerate() {
+            metal
+                .write_runtime_buffer(
+                    buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+                    &token.to_le_bytes(),
+                )
+                .map_err(anyhow::Error::msg)?;
+            let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+            stack
+                .encode_token(&mut graph, &buffers, &moe, position)
+                .map_err(anyhow::Error::msg)?;
+            buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+        }
+    } else {
+        metal
+            .write_runtime_buffer(
+                buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+                &initial_token_bytes,
+            )
+            .map_err(anyhow::Error::msg)?;
+    }
     let before = metal.metrics().map_err(anyhow::Error::msg)?;
     let start = Instant::now();
-    for position in 0..iterations {
+    let measured_position_start = prefill_tokens;
+    for position in measured_position_start..measured_position_start + iterations {
         let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
         stack
             .encode_token(&mut graph, &buffers, &moe, position)
@@ -4894,42 +5193,91 @@ fn benchmark_v2_token(
         .read_runtime_u32(buffers.buffer(qx_runtime_v2::BufferId::TokenOutput))
         .map_err(anyhow::Error::msg)?;
     let (artifact_bytes, artifact_hash) = artifact_fingerprint(artifact_path)?;
+    let plan_id = sealed_plan
+        .as_ref()
+        .map(|plan| plan.plan_id.clone())
+        .unwrap_or_else(|| "legacy-v1-unsealed".to_owned());
+    let target_id = mapped_artifact.info().header.target_id.clone();
+    let wall_ms_per_token = 1000.0 * wall.as_secs_f64() / count;
+    let gpu_ms_per_token = 1000.0 * gpu_seconds / count;
+    let command_buffers_per_token = (after.command_buffers - before.command_buffers) as f64 / count;
+    let encoders_per_token = (after.encoders - before.encoders) as f64 / count;
+    let dispatches_per_token = (after.dispatches - before.dispatches) as f64 / count;
+    let (current_physical_footprint_bytes, peak_physical_footprint_bytes) = physical_footprint();
+    let record = V2TokenBenchmarkRecord {
+        schema_version: 1,
+        implementation: "qx-v2",
+        qx_revision: option_env!("QX_GIT_REVISION").unwrap_or("unknown"),
+        artifact: artifact_path.display().to_string(),
+        artifact_bytes,
+        artifact_hash: format!("{artifact_hash:016x}"),
+        artifact_version: mapped_artifact.info().header.version,
+        plan_id: plan_id.clone(),
+        target_id,
+        fixture_name: fixture
+            .map(|fixture| fixture.name.clone())
+            .unwrap_or_else(unnamed_fixture),
+        fixture_domain: fixture
+            .map(|fixture| fixture.domain.clone())
+            .unwrap_or_else(unknown_domain),
+        fixture_token_hash: format!("{:016x}", token_fixture_hash(tokens)),
+        measurement,
+        context: context_length,
+        prefill_tokens,
+        measured_position_start,
+        measured_tokens: iterations,
+        warmup,
+        wall_ms_per_token,
+        gpu_ms_per_token,
+        tokens_per_second: count / wall.as_secs_f64(),
+        command_buffers_per_token,
+        encoders_per_token,
+        dispatches_per_token,
+        internal_cpu_waits: 0,
+        current_rss_bytes: current_rss_bytes(),
+        peak_rss_bytes: peak_rss_bytes(),
+        current_physical_footprint_bytes,
+        peak_physical_footprint_bytes,
+        mapped_artifact_bytes: artifact_bytes,
+        known_metal_allocated_bytes: metal.current_allocated_bytes(),
+        recommended_metal_working_set_bytes: metal.recommended_working_set_bytes(),
+        os_version: command_output("sw_vers", &["-productVersion"]),
+        power_state: command_output("pmset", &["-g", "batt"]),
+        thermal_state: command_output("pmset", &["-g", "therm"]),
+        memory_pressure: command_output("memory_pressure", &["-Q"]),
+        last_token_id: token,
+    };
     println!("QX V2 complete token graph (artifact-only, sequential positions)");
     println!("artifact:               {}", artifact_path.display());
     println!("artifact bytes:         {artifact_bytes}");
     println!("artifact hash:          {artifact_hash:016x}");
+    println!("artifact plan:          {}", plan_id);
     println!("context:                {context_length}");
     println!("initial token ID:       {initial_token}");
     println!("layers:                 {}", stack.layers.len());
     println!("warmup:                {warmup}");
     println!("iterations:             {iterations}");
     println!("last GPU token ID:      {token}");
-    println!("process peak RSS bytes:  {}", peak_rss_bytes());
-    println!("process current RSS bytes: {}", current_rss_bytes());
+    println!("process peak RSS bytes:  {}", record.peak_rss_bytes);
+    println!("process current RSS bytes: {}", record.current_rss_bytes);
     println!(
-        "wall ms/token:          {:.3}",
-        1000.0 * wall.as_secs_f64() / count
+        "physical footprint current/peak: {} / {}",
+        record.current_physical_footprint_bytes, record.peak_physical_footprint_bytes
     );
     println!(
-        "GPU ms/token:           {:.3}",
-        1000.0 * gpu_seconds / count
+        "Metal allocated bytes:   {}",
+        record.known_metal_allocated_bytes
     );
-    println!(
-        "command buffers/token:  {:.2}",
-        (after.command_buffers - before.command_buffers) as f64 / count
-    );
-    println!(
-        "encoders/token:         {:.2}",
-        (after.encoders - before.encoders) as f64 / count
-    );
-    println!(
-        "dispatches/token:       {:.2}",
-        (after.dispatches - before.dispatches) as f64 / count
-    );
-    println!(
-        "equivalent complete tok/s: {:.2}",
-        count / wall.as_secs_f64()
-    );
+    println!("wall ms/token:          {:.3}", wall_ms_per_token);
+    println!("GPU ms/token:           {:.3}", gpu_ms_per_token);
+    println!("command buffers/token:  {:.2}", command_buffers_per_token);
+    println!("encoders/token:         {:.2}", encoders_per_token);
+    println!("dispatches/token:       {:.2}", dispatches_per_token);
+    println!("equivalent complete tok/s: {:.2}", record.tokens_per_second);
+    if let Some(path) = result_json {
+        std::fs::write(path, serde_json::to_vec_pretty(&record)?)?;
+        println!("result JSON:            {}", path.display());
+    }
     Ok(())
 }
 
@@ -5093,6 +5441,91 @@ fn run_v2_teacher_forced(
         None => unsafe { std::env::remove_var("QX_V2_MOE_ACTIVE_K_BY_LAYER") },
     }
     result
+}
+
+#[cfg(target_os = "macos")]
+fn emit_v2_quality_trace(
+    artifact_path: &std::path::Path,
+    token_path: &std::path::Path,
+    output_path: &std::path::Path,
+    context_length: usize,
+    sample_stride: u32,
+) -> Result<()> {
+    if context_length < 2 || sample_stride == 0 {
+        bail!("quality tracing requires context >= 2 and a positive sample stride");
+    }
+    let corpus = qx_eval::read_token_corpus(token_path)?;
+    if corpus.tokens.len() < 2 {
+        bail!("quality corpus requires at least two tokens");
+    }
+    let mut generator = qx_runtime_v2::GraniteV2Generator::load(artifact_path, context_length)
+        .map_err(anyhow::Error::msg)?;
+    let mut blocks = Vec::new();
+    let mut samples = Vec::new();
+    let mut start = 0_usize;
+    while start + 1 < corpus.tokens.len() {
+        let end = (start + context_length).min(corpus.tokens.len());
+        let block = &corpus.tokens[start..end];
+        generator.reset();
+        let mut nll_sum = 0.0;
+        for local_position in 0..block.len() - 1 {
+            let logits = generator
+                .step_logits(block[local_position])
+                .map_err(anyhow::Error::msg)?;
+            let target = block[local_position + 1];
+            let nll = qx_eval::token_nll(&logits, target as usize);
+            let global_position = start + local_position;
+            nll_sum += nll;
+            if global_position % sample_stride as usize == 0 {
+                samples.push(qx_eval::LogitSample {
+                    position: global_position as u64,
+                    target,
+                    nll,
+                    logits,
+                });
+            }
+        }
+        blocks.push(qx_eval::QualityBlock {
+            start_position: start as u64,
+            positions: (block.len() - 1) as u32,
+            nll_sum,
+        });
+        if end == corpus.tokens.len() {
+            break;
+        }
+        start = end - 1;
+    }
+    let trace = qx_eval::QualityTrace {
+        vocab: qx_model::VOCAB as u32,
+        total_positions: (corpus.tokens.len() - 1) as u64,
+        block_tokens: context_length as u32,
+        sample_stride,
+        blocks,
+        samples,
+    };
+    qx_eval::write_quality_trace(output_path, &trace)?;
+    let nll =
+        trace.blocks.iter().map(|block| block.nll_sum).sum::<f64>() / trace.total_positions as f64;
+    println!("QX V2 triangular quality trace");
+    println!("domain:       {}", corpus.domain);
+    println!("split:        {}", corpus.split);
+    println!("positions:    {}", trace.total_positions);
+    println!("blocks:       {}", trace.blocks.len());
+    println!("logit samples: {}", trace.samples.len());
+    println!("NLL/PPL:      {:.6} / {:.6}", nll, nll.exp());
+    println!("trace:        {}", output_path.display());
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn emit_v2_quality_trace(
+    _artifact_path: &std::path::Path,
+    _token_path: &std::path::Path,
+    _output_path: &std::path::Path,
+    _context_length: usize,
+    _sample_stride: u32,
+) -> Result<()> {
+    bail!("V2 quality tracing requires macOS Metal")
 }
 
 #[cfg(target_os = "macos")]
@@ -5342,7 +5775,8 @@ fn benchmark_v2_token(
     _context_length: usize,
     _warmup: usize,
     _iterations: usize,
-    _initial_token: u32,
+    _fixture: Option<&BenchmarkFixture>,
+    _result_json: Option<&std::path::Path>,
 ) -> Result<()> {
     bail!("--v2-token requires macOS Metal")
 }
@@ -5639,6 +6073,16 @@ fn print_memory_plan(artifact_path: &std::path::Path) -> Result<()> {
     }
     println!("planned weights bytes: {}", info.memory_plan.weights_bytes);
     println!("planned total bytes:   {}", info.memory_plan.total_bytes);
+    println!("artifact version:      {}", info.header.version);
+    println!("weight slab offset:    {}", info.header.weights_offset);
+    println!("weight slab bytes:     {}", info.header.weights_length);
+    println!(
+        "execution plan:        {}",
+        info.execution_plan
+            .as_ref()
+            .map(|plan| plan.plan_id.as_str())
+            .unwrap_or("legacy-v1-unsealed")
+    );
     println!("expert packing layouts: {:?}", layouts);
     println!("process peak RSS bytes: {}", peak_rss_bytes());
     Ok(())
@@ -5646,6 +6090,15 @@ fn print_memory_plan(artifact_path: &std::path::Path) -> Result<()> {
 
 fn print_v2_plan(artifact: &MappedArtifact, context: usize) -> Result<()> {
     let plan = ExecutionPlan::granite(context).map_err(anyhow::Error::msg)?;
+    let sealed = artifact.info().execution_plan.as_ref();
+    if let Some(sealed) = sealed
+        && sealed.workload.context_limit as usize != context
+    {
+        bail!(
+            "requested context {context} differs from sealed context {}",
+            sealed.workload.context_limit
+        );
+    }
     let (expert_bytes, dense_bytes) =
         artifact
             .info()
@@ -5671,8 +6124,45 @@ fn print_v2_plan(artifact: &MappedArtifact, context: usize) -> Result<()> {
         plan.kv_bytes / 2
     };
     println!("QX Runtime V2 static audit");
+    println!(
+        "sealed plan:                {}",
+        sealed
+            .map(|plan| plan.plan_id.as_str())
+            .unwrap_or("legacy-v1")
+    );
+    println!(
+        "weight ownership:           {}",
+        sealed
+            .map(|plan| format!("{:?}", plan.memory.weight_storage))
+            .unwrap_or_else(|| "legacy-copied".to_owned())
+    );
+    println!(
+        "compiler revision:          {}",
+        sealed
+            .map(|plan| plan.provenance.compiler_revision.as_str())
+            .unwrap_or("unsealed")
+    );
+    println!(
+        "benchmark contract hash:    {}",
+        sealed
+            .map(|plan| plan.provenance.benchmark_contract_hash.as_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("missing")
+    );
+    println!(
+        "predicted peak bytes:       {}",
+        sealed
+            .map(|plan| plan.memory.predicted_peak_bytes)
+            .unwrap_or(0)
+    );
     println!("context:                    {}", plan.context);
-    println!("arena bytes:                {}", audit.arena_bytes);
+    println!(
+        "arena bytes:                {}",
+        sealed
+            .filter(|plan| plan.arena.arena_bytes != 0)
+            .map(|plan| plan.arena.arena_bytes as usize)
+            .unwrap_or(audit.arena_bytes)
+    );
     println!("KV bytes (FP32 validation): {}", audit.kv_bytes);
     println!(
         "KV mode:                    K={} V={}",
@@ -5721,12 +6211,21 @@ fn print_v2_plan(artifact: &MappedArtifact, context: usize) -> Result<()> {
     );
     println!(
         "command buffers/token:      {}",
-        plan.command_buffers_per_token
+        sealed
+            .map(|plan| plan.schedule.command_buffers_per_token as usize)
+            .unwrap_or(plan.command_buffers_per_token)
     );
-    println!("encoders/token:             {}", plan.encoders_per_token);
+    println!(
+        "encoders/token:             {}",
+        sealed
+            .map(|plan| plan.schedule.encoders_per_token as usize)
+            .unwrap_or(plan.encoders_per_token)
+    );
     println!(
         "planned dispatches/token:   {}",
-        plan.expected_dispatches_per_token()
+        sealed
+            .map(|plan| plan.schedule.expected_dispatches_per_token as usize)
+            .unwrap_or_else(|| plan.expected_dispatches_per_token())
     );
     Ok(())
 }
@@ -5772,6 +6271,53 @@ fn current_rss_bytes() -> u64 {
 #[cfg(not(target_os = "macos"))]
 fn current_rss_bytes() -> u64 {
     0
+}
+
+#[cfg(target_os = "macos")]
+fn physical_footprint() -> (u64, u64) {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: proc_pid_rusage initializes the supplied rusage_info_v4 buffer
+    // for the current process when it returns zero.
+    let status = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as i32,
+            libc::RUSAGE_INFO_V4,
+            usage.as_mut_ptr().cast(),
+        )
+    };
+    if status != 0 {
+        return (0, 0);
+    }
+    // SAFETY: a successful call initialized the complete structure.
+    let usage = unsafe { usage.assume_init() };
+    (
+        usage.ri_phys_footprint,
+        usage.ri_lifetime_max_phys_footprint,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn physical_footprint() -> (u64, u64) {
+    (0, 0)
+}
+
+fn command_output(program: &str, arguments: &[&str]) -> String {
+    std::process::Command::new(program)
+        .args(arguments)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
+fn token_fixture_hash(tokens: &[u32]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in tokens.iter().flat_map(|token| token.to_le_bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn compare_runtime_quality(

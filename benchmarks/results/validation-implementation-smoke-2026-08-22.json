@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "status": "development_smoke_not_acceptance",
+  "target": "Apple M5 Pro",
+  "power_source": "battery",
+  "workload": {
+    "context": 512,
+    "prefill_tokens": 384,
+    "measured_tokens": 128,
+    "fixtures": ["general", "instruction", "code", "reasoning", "chat"]
+  },
+  "runtime": {
+    "qx_top8_tokens_per_second_approx": 200.0,
+    "llama_q4_k_m_tokens_per_second_latest_smoke": 326.19,
+    "runtime_proof_passed": false
+  },
+  "command_buffer_candidate": {
+    "pairs": 15,
+    "one_buffer_median_wall_ms_per_token": 5.0689541015625,
+    "two_buffer_median_wall_ms_per_token": 4.9188662109375,
+    "paired_mean_delta_two_minus_one_ms": -0.13700540208333295,
+    "paired_mean_delta_bootstrap_95": [-0.15051868385416628, -0.12088344010416634],
+    "paired_mean_gpu_delta_ms": 0.010906793158937944,
+    "dispatches_per_token": 461,
+    "internal_cpu_waits": 0,
+    "promotion_status": "pending_full_quality_and_clean_provenance"
+  },
+  "memory_controls": {
+    "artifact_bytes": 751009792,
+    "llama_gguf_bytes": 821844576,
+    "copied": {
+      "current_rss_bytes": 1966702592,
+      "current_physical_footprint_bytes": 1306691504,
+      "known_metal_allocated_bytes": 802406400,
+      "wall_ms_per_token": 5.173
+    },
+    "hybrid": {
+      "current_rss_bytes": 196067328,
+      "current_physical_footprint_bytes": 214648008,
+      "known_metal_allocated_bytes": 873840640,
+      "wall_ms_per_token": 5.143
+    },
+    "mmap_no_copy": {
+      "current_rss_bytes": 20824064,
+      "current_physical_footprint_bytes": 110609008,
+      "known_metal_allocated_bytes": 802373632,
+      "wall_ms_per_token": 5.111
+    },
+    "memory_proof_passed": false,
+    "caveat": "macOS RSS and physical-footprint accounting is not symmetric for file-backed unified-memory resources"
+  },
+  "corrected_differential_gpu_us_ranges": {
+    "baseline": [4691, 4699],
+    "full_moe": [2669, 2688],
+    "moe_gate_up": [1718, 1800],
+    "moe_down": [827, 885],
+    "attention": [453, 463],
+    "input_rms_qkv": [407, 411],
+    "final_norm_head_argmax": [373, 462],
+    "router_topk": [228, 247],
+    "o_residual": [205, 258],
+    "rope_kv": [42, 51]
+  },
+  "quality": {
+    "triangular_infrastructure_complete": true,
+    "heldout_gate_complete": false,
+    "task_gate_complete": false,
+    "specialization_proof_passed": false,
+    "compiler_proof_passed": false,
+    "pareto_proof_passed": false
+  }
+}

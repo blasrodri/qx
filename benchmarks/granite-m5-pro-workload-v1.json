@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "model": "ibm-granite-3.0-1b-a400m-instruct",
+  "target": "apple-m5-pro",
+  "batch": 1,
+  "context": 512,
+  "sampling": "greedy",
+  "measured_tokens": 128,
+  "bands": {
+    "early": {"prefill_tokens": 1, "measured_positions": "1-128"},
+    "late": {"prefill_tokens": 384, "measured_positions": "385-512"}
+  },
+  "paired_blocks": 20,
+  "maximum_paired_blocks": 30,
+  "warmup": 3,
+  "fixtures": [
+    {"path": "fixtures/general.json", "source_hash": "fnv1a64:361ecc84e6f7a0bb"},
+    {"path": "fixtures/instruction.json", "source_hash": "fnv1a64:133509ec128ff2dc"},
+    {"path": "fixtures/code.json", "source_hash": "fnv1a64:d5106d54092bc1c8"},
+    {"path": "fixtures/reasoning.json", "source_hash": "fnv1a64:299160568256b7f2"},
+    {"path": "fixtures/chat.json", "source_hash": "fnv1a64:3648333824ced975"}
+  ],
+  "acceptance": {
+    "median_throughput_advantage": 0.03,
+    "paired_95_interval_above_parity": true,
+    "allow_significant_fixture_regression": false,
+    "internal_cpu_waits": 0
+  }
+}

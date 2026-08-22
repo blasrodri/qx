@@ -10,3 +10,5 @@ qx-format.workspace = true
 qx-model.workspace = true
 qx-quant.workspace = true
 rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -3,210 +3,146 @@
 Date: 2026-08-22  
 Target: Apple M5 Pro  
 Model: IBM Granite 3.0 1B-A400M Instruct  
-Canonical workload: batch-1 greedy decode, context 512, 128 sequential token
-steps from `benchmarks/granite_decode_512.json`
+Workload: batch-1 greedy decode, position 384 through 511, five fixed domains
 
 ## Executive status
 
-QX has a correct, complete, artifact-only GPU decode runtime. Runtime V2 keeps
-the transformer state, routing, expert intermediates, KV cache, logits, and
-argmax on the GPU. Each token uses one command buffer, one compute encoder, no
-internal CPU wait, and one final synchronization to return the selected token.
+QX now has the machinery needed to test three separate claims: runtime parity,
+specialization alpha, and automatic compiler selection. It does **not** yet
+pass the final Pareto gate against llama.cpp.
 
-The canonical release run after fixing fixture and warmup semantics is:
+The current quality-neutral top-8 runtime is about 200 tok/s in release builds,
+versus roughly 326 tok/s for the pinned llama control in the latest paired
+smoke. The remaining runtime gap is real. The new mmap/no-copy artifact path,
+however, removes the large duplicated host-weight allocation and gives QX a
+smaller artifact than the pinned GGUF.
 
-| Metric | QX V2 | llama.cpp reference |
+| Current measurement | QX | pinned llama control |
 |---|---:|---:|
-| Artifact/model bytes | 750,982,977 | 820,107,736 |
-| GPU ms/token | 4.987 median | not exposed by normal run |
-| Wall/eval ms/token | 5.418 median | 3.18 |
-| Decode tok/s | 184.58 median | 310.56 |
-| Command buffers/token | 1 | not instrumented |
-| Internal waits/token | 0 | not instrumented |
-| Dispatches/token | 461 | not instrumented |
-| Current process RSS | 1,214,414,848 B median | not exposed |
-| Peak process RSS | 1,891,237,888 B median | 916,668,416 B |
+| Model/artifact bytes | 751,009,792 | 821,844,576 |
+| Complete decode | ~200 tok/s | ~326 tok/s |
+| Wall latency | ~5.0 ms/token | ~3.1 ms/token |
+| Static model representation | group-32 Q4 | Q4_K_M |
+| Internal CPU waits | 0 | not yet equivalently exposed |
+| QX full no-copy RSS smoke | ~21 MB | ~914–922 MB process RSS |
+| Known QX Metal allocation | ~802 MB | 820,107,736 B model tensors before KV/scratch |
 
-The llama number is a fresh same-session `llama-simple` run from seed token
-8279 with 128 generated tokens, build commit `1719747`. QX currently reaches
-about 59.4% of its end-to-end throughput. The historical 205 tok/s QX result
-remains a valid observed run,
-but it is not the baseline to optimize against until reproduced under this
-canonical fixture and reporting path.
+RSS and macOS physical footprint are supporting measurements only: file-backed
+and unified-memory pages are not charged symmetrically. The defensible current
+memory facts are the smaller QX artifact, removal of copied host weights, and
+the explicit QX Metal allocation. A same-semantics total-allocation comparison
+is still required for the final memory proof.
 
-The eight-position sequential same-artifact gate passes through position 511:
-maximum KV-key error is below 0.01, logit cosine is 1.000000, and argmax agrees
-8/8. The release `qx-generate` command now uses Runtime V2 by default and emits
-coherent text; `--runtime v1` retains the reference runtime.
+## Canonical execution
 
-## Canonical architecture
+Artifact v2 carries a sealed execution plan with representations, topology,
+schedule, liveness/memory policy, sparse policy, target/workload constraints,
+and provenance. Runtime activation is driven by that plan rather than by a
+manually selected winner.
 
-The compiler emits a complete `.qx` artifact containing row-major group-32 Q4
-dense, router, embedding, gate/up, and down matrices plus exact FP32 norm
-vectors. Runtime V2 prepares persistent Metal resources from that artifact and
-uses a static 24-layer execution plan with a small reusable arena and dedicated
-KV allocation.
-
-The promoted per-layer graph is:
+The current top-8 graph is:
 
 ```text
 inverse-RMS scalar -> normalized fused QKV
 Q RoPE + direct K/V cache writes
-three-stage decode attention (QK, hierarchical softmax, GQA-aware V)
-Q4 O projection + residual
-inverse-RMS scalar -> normalized router -> top-8
-four-stage dynamic MoE (gate/up, SiLU product, down, weighted accumulation)
+three-stage attention (QK, hierarchical softmax, paired-GQA V)
+Q4 O + residual
+inverse-RMS scalar -> normalized router -> GPU top-8
+four-stage MoE (gate/up, SiLU product, down, weighted accumulation)
 residual
+final norm -> tied Q4 head -> GPU argmax -> u32 readback
 ```
 
-The token tail is final RMSNorm, tied Q4 LM head, hierarchical GPU argmax, then
-one `u32` readback.
+Every token has GPU-resident intermediates, no decode-time allocation, no
+intermediate readback, and one final CPU wait. Command-buffer count is now a
+compiler choice. A 15-pair, five-fixture diagnostic found that two GPU-ordered
+buffers reduced wall time by 0.137 ms/token (bootstrap 95% CI -0.151 to -0.121)
+without changing dispatch count or GPU work. It remains provisional until its
+full parity and quality/promotion records are complete.
 
-## What the experiments established
+Both the full mmap/no-copy one-buffer control and provisional two-buffer winner
+passed the hard sequential gate at
+positions `0,1,7,31,63,127,255,511`:
 
-### Execution topology is a first-class optimization
-
-Minimizing dispatches was repeatedly the wrong objective. Four-stage MoE beat
-the single fused MoE kernel, three-stage attention beat one-dispatch attention,
-and split/direct RoPE-KV improved the full model while increasing dispatches.
-The useful compiler objective is end-to-end latency subject to occupancy,
-register, memory, and quality constraints.
-
-### Local winners do not reliably compose
-
-Tile32 expert packing, split gate/up, and the `q2-kv1-g8` QKV geometry all won
-or looked promising in isolation and lost in the complete graph. Candidate
-selection therefore needs four tiers: kernel microbenchmark, producer/consumer
-replay, multi-layer replay, and complete-model promotion.
-
-### Correctness and quality are different gates
-
-Kernel/topology rewrites must pass the strict same-computation gate. Reduced
-precision or fewer active experts intentionally change the model and must be
-judged by teacher-forced NLL/PPL, KL, logit similarity, top-k behavior, and
-held-out generation. FP16 KV and active-k results made this distinction
-explicit.
-
-### MoE remains the dominant full-program opportunity
-
-Full-graph differential profiling attributes about 3.13 ms/token of removable
-cost to MoE, reconstructed coherently as roughly 2.02 ms gate/up, 1.09 ms down,
-and negligible SiLU/accumulation. Traffic controls show that selected-expert
-weight access dominates arithmetic, but simple prefetch, private resources,
-expert ordering, physical permutation, and uniform Q3 did not improve the
-complete model.
-
-### Active expert count has leverage but currently loses quality
-
-Global active-k improved the same-run GPU curve from 4.814 ms at k=8 to 4.448
-ms at k=6 and 3.576 ms at k=4. Teacher forcing rejected global k=7 (+3.59%
-PPL) and k=6 (+8.87% PPL). A layer-12-only k=6 policy stayed within the short
-quality budget (-0.33% PPL) and passed the implementation parity oracle, but
-its throughput was neutral. Canonical execution therefore remains top-8.
-
-## Promoted and rejected branches
-
-Promoted:
-
-- one-command-buffer Runtime V2;
-- cooperative Q4 SIMD kernels;
-- scalar RMS consumers for QKV and router/MoE;
-- fused QKV with canonical geometry;
-- split/direct RoPE-KV;
-- three-stage attention, hierarchical softmax, and paired-GQA V reduction;
-- four-stage dynamic top-8 MoE;
-- row-major expert representation at whole-model scope;
-- hierarchical GPU argmax;
-- canonical V2 user-facing generation.
-
-Retained only as diagnostics or rollback paths:
-
-- split Q/K/V and alternative fused-QKV geometry;
-- single-dispatch attention and single-dispatch MoE;
-- split gate/up;
-- Tile32, mixed, paired, reordered, and permuted expert plans;
-- serialized route prefetch and private static Metal buffers;
-- uniform dense or padded Q3 gate/up;
-- full FP16 KV under the strict reference contract;
-- global and current layerwise active-k policies.
-
-## What is still missing
-
-### 1. A quality-matched competitive baseline
-
-The largest scientific gap is a long, same-token, teacher-forced comparison of
-QX uniform Q4 against llama.cpp Q4_K_M. It must cover held-out general text,
-instruction/chat, code, and reasoning-like fixtures, with calibration and
-evaluation kept separate. Current active-k screening uses only 128 PTB
-positions and cannot support a product-quality claim.
-
-### 2. Steady-state and peak memory closure
-
-The logical Q4 target is about 765 MiB, current RSS is about 1.21 GB, and load
-peak is about 1.89 GB. The ~677 MB peak-to-current drop is close to the expert
-artifact size, strongly suggesting that faulted mmap pages coexist with copied
-Metal weight buffers during preparation. The next memory experiment should be
-mmap-backed/no-copy static Metal buffers or another streaming preparation path,
-plus allocation attribution for dense weights, expert weights, KV, pipelines,
-and scratch. Peak RSS alone previously overstated steady-state residency.
-
-### 3. A reproducible fresh llama comparison
-
-The canonical QX command is now fixture-stamped and the same-session llama run
-is recorded, but this must become an automated benchmark record containing the
-exact binary revision, flags, model hash, context, and token count. Per-kernel
-replay numbers are useful for hypotheses but are not additive live costs.
-
-### 4. Automated execution-plan selection
-
-QX has manually discovered several model/hardware-specific plans, but the
-compiler does not yet search, benchmark, store, and select them. The strongest
-thesis demonstrated so far is the search procedure, not an automated compiler.
-A plan database must treat full-program latency and quality as promotion gates.
-
-### 5. Sparse quality/latency allocation
-
-Uniform Q3 and global active-k are rejected, but the infrastructure supports a
-future optimizer over layer/expert precision and active count. This should not
-resume until the multi-domain quality harness exists. Router mass alone is not
-enough; actual weighted expert-output contribution and held-out NLL are needed.
-
-### 6. Repository reproducibility
-
-The workspace currently has no tracked baseline commit: every project file is
-reported as untracked. That makes artifact/result provenance fragile even
-though benchmark output now includes an artifact fingerprint. Establishing a
-real Git baseline is required before another large optimization phase.
-
-## Recommended order
-
-1. Freeze canonical top-8 V2 and record repeated same-session QX/llama runs.
-2. Build the matched multi-domain teacher-forced QX-Q4 versus llama-Q4 quality
-   gate.
-3. Attribute current and peak memory; test no-copy/mmap-backed static weights.
-4. Re-run the live differential profile under the canonical fixture and attack
-   only components with a large measured full-program delta and llama gap.
-5. Return to sparse specialization through a quality-constrained optimizer,
-   starting with actual expert contributions and layerwise choices.
-6. Encode successful/rejected plans into compiler-search data rather than
-   accumulating more environment-variable experiments.
-
-## Canonical commands
-
-```bash
-cargo build --release --workspace
-
-target/release/qx-bench \
-  external/models/granite-m5-pro-q4-dense.qx \
-  --v2-token --fixture benchmarks/granite_decode_512.json --warmup 3
-
-target/release/qx-bench \
-  external/models/granite-m5-pro-q4-dense.qx \
-  --model external/models/granite-3.0-1b-a400m-instruct \
-  --v2-parity --context 512
-
-target/release/qx-generate \
-  --model external/models/granite-3.0-1b-a400m-instruct \
-  --artifact external/models/granite-m5-pro-q4-dense.qx \
-  --prompt Hello --max-new-tokens 16 --context 512
+```text
+max KV key error       0.009850
+max KV value error     0.001048
+max attention error    0.000127
+max logit error        0.009907
+minimum logit cosine   1.000000
+argmax agreement       8/8
 ```
+
+## Corrected live attribution
+
+The profiler now prefills the real fixture to position 384 and freezes the
+canonical route trace for substitutions. Across all five fixtures, the
+complete-token baseline was about 4.69 ms GPU and the marginal ranges were:
+
+| Complete-token substitution | Marginal saving |
+|---|---:|
+| full MoE | 2.67–2.69 ms |
+| attention | 0.45–0.46 ms |
+| input RMS/QKV | 0.41 ms |
+| final norm/head/argmax | 0.37–0.46 ms |
+| router/top-k | 0.23–0.25 ms |
+| O/residual | 0.21–0.26 ms |
+| RoPE/KV | 0.04–0.05 ms |
+
+The fixed-route MoE decomposition is coherent: gate/up contributes roughly
+1.72–1.80 ms, down 0.83–0.89 ms, while SiLU and accumulation are negligible.
+These are marginal A/B measurements and are not added together to predict
+throughput. MoE is the next quality-neutral implementation target.
+
+## Implemented validation/compiler infrastructure
+
+- tracked benchmark provenance contract and five exact-token fixtures;
+- randomized paired QX/llama runner with thermal-transition retries and paired
+  bootstrap intervals;
+- early- and late-decode fixture support;
+- artifact-v2 sealed plan IDs and automatic evidence-based plan selector;
+- four promotion tiers: kernel, producer/consumer, multi-layer, complete model;
+- copied, hybrid, and full mmap/no-copy static-weight ownership candidates;
+- Q4_K expert representation and Metal kernel as an early scientific control;
+- triangular FP reference / llama / QX teacher-forced trace comparison;
+- confidence-width and 32,768-token/domain minimum enforcement;
+- paired HumanEval and GSM8K task-result scorer;
+- corrected full-graph and fixed-route MoE differential profilers;
+- a tracked patch reproducing the pinned llama instrumentation.
+
+The selector rejects missing task evidence, failed quality gates, missing
+promotion tiers, non-finite timings, internal CPU waits, and memory-budget
+violations. A numerically plausible but underpowered quality run cannot be
+promoted.
+
+## Controls and negative results
+
+The Q4_K expert control is implemented, byte-checked against a pinned llama C
+reference, and executable in the full model. On the current small calibration
+fixture it was both slower (~147 tok/s) and worse in PPL than QX group-32 Q4,
+so it is not canonical. The fixture is too small for final quality claims, but
+the control already separates representation from the rest of the runtime.
+
+Earlier Tile32, split gate/up, alternate fused-QKV geometry, uniform Q3,
+prefetch, physical expert permutation, and active-k candidates remain useful
+search evidence. None may be promoted from isolated timing alone.
+
+## What remains before the three proofs pass
+
+1. Run the held-out triangular gate on at least 32,768 tokens for each of
+   WikiText-2, Dolly, HumanEval, and GSM8K, increasing to 131,072 where needed.
+2. Supply paired greedy HumanEval execution results and GSM8K exact-match
+   results; perplexity is not a substitute for task accuracy.
+3. Run 20–30 randomized QX/llama pairs on AC power with a clean revision and
+   repeat any thermal-transition blocks.
+4. Close the current ~39% throughput deficit, beginning with the corrected
+   live top-8 MoE gate/up and down paths.
+5. Measure llama memory with semantics comparable to QX Metal/KV/scratch
+   allocation, then establish lower steady and peak physical footprint.
+6. Re-run clean install-time tuning and show it repeatedly selects the same
+   winner or a statistically equivalent Pareto plan.
+7. Only after top-8 is within 10% of llama may active-k, mixed precision, or
+   shared-plus-residual expert approximations enter the promotion frontier.
+
+See [qx-validation-plan-implementation.md](qx-validation-plan-implementation.md)
+for commands, schemas, and the proof checklist.

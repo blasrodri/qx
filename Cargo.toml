@@ -9,12 +9,18 @@ members = [
     "crates/qx-format",
     "crates/qx-safetensors",
     "crates/qx-tokenizer",
+    "crates/qx-eval",
     "tools/qx-inspect",
     "tools/qx-compile",
     "tools/qx-bench",
     "tools/qx-parity",
     "tools/qx-sensitivity",
     "tools/qx-generate",
+    "tools/qx-autotune",
+    "tools/qx-fixture",
+    "tools/qx-validate",
+    "tools/qx-quality",
+    "tools/qx-task-eval",
 ]
 resolver = "2"
 
@@ -38,8 +44,10 @@ qx-runtime = { path = "crates/qx-runtime" }
 qx-runtime-v2 = { path = "crates/qx-runtime-v2" }
 qx-safetensors = { path = "crates/qx-safetensors" }
 qx-tokenizer = { path = "crates/qx-tokenizer" }
+qx-eval = { path = "crates/qx-eval" }
 regex = "1"
 rayon = "1"
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
