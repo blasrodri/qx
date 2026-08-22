@@ -19,6 +19,17 @@
     "winner": "granite-m5-top8-rowinline-nocopy-2cb-candidate",
     "selection_basis": "lowest measured complete-model latency after exact semantic verification"
   },
+  "ac_paired_runtime": {
+    "pairs": 20,
+    "row_inline_median_qx_tokens_per_second": 220.1685579518476,
+    "row_inline_median_llama_tokens_per_second": 322.406,
+    "row_inline_throughput_advantage_median": -0.3092,
+    "row_inline_throughput_advantage_ci_95": [-0.3580, -0.3221],
+    "row_major_throughput_advantage_median": -0.3542,
+    "row_major_throughput_advantage_ci_95": [-0.3564, -0.3518],
+    "runtime_parity": "not achieved",
+    "power_state": "AC charging"
+  },
   "fixed_route_moe_differential_gpu_us_per_token": {
     "row_major": {
       "full_moe": 4542.874987237155,

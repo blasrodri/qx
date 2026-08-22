@@ -203,5 +203,11 @@ accounted for `246.79` us of the reduction and down for another `67.29` us;
 SiLU and accumulation were unchanged within measurement noise. The consolidated
 record is `benchmarks/results/row-inline-specialization-result-2026-08-22.json`.
 
+The final AC paired runtime gate does not yet pass against llama.cpp. Across 20
+early/late paired blocks, row-inline's throughput advantage was `-30.92%` with
+95% interval `[-35.80%, -32.21%]`; the row-major control was `-35.42%` with
+interval `[-35.64%, -35.18%]`. This rejects the runtime-parity claim while
+preserving the exact-semantic compiler-selection result.
+
 See [qx-validation-plan-implementation.md](qx-validation-plan-implementation.md)
 for commands, schemas, and the proof checklist.
