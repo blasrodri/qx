@@ -97,6 +97,7 @@ enum ExpertFormat {
 enum ExpertLayout {
     RowMajor,
     Tile32,
+    RowInline,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -110,6 +111,7 @@ impl From<ExpertLayout> for PackingLayout {
         match value {
             ExpertLayout::RowMajor => Self::RowMajor,
             ExpertLayout::Tile32 => Self::MetalTile32,
+            ExpertLayout::RowInline => Self::Q4RowInline,
         }
     }
 }
@@ -703,6 +705,11 @@ fn representation_for(tensors: &[CompiledTensor], kind: TensorKind) -> ExpertRep
             && tensor.tensor.layout == PackingLayout::MetalTile32
     }) {
         ExpertRepresentation::Group32Q4MetalTile32
+    } else if matching.iter().all(|tensor| {
+        tensor.tensor.quant_type == QuantType::Q4
+            && tensor.tensor.layout == PackingLayout::Q4RowInline
+    }) {
+        ExpertRepresentation::Group32Q4RowInline
     } else {
         ExpertRepresentation::MixedQ2Q3Q4
     }

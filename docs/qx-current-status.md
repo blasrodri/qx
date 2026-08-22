@@ -163,5 +163,23 @@ The candidate is retained as an artifact-v2 plan ID and runtime variant so the
 automatic selector can represent and reject it from evidence, rather than
 silently deleting a failed search branch.
 
+The next exact-Q4 transport candidate is now implemented as
+`group32_q4_row_inline`. Each group stores its existing 16 Q4 code bytes and
+2-byte FP16 scale contiguously. It has identical logical values, identical
+artifact size, and uses dedicated live Metal kernels for gate/up and down.
+The first five-fixture release screen is consistently positive:
+
+| Plan | Median-ish wall range | Throughput range |
+|---|---:|---:|
+| row-major control | 4.942--4.978 ms/token | 200.88--202.34 tok/s |
+| row-inline candidate | 4.607--4.647 ms/token | 215.20--217.06 tok/s |
+
+The candidate also passed the complete sequential gate at
+`0,1,7,31,63,127,255,511` with cosine `1.000000` and `8/8` argmax agreement.
+This is the first representation candidate with a repeatable complete-model
+win, but it is not canonical yet: it still needs randomized paired suite
+evidence and the triangular held-out quality gate. The result is recorded in
+`benchmarks/results/row-inline-q4-candidate-2026-08-22.json`.
+
 See [qx-validation-plan-implementation.md](qx-validation-plan-implementation.md)
 for commands, schemas, and the proof checklist.

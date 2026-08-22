@@ -97,6 +97,9 @@ pub fn activate_artifact_execution_plan(
         qx_format::ExpertRepresentation::Group32Q4MetalTile32 => {
             set_plan_env("QX_V2_MOE_LAYOUT", "tile32")
         }
+        qx_format::ExpertRepresentation::Group32Q4RowInline => {
+            set_plan_env("QX_V2_MOE_LAYOUT", "row-inline")
+        }
         qx_format::ExpertRepresentation::MixedQ2Q3Q4 => set_plan_env("QX_V2_MOE_LAYOUT", "mixed"),
         qx_format::ExpertRepresentation::Q4K => set_plan_env("QX_V2_MOE_LAYOUT", "rowmajor"),
         qx_format::ExpertRepresentation::DenseQ3 | qx_format::ExpertRepresentation::PaddedQ3 => {
@@ -717,6 +720,9 @@ fn moe_requested_layout() -> Option<qx_quant::PackingLayout> {
         .as_deref()
     {
         Some("row") | Some("rowmajor") | Some("current") => Some(qx_quant::PackingLayout::RowMajor),
+        Some("row-inline") | Some("inline") | Some("q4-row-inline") => {
+            Some(qx_quant::PackingLayout::Q4RowInline)
+        }
         Some("tile") | Some("tile32") | Some("lane") | Some("lane-native") => {
             Some(qx_quant::PackingLayout::MetalTile32)
         }
@@ -1363,6 +1369,11 @@ impl PreparedMoeStack {
                 );
             }
             return load_no_copy_moe_stack(context, artifact, requested_layout);
+        }
+        if requested_layout == Some(qx_quant::PackingLayout::Q4RowInline) {
+            return Err(
+                "Q4 row-inline currently requires mmap/no-copy or hybrid expert slabs".to_owned(),
+            );
         }
         let mut layers = Vec::with_capacity(LAYERS);
         for (layer, layer_permutation) in permutation.iter().enumerate() {

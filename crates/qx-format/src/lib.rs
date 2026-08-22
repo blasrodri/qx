@@ -21,6 +21,7 @@ pub const WEIGHT_SLAB_ALIGNMENT: u64 = 16 * 1024;
 pub enum ExpertRepresentation {
     Group32Q4RowMajor,
     Group32Q4MetalTile32,
+    Group32Q4RowInline,
     MixedQ2Q3Q4,
     DenseQ3,
     PaddedQ3,
@@ -474,6 +475,39 @@ impl MappedArtifact {
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("QX tensor index out of range"))?;
         let (scales, data) = self.tensor_bytes(index)?;
+        if entry.layout == PackingLayout::Q4RowInline {
+            if entry.quant_type != QuantType::Q4 || entry.group_size != 32 {
+                bail!("inline artifact tensor is not group-32 Q4");
+            }
+            let groups = (entry.cols as usize).div_ceil(entry.group_size as usize);
+            let group_bytes = 16_usize;
+            let stride = groups * (group_bytes + 2);
+            if data.len() != entry.rows as usize * stride {
+                bail!("inline artifact tensor has invalid stream length");
+            }
+            let mut split_data = Vec::with_capacity(entry.rows as usize * groups * group_bytes);
+            let mut split_scales = Vec::with_capacity(entry.rows as usize * groups);
+            for row in 0..entry.rows as usize {
+                for group in 0..groups {
+                    let start = row * stride + group * (group_bytes + 2);
+                    split_data.extend_from_slice(&data[start..start + group_bytes]);
+                    split_scales.push(f16::from_bits(u16::from_le_bytes(
+                        data[start + group_bytes..start + group_bytes + 2]
+                            .try_into()
+                            .unwrap(),
+                    )));
+                }
+            }
+            return Ok(QuantizedTensor {
+                quant_type: entry.quant_type,
+                layout: PackingLayout::RowMajor,
+                rows: entry.rows as usize,
+                cols: entry.cols as usize,
+                group_size: entry.group_size as usize,
+                scales: split_scales,
+                data: split_data,
+            });
+        }
         if scales.len() % 2 != 0 {
             bail!("QX scale section is not FP16 aligned");
         }
@@ -646,6 +680,36 @@ fn write_artifact_internal(
             group_end += 1;
         }
         let group = &physical_order[group_start..group_end];
+        if first.tensor.layout == PackingLayout::Q4RowInline {
+            for index in group {
+                let compiled = &tensors[*index];
+                let inline = compiled
+                    .tensor
+                    .row_inline_bytes()
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                let offset = data_offset + blobs.len() as u64;
+                blobs.extend_from_slice(&inline);
+                quantized_entries[*index] = Some(TensorDirectoryEntry {
+                    layer: compiled.layer,
+                    expert: compiled.expert,
+                    quant_type: compiled.tensor.quant_type,
+                    layout: compiled.tensor.layout,
+                    kind: compiled.kind,
+                    rows: compiled.tensor.rows as u32,
+                    cols: compiled.tensor.cols as u32,
+                    group_size: compiled.tensor.group_size as u16,
+                    // Inline entries deliberately point both views at the
+                    // same exact byte stream. Runtime preparation selects
+                    // the inline Metal kernel from the layout tag.
+                    scale_offset: offset,
+                    scale_length: inline.len() as u64,
+                    data_offset: offset,
+                    data_length: inline.len() as u64,
+                });
+            }
+            group_start = group_end;
+            continue;
+        }
         let mut scale_locations = Vec::with_capacity(group.len());
         for index in group {
             let tensor = &tensors[*index].tensor;
@@ -983,6 +1047,41 @@ mod tests {
         );
         assert_eq!(artifact.info.entries[0].quant_type, QuantType::Q3);
         assert_eq!(artifact.info.memory_plan.total_bytes, 10);
+    }
+
+    #[test]
+    fn artifact_round_trip_decodes_row_inline_q4_stream() {
+        let values = (0..64)
+            .map(|index| (index as f32 - 12.0) / 7.0)
+            .collect::<Vec<_>>();
+        let mut tensor = QuantizedTensor::quantize(&values, 2, 32, QuantType::Q4, 32);
+        tensor.layout = PackingLayout::Q4RowInline;
+        let path = std::env::temp_dir().join(format!("qx-inline-{}.qx", std::process::id()));
+        write_artifact_with_raw(
+            &path,
+            "granite",
+            "apple-m5-pro",
+            512,
+            MemoryPlan {
+                weights_bytes: tensor.bytes() as u64,
+                total_bytes: tensor.bytes() as u64,
+                ..Default::default()
+            },
+            &[CompiledTensor {
+                layer: 0,
+                expert: 0,
+                kind: TensorKind::GateUp,
+                tensor: tensor.clone(),
+            }],
+            &[],
+        )
+        .unwrap();
+        let artifact = MappedArtifact::open(&path).unwrap();
+        let decoded = artifact.quantized_tensor(0).unwrap();
+        assert_eq!(decoded.layout, PackingLayout::RowMajor);
+        assert_eq!(decoded.data, tensor.data);
+        assert_eq!(decoded.scales, tensor.scales);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

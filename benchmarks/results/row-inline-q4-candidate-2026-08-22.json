@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "status": "candidate_not_canonical",
+  "candidate_plan": "granite-m5-top8-rowinline-nocopy-2cb-candidate",
+  "control_plan": "granite-m5-top8-rowmajor-nocopy-2cb-v2",
+  "workload": "context-512, batch-1, greedy, 128 decode positions",
+  "artifact_bytes": 751009792,
+  "known_metal_bytes": 802373632,
+  "dispatches_per_token": 461,
+  "command_buffers_per_token": 2,
+  "parity": {
+    "positions": [0, 1, 7, 31, 63, 127, 255, 511],
+    "max_kv_key_error": 0.009853,
+    "max_kv_value_error": 0.001048,
+    "max_attention_error": 0.000127,
+    "max_logit_error": 0.009898,
+    "minimum_logit_cosine": 1.0,
+    "argmax_agreement": "8/8"
+  },
+  "fixtures": {
+    "general": {"candidate_wall_ms": 4.607, "control_wall_ms": 4.942, "candidate_tok_s": 217.06, "control_tok_s": 202.34},
+    "instruction": {"candidate_wall_ms": 4.647, "control_wall_ms": 4.978, "candidate_tok_s": 215.20, "control_tok_s": 200.88},
+    "code": {"candidate_wall_ms": 4.619, "control_wall_ms": 4.949, "candidate_tok_s": 216.50, "control_tok_s": 202.07},
+    "reasoning": {"candidate_wall_ms": 4.616, "control_wall_ms": 4.948, "candidate_tok_s": 216.63, "control_tok_s": 202.10},
+    "chat": {"candidate_wall_ms": 4.630, "control_wall_ms": 4.953, "candidate_tok_s": 215.98, "control_tok_s": 201.92}
+  },
+  "note": "Single release run per fixture; rerun through qx-autotune paired suite and triangular quality gate before promotion."
+}
