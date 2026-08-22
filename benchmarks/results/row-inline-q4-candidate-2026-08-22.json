@@ -8,6 +8,16 @@
   "known_metal_bytes": 802373632,
   "dispatches_per_token": 461,
   "command_buffers_per_token": 2,
+  "provenance": {
+    "qx_revision": "f3ee7e8edcc60c7709fe65fe17b5a532f64926ac",
+    "candidate_artifact_sha256": "2451019310dfebc8ef14986e799bded41405d7bf816ab400487bacd0c4d8f50f",
+    "control_artifact_sha256": "14090a7f8fa6881d61c51d1ba4739182f335baa2e97066c2f7640dedc440e92a",
+    "metal_sources_sha256": "2fdc8996ee1f1e4eff03d883da2395fcdffe796750e9e38d1bc8ad289952bc20",
+    "workload_contract_sha256": "7ca84dd6e2113e1f3828d2dde69f66060f4c87a65b3d125ae4e8b3e2f7ab318c",
+    "llama_revision": "17197474510622a3b4ea7d0909d70b606f542b96",
+    "hardware": "Apple M5 Pro",
+    "os_build": "25F84"
+  },
   "parity": {
     "positions": [0, 1, 7, 31, 63, 127, 255, 511],
     "max_kv_key_error": 0.009853,
