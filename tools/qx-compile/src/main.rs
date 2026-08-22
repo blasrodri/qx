@@ -42,6 +42,11 @@ struct Args {
     /// row-major the Granite/M5 control even though Tile32 wins in isolation.
     #[arg(long, value_enum, default_value_t = ExpertLayout::RowMajor)]
     expert_layout: ExpertLayout,
+    /// Four-stage MoE execution candidate. `wide-expert` changes only the
+    /// threadgroup mapping; it is never selected without complete-model
+    /// evidence by qx-autotune.
+    #[arg(long, value_enum, default_value_t = MoeVariant::FourStage)]
+    moe_variant: MoeVariant,
     #[arg(long, default_value_t = MAX_CONTEXT)]
     context: usize,
     /// Stable identifier embedded in artifact v2 for compiler/autotuner provenance.
@@ -92,6 +97,12 @@ enum ExpertFormat {
 enum ExpertLayout {
     RowMajor,
     Tile32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum MoeVariant {
+    FourStage,
+    WideExpert,
 }
 
 impl From<ExpertLayout> for PackingLayout {
@@ -623,6 +634,10 @@ fn main() -> Result<()> {
         ExpertRepresentation::MixedQ2Q3Q4
     } else {
         ExpertRepresentation::Group32Q4RowMajor
+    };
+    execution_plan.topology.moe = match args.moe_variant {
+        MoeVariant::FourStage => qx_format::MoeTopology::FourStage,
+        MoeVariant::WideExpert => qx_format::MoeTopology::FourStageWideExpert,
     };
     write_artifact_with_raw_and_plan(
         &args.output,

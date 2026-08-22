@@ -127,6 +127,15 @@ fixtures, combines those measurements with kernel, producer/consumer, and
 multi-layer screening evidence, reads each sealed plan from its artifact, and
 selects by measured complete-model latency subject to quality and memory.
 
+The current search also includes the first explicit live-MoE topology
+candidate, `four_stage_wide_expert`. It is deliberately feature-flagged and
+not canonical. Its initial screening was negative: a 1024-threadgroup-per-
+expert mapping increased live gate/up and down latency and failed to remain
+usable through the long parity replay. The canonical four-stage mapping is
+therefore still selected by default. The result is retained as evidence that
+the compiler must optimize occupancy and full execution context, not merely
+reduce repeated activation staging.
+
 ```bash
 target/release/qx-autotune \
   --suite autotune-suite.json --write-evidence autotune-evidence.json \

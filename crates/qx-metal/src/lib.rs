@@ -171,6 +171,23 @@ pub mod platform {
         })
     }
 
+    /// Experimental four-stage MoE topology: one 1024-threadgroup owns each
+    /// selected expert projection. It reduces repeated staging of the small
+    /// batch-1 activation vector. The canonical path remains the default.
+    pub fn moe_wide_expert_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("QX_V2_MOE_WIDE_EXPERT")
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
     /// Validated fixed-shape RoPE/KV topology. The split Q plus direct-KV
     /// path is canonical after its sequential parity and full-token gates.
     /// Set `QX_V2_ROPE_KV_TOPOLOGY=legacy` (or `0`) for the one-dispatch
@@ -467,6 +484,9 @@ pub mod platform {
         simd_pipeline: Pipeline,
         batched_gate_up_pipeline: Pipeline,
         batched_gate_up_norm_pipeline: Pipeline,
+        wide_gate_up_pipeline: Pipeline,
+        wide_gate_up_norm_pipeline: Pipeline,
+        wide_supported: bool,
         q3_gate_up_pipeline: Option<Pipeline>,
         q3_gate_up_norm_pipeline: Option<Pipeline>,
         q3_gate_up_packed: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
@@ -484,6 +504,7 @@ pub mod platform {
         batched_projection_norm_pipeline: Pipeline,
         batched_silu_pipeline: Pipeline,
         batched_down_pipeline: Pipeline,
+        wide_down_pipeline: Pipeline,
         batched_accumulate_pipeline: Pipeline,
         gate_up_packed: RuntimeBuffer,
         gate_up_scales: RuntimeBuffer,
@@ -1649,10 +1670,15 @@ pub mod platform {
             let gate_up_layout = prepared.gate_up_layout as u32;
             let down_layout = prepared.down_layout as u32;
             let q3_block_bytes = prepared.q3_gate_up_block_bytes;
+            let wide_expert =
+                moe_wide_expert_enabled() && prepared.wide_supported && q3_block_bytes.is_none();
 
             if let Some((norm_weights, inverse_rms)) = norm {
                 if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
                     self.encoder.setComputePipelineState(pipeline);
+                } else if wide_expert {
+                    self.encoder
+                        .setComputePipelineState(&prepared.wide_gate_up_norm_pipeline);
                 } else {
                     self.encoder
                         .setComputePipelineState(&prepared.batched_gate_up_norm_pipeline);
@@ -1676,6 +1702,9 @@ pub mod platform {
             } else {
                 if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
                     self.encoder.setComputePipelineState(pipeline);
+                } else if wide_expert {
+                    self.encoder
+                        .setComputePipelineState(&prepared.wide_gate_up_pipeline);
                 } else {
                     self.encoder
                         .setComputePipelineState(&prepared.batched_gate_up_pipeline);
@@ -1723,12 +1752,12 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: 8 * (1024 / 8),
+                    width: if wide_expert { 8 } else { 8 * (1024 / 8) },
                     height: 1,
                     depth: 1,
                 },
                 MTLSize {
-                    width: 256,
+                    width: if wide_expert { 1024 } else { 256 },
                     height: 1,
                     depth: 1,
                 },
@@ -1755,8 +1784,13 @@ pub mod platform {
                 },
             );
 
-            self.encoder
-                .setComputePipelineState(&prepared.batched_down_pipeline);
+            if wide_expert {
+                self.encoder
+                    .setComputePipelineState(&prepared.wide_down_pipeline);
+            } else {
+                self.encoder
+                    .setComputePipelineState(&prepared.batched_down_pipeline);
+            }
             unsafe {
                 self.encoder.setBuffer_offset_atIndex(
                     Some(&prepared.down_packed.buffer),
@@ -1788,12 +1822,12 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: 8 * (1024 / 8),
+                    width: if wide_expert { 8 } else { 8 * (1024 / 8) },
                     height: 1,
                     depth: 1,
                 },
                 MTLSize {
-                    width: 256,
+                    width: if wide_expert { 1024 } else { 256 },
                     height: 1,
                     depth: 1,
                 },
@@ -2338,11 +2372,16 @@ pub mod platform {
             let gate_up_layout = prepared.gate_up_layout as u32;
             let down_layout = prepared.down_layout as u32;
             let q3_block_bytes = prepared.q3_gate_up_block_bytes;
+            let wide_expert =
+                moe_wide_expert_enabled() && prepared.wide_supported && q3_block_bytes.is_none();
             match stage {
                 0 => {
                     if let Some((norm_weights, inverse_rms)) = norm {
                         if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
                             self.encoder.setComputePipelineState(pipeline);
+                        } else if wide_expert {
+                            self.encoder
+                                .setComputePipelineState(&prepared.wide_gate_up_norm_pipeline);
                         } else {
                             self.encoder
                                 .setComputePipelineState(&prepared.batched_gate_up_norm_pipeline);
@@ -2362,6 +2401,9 @@ pub mod platform {
                     } else {
                         if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
                             self.encoder.setComputePipelineState(pipeline);
+                        } else if wide_expert {
+                            self.encoder
+                                .setComputePipelineState(&prepared.wide_gate_up_pipeline);
                         } else {
                             self.encoder
                                 .setComputePipelineState(&prepared.batched_gate_up_pipeline);
@@ -2412,12 +2454,12 @@ pub mod platform {
                     }
                     self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: 1024,
+                            width: if wide_expert { 8 } else { 1024 },
                             height: 1,
                             depth: 1,
                         },
                         MTLSize {
-                            width: 256,
+                            width: if wide_expert { 1024 } else { 256 },
                             height: 1,
                             depth: 1,
                         },
@@ -2452,8 +2494,13 @@ pub mod platform {
                     );
                 }
                 2 => {
-                    self.encoder
-                        .setComputePipelineState(&prepared.batched_down_pipeline);
+                    if wide_expert {
+                        self.encoder
+                            .setComputePipelineState(&prepared.wide_down_pipeline);
+                    } else {
+                        self.encoder
+                            .setComputePipelineState(&prepared.batched_down_pipeline);
+                    }
                     unsafe {
                         self.encoder.setBuffer_offset_atIndex(
                             Some(&prepared.down_packed.buffer),
@@ -2488,12 +2535,12 @@ pub mod platform {
                     }
                     self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: 1024,
+                            width: if wide_expert { 8 } else { 1024 },
                             height: 1,
                             depth: 1,
                         },
                         MTLSize {
-                            width: 256,
+                            width: if wide_expert { 1024 } else { 256 },
                             height: 1,
                             depth: 1,
                         },
@@ -5360,6 +5407,11 @@ pub mod platform {
                 batched_gate_up_pipeline: self.dynamic_moe_named_pipeline(gate_up_pipeline)?,
                 batched_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline(gate_up_norm_pipeline)?,
+                wide_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_wide_simd")?,
+                wide_gate_up_norm_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_wide_norm_simd")?,
+                wide_supported: is_q4,
                 q3_gate_up_pipeline: None,
                 q3_gate_up_norm_pipeline: None,
                 q3_gate_up_packed: None,
@@ -5387,6 +5439,8 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_projection_norm_simd")?,
                 batched_silu_pipeline: self.dynamic_moe_named_pipeline("qx_dynamic_q4_moe_silu")?,
                 batched_down_pipeline: self.dynamic_moe_named_pipeline(down_pipeline)?,
+                wide_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_wide_simd")?,
                 batched_accumulate_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_accumulate")?,
                 gate_up_packed: self.input_runtime_buffer(gate_up_packed)?,
@@ -5456,6 +5510,11 @@ pub mod platform {
                 batched_gate_up_pipeline: self.dynamic_moe_named_pipeline(gate_up_pipeline)?,
                 batched_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline(gate_up_norm_pipeline)?,
+                wide_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_wide_simd")?,
+                wide_gate_up_norm_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_wide_norm_simd")?,
+                wide_supported: is_q4,
                 q3_gate_up_pipeline: None,
                 q3_gate_up_norm_pipeline: None,
                 q3_gate_up_packed: None,
@@ -5483,6 +5542,8 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_projection_norm_simd")?,
                 batched_silu_pipeline: self.dynamic_moe_named_pipeline("qx_dynamic_q4_moe_silu")?,
                 batched_down_pipeline: self.dynamic_moe_named_pipeline(down_pipeline)?,
+                wide_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_wide_simd")?,
                 batched_accumulate_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_accumulate")?,
                 gate_up_packed,
@@ -5592,6 +5653,11 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_simd")?,
                 batched_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_norm_simd")?,
+                wide_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_wide_simd")?,
+                wide_gate_up_norm_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_wide_norm_simd")?,
+                wide_supported: true,
                 q3_gate_up_pipeline: None,
                 q3_gate_up_norm_pipeline: None,
                 q3_gate_up_packed: None,
@@ -5620,6 +5686,8 @@ pub mod platform {
                 batched_silu_pipeline: self.dynamic_moe_named_pipeline("qx_dynamic_q4_moe_silu")?,
                 batched_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_simd")?,
+                wide_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_wide_simd")?,
                 batched_accumulate_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_accumulate")?,
                 gate_up_packed: self.input_runtime_buffer(gate_up_packed)?,

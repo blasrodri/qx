@@ -62,6 +62,10 @@ pub enum AttentionTopology {
 pub enum MoeTopology {
     SingleDispatch,
     FourStage,
+    /// Four-stage MoE with one 1024-threadgroup per selected expert. This is
+    /// an install-time candidate; it is intentionally distinct from the
+    /// canonical 8-rows-per-threadgroup mapping.
+    FourStageWideExpert,
     SplitGateUp,
 }
 

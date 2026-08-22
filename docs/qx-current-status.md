@@ -144,5 +144,24 @@ search evidence. None may be promoted from isolated timing alone.
 7. Only after top-8 is within 10% of llama may active-k, mixed precision, or
    shared-plus-residual expert approximations enter the promotion frontier.
 
+## Latest MoE candidate screening
+
+The first implementation candidate after the corrected live attribution was a
+`four_stage_wide_expert` plan. It kept the canonical top-8 Q4 representation,
+four GPU stages, GPU-resident routes, and numerical operations, but changed the
+Metal mapping to one 1024-threadgroup per selected expert so the input vector
+would be staged once per expert instead of once per eight-row tile.
+
+It was rejected during screening. On the live layer profile it measured about
+342 us for gate/up and 178 us for down, and the long sequential parity replay
+was already abnormally slow by position 127. The canonical row-major mapping
+remains the control. This is not a promotion result; it is a valid negative
+compiler candidate showing that reducing activation staging does not overcome
+the occupancy/register cost of a 1024-threadgroup on this workload.
+
+The candidate is retained as an artifact-v2 plan ID and runtime variant so the
+automatic selector can represent and reject it from evidence, rather than
+silently deleting a failed search branch.
+
 See [qx-validation-plan-implementation.md](qx-validation-plan-implementation.md)
 for commands, schemas, and the proof checklist.

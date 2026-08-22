@@ -74,8 +74,18 @@ pub fn activate_artifact_execution_plan(
         }
     }
     match plan.topology.moe {
-        qx_format::MoeTopology::FourStage => set_plan_bool_env("QX_V2_MOE_SPLIT_GATE_UP", false),
-        qx_format::MoeTopology::SplitGateUp => set_plan_bool_env("QX_V2_MOE_SPLIT_GATE_UP", true),
+        qx_format::MoeTopology::FourStage => {
+            set_plan_bool_env("QX_V2_MOE_SPLIT_GATE_UP", false);
+            set_plan_bool_env("QX_V2_MOE_WIDE_EXPERT", false);
+        }
+        qx_format::MoeTopology::FourStageWideExpert => {
+            set_plan_bool_env("QX_V2_MOE_SPLIT_GATE_UP", false);
+            set_plan_bool_env("QX_V2_MOE_WIDE_EXPERT", true);
+        }
+        qx_format::MoeTopology::SplitGateUp => {
+            set_plan_bool_env("QX_V2_MOE_SPLIT_GATE_UP", true);
+            set_plan_bool_env("QX_V2_MOE_WIDE_EXPERT", false);
+        }
         qx_format::MoeTopology::SingleDispatch => {
             return Err("single-dispatch MoE is diagnostic-only and cannot be sealed".to_owned());
         }
