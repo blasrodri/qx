@@ -439,7 +439,9 @@ fn validation_metadata_descendant(expected: &str, actual: &str) -> Result<bool> 
     let paths = String::from_utf8(output.stdout)?;
     Ok(!paths.trim().is_empty()
         && paths.lines().all(|path| {
-            path.starts_with("benchmarks/granite-m5-pro-validation-") && path.ends_with(".json")
+            (path.starts_with("benchmarks/granite-m5-pro-validation-")
+                || path.starts_with("benchmarks/results/"))
+                && path.ends_with(".json")
         }))
 }
 
