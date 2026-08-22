@@ -127,6 +127,14 @@ fixtures, combines those measurements with kernel, producer/consumer, and
 multi-layer screening evidence, reads each sealed plan from its artifact, and
 selects by measured complete-model latency subject to quality and memory.
 
+For exact transport/layout candidates, a suite entry may instead provide
+`exact_equivalent_to`. The runner then compares every decoded quantized tensor
+against the reference artifact, including codes and FP16 scales. This is a
+strict quality-neutral path for representation candidates such as row-major
+versus row-inline Q4; lossy candidates still require the triangular quality
+gate. The selection report records the equivalence result, complete-model
+latency for every candidate, and the measured reason for the winner.
+
 The current search also includes the first explicit live-MoE topology
 candidate, `four_stage_wide_expert`. It is deliberately feature-flagged and
 not canonical. Its initial screening was negative: a 1024-threadgroup-per-

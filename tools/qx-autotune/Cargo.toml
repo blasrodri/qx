@@ -9,5 +9,6 @@ anyhow.workspace = true
 clap.workspace = true
 qx-compiler.workspace = true
 qx-format.workspace = true
+qx-quant.workspace = true
 serde.workspace = true
 serde_json.workspace = true

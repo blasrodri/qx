@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "qx_bench": "target/release/qx-bench",
+  "fixtures": [
+    "benchmarks/fixtures/general.json",
+    "benchmarks/fixtures/instruction.json",
+    "benchmarks/fixtures/code.json",
+    "benchmarks/fixtures/reasoning.json",
+    "benchmarks/fixtures/chat.json"
+  ],
+  "rounds": 3,
+  "warmup": 2,
+  "candidates": [
+    {
+      "artifact": "external/models/granite-m5-pro-q4-rowmajor-nocopy-2cb-v2.qx",
+      "screening_tiers": [
+        {"tier": "kernel", "wall_ms_per_token": 0.320, "gpu_ms_per_token": 0.300},
+        {"tier": "producer_consumer", "wall_ms_per_token": 0.021, "gpu_ms_per_token": 0.020},
+        {"tier": "multi_layer", "wall_ms_per_token": 0.0053, "gpu_ms_per_token": 0.0051}
+      ],
+      "exact_equivalent_to": "external/models/granite-m5-pro-q4-rowmajor-nocopy-2cb-v2.qx"
+    },
+    {
+      "artifact": "external/models/granite-m5-pro-q4-rowinline-nocopy-2cb-candidate.qx",
+      "screening_tiers": [
+        {"tier": "kernel", "wall_ms_per_token": 0.271, "gpu_ms_per_token": 0.271},
+        {"tier": "producer_consumer", "wall_ms_per_token": 0.021, "gpu_ms_per_token": 0.020},
+        {"tier": "multi_layer", "wall_ms_per_token": 0.0046, "gpu_ms_per_token": 0.0043}
+      ],
+      "exact_equivalent_to": "external/models/granite-m5-pro-q4-rowmajor-nocopy-2cb-v2.qx"
+    }
+  ]
+}

@@ -42,7 +42,20 @@ struct Args {
 #[derive(Serialize)]
 struct SelectionReport<'a> {
     selected_plan_id: &'a str,
+    selected_complete_model_wall_ms_per_token: f64,
+    selected_reason: &'static str,
+    candidates: Vec<CandidateSummary>,
     rejected: &'a [(String, qx_compiler::CandidateRejection)],
+}
+
+#[derive(Serialize)]
+struct CandidateSummary {
+    plan_id: String,
+    exact_semantics_verified: bool,
+    complete_model_wall_ms_per_token: f64,
+    complete_model_gpu_ms_per_token: f64,
+    peak_physical_footprint_bytes: u64,
+    quality_accepted: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,7 +82,14 @@ const fn default_warmup() -> usize {
 struct CandidateRun {
     artifact: PathBuf,
     screening_tiers: Vec<TierMeasurement>,
-    quality_gate: PathBuf,
+    #[serde(default)]
+    quality_gate: Option<PathBuf>,
+    /// Optional reference artifact for exact transport/layout candidates.
+    /// The runner verifies every quantized tensor decodes to identical codes
+    /// and scales before allowing the candidate to use the exact-semantic
+    /// quality path.
+    #[serde(default)]
+    exact_equivalent_to: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,10 +150,43 @@ fn main() -> Result<()> {
     )
     .with_context(|| format!("write {}", args.output.display()))?;
     if let Some(report) = &args.report {
+        let candidates_report = candidates
+            .iter()
+            .map(|candidate| {
+                let complete = candidate
+                    .tiers
+                    .iter()
+                    .find(|measurement| measurement.tier == PromotionTier::CompleteModel)
+                    .expect("complete-model tier is added by run_suite or required by evidence");
+                CandidateSummary {
+                    plan_id: candidate.plan.plan_id.clone(),
+                    exact_semantics_verified: candidate.exact_semantics_verified,
+                    complete_model_wall_ms_per_token: complete.wall_ms_per_token,
+                    complete_model_gpu_ms_per_token: complete.gpu_ms_per_token,
+                    peak_physical_footprint_bytes: candidate.memory.peak_physical_footprint_bytes,
+                    quality_accepted: candidate.quality.accepted
+                        || candidate.exact_semantics_verified,
+                }
+            })
+            .collect();
+        let selected_complete_model_wall_ms_per_token = candidates
+            .iter()
+            .find(|candidate| candidate.plan.plan_id == selection.selected.plan_id)
+            .and_then(|candidate| {
+                candidate
+                    .tiers
+                    .iter()
+                    .find(|measurement| measurement.tier == PromotionTier::CompleteModel)
+            })
+            .map(|measurement| measurement.wall_ms_per_token)
+            .expect("selected plan has complete-model evidence");
         fs::write(
             report,
             serde_json::to_vec_pretty(&SelectionReport {
                 selected_plan_id: &selection.selected.plan_id,
+                selected_complete_model_wall_ms_per_token,
+                selected_reason: "lowest measured complete-model wall latency after semantic, quality, memory, and promotion-tier gates",
+                candidates: candidates_report,
                 rejected: &selection.rejected,
             })?,
         )
@@ -254,16 +307,42 @@ fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
                 wall_ms_per_token: wall,
                 gpu_ms_per_token: gpu,
             });
-            let quality_gate = serde_json::from_slice::<QualityGateRecord>(
-                &fs::read(&candidate.quality_gate)
-                    .with_context(|| format!("read {}", candidate.quality_gate.display()))?,
-            )?;
-            if !quality_gate.accepted {
-                eprintln!(
-                    "candidate {} carries a failed quality gate and will be rejected",
+            let exact_semantics_verified = if let Some(reference) = &candidate.exact_equivalent_to {
+                verify_exact_semantics(&candidate.artifact, reference)?;
+                true
+            } else {
+                false
+            };
+            let quality_gate = candidate
+                .quality_gate
+                .as_ref()
+                .map(|path| -> Result<QualityGateRecord> {
+                    let bytes =
+                        fs::read(path).with_context(|| format!("read {}", path.display()))?;
+                    Ok(serde_json::from_slice::<QualityGateRecord>(&bytes)?)
+                })
+                .transpose()?;
+            if quality_gate.is_none() && !exact_semantics_verified {
+                bail!(
+                    "candidate {} requires a triangular quality gate or exact_equivalent_to proof",
                     candidate.artifact.display()
                 );
             }
+            if let Some(quality_gate) = &quality_gate {
+                if !quality_gate.accepted {
+                    eprintln!(
+                        "candidate {} carries a failed quality gate and will be rejected",
+                        candidate.artifact.display()
+                    );
+                }
+            }
+            let quality_gate = quality_gate.unwrap_or(QualityGateRecord {
+                aggregate_relative_ppl_delta: 0.0,
+                worst_domain_relative_ppl_delta: 0.0,
+                human_eval_delta_points_vs_llama: Some(0.0),
+                gsm8k_delta_points_vs_llama: Some(0.0),
+                accepted: true,
+            });
             Ok(PlanCandidateEvidence {
                 plan,
                 tiers,
@@ -292,9 +371,114 @@ fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
                         record.mapped_artifact_bytes
                     }),
                 },
+                exact_semantics_verified,
             })
         })
         .collect()
+}
+
+fn verify_exact_semantics(candidate_path: &PathBuf, reference_path: &PathBuf) -> Result<()> {
+    let candidate = qx_format::MappedArtifact::open(candidate_path)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let reference = qx_format::MappedArtifact::open(reference_path)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let candidate_plan = candidate
+        .info()
+        .execution_plan
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("candidate artifact has no execution plan"))?;
+    let reference_plan = reference
+        .info()
+        .execution_plan
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("reference artifact has no execution plan"))?;
+    let compatible_expert_layout =
+        |candidate: qx_format::ExpertRepresentation, reference: qx_format::ExpertRepresentation| {
+            candidate == reference
+                || matches!(
+                    (candidate, reference),
+                    (
+                        qx_format::ExpertRepresentation::Group32Q4RowInline,
+                        qx_format::ExpertRepresentation::Group32Q4RowMajor
+                    ) | (
+                        qx_format::ExpertRepresentation::Group32Q4RowMajor,
+                        qx_format::ExpertRepresentation::Group32Q4RowInline
+                    )
+                )
+        };
+    if candidate_plan.model_id != reference_plan.model_id
+        || candidate_plan.target != reference_plan.target
+        || candidate_plan.workload != reference_plan.workload
+        || candidate_plan.topology != reference_plan.topology
+        || candidate_plan.schedule != reference_plan.schedule
+        || candidate_plan.sparse_experts != reference_plan.sparse_experts
+        || candidate_plan.memory != reference_plan.memory
+        || candidate_plan.representations.dense != reference_plan.representations.dense
+        || !compatible_expert_layout(
+            candidate_plan.representations.gate_up,
+            reference_plan.representations.gate_up,
+        )
+        || !compatible_expert_layout(
+            candidate_plan.representations.down,
+            reference_plan.representations.down,
+        )
+    {
+        bail!("exact-equivalence artifacts differ outside expert transport layout");
+    }
+    if candidate.info().entries.len() != reference.info().entries.len() {
+        bail!("exact-equivalence artifacts have different tensor counts");
+    }
+    for (reference_index, reference_entry) in reference.info().entries.iter().enumerate() {
+        let candidate_index = candidate
+            .info()
+            .entries
+            .iter()
+            .position(|entry| {
+                entry.layer == reference_entry.layer
+                    && entry.expert == reference_entry.expert
+                    && entry.kind == reference_entry.kind
+            })
+            .ok_or_else(|| anyhow::anyhow!("candidate is missing a matching tensor entry"))?;
+        let candidate_entry = &candidate.info().entries[candidate_index];
+        let layout_compatible = candidate_entry.layout == reference_entry.layout
+            || (matches!(
+                reference_entry.kind,
+                qx_format::TensorKind::GateUp | qx_format::TensorKind::Down
+            ) && matches!(
+                (reference_entry.layout, candidate_entry.layout),
+                (
+                    qx_quant::PackingLayout::RowMajor,
+                    qx_quant::PackingLayout::Q4RowInline
+                ) | (
+                    qx_quant::PackingLayout::Q4RowInline,
+                    qx_quant::PackingLayout::RowMajor
+                )
+            ));
+        if candidate_entry.quant_type != reference_entry.quant_type
+            || candidate_entry.rows != reference_entry.rows
+            || candidate_entry.cols != reference_entry.cols
+            || candidate_entry.group_size != reference_entry.group_size
+            || !layout_compatible
+        {
+            bail!("exact-equivalence tensor metadata differs");
+        }
+        let reference_tensor = reference
+            .quantized_tensor(reference_index)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let candidate_tensor = candidate
+            .quantized_tensor(candidate_index)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if reference_tensor.quant_type != candidate_tensor.quant_type
+            || reference_tensor.rows != candidate_tensor.rows
+            || reference_tensor.cols != candidate_tensor.cols
+            || reference_tensor.group_size != candidate_tensor.group_size
+            || reference_tensor.data != candidate_tensor.data
+            || reference_tensor.scales != candidate_tensor.scales
+        {
+            bail!("exact-equivalence tensor values differ");
+        }
+    }
+    Ok(())
 }
 
 fn median(values: &[f64]) -> f64 {

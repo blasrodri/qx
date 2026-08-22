@@ -516,6 +516,13 @@ pub struct PlanCandidateEvidence {
     pub tiers: Vec<TierMeasurement>,
     pub quality: QualityMeasurement,
     pub memory: ResidentMemoryMeasurement,
+    /// True when the candidate's representation has been checked against an
+    /// equivalent artifact and every quantized tensor decodes to identical
+    /// codes and scales. This permits exact transport/layout candidates to
+    /// enter selection without pretending a missing triangular quality run
+    /// exists; lossy candidates still require the full quality gate.
+    #[serde(default)]
+    pub exact_semantics_verified: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -578,17 +585,21 @@ pub fn select_execution_plan(
             ));
             continue;
         }
-        let (Some(human_eval_delta), Some(gsm8k_delta)) = (
+        let (human_eval_delta, gsm8k_delta) = match (
             candidate.quality.human_eval_delta_points_vs_llama,
             candidate.quality.gsm8k_delta_points_vs_llama,
-        ) else {
-            rejected.push((
-                candidate.plan.plan_id.clone(),
-                CandidateRejection::MissingQuality,
-            ));
-            continue;
+        ) {
+            (Some(human_eval_delta), Some(gsm8k_delta)) => (human_eval_delta, gsm8k_delta),
+            _ if candidate.exact_semantics_verified => (0.0, 0.0),
+            _ => {
+                rejected.push((
+                    candidate.plan.plan_id.clone(),
+                    CandidateRejection::MissingQuality,
+                ));
+                continue;
+            }
         };
-        if !candidate.quality.accepted
+        if (!candidate.quality.accepted && !candidate.exact_semantics_verified)
             || candidate.quality.aggregate_relative_ppl_delta_vs_llama
                 > constraints.max_aggregate_relative_ppl_delta
             || candidate.quality.maximum_domain_relative_ppl_delta_vs_llama
@@ -852,6 +863,7 @@ mod tests {
                 known_metal_bytes: 760_000_000,
                 mapped_model_bytes: 750_000_000,
             },
+            exact_semantics_verified: false,
         }
     }
 
@@ -886,5 +898,25 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn exact_semantic_candidate_can_enter_selection_without_triangular_run() {
+        let mut candidate = plan_candidate("row-inline", 4.4, 0.0);
+        candidate.quality.accepted = false;
+        candidate.quality.human_eval_delta_points_vs_llama = None;
+        candidate.quality.gsm8k_delta_points_vs_llama = None;
+        candidate.exact_semantics_verified = true;
+        let result = select_execution_plan(
+            &[candidate],
+            PlanSelectionConstraints {
+                max_aggregate_relative_ppl_delta: 0.01,
+                max_domain_relative_ppl_delta: 0.02,
+                max_task_delta_points: 2.0,
+                max_peak_physical_footprint_bytes: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.selected.plan_id, "row-inline");
     }
 }

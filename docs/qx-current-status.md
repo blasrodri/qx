@@ -181,5 +181,21 @@ win, but it is not canonical yet: it still needs randomized paired suite
 evidence and the triangular held-out quality gate. The result is recorded in
 `benchmarks/results/row-inline-q4-candidate-2026-08-22.json`.
 
+The compiler-selection experiment is now also real rather than descriptive.
+`qx-autotune` ran row-major and row-inline as two artifact-v2 candidates,
+verified every quantized tensor decodes to identical codes and scales, and
+selected row-inline from complete-model measurements:
+
+| Plan | Complete-model wall | Peak physical footprint |
+|---|---:|---:|
+| row-major | 4.8592 ms/token | 111,559,280 B |
+| row-inline | 4.5404 ms/token | 111,592,072 B |
+
+The selection report is
+`benchmarks/results/rowinline-selection-report-2026-08-22.json`. This is the
+first compiler-proof artifact for a model/hardware/workload-specific physical
+representation choice. It does not yet claim the final triangular quality
+gate or parity with llama.cpp.
+
 See [qx-validation-plan-implementation.md](qx-validation-plan-implementation.md)
 for commands, schemas, and the proof checklist.

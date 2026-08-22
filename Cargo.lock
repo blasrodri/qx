@@ -365,6 +365,7 @@ dependencies = [
  "clap",
  "qx-compiler",
  "qx-format",
+ "qx-quant",
  "serde",
  "serde_json",
 ]
