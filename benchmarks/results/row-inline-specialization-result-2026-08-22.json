@@ -30,6 +30,19 @@
     "runtime_parity": "not achieved",
     "power_state": "AC charging"
   },
+  "q4k_control": {
+    "artifact": "external/models/granite-m5-pro-q4k-current-control.qx",
+    "artifact_sha256": "bffb7b087c03aec3fad32e69a6389d7283817a4e98429a62393575c0f23956b9",
+    "representation": "Q4_K experts with QX dense Q4, mmap/no-copy, 2 command buffers",
+    "general_fixture_wall_ms_per_token": 6.490797851562499,
+    "general_fixture_gpu_ms_per_token": 6.190945638536505,
+    "general_fixture_tokens_per_second": 154.06426495924143,
+    "exact_parity_positions": [0, 1, 7, 31, 63, 127, 255, 511],
+    "exact_parity_minimum_logit_cosine": 1.0,
+    "exact_parity_argmax_agreement": "8/8",
+    "quality_gate": "pending",
+    "runtime_result": "slower_than_exact-q4-row-inline-control"
+  },
   "fixed_route_moe_differential_gpu_us_per_token": {
     "row_major": {
       "full_moe": 4542.874987237155,

@@ -209,5 +209,13 @@ early/late paired blocks, row-inline's throughput advantage was `-30.92%` with
 interval `[-35.64%, -35.18%]`. This rejects the runtime-parity claim while
 preserving the exact-semantic compiler-selection result.
 
+The current Q4_K scientific control is also complete at the runtime/parity
+screening level. With the same dense Q4, mmap/no-copy, two-command-buffer plan,
+Q4_K measured `154.06 tok/s` / `6.491 ms` wall per token on the general
+context-512 fixture, versus `216.15 tok/s` / `4.626 ms` for row-inline in the
+same local run. Its sequential parity checkpoints passed with cosine `1.0`
+and `8/8` argmax agreement. The Q4_K triangular quality gate remains pending,
+so this is a performance control, not a quality claim.
+
 See [qx-validation-plan-implementation.md](qx-validation-plan-implementation.md)
 for commands, schemas, and the proof checklist.
