@@ -118,10 +118,11 @@ promoted.
 ## Controls and negative results
 
 The Q4_K expert control is implemented, byte-checked against a pinned llama C
-reference, and executable in the full model. On the current small calibration
-fixture it was both slower (~147 tok/s) and worse in PPL than QX group-32 Q4,
-so it is not canonical. The fixture is too small for final quality claims, but
-the control already separates representation from the rest of the runtime.
+reference, and executable in the full model. Rebuilt with the current dense Q4,
+mmap/no-copy, two-command-buffer plan, it measured `154.06 tok/s` versus
+`216.15 tok/s` for row-inline Q4 on the same context-512 fixture. It is now
+frozen permanently as a scientific representation control, not a production
+candidate. Its full triangular quality gate remains pending.
 
 Earlier Tile32, split gate/up, alternate fused-QKV geometry, uniform Q3,
 prefetch, physical expert permutation, and active-k candidates remain useful
@@ -129,13 +130,14 @@ search evidence. None may be promoted from isolated timing alone.
 
 ## What remains before the three proofs pass
 
-1. Run the held-out triangular gate on at least 32,768 tokens for each of
-   WikiText-2, Dolly, HumanEval, and GSM8K, increasing to 131,072 where needed.
+1. Run the held-out triangular gate with WikiText-2 and Dolly using NLL/PPL
+   acceptance, and HumanEval/GSM8K using task accuracy acceptance; retain
+   teacher-forced NLL/logit diagnostics for all four.
 2. Supply paired greedy HumanEval execution results and GSM8K exact-match
    results; perplexity is not a substitute for task accuracy.
 3. Run 20–30 randomized QX/llama pairs on AC power with a clean revision and
    repeat any thermal-transition blocks.
-4. Close the current ~39% throughput deficit, beginning with the corrected
+4. Close the current ~31% throughput deficit, beginning with the corrected
    live top-8 MoE gate/up and down paths.
 5. Measure llama memory with semantics comparable to QX Metal/KV/scratch
    allocation, then establish lower steady and peak physical footprint.

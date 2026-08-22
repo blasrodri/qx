@@ -20,6 +20,7 @@ members = [
     "tools/qx-fixture",
     "tools/qx-validate",
     "tools/qx-quality",
+    "tools/qx-quality-corpus",
     "tools/qx-task-eval",
 ]
 resolver = "2"

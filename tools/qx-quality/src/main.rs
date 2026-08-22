@@ -123,6 +123,8 @@ struct TaskMetrics {
 struct QualityGateReport {
     schema_version: u32,
     domains: usize,
+    ppl_domains: Vec<String>,
+    task_domains: Vec<String>,
     positions: u64,
     aggregate_relative_ppl_delta: f64,
     worst_domain_relative_ppl_delta: f64,
@@ -268,7 +270,25 @@ fn gate(reports: Vec<PathBuf>, tasks: Option<PathBuf>, output: PathBuf) -> Resul
             "quality gate requires held-out WikiText-2, Dolly, HumanEval, and GSM8K token streams"
         );
     }
-    let minimum_domain_positions = reports
+    let text_reports = reports
+        .iter()
+        .filter(|report| {
+            matches!(
+                report.domain.to_ascii_lowercase().as_str(),
+                "wikitext-2" | "dolly"
+            )
+        })
+        .collect::<Vec<_>>();
+    let task_domains = reports
+        .iter()
+        .filter(|report| {
+            matches!(
+                report.domain.to_ascii_lowercase().as_str(),
+                "humaneval" | "gsm8k"
+            )
+        })
+        .collect::<Vec<_>>();
+    let minimum_domain_positions = text_reports
         .iter()
         .map(|report| report.candidate.positions)
         .min()
@@ -276,22 +296,22 @@ fn gate(reports: Vec<PathBuf>, tasks: Option<PathBuf>, output: PathBuf) -> Resul
     if minimum_domain_positions < 32_768 {
         bail!("every held-out quality domain requires at least 32,768 scored positions");
     }
-    let positions = reports
+    let positions = text_reports
         .iter()
         .map(|report| report.candidate.positions)
         .sum::<u64>();
-    let llama_nll = reports
+    let llama_nll = text_reports
         .iter()
         .map(|report| report.llama.nll * report.llama.positions as f64)
         .sum::<f64>()
         / positions as f64;
-    let candidate_nll = reports
+    let candidate_nll = text_reports
         .iter()
         .map(|report| report.candidate.nll * report.candidate.positions as f64)
         .sum::<f64>()
         / positions as f64;
     let aggregate_delta = (candidate_nll - llama_nll).exp() - 1.0;
-    let worst_domain = reports
+    let worst_domain = text_reports
         .iter()
         .map(|report| report.candidate_vs_llama.relative_ppl_delta)
         .fold(f64::NEG_INFINITY, f64::max);
@@ -330,6 +350,14 @@ fn gate(reports: Vec<PathBuf>, tasks: Option<PathBuf>, output: PathBuf) -> Resul
     let gate = QualityGateReport {
         schema_version: 1,
         domains: reports.len(),
+        ppl_domains: text_reports
+            .iter()
+            .map(|report| report.domain.clone())
+            .collect(),
+        task_domains: task_domains
+            .iter()
+            .map(|report| report.domain.clone())
+            .collect(),
         positions,
         aggregate_relative_ppl_delta: aggregate_delta,
         worst_domain_relative_ppl_delta: worst_domain,

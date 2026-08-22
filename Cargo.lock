@@ -518,6 +518,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "qx-quality-corpus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "qx-eval",
+ "qx-tokenizer",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "qx-quant"
 version = "0.1.0"
 dependencies = [

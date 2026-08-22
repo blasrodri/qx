@@ -45,12 +45,30 @@ pairs. `--pairs 1` is smoke-only.
 
 ## Triangular quality gate
 
-`qx-eval` defines exact corpus and logit-trace formats. `qx-quality` prepares
-token streams, compares FP16/BF16 reference, llama Q4_K_M, and QX traces, and
-gates aggregate/domain PPL, block-bootstrap uncertainty, KL, cosine, and top-k
-agreement. Held-out domains must be exactly WikiText-2, Dolly, HumanEval, and
-GSM8K, with at least 32,768 scored positions each. Data grows to 131,072 where
-the interval cannot resolve one percentage point of relative PPL.
+`qx-eval` defines exact corpus and logit-trace formats. `qx-quality` compares
+FP16/BF16 reference, llama Q4_K_M, and QX traces. WikiText-2 and Dolly drive
+the NLL/PPL gates; HumanEval and GSM8K drive task-accuracy gates while retaining
+teacher-forced NLL, KL, cosine, and top-k diagnostics. Text domains require at
+least 32,768 scored positions and grow to 131,072 where the interval cannot
+resolve one percentage point of relative PPL.
+
+Build a reproducible corpus manifest before generating traces:
+
+```bash
+target/release/qx-quality-corpus \
+  --model external/models/granite-3.0-1b-a400m-instruct \
+  --wikitext quality/raw/wikitext-2-heldout.txt \
+  --dolly quality/raw/dolly-heldout.txt \
+  --humaneval quality/raw/humaneval-heldout.jsonl \
+  --gsm8k quality/raw/gsm8k-heldout.jsonl \
+  --source-revision DATASET_REVISION \
+  --output quality/granite-heldout
+```
+
+The manifest seals the source revision, split, sampling seed and strategy,
+tokenizer hash, raw-source hash, processed-corpus hash, and token/record
+counts. It writes `wikitext.tokens`, `dolly.tokens`, `humaneval.jsonl`, and
+`gsm8k.jsonl` beside `manifest.json`.
 
 ```bash
 target/release/qx-quality prepare \
