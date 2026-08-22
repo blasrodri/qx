@@ -197,5 +197,11 @@ first compiler-proof artifact for a model/hardware/workload-specific physical
 representation choice. It does not yet claim the final triangular quality
 gate or parity with llama.cpp.
 
+The fixed-route differential also explains the win. Row-inline reduced the
+complete live MoE marginal from `4542.87` to `4224.17` GPU us/token. Gate/up
+accounted for `246.79` us of the reduction and down for another `67.29` us;
+SiLU and accumulation were unchanged within measurement noise. The consolidated
+record is `benchmarks/results/row-inline-specialization-result-2026-08-22.json`.
+
 See [qx-validation-plan-implementation.md](qx-validation-plan-implementation.md)
 for commands, schemas, and the proof checklist.

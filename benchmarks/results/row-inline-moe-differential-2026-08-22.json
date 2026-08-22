@@ -1,0 +1,43 @@
+{
+  "schema_version": 2,
+  "artifact": "external/models/granite-m5-pro-q4-rowinline-nocopy-2cb-candidate.qx",
+  "fixture_name": "general-systems",
+  "fixture_domain": "general",
+  "context": 512,
+  "position": 384,
+  "routes_frozen": true,
+  "iterations": 100,
+  "warmup": 1,
+  "rows": [
+    {
+      "name": "canonical MoE",
+      "gpu_us_per_token": 4224.166652420536,
+      "dispatches": 461,
+      "marginal_saved_us": 0.0
+    },
+    {
+      "name": "without gate/up",
+      "gpu_us_per_token": 2823.0000170879066,
+      "dispatches": 461,
+      "marginal_saved_us": 1401.166635332629
+    },
+    {
+      "name": "without SiLU",
+      "gpu_us_per_token": 4230.041668051854,
+      "dispatches": 461,
+      "marginal_saved_us": -5.875015631318092
+    },
+    {
+      "name": "without down",
+      "gpu_us_per_token": 3460.99998569116,
+      "dispatches": 461,
+      "marginal_saved_us": 763.1666667293757
+    },
+    {
+      "name": "without accumulation",
+      "gpu_us_per_token": 4201.166651910171,
+      "dispatches": 461,
+      "marginal_saved_us": 23.00000051036477
+    }
+  ]
+}

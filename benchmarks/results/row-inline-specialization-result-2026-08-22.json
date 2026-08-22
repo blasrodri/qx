@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "result": "specialization_1_exact_q4_row_inline",
+  "status": "compiler_proof_initial",
+  "workload": "Granite 3.0 1B, Apple M5 Pro, batch 1, context 512, 128 decode positions",
+  "control_artifact": "external/models/granite-m5-pro-q4-rowmajor-nocopy-2cb-v2.qx",
+  "candidate_artifact": "external/models/granite-m5-pro-q4-rowinline-nocopy-2cb-candidate.qx",
+  "semantic_equivalence": {
+    "verified_by": "qx-autotune exact_equivalent_to",
+    "quantized_tensor_codes_and_scales": "pass",
+    "sequential_parity_positions": [0, 1, 7, 31, 63, 127, 255, 511],
+    "minimum_logit_cosine": 1.0,
+    "argmax_agreement": "8/8"
+  },
+  "automatic_selection": {
+    "control_wall_ms_per_token": 4.852781898437501,
+    "candidate_wall_ms_per_token": 4.536928390625,
+    "improvement_percent": 6.508,
+    "winner": "granite-m5-top8-rowinline-nocopy-2cb-candidate",
+    "selection_basis": "lowest measured complete-model latency after exact semantic verification"
+  },
+  "fixed_route_moe_differential_gpu_us_per_token": {
+    "row_major": {
+      "full_moe": 4542.874987237155,
+      "gate_up": 1647.958328248933,
+      "down": 830.4583025164902,
+      "silu": -1.0833609849214554,
+      "accumulation": 22.2083181142807
+    },
+    "row_inline": {
+      "full_moe": 4224.166652420536,
+      "gate_up": 1401.166635332629,
+      "down": 763.1666667293757,
+      "silu": -5.875015631318092,
+      "accumulation": 23.00000051036477
+    },
+    "delta_row_inline_minus_row_major": {
+      "full_moe": -318.708334816619,
+      "gate_up": -246.791693560304,
+      "down": -67.2916357871145
+    }
+  },
+  "quality_gate": "pending",
+  "llama_runtime_parity": "not achieved"
+}
