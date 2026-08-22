@@ -11,7 +11,7 @@
     "fixtures/chat.json"
   ],
   "provenance": {
-    "qx_revision": "e3c323281a2cd23be735b296856d7defe7351e25",
+    "qx_revision": "34cf4f82fef7d92ebce503c4430cd5ee4c62b880",
     "llama_revision": "17197474510622a3b4ea7d0909d70b606f542b96",
     "artifact_sha256": "14090a7f8fa6881d61c51d1ba4739182f335baa2e97066c2f7640dedc440e92a",
     "gguf_sha256": "46a2a757a579446d95d900085a5daaf59d78bb753302f656ec01a7192b4928a6",
