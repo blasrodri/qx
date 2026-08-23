@@ -2251,6 +2251,85 @@ struct ContextualTiming {
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Serialize)]
+struct TwoCommandBufferTiming {
+    predecessor_gpu_us: f64,
+    moe_gpu_us: f64,
+    total_gpu_us: f64,
+    wall_us: f64,
+    dispatches: f64,
+    command_buffers: f64,
+    encoders: f64,
+}
+
+#[cfg(target_os = "macos")]
+fn profile_two_command_buffers<P, M>(
+    context: &qx_metal::platform::MetalContext,
+    warmup: usize,
+    iterations: usize,
+    mut encode_predecessor: P,
+    mut encode_moe: M,
+) -> Result<TwoCommandBufferTiming>
+where
+    P: FnMut(&mut qx_metal::platform::DecodeGraph) -> Result<()>,
+    M: FnMut(&mut qx_metal::platform::DecodeGraph) -> Result<()>,
+{
+    let run = |encode_predecessor: &mut P,
+               encode_moe: &mut M|
+     -> Result<(f64, f64, f64, f64, f64)> {
+        let before = context.metrics().map_err(anyhow::Error::msg)?;
+        let start = Instant::now();
+        let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+        encode_predecessor(&mut graph)?;
+        // This commits CB1 without waiting and starts CB2 on the same Metal
+        // queue. The final wait happens only in finish(), after CB2.
+        graph
+            .begin_next_command_buffer(context)
+            .map_err(anyhow::Error::msg)?;
+        encode_moe(&mut graph)?;
+        graph.finish(context).map_err(anyhow::Error::msg)?;
+        let after = context.metrics().map_err(anyhow::Error::msg)?;
+        let timeline = context.last_stage_timeline().map_err(anyhow::Error::msg)?;
+        let predecessor_gpu_us = timeline.segment_gpu_seconds.first().copied().unwrap_or(0.0) * 1e6;
+        let moe_gpu_us = timeline.segment_gpu_seconds.get(1).copied().unwrap_or(0.0) * 1e6;
+        Ok((
+            predecessor_gpu_us,
+            moe_gpu_us,
+            (after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1e6,
+            start.elapsed().as_secs_f64() * 1e6,
+            (after.dispatches - before.dispatches) as f64,
+        ))
+    };
+
+    for _ in 0..warmup {
+        run(&mut encode_predecessor, &mut encode_moe)?;
+    }
+    let mut predecessor = Vec::with_capacity(iterations);
+    let mut moe = Vec::with_capacity(iterations);
+    let mut total = Vec::with_capacity(iterations);
+    let mut wall = Vec::with_capacity(iterations);
+    let mut dispatches = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let (pred, moe_time, total_time, wall_time, dispatch_count) =
+            run(&mut encode_predecessor, &mut encode_moe)?;
+        predecessor.push(pred);
+        moe.push(moe_time);
+        total.push(total_time);
+        wall.push(wall_time);
+        dispatches.push(dispatch_count);
+    }
+    Ok(TwoCommandBufferTiming {
+        predecessor_gpu_us: median_sample(&mut predecessor),
+        moe_gpu_us: median_sample(&mut moe),
+        total_gpu_us: median_sample(&mut total),
+        wall_us: median_sample(&mut wall),
+        dispatches: median_sample(&mut dispatches),
+        command_buffers: 2.0,
+        encoders: 2.0,
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Serialize)]
 struct ContextualMemory {
     artifact_bytes: u64,
     mapped_artifact_bytes: u64,
@@ -2623,17 +2702,116 @@ fn benchmark_v2_moe_contextual_profile(
 }
 
 #[cfg(target_os = "macos")]
+fn encode_canonical_pre_moe(
+    graph: &mut qx_metal::platform::DecodeGraph,
+    context: &qx_metal::platform::MetalContext,
+    buffers: &qx_runtime_v2::GpuRuntimeBuffers,
+    stack: &qx_runtime_v2::PreparedAttentionStack,
+    position: usize,
+) -> Result<()> {
+    graph
+        .encode_q4_embedding_lookup(
+            &stack.embedding_lookup,
+            buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+            buffers.buffer(qx_runtime_v2::BufferId::HiddenA),
+            EMBEDDING_MULTIPLIER,
+        )
+        .map_err(anyhow::Error::msg)?;
+
+    // This is the real pre-MoE workload: embedding, attention-side layer
+    // work, post-attention normalization, router, and top-k. MoE itself is
+    // deliberately omitted so CB2 can contain the exact frozen-route MoE.
+    // The hidden state after each layer is therefore a workload carrier, not
+    // a semantic model output; this probe is about GPU interference only.
+    for (layer, weights) in stack.layers.iter().enumerate() {
+        let input = if layer.is_multiple_of(2) {
+            qx_runtime_v2::BufferId::HiddenA
+        } else {
+            qx_runtime_v2::BufferId::HiddenB
+        };
+        let output = if layer.is_multiple_of(2) {
+            qx_runtime_v2::BufferId::HiddenB
+        } else {
+            qx_runtime_v2::BufferId::HiddenA
+        };
+        buffers
+            .encode_attention_layer(
+                graph,
+                layer,
+                input,
+                output,
+                &weights.input_norm,
+                &weights.qkv,
+                &weights.o_proj,
+                position,
+            )
+            .map_err(anyhow::Error::msg)?;
+        let inverse_rms = buffers
+            .buffer(qx_runtime_v2::BufferId::MoeScratch)
+            .subregion(81_916, std::mem::size_of::<f32>())
+            .map_err(anyhow::Error::msg)?;
+        if qx_metal::platform::rms_scalar_router_enabled() {
+            graph
+                .encode_rmsnorm_scalar(
+                    context,
+                    buffers.buffer(output),
+                    &weights.post_attention_norm,
+                    &inverse_rms,
+                )
+                .map_err(anyhow::Error::msg)?;
+            graph
+                .encode_prepared_q4_dense_simd_normalized(
+                    &weights.router,
+                    buffers.buffer(output),
+                    &weights.post_attention_norm,
+                    &inverse_rms,
+                    buffers.buffer(qx_runtime_v2::BufferId::RouterScores),
+                )
+                .map_err(anyhow::Error::msg)?;
+        } else {
+            graph
+                .encode_rmsnorm(
+                    context,
+                    buffers.buffer(output),
+                    &weights.post_attention_norm,
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeInput),
+                )
+                .map_err(anyhow::Error::msg)?;
+            graph
+                .encode_prepared_q4_dense_simd(
+                    &weights.router,
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeInput),
+                    buffers.buffer(qx_runtime_v2::BufferId::RouterScores),
+                )
+                .map_err(anyhow::Error::msg)?;
+        }
+        graph
+            .encode_topk(
+                context,
+                buffers.buffer(qx_runtime_v2::BufferId::RouterScores),
+                buffers.buffer(qx_runtime_v2::BufferId::TopKIds),
+                buffers.buffer(qx_runtime_v2::BufferId::TopKWeights),
+            )
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn encode_moe_predecessor(
     graph: &mut qx_metal::platform::DecodeGraph,
     context: &qx_metal::platform::MetalContext,
     buffers: &qx_runtime_v2::GpuRuntimeBuffers,
+    stack: &qx_runtime_v2::PreparedAttentionStack,
     moe: &qx_runtime_v2::PreparedMoeStack,
     route_trace: &RouteTrace,
+    position: usize,
     mode: &str,
 ) -> Result<()> {
     match mode {
         "none" => Ok(()),
         "noop-24" => differential_noops(graph, context, LAYERS),
+        "canonical-24" => encode_canonical_pre_moe(graph, context, buffers, stack, position),
         "compute-24" => {
             for layer in 0..LAYERS {
                 let ids = route_trace.ids_for(layer)?;
@@ -2663,8 +2841,23 @@ fn encode_moe_predecessor(
             }
             Ok(())
         }
+        "contiguous-memory-24" => {
+            for layer in 0..LAYERS {
+                let ids = route_trace.ids_for(layer)?;
+                graph
+                    .encode_dynamic_q4_moe_gate_up_touch(
+                        &moe.layers[layer],
+                        &ids,
+                        buffers.buffer(qx_runtime_v2::BufferId::MoeInput),
+                        buffers.buffer(qx_runtime_v2::BufferId::MoeScratch),
+                        11,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+            }
+            Ok(())
+        }
         other => bail!(
-            "unknown MoE predecessor {other}; expected none, noop-24, compute-24, or memory-24"
+            "unknown MoE predecessor {other}; expected none, noop-24, canonical-24, compute-24, contiguous-memory-24, or memory-24"
         ),
     }
 }
@@ -2709,32 +2902,53 @@ fn benchmark_v2_moe_predecessor_profile(
         context_length,
     )?;
     let route_trace = capture_route_trace(context.as_ref(), &buffers, &stack, &moe, position)?;
-    let modes = ["none", "noop-24", "compute-24", "memory-24"];
+    let modes = [
+        ("none/control", "none"),
+        ("24 no-ops", "noop-24"),
+        ("canonical pre-MoE graph", "canonical-24"),
+        ("compute-heavy", "compute-24"),
+        ("contiguous-memory-heavy", "contiguous-memory-24"),
+        ("selected-expert-memory-heavy", "memory-24"),
+    ];
     let mut rows = Vec::with_capacity(modes.len());
-    println!("QX fixed-route MoE predecessor perturbation");
+    println!("QX two-command-buffer fixed-route MoE attribution");
     println!("artifact:         {}", artifact_path.display());
     println!("context/position: {context_length}/{position}");
     println!("routes frozen:    true");
-    println!("predecessor                         GPU us       wall us  dispatches");
-    for mode in modes {
-        let timing =
-            profile_graph_stage_contextual(context.as_ref(), warmup, iterations, |graph| {
+    println!("CB1 predecessor is committed without a CPU wait; CB2 contains MoE only.");
+    println!(
+        "predecessor                         CB1 GPU us  CB2 MoE us  total GPU us   wall us  dispatches"
+    );
+    for (label, mode) in modes {
+        let timing = profile_two_command_buffers(
+            context.as_ref(),
+            warmup,
+            iterations,
+            |graph| {
                 encode_moe_predecessor(
                     graph,
                     context.as_ref(),
                     &buffers,
+                    &stack,
                     &moe,
                     &route_trace,
+                    position,
                     mode,
-                )?;
-                encode_fixed_route_moe(graph, &buffers, &stack, &moe, &route_trace, false)
-            })?;
+                )
+            },
+            |graph| encode_fixed_route_moe(graph, &buffers, &stack, &moe, &route_trace, false),
+        )?;
         println!(
-            "{mode:<34} {:>10.2}  {:>10.2}  {:>10.2}",
-            timing.gpu_us_per_sample, timing.wall_us_per_sample, timing.dispatches_per_sample
+            "{label:<34} {:>11.2}  {:>10.2}  {:>12.2}  {:>8.2}  {:>10.2}",
+            timing.predecessor_gpu_us,
+            timing.moe_gpu_us,
+            timing.total_gpu_us,
+            timing.wall_us,
+            timing.dispatches,
         );
         rows.push(serde_json::json!({
             "predecessor": mode,
+            "label": label,
             "timing": timing,
         }));
     }
@@ -2742,7 +2956,7 @@ fn benchmark_v2_moe_predecessor_profile(
         let (artifact_bytes, artifact_hash) = artifact_fingerprint(artifact_path)?;
         let report = serde_json::json!({
             "schema_version": 1,
-            "mode": "v2_moe_predecessor_profile",
+            "mode": "v2_moe_predecessor_cb2_profile",
             "artifact": artifact_path.display().to_string(),
             "artifact_bytes": artifact_bytes,
             "artifact_hash": format!("{artifact_hash:016x}"),
@@ -2752,6 +2966,7 @@ fn benchmark_v2_moe_predecessor_profile(
             "iterations": iterations,
             "warmup": warmup,
             "routes_frozen": true,
+            "submission": "CB1 predecessor -> CB2 frozen-route MoE, one final CPU wait",
             "rows": rows,
         });
         std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
