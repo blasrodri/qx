@@ -111,6 +111,12 @@ struct Args {
     /// Measure marginal GPU cost of each canonical GPU-resident MoE stage.
     #[arg(long)]
     v2_moe_differential_profile: bool,
+    /// Capture contextual gate/up, fixed-route MoE, and complete-token timings.
+    #[arg(long)]
+    v2_moe_contextual_profile: bool,
+    /// Label for the candidate being measured in a contextual profile.
+    #[arg(long, default_value = "canonical")]
+    contextual_candidate: String,
     /// Measure top-8 expert-set overlap across sequential artifact-only tokens.
     #[arg(long)]
     v2_route_overlap: bool,
@@ -398,6 +404,25 @@ fn main() -> Result<()> {
             args.warmup,
             args.iterations,
             fixture.as_ref(),
+            args.result_json.as_deref(),
+        );
+    }
+    if args.v2_moe_contextual_profile {
+        let artifact = args.artifact.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--v2-moe-contextual-profile requires an artifact path")
+        })?;
+        let fixture = args.fixture.as_deref().map(load_fixture).transpose()?;
+        let context = fixture
+            .as_ref()
+            .and_then(|fixture| fixture.context)
+            .unwrap_or(args.context);
+        return benchmark_v2_moe_contextual_profile(
+            artifact,
+            context,
+            args.warmup,
+            args.iterations,
+            fixture.as_ref(),
+            &args.contextual_candidate,
             args.result_json.as_deref(),
         );
     }
@@ -2123,6 +2148,389 @@ struct DifferentialProfileReport {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Serialize)]
+struct ContextualTiming {
+    gpu_us_per_sample: f64,
+    wall_us_per_sample: f64,
+    dispatches_per_sample: f64,
+    command_buffers_per_sample: f64,
+    encoders_per_sample: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Serialize)]
+struct ContextualMemory {
+    artifact_bytes: u64,
+    mapped_artifact_bytes: u64,
+    known_metal_allocated_bytes: u64,
+    recommended_metal_working_set_bytes: u64,
+    current_rss_bytes: u64,
+    peak_rss_bytes: u64,
+    current_physical_footprint_bytes: u64,
+    peak_physical_footprint_bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Serialize)]
+struct ContextualLevelReport {
+    level: String,
+    timing: ContextualTiming,
+    memory: ContextualMemory,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Serialize)]
+struct ContextualProfileReport {
+    schema_version: u32,
+    mode: &'static str,
+    candidate: String,
+    artifact: String,
+    artifact_hash: String,
+    fixture_name: Option<String>,
+    fixture_domain: Option<String>,
+    context: usize,
+    position: usize,
+    iterations: usize,
+    warmup: usize,
+    routes_frozen: bool,
+    route_source: &'static str,
+    topology: Vec<String>,
+    levels: Vec<ContextualLevelReport>,
+}
+
+#[cfg(target_os = "macos")]
+fn profile_graph_stage_contextual<F>(
+    context: &qx_metal::platform::MetalContext,
+    warmup: usize,
+    iterations: usize,
+    mut encode: F,
+) -> Result<ContextualTiming>
+where
+    F: FnMut(&mut qx_metal::platform::DecodeGraph) -> Result<()>,
+{
+    for _ in 0..warmup {
+        let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+        encode(&mut graph)?;
+        graph.finish(context).map_err(anyhow::Error::msg)?;
+    }
+    let mut gpu_samples = Vec::with_capacity(iterations);
+    let mut wall_samples = Vec::with_capacity(iterations);
+    let mut dispatch_samples = Vec::with_capacity(iterations);
+    let mut command_buffer_samples = Vec::with_capacity(iterations);
+    let mut encoder_samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let before = context.metrics().map_err(anyhow::Error::msg)?;
+        let start = Instant::now();
+        let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+        encode(&mut graph)?;
+        graph.finish(context).map_err(anyhow::Error::msg)?;
+        let after = context.metrics().map_err(anyhow::Error::msg)?;
+        gpu_samples.push((after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1e6);
+        wall_samples.push(start.elapsed().as_secs_f64() * 1e6);
+        dispatch_samples.push((after.dispatches - before.dispatches) as f64);
+        command_buffer_samples.push((after.command_buffers - before.command_buffers) as f64);
+        encoder_samples.push((after.encoders - before.encoders) as f64);
+    }
+    Ok(ContextualTiming {
+        gpu_us_per_sample: median_sample(&mut gpu_samples),
+        wall_us_per_sample: median_sample(&mut wall_samples),
+        dispatches_per_sample: median_sample(&mut dispatch_samples),
+        command_buffers_per_sample: median_sample(&mut command_buffer_samples),
+        encoders_per_sample: median_sample(&mut encoder_samples),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn contextual_memory(
+    context: &qx_metal::platform::MetalContext,
+    artifact_bytes: u64,
+) -> ContextualMemory {
+    let (current_physical_footprint_bytes, peak_physical_footprint_bytes) = physical_footprint();
+    ContextualMemory {
+        artifact_bytes,
+        mapped_artifact_bytes: artifact_bytes,
+        known_metal_allocated_bytes: context.current_allocated_bytes(),
+        recommended_metal_working_set_bytes: context.recommended_working_set_bytes(),
+        current_rss_bytes: current_rss_bytes(),
+        peak_rss_bytes: peak_rss_bytes(),
+        current_physical_footprint_bytes,
+        peak_physical_footprint_bytes,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn encode_fixed_route_moe(
+    graph: &mut qx_metal::platform::DecodeGraph,
+    buffers: &qx_runtime_v2::GpuRuntimeBuffers,
+    stack: &qx_runtime_v2::PreparedAttentionStack,
+    moe: &qx_runtime_v2::PreparedMoeStack,
+    route_trace: &RouteTrace,
+    gate_up_only: bool,
+) -> Result<()> {
+    let context = buffers.context().as_ref();
+    for (layer, weights) in stack.layers.iter().enumerate() {
+        let ids = route_trace.ids_for(layer)?;
+        let route_weights = route_trace.weights_for(layer)?;
+        if qx_metal::platform::rms_scalar_router_enabled() {
+            let inverse_rms = buffers
+                .buffer(qx_runtime_v2::BufferId::MoeScratch)
+                .subregion(81_916, std::mem::size_of::<f32>())
+                .map_err(anyhow::Error::msg)?;
+            if gate_up_only {
+                graph
+                    .encode_dynamic_q4_moe_batched_stage_normalized(
+                        &moe.layers[layer],
+                        buffers.buffer(qx_runtime_v2::BufferId::HiddenB),
+                        &weights.post_attention_norm,
+                        &inverse_rms,
+                        &ids,
+                        &route_weights,
+                        buffers.buffer(qx_runtime_v2::BufferId::MoeScratch),
+                        buffers.buffer(qx_runtime_v2::BufferId::MoeOutput),
+                        0,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+            } else {
+                graph
+                    .encode_dynamic_q4_moe_batched_simd_normalized(
+                        &moe.layers[layer],
+                        buffers.buffer(qx_runtime_v2::BufferId::HiddenB),
+                        &weights.post_attention_norm,
+                        &inverse_rms,
+                        &ids,
+                        &route_weights,
+                        buffers.buffer(qx_runtime_v2::BufferId::MoeScratch),
+                        buffers.buffer(qx_runtime_v2::BufferId::MoeOutput),
+                    )
+                    .map_err(anyhow::Error::msg)?;
+            }
+        } else if gate_up_only {
+            graph
+                .encode_dynamic_q4_moe_batched_stage(
+                    &moe.layers[layer],
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeInput),
+                    &ids,
+                    &route_weights,
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeScratch),
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeOutput),
+                    0,
+                )
+                .map_err(anyhow::Error::msg)?;
+        } else {
+            graph
+                .encode_dynamic_q4_moe_batched_simd(
+                    &moe.layers[layer],
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeInput),
+                    &ids,
+                    &route_weights,
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeScratch),
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeOutput),
+                )
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
+    let _ = context;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn replay_contextual_fixture(
+    context: &qx_metal::platform::MetalContext,
+    buffers: &qx_runtime_v2::GpuRuntimeBuffers,
+    stack: &qx_runtime_v2::PreparedAttentionStack,
+    moe: &qx_runtime_v2::PreparedMoeStack,
+    fixture: Option<&BenchmarkFixture>,
+    context_length: usize,
+) -> Result<usize> {
+    let Some(fixture) = fixture else {
+        return Ok(context_length.saturating_sub(1));
+    };
+    if fixture.measurement != MeasurementMode::PostPrefill {
+        bail!("contextual profiles require post_prefill fixtures");
+    }
+    if fixture.tokens.len() >= context_length {
+        bail!("fixture prefill must leave one decode position");
+    }
+    for (position, token) in fixture.tokens.iter().enumerate() {
+        context
+            .write_runtime_buffer(
+                buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+                &token.to_le_bytes(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+        stack
+            .encode_token(&mut graph, buffers, moe, position)
+            .map_err(anyhow::Error::msg)?;
+        buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+    }
+    Ok(fixture.tokens.len())
+}
+
+#[cfg(target_os = "macos")]
+fn benchmark_v2_moe_contextual_profile(
+    artifact_path: &std::path::Path,
+    context_length: usize,
+    warmup: usize,
+    iterations: usize,
+    fixture: Option<&BenchmarkFixture>,
+    candidate: &str,
+    result_json: Option<&std::path::Path>,
+) -> Result<()> {
+    use std::rc::Rc;
+    if iterations == 0 {
+        bail!("contextual profile iterations must be positive");
+    }
+    let context = Rc::new(
+        qx_metal::platform::MetalContext::system_default()
+            .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
+    );
+    let plan = ExecutionPlan::granite(context_length).map_err(anyhow::Error::msg)?;
+    let buffers =
+        qx_runtime_v2::GpuRuntimeBuffers::new(context.clone(), plan).map_err(anyhow::Error::msg)?;
+    let mapped_artifact = std::sync::Arc::new(MappedArtifact::open(artifact_path)?);
+    let stack = qx_runtime_v2::PreparedAttentionStack::load_from_mapped_artifact(
+        context.as_ref(),
+        mapped_artifact.clone(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let moe = qx_runtime_v2::PreparedMoeStack::load_from_mapped_artifact(
+        context.as_ref(),
+        mapped_artifact,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let position = replay_contextual_fixture(
+        context.as_ref(),
+        &buffers,
+        &stack,
+        &moe,
+        fixture,
+        context_length,
+    )?;
+    let route_trace = capture_route_trace(context.as_ref(), &buffers, &stack, &moe, position)?;
+    let (artifact_bytes, artifact_hash) = artifact_fingerprint(artifact_path)?;
+    let topology = vec![
+        format!(
+            "qkv={}",
+            std::env::var("QX_V2_QKV_TOPOLOGY").unwrap_or_else(|_| "fused".to_owned())
+        ),
+        format!(
+            "rope_kv_split={}",
+            qx_metal::platform::rope_kv_split_enabled()
+        ),
+        format!(
+            "attention_3stage={}",
+            qx_metal::platform::three_stage_attention_enabled()
+        ),
+        format!(
+            "rms_scalar_qkv={}",
+            qx_metal::platform::rms_scalar_qkv_enabled()
+        ),
+        format!(
+            "rms_scalar_router={}",
+            qx_metal::platform::rms_scalar_router_enabled()
+        ),
+        format!(
+            "moe_layout={}",
+            std::env::var("QX_V2_MOE_LAYOUT").unwrap_or_else(|_| "artifact".to_owned())
+        ),
+    ];
+    let memory = || contextual_memory(context.as_ref(), artifact_bytes);
+    let gate_up_timing =
+        profile_graph_stage_contextual(context.as_ref(), warmup, iterations, |graph| {
+            encode_fixed_route_moe(graph, &buffers, &stack, &moe, &route_trace, true)
+        })?;
+    let fixed_moe_timing =
+        profile_graph_stage_contextual(context.as_ref(), warmup, iterations, |graph| {
+            encode_fixed_route_moe(graph, &buffers, &stack, &moe, &route_trace, false)
+        })?;
+    let complete_timing =
+        profile_graph_stage_contextual(context.as_ref(), warmup, iterations, |graph| {
+            encode_differential_token(
+                graph,
+                &buffers,
+                &stack,
+                &moe,
+                position,
+                None,
+                Some(&route_trace),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        })?;
+    let levels = vec![
+        ContextualLevelReport {
+            level: "gate_up_boundary_24_layers".to_owned(),
+            timing: gate_up_timing,
+            memory: memory(),
+        },
+        ContextualLevelReport {
+            level: "fixed_route_moe_24_layers".to_owned(),
+            timing: fixed_moe_timing,
+            memory: memory(),
+        },
+        ContextualLevelReport {
+            level: "complete_token_fixed_route".to_owned(),
+            timing: complete_timing,
+            memory: memory(),
+        },
+    ];
+    println!("QX V2 contextual MoE profile");
+    println!("candidate:          {candidate}");
+    println!("artifact:           {}", artifact_path.display());
+    println!("artifact bytes:     {artifact_bytes}");
+    println!("artifact hash:      {artifact_hash:016x}");
+    println!("context/position:   {context_length}/{position}");
+    println!("iterations/warmup:  {iterations}/{warmup}");
+    println!("routes frozen:      true (captured once before all measurements)");
+    println!("level                              GPU us     wall us  dispatches  CBs");
+    for level in &levels {
+        let timing = level.timing;
+        println!(
+            "{:<34} {:>9.2}  {:>9.2}  {:>10.2}  {:>4.2}",
+            level.level,
+            timing.gpu_us_per_sample,
+            timing.wall_us_per_sample,
+            timing.dispatches_per_sample,
+            timing.command_buffers_per_sample,
+        );
+        println!(
+            "  memory: metal={} physical={}/{} RSS={}/{}",
+            level.memory.known_metal_allocated_bytes,
+            level.memory.current_physical_footprint_bytes,
+            level.memory.peak_physical_footprint_bytes,
+            level.memory.current_rss_bytes,
+            level.memory.peak_rss_bytes,
+        );
+    }
+    if let Some(path) = result_json {
+        let report = ContextualProfileReport {
+            schema_version: 1,
+            mode: "v2_moe_contextual_profile",
+            candidate: candidate.to_owned(),
+            artifact: artifact_path.display().to_string(),
+            artifact_hash: format!("{artifact_hash:016x}"),
+            fixture_name: fixture.map(|value| value.name.clone()),
+            fixture_domain: fixture.map(|value| value.domain.clone()),
+            context: context_length,
+            position,
+            iterations,
+            warmup,
+            routes_frozen: true,
+            route_source: "canonical top-8 captured once after fixture prefill",
+            topology,
+            levels,
+        };
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
+        println!("contextual result JSON: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn artifact_fingerprint(path: &std::path::Path) -> Result<(u64, u64)> {
     use std::hash::Hasher;
     use std::io::Read;
@@ -3192,6 +3600,19 @@ fn benchmark_v2_moe_differential_profile(
     _result_json: Option<&std::path::Path>,
 ) -> Result<()> {
     bail!("--v2-moe-differential-profile requires macOS Metal")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn benchmark_v2_moe_contextual_profile(
+    _artifact_path: &std::path::Path,
+    _context_length: usize,
+    _warmup: usize,
+    _iterations: usize,
+    _fixture: Option<&BenchmarkFixture>,
+    _candidate: &str,
+    _result_json: Option<&std::path::Path>,
+) -> Result<()> {
+    bail!("--v2-moe-contextual-profile requires macOS Metal")
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "mode": "v2_moe_contextual_profile",
+  "candidate": "row-inline-1-control",
+  "artifact": "/Users/blas/projects/qx/external/models/granite-m5-pro-q4-rowinline-1-control.qx",
+  "artifact_hash": "327d8e72af755a0c",
+  "fixture_name": "support-dialogue",
+  "fixture_domain": "chat",
+  "context": 512,
+  "position": 384,
+  "iterations": 5,
+  "warmup": 1,
+  "routes_frozen": true,
+  "route_source": "canonical top-8 captured once after fixture prefill",
+  "topology": [
+    "qkv=fused",
+    "rope_kv_split=true",
+    "attention_3stage=true",
+    "rms_scalar_qkv=true",
+    "rms_scalar_router=true",
+    "moe_layout=artifact"
+  ],
+  "levels": [
+    {
+      "level": "gate_up_boundary_24_layers",
+      "timing": {
+        "gpu_us_per_sample": 3653.124993434176,
+        "wall_us_per_sample": 10970.291,
+        "dispatches_per_sample": 24.0,
+        "command_buffers_per_sample": 1.0,
+        "encoders_per_sample": 1.0
+      },
+      "memory": {
+        "artifact_bytes": 751009792,
+        "mapped_artifact_bytes": 751009792,
+        "known_metal_allocated_bytes": 802373632,
+        "recommended_metal_working_set_bytes": 19069665280,
+        "current_rss_bytes": 17760256,
+        "peak_rss_bytes": 21331968,
+        "current_physical_footprint_bytes": 112067184,
+        "peak_physical_footprint_bytes": 112067184
+      }
+    },
+    {
+      "level": "fixed_route_moe_24_layers",
+      "timing": {
+        "gpu_us_per_sample": 4509.499995037913,
+        "wall_us_per_sample": 5229.709,
+        "dispatches_per_sample": 96.0,
+        "command_buffers_per_sample": 1.0,
+        "encoders_per_sample": 1.0
+      },
+      "memory": {
+        "artifact_bytes": 751009792,
+        "mapped_artifact_bytes": 751009792,
+        "known_metal_allocated_bytes": 802373632,
+        "recommended_metal_working_set_bytes": 19069665280,
+        "current_rss_bytes": 17760256,
+        "peak_rss_bytes": 21331968,
+        "current_physical_footprint_bytes": 112067184,
+        "peak_physical_footprint_bytes": 112067184
+      }
+    },
+    {
+      "level": "complete_token_fixed_route",
+      "timing": {
+        "gpu_us_per_sample": 4712.916677817702,
+        "wall_us_per_sample": 5238.708,
+        "dispatches_per_sample": 461.0,
+        "command_buffers_per_sample": 1.0,
+        "encoders_per_sample": 1.0
+      },
+      "memory": {
+        "artifact_bytes": 751009792,
+        "mapped_artifact_bytes": 751009792,
+        "known_metal_allocated_bytes": 802373632,
+        "recommended_metal_working_set_bytes": 19069665280,
+        "current_rss_bytes": 17760256,
+        "peak_rss_bytes": 21331968,
+        "current_physical_footprint_bytes": 112067184,
+        "peak_physical_footprint_bytes": 112067184
+      }
+    }
+  ]
+}
