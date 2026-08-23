@@ -393,7 +393,17 @@ fn verify_exact_semantics(candidate_path: &PathBuf, reference_path: &PathBuf) ->
         .ok_or_else(|| anyhow::anyhow!("reference artifact has no execution plan"))?;
     let compatible_expert_layout =
         |candidate: qx_format::ExpertRepresentation, reference: qx_format::ExpertRepresentation| {
+            let q4_transport = |value| {
+                matches!(
+                    value,
+                    qx_format::ExpertRepresentation::Group32Q4RowInline
+                        | qx_format::ExpertRepresentation::Group32Q4RowInlineRows2
+                        | qx_format::ExpertRepresentation::Group32Q4RowInlineRows4
+                        | qx_format::ExpertRepresentation::Group32Q4RowInlineRows8
+                )
+            };
             candidate == reference
+                || (q4_transport(candidate) && q4_transport(reference))
                 || matches!(
                     (candidate, reference),
                     (
@@ -405,24 +415,48 @@ fn verify_exact_semantics(candidate_path: &PathBuf, reference_path: &PathBuf) ->
                     )
                 )
         };
-    if candidate_plan.model_id != reference_plan.model_id
-        || candidate_plan.target != reference_plan.target
-        || candidate_plan.workload != reference_plan.workload
-        || candidate_plan.topology != reference_plan.topology
-        || candidate_plan.schedule != reference_plan.schedule
-        || candidate_plan.sparse_experts != reference_plan.sparse_experts
-        || candidate_plan.memory != reference_plan.memory
-        || candidate_plan.representations.dense != reference_plan.representations.dense
-        || !compatible_expert_layout(
-            candidate_plan.representations.gate_up,
-            reference_plan.representations.gate_up,
-        )
-        || !compatible_expert_layout(
-            candidate_plan.representations.down,
-            reference_plan.representations.down,
-        )
-    {
-        bail!("exact-equivalence artifacts differ outside expert transport layout");
+    let mut plan_mismatches = Vec::new();
+    if candidate_plan.model_id != reference_plan.model_id {
+        plan_mismatches.push("model_id");
+    }
+    if candidate_plan.target != reference_plan.target {
+        plan_mismatches.push("target");
+    }
+    if candidate_plan.workload != reference_plan.workload {
+        plan_mismatches.push("workload");
+    }
+    if candidate_plan.topology != reference_plan.topology {
+        plan_mismatches.push("topology");
+    }
+    if candidate_plan.schedule != reference_plan.schedule {
+        plan_mismatches.push("schedule");
+    }
+    if candidate_plan.sparse_experts != reference_plan.sparse_experts {
+        plan_mismatches.push("sparse_experts");
+    }
+    if candidate_plan.memory != reference_plan.memory {
+        plan_mismatches.push("memory");
+    }
+    if candidate_plan.representations.dense != reference_plan.representations.dense {
+        plan_mismatches.push("dense_representation");
+    }
+    if !compatible_expert_layout(
+        candidate_plan.representations.gate_up,
+        reference_plan.representations.gate_up,
+    ) {
+        plan_mismatches.push("gate_up_representation");
+    }
+    if !compatible_expert_layout(
+        candidate_plan.representations.down,
+        reference_plan.representations.down,
+    ) {
+        plan_mismatches.push("down_representation");
+    }
+    if !plan_mismatches.is_empty() {
+        bail!(
+            "exact-equivalence artifacts differ outside expert transport layout: {}",
+            plan_mismatches.join(", ")
+        );
     }
     if candidate.info().entries.len() != reference.info().entries.len() {
         bail!("exact-equivalence artifacts have different tensor counts");
@@ -443,16 +477,12 @@ fn verify_exact_semantics(candidate_path: &PathBuf, reference_path: &PathBuf) ->
             || (matches!(
                 reference_entry.kind,
                 qx_format::TensorKind::GateUp | qx_format::TensorKind::Down
-            ) && matches!(
-                (reference_entry.layout, candidate_entry.layout),
-                (
-                    qx_quant::PackingLayout::RowMajor,
-                    qx_quant::PackingLayout::Q4RowInline
-                ) | (
-                    qx_quant::PackingLayout::Q4RowInline,
-                    qx_quant::PackingLayout::RowMajor
-                )
-            ));
+            ) && matches!(reference_entry.layout, qx_quant::PackingLayout::RowMajor)
+                && candidate_entry.layout.is_q4_row_inline())
+            || (candidate_entry.layout.is_q4_row_inline()
+                && reference_entry.layout.is_q4_row_inline())
+            || (matches!(candidate_entry.layout, qx_quant::PackingLayout::RowMajor)
+                && reference_entry.layout.is_q4_row_inline());
         if candidate_entry.quant_type != reference_entry.quant_type
             || candidate_entry.rows != reference_entry.rows
             || candidate_entry.cols != reference_entry.cols

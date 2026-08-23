@@ -100,13 +100,38 @@ pub fn activate_artifact_execution_plan(
         qx_format::ExpertRepresentation::Group32Q4RowInline => {
             set_plan_env("QX_V2_MOE_LAYOUT", "row-inline")
         }
+        qx_format::ExpertRepresentation::Group32Q4RowInlineRows2 => {
+            set_plan_env("QX_V2_MOE_LAYOUT", "row-inline-2")
+        }
+        qx_format::ExpertRepresentation::Group32Q4RowInlineRows4 => {
+            set_plan_env("QX_V2_MOE_LAYOUT", "row-inline-4")
+        }
+        qx_format::ExpertRepresentation::Group32Q4RowInlineRows8 => {
+            set_plan_env("QX_V2_MOE_LAYOUT", "row-inline-8")
+        }
         qx_format::ExpertRepresentation::MixedQ2Q3Q4 => set_plan_env("QX_V2_MOE_LAYOUT", "mixed"),
         qx_format::ExpertRepresentation::Q4K => set_plan_env("QX_V2_MOE_LAYOUT", "rowmajor"),
         qx_format::ExpertRepresentation::DenseQ3 | qx_format::ExpertRepresentation::PaddedQ3 => {
-            return Err(format!(
-                "expert representation {:?} is not executable yet",
-                plan.representations.gate_up
-            ));
+            // Uniform Q3 artifacts use the row-major Q3 Metal kernels. The
+            // physical block width is inferred from the sealed slab; this
+            // plan field selects the representation without requiring an
+            // environment override.
+            set_plan_env("QX_V2_MOE_LAYOUT", "rowmajor");
+        }
+        qx_format::ExpertRepresentation::LayerwiseQ3Q4 => {
+            // The loader validates each layer's native Q3/Q4 slab. Both use
+            // row-major addressing; the layer-local quantizer selects the
+            // corresponding Metal pipeline at load time.
+            set_plan_env("QX_V2_MOE_LAYOUT", "rowmajor");
+        }
+        qx_format::ExpertRepresentation::LayerwiseQ3Q4RowInline => {
+            set_plan_env("QX_V2_MOE_LAYOUT", "row-inline");
+        }
+        qx_format::ExpertRepresentation::LayerwiseTensorQ3Q4 => {
+            set_plan_env("QX_V2_MOE_LAYOUT", "q3-q4");
+        }
+        qx_format::ExpertRepresentation::PerExpertTensorQ3Q4 => {
+            set_plan_env("QX_V2_MOE_LAYOUT", "q3-q4-expert");
         }
     }
     set_plan_bool_env("QX_V2_KV_FP16", false);
@@ -723,10 +748,19 @@ fn moe_requested_layout() -> Option<qx_quant::PackingLayout> {
         Some("row-inline") | Some("inline") | Some("q4-row-inline") => {
             Some(qx_quant::PackingLayout::Q4RowInline)
         }
+        Some("row-inline-2") | Some("inline-2") | Some("q4-row-inline-2") => {
+            Some(qx_quant::PackingLayout::Q4RowInlineRows2)
+        }
+        Some("row-inline-4") | Some("inline-4") | Some("q4-row-inline-4") => {
+            Some(qx_quant::PackingLayout::Q4RowInlineRows4)
+        }
+        Some("row-inline-8") | Some("inline-8") | Some("q4-row-inline-8") => {
+            Some(qx_quant::PackingLayout::Q4RowInlineRows8)
+        }
         Some("tile") | Some("tile32") | Some("lane") | Some("lane-native") => {
             Some(qx_quant::PackingLayout::MetalTile32)
         }
-        Some("mixed") | Some("tile32-gate-row-down") => None,
+        Some("mixed") | Some("tile32-gate-row-down") | Some("q3-q4") | Some("q3-q4-expert") => None,
         Some("paired") | Some("gate-up-paired") | Some("paired-gate-up") => {
             Some(qx_quant::PackingLayout::MetalTile32Paired)
         }
@@ -770,6 +804,12 @@ fn moe_q3_gate_up_requested() -> Option<(std::path::PathBuf, usize)> {
         Some(other) => panic!("unsupported QX_V2_MOE_Q3_LAYOUT={other}"),
     };
     Some((std::path::PathBuf::from(path), block_bytes))
+}
+
+fn moe_expertwise_requested() -> bool {
+    std::env::var("QX_V2_MOE_LAYOUT")
+        .ok()
+        .is_some_and(|value| value == "q3-q4-expert")
 }
 
 fn active_k_for_layer(layer: usize) -> Option<usize> {
@@ -1334,6 +1374,7 @@ impl PreparedMoeStack {
         let requested_layout = moe_requested_layout();
         let mixed_layout = moe_mixed_layout_requested();
         let split_gate_up = moe_split_gate_up_requested();
+        let expertwise = moe_expertwise_requested();
         let q3_request = moe_q3_gate_up_requested();
         if q3_request.is_some() && split_gate_up {
             return Err("Q3 gate/up is currently incompatible with split gate/up".to_owned());
@@ -1356,21 +1397,34 @@ impl PreparedMoeStack {
                 .enumerate()
                 .all(|(expert, logical)| *logical as usize == expert)
         });
+        if expertwise {
+            if !identity_permutation || mixed_layout || split_gate_up || q3_request.is_some() {
+                return Err(
+                    "expertwise Q3/Q4 requires identity routing and one sealed artifact".to_owned(),
+                );
+            }
+            return load_no_copy_moe_stack_expertwise(context, artifact);
+        }
         if no_copy_storage {
-            if !identity_permutation
-                || mixed_layout
-                || split_gate_up
-                || q3_request.is_some()
-                || q3_artifact.is_some()
-            {
+            if !identity_permutation || mixed_layout || split_gate_up {
                 return Err(
                     "mmap/no-copy MoE requires identity expert placement and a sealed native representation"
                         .to_owned(),
                 );
             }
+            if let Some((q3_path, block_bytes)) = q3_request.as_ref() {
+                let q3_artifact =
+                    qx_format::MappedArtifact::open(q3_path).map_err(|error| error.to_string())?;
+                return load_no_copy_moe_stack_with_q3(
+                    context,
+                    artifact,
+                    Arc::new(q3_artifact),
+                    *block_bytes,
+                );
+            }
             return load_no_copy_moe_stack(context, artifact, requested_layout);
         }
-        if requested_layout == Some(qx_quant::PackingLayout::Q4RowInline) {
+        if requested_layout.is_some_and(qx_quant::PackingLayout::is_q4_row_inline) {
             return Err(
                 "Q4 row-inline currently requires mmap/no-copy or hybrid expert slabs".to_owned(),
             );
@@ -1608,6 +1662,223 @@ impl PreparedMoeStack {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct ExpertwiseSlab {
+    scales: std::ops::Range<usize>,
+    data: std::ops::Range<usize>,
+    map: [u32; EXPERTS],
+    layout: qx_quant::PackingLayout,
+    block_bytes: Option<usize>,
+}
+
+#[cfg(target_os = "macos")]
+fn load_no_copy_moe_stack_expertwise(
+    context: &qx_metal::platform::MetalContext,
+    artifact: Arc<qx_format::MappedArtifact>,
+) -> Result<PreparedMoeStack, String> {
+    if artifact.info().header.version != qx_format::VERSION {
+        return Err("expertwise MoE requires a QX artifact-v2 slab".to_owned());
+    }
+    let bytes = artifact.weight_slab().map_err(|error| error.to_string())?;
+    let pointer = NonNull::new(bytes.as_ptr().cast_mut().cast::<c_void>())
+        .ok_or_else(|| "expertwise artifact weight slab has a null address".to_owned())?;
+    let slab = unsafe { context.input_buffer_no_copy(pointer, bytes.len(), artifact.clone())? };
+    let mut layers = Vec::with_capacity(LAYERS);
+    for layer in 0..LAYERS {
+        let gate_q3 = expertwise_typed_slab(
+            &artifact,
+            layer as u16,
+            qx_format::TensorKind::GateUp,
+            qx_quant::QuantType::Q3,
+        )?;
+        let gate_q4 = expertwise_typed_slab(
+            &artifact,
+            layer as u16,
+            qx_format::TensorKind::GateUp,
+            qx_quant::QuantType::Q4,
+        )?;
+        let down_q3 = expertwise_typed_slab(
+            &artifact,
+            layer as u16,
+            qx_format::TensorKind::Down,
+            qx_quant::QuantType::Q3,
+        )?;
+        let down_q4 = expertwise_typed_slab(
+            &artifact,
+            layer as u16,
+            qx_format::TensorKind::Down,
+            qx_quant::QuantType::Q4,
+        )?;
+        let gate_map = merge_expertwise_maps(gate_q3.as_ref(), gate_q4.as_ref())?;
+        let down_map = merge_expertwise_maps(down_q3.as_ref(), down_q4.as_ref())?;
+        let gate_map_buffer = context.allocate_runtime_buffer(32 * 4)?;
+        let down_map_buffer = context.allocate_runtime_buffer(32 * 4)?;
+        context.write_runtime_buffer(&gate_map_buffer, &u32_bytes(&gate_map))?;
+        context.write_runtime_buffer(&down_map_buffer, &u32_bytes(&down_map))?;
+        let prepared = context.prepare_dynamic_q4_moe_expertwise_runtime_views(
+            slab_view(&slab, gate_q4.as_ref())?,
+            slab_scales_view(&slab, gate_q4.as_ref())?,
+            slab_view(&slab, gate_q3.as_ref())?,
+            slab_scales_view(&slab, gate_q3.as_ref())?,
+            gate_map_buffer,
+            slab_view(&slab, down_q4.as_ref())?,
+            slab_scales_view(&slab, down_q4.as_ref())?,
+            slab_view(&slab, down_q3.as_ref())?,
+            slab_scales_view(&slab, down_q3.as_ref())?,
+            down_map_buffer,
+            gate_q3.as_ref().and_then(|value| value.block_bytes),
+            down_q3.as_ref().and_then(|value| value.block_bytes),
+            gate_q4
+                .as_ref()
+                .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q4RowInline),
+            down_q4
+                .as_ref()
+                .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q4RowInline),
+        )?;
+        layers.push(prepared);
+    }
+    Ok(PreparedMoeStack { layers })
+}
+
+#[cfg(target_os = "macos")]
+fn u32_bytes(values: &[u32; EXPERTS]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn slab_view(
+    slab: &qx_metal::platform::RuntimeBuffer,
+    value: Option<&ExpertwiseSlab>,
+) -> Result<Option<qx_metal::platform::RuntimeBuffer>, String> {
+    value
+        .map(|value| slab.subregion(value.data.start, value.data.len()))
+        .transpose()
+}
+
+#[cfg(target_os = "macos")]
+fn slab_scales_view(
+    slab: &qx_metal::platform::RuntimeBuffer,
+    value: Option<&ExpertwiseSlab>,
+) -> Result<Option<qx_metal::platform::RuntimeBuffer>, String> {
+    value
+        .map(|value| slab.subregion(value.scales.start, value.scales.len()))
+        .transpose()
+}
+
+#[cfg(target_os = "macos")]
+fn merge_expertwise_maps(
+    q3: Option<&ExpertwiseSlab>,
+    q4: Option<&ExpertwiseSlab>,
+) -> Result<[u32; EXPERTS], String> {
+    let mut map = [0xffff_ffff_u32; EXPERTS];
+    let mut seen = [false; EXPERTS];
+    for value in [q3, q4].into_iter().flatten() {
+        for (logical, encoded) in value.map.iter().copied().enumerate() {
+            if encoded != 0xffff_ffff && seen[logical] {
+                return Err(format!(
+                    "expertwise map contains duplicate expert {logical}"
+                ));
+            }
+            if encoded != 0xffff_ffff {
+                map[logical] = encoded;
+                seen[logical] = true;
+            }
+        }
+    }
+    if seen.iter().any(|value| !value) {
+        return Err("expertwise map does not cover all 32 logical experts".to_owned());
+    }
+    Ok(map)
+}
+
+#[cfg(target_os = "macos")]
+fn expertwise_typed_slab(
+    artifact: &qx_format::MappedArtifact,
+    layer: u16,
+    kind: qx_format::TensorKind,
+    quant_type: qx_quant::QuantType,
+) -> Result<Option<ExpertwiseSlab>, String> {
+    let mut entries = artifact
+        .info()
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.layer == layer && entry.kind == kind && entry.quant_type == quant_type
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    entries.sort_by_key(|(_, entry)| entry.data_offset);
+    let mut map = [0xffff_ffff_u32; EXPERTS];
+    let mut scale_ranges = Vec::with_capacity(entries.len());
+    let mut data_ranges = Vec::with_capacity(entries.len());
+    let mut layout = None;
+    let mut block_bytes = None;
+    let (rows, groups) = match kind {
+        qx_format::TensorKind::GateUp => (1024usize, 32usize),
+        qx_format::TensorKind::Down => (1024usize, 16usize),
+        _ => return Err("expertwise slab requested for a non-expert tensor".to_owned()),
+    };
+    for (physical, (index, entry)) in entries.iter().enumerate() {
+        if entry.expert as usize >= EXPERTS || map[entry.expert as usize] != 0xffff_ffff {
+            return Err(format!(
+                "invalid expertwise physical entry for layer {layer}"
+            ));
+        }
+        let valid_layout = if quant_type == qx_quant::QuantType::Q3 {
+            entry.layout == qx_quant::PackingLayout::RowMajor
+        } else {
+            matches!(
+                entry.layout,
+                qx_quant::PackingLayout::RowMajor | qx_quant::PackingLayout::Q4RowInline
+            )
+        };
+        if !valid_layout {
+            return Err(
+                "expertwise Q3 requires row-major and Q4 requires row-major or row-inline"
+                    .to_owned(),
+            );
+        }
+        if layout
+            .replace(entry.layout)
+            .is_some_and(|value| value != entry.layout)
+        {
+            return Err("expertwise slab has mixed layouts".to_owned());
+        }
+        let (scales, data) = artifact
+            .tensor_slab_ranges(*index)
+            .map_err(|error| error.to_string())?;
+        scale_ranges.push(scales);
+        data_ranges.push(data);
+        map[entry.expert as usize] = if quant_type == qx_quant::QuantType::Q3 {
+            0x8000_0000 | physical as u32
+        } else {
+            physical as u32
+        };
+        if quant_type == qx_quant::QuantType::Q3 {
+            let blocks = rows * groups;
+            let bytes = entry.data_length as usize / blocks;
+            if !matches!(bytes, 12 | 16) {
+                return Err(format!("invalid Q3 block size {bytes} for layer {layer}"));
+            }
+            block_bytes = Some(bytes);
+        }
+    }
+    Ok(Some(ExpertwiseSlab {
+        scales: contiguous_slab_range(&scale_ranges, layer, kind, "scale")?,
+        data: contiguous_slab_range(&data_ranges, layer, kind, "payload")?,
+        map,
+        layout: layout.expect("non-empty expertwise slab"),
+        block_bytes,
+    }))
+}
+
+#[cfg(target_os = "macos")]
 fn load_no_copy_moe_stack(
     context: &qx_metal::platform::MetalContext,
     artifact: Arc<qx_format::MappedArtifact>,
@@ -1632,25 +1903,113 @@ fn load_no_copy_moe_stack(
             expert_group_slab_ranges(&artifact, layer as u16, qx_format::TensorKind::GateUp)?;
         let (down_scales, down_packed, down_quant, down_layout) =
             expert_group_slab_ranges(&artifact, layer as u16, qx_format::TensorKind::Down)?;
-        if gate_quant != down_quant || gate_layout != down_layout {
+        let asymmetric_gate_packet = gate_quant == qx_quant::QuantType::Q4
+            && down_quant == qx_quant::QuantType::Q4
+            && gate_layout
+                .row_inline_packet_rows()
+                .is_some_and(|rows| rows > 1)
+            && down_layout == qx_quant::PackingLayout::Q4RowInline;
+        let uniform = gate_quant == down_quant && gate_layout == down_layout;
+        let tensorwise_q3_q4 = matches!(
+            (gate_quant, down_quant),
+            (qx_quant::QuantType::Q3, qx_quant::QuantType::Q4)
+                | (qx_quant::QuantType::Q4, qx_quant::QuantType::Q3)
+        ) && (gate_quant != qx_quant::QuantType::Q3
+            || gate_layout == qx_quant::PackingLayout::RowMajor)
+            && (down_quant != qx_quant::QuantType::Q3
+                || down_layout == qx_quant::PackingLayout::RowMajor);
+        if !uniform && !tensorwise_q3_q4 && !asymmetric_gate_packet {
             return Err(format!(
-                "layer {layer} no-copy expert tensors do not share one representation"
+                "layer {layer} no-copy expert tensors do not share one executable representation"
             ));
         }
         if let Some(requested) = requested_layout {
-            if requested != gate_layout {
+            let q3_row_major_for_inline = gate_quant == qx_quant::QuantType::Q3
+                && gate_layout == qx_quant::PackingLayout::RowMajor
+                && requested == qx_quant::PackingLayout::Q4RowInline;
+            if requested != gate_layout && !q3_row_major_for_inline {
                 return Err(format!(
                     "layer {layer} sealed layout {requested:?} requires repacking from artifact layout {gate_layout:?}"
                 ));
             }
         }
-        let prepared = context.prepare_dynamic_q4_moe_runtime_views(
-            slab.subregion(gate_packed.start, gate_packed.len())?,
-            slab.subregion(gate_scales.start, gate_scales.len())?,
-            slab.subregion(down_packed.start, down_packed.len())?,
-            slab.subregion(down_scales.start, down_scales.len())?,
-            gate_layout,
-            down_layout,
+        let prepared =
+            if gate_quant == qx_quant::QuantType::Q3 && down_quant == qx_quant::QuantType::Q3 {
+                let gate_block_bytes = gate_packed.len() / (EXPERTS * 1024 * 32);
+                let down_block_bytes = down_packed.len() / (EXPERTS * 1024 * 16);
+                if gate_block_bytes != down_block_bytes {
+                    return Err(format!("layer {layer} Q3 gate/down block sizes differ"));
+                }
+                context.prepare_dynamic_q3_moe_runtime_views(
+                    slab.subregion(gate_packed.start, gate_packed.len())?,
+                    slab.subregion(gate_scales.start, gate_scales.len())?,
+                    slab.subregion(down_packed.start, down_packed.len())?,
+                    slab.subregion(down_scales.start, down_scales.len())?,
+                    gate_block_bytes,
+                )?
+            } else {
+                context.prepare_dynamic_q4_moe_runtime_views(
+                    slab.subregion(gate_packed.start, gate_packed.len())?,
+                    slab.subregion(gate_scales.start, gate_scales.len())?,
+                    slab.subregion(down_packed.start, down_packed.len())?,
+                    slab.subregion(down_scales.start, down_scales.len())?,
+                    gate_layout,
+                    down_layout,
+                )?
+            };
+        layers.push(prepared);
+    }
+    Ok(PreparedMoeStack { layers })
+}
+
+#[cfg(target_os = "macos")]
+fn load_no_copy_moe_stack_with_q3(
+    context: &qx_metal::platform::MetalContext,
+    artifact: Arc<qx_format::MappedArtifact>,
+    q3_artifact: Arc<qx_format::MappedArtifact>,
+    block_bytes: usize,
+) -> Result<PreparedMoeStack, String> {
+    if !matches!(block_bytes, 12 | 16) {
+        return Err("Q3 no-copy control requires 12 or 16 byte blocks".to_owned());
+    }
+    let (q3_pointer, q3_length) = {
+        let bytes = q3_artifact
+            .weight_slab()
+            .map_err(|error| error.to_string())?;
+        let pointer = NonNull::new(bytes.as_ptr().cast_mut().cast::<c_void>())
+            .ok_or_else(|| "Q3 artifact weight slab has a null address".to_owned())?;
+        (pointer, bytes.len())
+    };
+    // The Q4 artifact remains the logical model owner and is validated below;
+    // only the selected Q3 slab needs a Metal resource in this path.
+    let q3_slab =
+        unsafe { context.input_buffer_no_copy(q3_pointer, q3_length, q3_artifact.clone())? };
+    let mut layers = Vec::with_capacity(LAYERS);
+    for layer in 0..LAYERS {
+        let (q3_gate_scales, q3_gate_packed, q3_gate_quant, q3_gate_layout) =
+            expert_group_slab_ranges(&q3_artifact, layer as u16, qx_format::TensorKind::GateUp)?;
+        let (q3_down_scales, q3_down_packed, q3_down_quant, q3_down_layout) =
+            expert_group_slab_ranges(&q3_artifact, layer as u16, qx_format::TensorKind::Down)?;
+        if q3_gate_quant != qx_quant::QuantType::Q3
+            || q3_down_quant != qx_quant::QuantType::Q3
+            || q3_gate_layout != qx_quant::PackingLayout::RowMajor
+            || q3_down_layout != qx_quant::PackingLayout::RowMajor
+        {
+            return Err(format!(
+                "layer {layer} Q3 no-copy control requires uniform row-major Q3 experts"
+            ));
+        }
+        // Validate that the sealed native Q4 artifact has the ordinary expert
+        // groups too; these ranges also protect against accidental artifact
+        // mixing even though the Q3 pipelines consume the Q3 views.
+        let _ = expert_group_slab_ranges(&artifact, layer as u16, qx_format::TensorKind::GateUp)?;
+        let _ = expert_group_slab_ranges(&artifact, layer as u16, qx_format::TensorKind::Down)?;
+        let prepared = context.prepare_dynamic_q3_moe_runtime_views(
+            q3_slab.subregion(q3_gate_packed.start, q3_gate_packed.len())?,
+            q3_slab.subregion(q3_gate_scales.start, q3_gate_scales.len())?,
+            q3_slab.subregion(q3_down_packed.start, q3_down_packed.len())?,
+            q3_slab.subregion(q3_down_scales.start, q3_down_scales.len())?,
+            block_bytes,
         )?;
         layers.push(prepared);
     }
@@ -1687,10 +2046,10 @@ fn expert_group_slab_ranges(
         let entry = &artifact.info().entries[index];
         if !matches!(
             entry.quant_type,
-            qx_quant::QuantType::Q4 | qx_quant::QuantType::Q4K
+            qx_quant::QuantType::Q3 | qx_quant::QuantType::Q4 | qx_quant::QuantType::Q4K
         ) {
             return Err(format!(
-                "layer {layer} expert {expert} {kind:?} is not executable Q4/Q4_K"
+                "layer {layer} expert {expert} {kind:?} is not executable Q3/Q4/Q4_K"
             ));
         }
         if quant_type

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use qx_compiler::{
     ExpertSensitivity, ExpertWeights, QxTrace, allocate_with_minimum_options, granite_memory_plan,
-    measure_sensitivity,
+    measure_sensitivity, quantized_bytes,
 };
 use qx_format::{
     CompiledTensor, ExecutionPlanManifest, ExpertRepresentation, RawTensor, TensorKind,
@@ -33,6 +33,30 @@ struct Args {
     /// Exclude Q3 to measure the hardware-friendly Q2/Q4 alternative.
     #[arg(long)]
     disable_q3: bool,
+    /// Force every expert tensor to one quantization type. This is a
+    /// representation control used by the runtime's uniform native-slab
+    /// experiments; traced mixed allocation remains the default.
+    #[arg(long, value_parser = parse_quant_type)]
+    uniform_expert_bits: Option<QuantType>,
+    /// Select whole layers for native Q3 only when all experts in the layer
+    /// have finite traced sensitivity and the weighted layer error is within
+    /// `--layerwise-q3-threshold`. Other layers remain native Q4.
+    #[arg(long)]
+    layerwise_q3: bool,
+    #[arg(long, default_value_t = 0.01)]
+    layerwise_q3_threshold: f32,
+    /// Select Q3 independently for complete layer gate/up and down tensor
+    /// families. This is the first executable mixed-precision candidate;
+    /// expert-level routing selection remains a later slab-format step.
+    #[arg(long)]
+    tensorwise_q3: bool,
+    /// Select Q3 independently for every (layer, expert, gate/up|down)
+    /// tensor. This emits compact typed slabs and requires the expertwise
+    /// GPU-map runtime path.
+    #[arg(long)]
+    expertwise_q3: bool,
+    #[arg(long, default_value_t = 0.01)]
+    expertwise_q3_threshold: f32,
     #[arg(long, default_value_t = 32)]
     group_size: usize,
     /// Expert-only scientific control; dense tensors remain QX group-32 Q4.
@@ -98,6 +122,9 @@ enum ExpertLayout {
     RowMajor,
     Tile32,
     RowInline,
+    RowInline2,
+    RowInline4,
+    RowInline8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -112,6 +139,9 @@ impl From<ExpertLayout> for PackingLayout {
             ExpertLayout::RowMajor => Self::RowMajor,
             ExpertLayout::Tile32 => Self::MetalTile32,
             ExpertLayout::RowInline => Self::Q4RowInline,
+            ExpertLayout::RowInline2 => Self::Q4RowInlineRows2,
+            ExpertLayout::RowInline4 => Self::Q4RowInlineRows4,
+            ExpertLayout::RowInline8 => Self::Q4RowInlineRows8,
         }
     }
 }
@@ -195,10 +225,78 @@ fn main() -> Result<()> {
             );
         }
     } else {
+        let format = args.uniform_expert_bits.unwrap_or(QuantType::Q4);
         eprintln!(
-            "warning: no --trace supplied; emitting uniform {:?} experts without quality claims",
-            args.expert_format
+            "warning: no --trace supplied; emitting uniform {format:?} experts without quality claims"
         );
+    }
+    if args.layerwise_q3 {
+        if trace.is_none() {
+            bail!("--layerwise-q3 requires --trace");
+        }
+        if args.uniform_expert_bits.is_some()
+            || args.expert_format != ExpertFormat::QxQ4
+            || !matches!(
+                args.expert_layout,
+                ExpertLayout::RowMajor | ExpertLayout::RowInline
+            )
+        {
+            bail!(
+                "--layerwise-q3 requires traced QX Q4 row-major experts without --uniform-expert-bits"
+            );
+        }
+        if !(0.0..=1.0).contains(&args.layerwise_q3_threshold) {
+            bail!("--layerwise-q3-threshold must be between 0 and 1");
+        }
+    }
+    if args.tensorwise_q3 {
+        if trace.is_none() {
+            bail!("--tensorwise-q3 requires --trace");
+        }
+        if args.uniform_expert_bits.is_some()
+            || args.expert_format != ExpertFormat::QxQ4
+            || !matches!(
+                args.expert_layout,
+                ExpertLayout::RowMajor | ExpertLayout::RowInline
+            )
+        {
+            bail!("--tensorwise-q3 requires traced QX Q4 row-major or row-inline experts");
+        }
+        if args.layerwise_q3 {
+            bail!("--tensorwise-q3 cannot be combined with --layerwise-q3");
+        }
+    }
+    if args.expertwise_q3 {
+        if trace.is_none() {
+            bail!("--expertwise-q3 requires --trace");
+        }
+        if args.uniform_expert_bits.is_some()
+            || args.expert_format != ExpertFormat::QxQ4
+            || args.layerwise_q3
+            || args.tensorwise_q3
+            || !matches!(
+                args.expert_layout,
+                ExpertLayout::RowMajor | ExpertLayout::RowInline
+            )
+        {
+            bail!(
+                "--expertwise-q3 requires traced QX Q4 row-major or row-inline experts and cannot be combined with layerwise/tensorwise Q3"
+            );
+        }
+        if !(0.0..=1.0).contains(&args.expertwise_q3_threshold) {
+            bail!("--expertwise-q3-threshold must be between 0 and 1");
+        }
+    }
+    if matches!(
+        args.expert_layout,
+        ExpertLayout::RowInline2 | ExpertLayout::RowInline4 | ExpertLayout::RowInline8
+    ) && (args.expert_format != ExpertFormat::QxQ4
+        || args.uniform_expert_bits.is_some()
+        || args.layerwise_q3
+        || args.tensorwise_q3
+        || args.expertwise_q3)
+    {
+        bail!("multi-row row-inline candidates require uniform exact group-32 Q4 experts");
     }
 
     let grouped = trace.as_ref().map(QxTrace::samples).unwrap_or_default();
@@ -268,6 +366,10 @@ fn main() -> Result<()> {
                     q2_cosine: 0.0,
                     q3_cosine: 0.0,
                     q4_cosine: 1.0,
+                    gate_up_q3_error: f32::INFINITY,
+                    down_q3_error: f32::INFINITY,
+                    gate_up_q4_error: 0.0,
+                    down_q4_error: 0.0,
                     activation_frequency: 0.0,
                     mean_router_weight: 0.0,
                     gate_up_rows: weights.gate_up_rows,
@@ -377,26 +479,276 @@ fn main() -> Result<()> {
             );
         }
     }
+    let layerwise_q3_layers = if args.layerwise_q3 {
+        let mut layers = [false; LAYERS];
+        for layer in 0..LAYERS {
+            let items = sensitivities
+                .iter()
+                .filter(|item| item.layer == layer as u16)
+                .collect::<Vec<_>>();
+            let total_importance = items.iter().map(|item| item.importance()).sum::<f32>();
+            let weighted_error = items
+                .iter()
+                .map(|item| item.importance() * item.q3_error)
+                .sum::<f32>()
+                / total_importance.max(f32::EPSILON);
+            layers[layer] = items.len() == EXPERTS
+                && items.iter().all(|item| item.q3_error.is_finite())
+                && weighted_error <= args.layerwise_q3_threshold;
+        }
+        layers
+    } else {
+        [false; LAYERS]
+    };
+    let tensorwise_q3_layers = if args.tensorwise_q3 {
+        let mut gate = [false; LAYERS];
+        let mut down = [false; LAYERS];
+        for layer in 0..LAYERS {
+            let items = sensitivities
+                .iter()
+                .filter(|item| item.layer == layer as u16)
+                .collect::<Vec<_>>();
+            let total_importance = items.iter().map(|item| item.importance()).sum::<f32>();
+            let gate_error = items
+                .iter()
+                .map(|item| item.importance() * item.gate_up_q3_error)
+                .sum::<f32>()
+                / total_importance.max(f32::EPSILON);
+            let down_error = items
+                .iter()
+                .map(|item| item.importance() * item.down_q3_error)
+                .sum::<f32>()
+                / total_importance.max(f32::EPSILON);
+            let measured = items.len() == EXPERTS
+                && items.iter().all(|item| {
+                    item.gate_up_q3_error.is_finite() && item.down_q3_error.is_finite()
+                });
+            gate[layer] = measured && gate_error <= args.layerwise_q3_threshold;
+            down[layer] = measured && down_error <= args.layerwise_q3_threshold;
+        }
+        (gate, down)
+    } else {
+        ([false; LAYERS], [false; LAYERS])
+    };
+    let expertwise_q3_tensors = if args.expertwise_q3 {
+        let threshold = args.expertwise_q3_threshold;
+        sensitivities
+            .iter()
+            .map(|item| {
+                (
+                    item.gate_up_q3_error.is_finite() && item.gate_up_q3_error <= threshold,
+                    item.down_q3_error.is_finite() && item.down_q3_error <= threshold,
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![(false, false); sensitivities.len()]
+    };
+    if args.expertwise_q3 {
+        let total_importance = sensitivities
+            .iter()
+            .map(ExpertSensitivity::importance)
+            .sum::<f32>();
+        let weighted_error = sensitivities
+            .iter()
+            .zip(&expertwise_q3_tensors)
+            .map(|(item, &(gate_q3, down_q3))| {
+                let gate = if gate_q3 { item.gate_up_q3_error } else { 0.0 };
+                let down = if down_q3 { item.down_q3_error } else { 0.0 };
+                item.importance() * (gate + down) * 0.5
+            })
+            .sum::<f32>()
+            / total_importance.max(f32::EPSILON);
+        if weighted_error > args.quality_loss {
+            bail!(
+                "expertwise Q3/Q4 allocation has weighted error {weighted_error}, above --quality-loss {}",
+                args.quality_loss
+            );
+        }
+        let selected_bytes = sensitivities
+            .iter()
+            .zip(&expertwise_q3_tensors)
+            .map(|(item, &(gate_q3, down_q3))| {
+                quantized_bytes(
+                    item.gate_up_rows,
+                    item.gate_up_cols,
+                    if gate_q3 {
+                        QuantType::Q3
+                    } else {
+                        QuantType::Q4
+                    },
+                    args.group_size,
+                ) + quantized_bytes(
+                    item.down_rows,
+                    item.down_cols,
+                    if down_q3 {
+                        QuantType::Q3
+                    } else {
+                        QuantType::Q4
+                    },
+                    args.group_size,
+                )
+            })
+            .sum::<usize>();
+        if selected_bytes > expert_memory_budget {
+            bail!(
+                "expertwise Q3/Q4 allocation needs {selected_bytes} bytes after reserving {fixed_plan_bytes} bytes for dense/runtime state"
+            );
+        }
+        eprintln!(
+            "expertwise Q3/Q4 candidate: {} gate/up and {} down tensors selected for Q3; weighted error {weighted_error:.6}",
+            expertwise_q3_tensors.iter().filter(|item| item.0).count(),
+            expertwise_q3_tensors.iter().filter(|item| item.1).count(),
+        );
+    }
+    if args.tensorwise_q3 {
+        let total_importance = sensitivities
+            .iter()
+            .map(ExpertSensitivity::importance)
+            .sum::<f32>();
+        let weighted_error = sensitivities
+            .iter()
+            .map(|item| {
+                let gate = if tensorwise_q3_layers.0[item.layer as usize] {
+                    item.gate_up_q3_error
+                } else {
+                    0.0
+                };
+                let down = if tensorwise_q3_layers.1[item.layer as usize] {
+                    item.down_q3_error
+                } else {
+                    0.0
+                };
+                item.importance() * (gate + down) * 0.5
+            })
+            .sum::<f32>()
+            / total_importance.max(f32::EPSILON);
+        if weighted_error > args.quality_loss {
+            bail!(
+                "tensorwise Q3/Q4 allocation has weighted error {weighted_error}, above --quality-loss {}",
+                args.quality_loss
+            );
+        }
+    }
+    if args.layerwise_q3 {
+        for layer in 0..LAYERS {
+            for expert in 0..EXPERTS {
+                selected.insert(
+                    (layer as u16, expert as u8),
+                    if layerwise_q3_layers[layer] {
+                        QuantType::Q3
+                    } else {
+                        QuantType::Q4
+                    },
+                );
+            }
+        }
+        let selected_bytes = sensitivities
+            .iter()
+            .map(|item| item.bytes_for(selected[&(item.layer, item.expert)], args.group_size))
+            .sum::<usize>();
+        let total_importance = sensitivities
+            .iter()
+            .map(ExpertSensitivity::importance)
+            .sum::<f32>();
+        let weighted_error = sensitivities
+            .iter()
+            .map(|item| item.importance() * item.error_for(selected[&(item.layer, item.expert)]))
+            .sum::<f32>()
+            / total_importance.max(f32::EPSILON);
+        if selected_bytes > expert_memory_budget {
+            bail!(
+                "layerwise Q3/Q4 experts need {selected_bytes} bytes after reserving {fixed_plan_bytes} bytes for dense/runtime state"
+            );
+        }
+        if weighted_error > args.quality_loss {
+            bail!(
+                "layerwise Q3/Q4 allocation has weighted error {weighted_error}, above --quality-loss {}",
+                args.quality_loss
+            );
+        }
+    }
     let mut compiled = Vec::with_capacity(tensors.len() * 2 + LAYERS * 5 + 1);
     let mut raw_tensors = Vec::with_capacity(LAYERS * 2 + 1);
     let mut actual_weight_bytes = 0usize;
     let packing_layout: PackingLayout = args.expert_layout.into();
     for (layer, expert, input, output, input_rows, input_cols, output_rows, output_cols) in tensors
     {
+        let tensor_index = layer as usize * EXPERTS + expert as usize;
         let quant_type = if args.expert_format == ExpertFormat::Q4K {
             QuantType::Q4K
+        } else if let Some(uniform) = args.uniform_expert_bits {
+            uniform
+        } else if args.layerwise_q3 && layerwise_q3_layers[layer as usize] {
+            QuantType::Q3
+        } else if args.tensorwise_q3
+            && (tensorwise_q3_layers.0[layer as usize] || tensorwise_q3_layers.1[layer as usize])
+        {
+            QuantType::Q3
+        } else if args.expertwise_q3 {
+            // Expertwise mode is deliberately a Q3/Q4 experiment. Do not
+            // let the general allocator silently introduce Q2 tensors that
+            // the typed GPU-map path does not support.
+            QuantType::Q4
         } else if trace.is_some() {
-            selected[&(layer, expert)]
+            if args.layerwise_q3 {
+                QuantType::Q4
+            } else {
+                selected[&(layer, expert)]
+            }
         } else {
             QuantType::Q4
         };
-        let expert_group_size = if quant_type == QuantType::Q4K {
+        let gate_quant_type = if args.expertwise_q3 && expertwise_q3_tensors[tensor_index].0 {
+            QuantType::Q3
+        } else if args.tensorwise_q3 && tensorwise_q3_layers.0[layer as usize] {
+            QuantType::Q3
+        } else {
+            quant_type
+        };
+        let down_quant_type = if args.expertwise_q3 && expertwise_q3_tensors[tensor_index].1 {
+            QuantType::Q3
+        } else if args.tensorwise_q3 && tensorwise_q3_layers.1[layer as usize] {
+            QuantType::Q3
+        } else {
+            quant_type
+        };
+        let gate_group_size = if gate_quant_type == QuantType::Q4K {
             256
         } else {
             args.group_size
         };
-        let expert_layout = if quant_type == QuantType::Q4K {
+        let down_group_size = if down_quant_type == QuantType::Q4K {
+            256
+        } else {
+            args.group_size
+        };
+        let gate_layout = if gate_quant_type == QuantType::Q4K {
             PackingLayout::RowMajor
+        } else if (args.layerwise_q3 || args.tensorwise_q3 || args.expertwise_q3)
+            && gate_quant_type == QuantType::Q3
+        {
+            // Q3 has no row-inline transport; Q4 layers may still use the
+            // proven row-inline representation in the same native slab.
+            PackingLayout::RowMajor
+        } else {
+            packing_layout
+        };
+        let down_layout = if down_quant_type == QuantType::Q4K {
+            PackingLayout::RowMajor
+        } else if (args.layerwise_q3 || args.tensorwise_q3 || args.expertwise_q3)
+            && down_quant_type == QuantType::Q3
+        {
+            PackingLayout::RowMajor
+        } else if packing_layout
+            .row_inline_packet_rows()
+            .is_some_and(|rows| rows > 1)
+        {
+            // The first experiment is deliberately asymmetric: packetize
+            // gate/up rows while keeping down on the proven row-inline-1
+            // stream. This isolates the representation change to the
+            // dominant gate/up traffic.
+            PackingLayout::Q4RowInline
         } else {
             packing_layout
         };
@@ -404,18 +756,18 @@ fn main() -> Result<()> {
             &input,
             input_rows,
             input_cols,
-            quant_type,
-            expert_group_size,
-            expert_layout,
+            gate_quant_type,
+            gate_group_size,
+            gate_layout,
         )
         .map_err(anyhow::Error::msg)?;
         let down = QuantizedTensor::quantize_for_layout(
             &output,
             output_rows,
             output_cols,
-            quant_type,
-            expert_group_size,
-            expert_layout,
+            down_quant_type,
+            down_group_size,
+            down_layout,
         )
         .map_err(anyhow::Error::msg)?;
         actual_weight_bytes += gate_up.bytes() + down.bytes();
@@ -630,8 +982,24 @@ fn main() -> Result<()> {
         .provenance
         .benchmark_contract_hash
         .clone_from(&args.benchmark_contract_hash);
-    execution_plan.representations.gate_up = representation_for(&compiled, TensorKind::GateUp);
-    execution_plan.representations.down = representation_for(&compiled, TensorKind::Down);
+    execution_plan.representations.gate_up = if args.expertwise_q3 {
+        ExpertRepresentation::PerExpertTensorQ3Q4
+    } else if args.tensorwise_q3 {
+        tensorwise_representation_for(&compiled, TensorKind::GateUp)
+    } else if args.layerwise_q3 {
+        layerwise_representation_for(&compiled, TensorKind::GateUp)
+    } else {
+        representation_for(&compiled, TensorKind::GateUp)
+    };
+    execution_plan.representations.down = if args.expertwise_q3 {
+        ExpertRepresentation::PerExpertTensorQ3Q4
+    } else if args.tensorwise_q3 {
+        tensorwise_representation_for(&compiled, TensorKind::Down)
+    } else if args.layerwise_q3 {
+        layerwise_representation_for(&compiled, TensorKind::Down)
+    } else {
+        representation_for(&compiled, TensorKind::Down)
+    };
     execution_plan.representations.dense = if args.experts_only {
         ExpertRepresentation::MixedQ2Q3Q4
     } else {
@@ -701,6 +1069,10 @@ fn representation_for(tensors: &[CompiledTensor], kind: TensorKind) -> ExpertRep
     }) {
         ExpertRepresentation::Group32Q4RowMajor
     } else if matching.iter().all(|tensor| {
+        tensor.tensor.quant_type == QuantType::Q3 && tensor.tensor.layout == PackingLayout::RowMajor
+    }) {
+        ExpertRepresentation::DenseQ3
+    } else if matching.iter().all(|tensor| {
         tensor.tensor.quant_type == QuantType::Q4
             && tensor.tensor.layout == PackingLayout::MetalTile32
     }) {
@@ -710,6 +1082,104 @@ fn representation_for(tensors: &[CompiledTensor], kind: TensorKind) -> ExpertRep
             && tensor.tensor.layout == PackingLayout::Q4RowInline
     }) {
         ExpertRepresentation::Group32Q4RowInline
+    } else if kind == TensorKind::GateUp
+        && matching.iter().all(|tensor| {
+            tensor.tensor.quant_type == QuantType::Q4
+                && tensor.tensor.layout == PackingLayout::Q4RowInlineRows2
+        })
+    {
+        ExpertRepresentation::Group32Q4RowInlineRows2
+    } else if kind == TensorKind::GateUp
+        && matching.iter().all(|tensor| {
+            tensor.tensor.quant_type == QuantType::Q4
+                && tensor.tensor.layout == PackingLayout::Q4RowInlineRows4
+        })
+    {
+        ExpertRepresentation::Group32Q4RowInlineRows4
+    } else if kind == TensorKind::GateUp
+        && matching.iter().all(|tensor| {
+            tensor.tensor.quant_type == QuantType::Q4
+                && tensor.tensor.layout == PackingLayout::Q4RowInlineRows8
+        })
+    {
+        ExpertRepresentation::Group32Q4RowInlineRows8
+    } else {
+        ExpertRepresentation::MixedQ2Q3Q4
+    }
+}
+
+fn layerwise_representation_for(
+    tensors: &[CompiledTensor],
+    kind: TensorKind,
+) -> ExpertRepresentation {
+    let matching = tensors
+        .iter()
+        .filter(|tensor| tensor.kind == kind)
+        .collect::<Vec<_>>();
+    let valid = matching.iter().all(|tensor| {
+        matches!(tensor.tensor.quant_type, QuantType::Q3 | QuantType::Q4)
+            && ((tensor.tensor.quant_type == QuantType::Q3
+                && tensor.tensor.layout == PackingLayout::RowMajor)
+                || (tensor.tensor.quant_type == QuantType::Q4
+                    && matches!(
+                        tensor.tensor.layout,
+                        PackingLayout::RowMajor | PackingLayout::Q4RowInline
+                    )))
+    });
+    let layerwise = (0..LAYERS).all(|layer| {
+        let layer_tensors = matching
+            .iter()
+            .filter(|tensor| tensor.layer == layer as u16)
+            .collect::<Vec<_>>();
+        layer_tensors.len() == EXPERTS
+            && layer_tensors
+                .iter()
+                .all(|tensor| tensor.tensor.quant_type == layer_tensors[0].tensor.quant_type)
+    });
+    if valid && layerwise {
+        if matching
+            .iter()
+            .any(|tensor| tensor.tensor.layout == PackingLayout::Q4RowInline)
+        {
+            ExpertRepresentation::LayerwiseQ3Q4RowInline
+        } else {
+            ExpertRepresentation::LayerwiseQ3Q4
+        }
+    } else {
+        ExpertRepresentation::MixedQ2Q3Q4
+    }
+}
+
+fn tensorwise_representation_for(
+    tensors: &[CompiledTensor],
+    kind: TensorKind,
+) -> ExpertRepresentation {
+    let matching = tensors
+        .iter()
+        .filter(|tensor| tensor.kind == kind)
+        .collect::<Vec<_>>();
+    let valid = matching.iter().all(|tensor| {
+        matches!(tensor.tensor.quant_type, QuantType::Q3 | QuantType::Q4)
+            && ((tensor.tensor.quant_type == QuantType::Q3
+                && tensor.tensor.layout == PackingLayout::RowMajor)
+                || (tensor.tensor.quant_type == QuantType::Q4
+                    && matches!(
+                        tensor.tensor.layout,
+                        PackingLayout::RowMajor | PackingLayout::Q4RowInline
+                    )))
+    });
+    let uniform_per_layer = (0..LAYERS).all(|layer| {
+        let layer_tensors = matching
+            .iter()
+            .filter(|tensor| tensor.layer == layer as u16)
+            .collect::<Vec<_>>();
+        layer_tensors.len() == EXPERTS
+            && layer_tensors
+                .iter()
+                .all(|tensor| tensor.tensor.quant_type == layer_tensors[0].tensor.quant_type)
+    });
+    if valid && uniform_per_layer {
+        ExpertRepresentation::LayerwiseTensorQ3Q4
     } else {
         ExpertRepresentation::MixedQ2Q3Q4
     }
@@ -724,31 +1194,64 @@ fn write_sensitivity_report(
     let mut csv = "layer,expert,selected,bits,bytes,importance,frequency,mean_router_weight,"
         .to_owned()
         + "q2_relative_l2,q3_relative_l2,q4_relative_l2,q2_mse,q3_mse,q4_mse,"
-        + "q2_cosine,q3_cosine,q4_cosine\n";
+        + "q2_cosine,q3_cosine,q4_cosine,gate_up_q3_relative_l2,"
+        + "down_q3_relative_l2,gate_up_q4_relative_l2,down_q4_relative_l2,"
+        + "gate_up_q3_bytes_saved,down_q3_bytes_saved,gate_up_route_value,down_route_value\n";
     for item in sensitivities {
         let quant_type = selected[&(item.layer, item.expert)];
         let bytes = item.bytes_for(quant_type, plan.group_size);
-        writeln!(
-            csv,
-            "{},{},{},{},{},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8}",
-            item.layer,
-            item.expert,
-            quant_type,
-            quant_type.bits(),
-            bytes,
-            item.importance(),
-            item.activation_frequency,
-            item.mean_router_weight,
-            item.q2_error,
-            item.q3_error,
-            item.q4_error,
-            item.q2_mse,
-            item.q3_mse,
-            item.q4_mse,
-            item.q2_cosine,
-            item.q3_cosine,
-            item.q4_cosine,
-        )?;
+        let gate_up_bytes_saved = quantized_bytes(
+            item.gate_up_rows,
+            item.gate_up_cols,
+            QuantType::Q4,
+            plan.group_size,
+        )
+        .saturating_sub(quantized_bytes(
+            item.gate_up_rows,
+            item.gate_up_cols,
+            QuantType::Q3,
+            plan.group_size,
+        ));
+        let down_bytes_saved = quantized_bytes(
+            item.down_rows,
+            item.down_cols,
+            QuantType::Q4,
+            plan.group_size,
+        )
+        .saturating_sub(quantized_bytes(
+            item.down_rows,
+            item.down_cols,
+            QuantType::Q3,
+            plan.group_size,
+        ));
+        let fields = [
+            item.layer.to_string(),
+            item.expert.to_string(),
+            quant_type.to_string(),
+            quant_type.bits().to_string(),
+            bytes.to_string(),
+            format!("{:.8}", item.importance()),
+            format!("{:.8}", item.activation_frequency),
+            format!("{:.8}", item.mean_router_weight),
+            format!("{:.8}", item.q2_error),
+            format!("{:.8}", item.q3_error),
+            format!("{:.8}", item.q4_error),
+            format!("{:.8}", item.q2_mse),
+            format!("{:.8}", item.q3_mse),
+            format!("{:.8}", item.q4_mse),
+            format!("{:.8}", item.q2_cosine),
+            format!("{:.8}", item.q3_cosine),
+            format!("{:.8}", item.q4_cosine),
+            format!("{:.8}", item.gate_up_q3_error),
+            format!("{:.8}", item.down_q3_error),
+            format!("{:.8}", item.gate_up_q4_error),
+            format!("{:.8}", item.down_q4_error),
+            gate_up_bytes_saved.to_string(),
+            down_bytes_saved.to_string(),
+            format!("{:.8}", item.importance() * gate_up_bytes_saved as f32),
+            format!("{:.8}", item.importance() * down_bytes_saved as f32),
+        ];
+        writeln!(csv, "{}", fields.join(","))?;
     }
     fs::write(path, csv).with_context(|| format!("write {}", path.display()))?;
     Ok(())

@@ -25,6 +25,26 @@ pub enum ExpertRepresentation {
     MixedQ2Q3Q4,
     DenseQ3,
     PaddedQ3,
+    /// Each transformer layer is uniform Q3 or Q4, but layers may differ.
+    /// This keeps the mmap/no-copy slab executable without per-expert gathers.
+    LayerwiseQ3Q4,
+    /// Layerwise Q3/Q4 with the Q4 layers using the exact row-inline Q4
+    /// transport selected by the Granite/M5 plan.
+    LayerwiseQ3Q4RowInline,
+    /// Gate/up and down may independently be native Q3 or Q4 per layer.
+    /// Expert IDs remain unchanged; the runtime binds each tensor family
+    /// directly from the artifact slab.
+    LayerwiseTensorQ3Q4,
+    /// Gate/up and down may independently select native Q3 or Q4 for every
+    /// (layer, expert). The artifact stores typed compact slabs and the
+    /// runtime dispatches each selected representation through a GPU map.
+    PerExpertTensorQ3Q4,
+    /// Exact-Q4 gate/up packets containing two rows, with row-inline down.
+    Group32Q4RowInlineRows2,
+    /// Exact-Q4 gate/up packets containing four rows, with row-inline down.
+    Group32Q4RowInlineRows4,
+    /// Exact-Q4 gate/up packets containing eight rows, with row-inline down.
+    Group32Q4RowInlineRows8,
     Q4K,
 }
 
@@ -475,21 +495,29 @@ impl MappedArtifact {
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("QX tensor index out of range"))?;
         let (scales, data) = self.tensor_bytes(index)?;
-        if entry.layout == PackingLayout::Q4RowInline {
+        if entry.layout.is_q4_row_inline() {
             if entry.quant_type != QuantType::Q4 || entry.group_size != 32 {
                 bail!("inline artifact tensor is not group-32 Q4");
             }
             let groups = (entry.cols as usize).div_ceil(entry.group_size as usize);
             let group_bytes = 16_usize;
-            let stride = groups * (group_bytes + 2);
-            if data.len() != entry.rows as usize * stride {
+            let packet_rows = entry.layout.row_inline_packet_rows().unwrap();
+            if entry.rows as usize % packet_rows != 0 {
+                bail!("inline artifact tensor rows do not divide packet width");
+            }
+            let packet_bytes = groups * packet_rows * (group_bytes + 2);
+            if data.len() != (entry.rows as usize / packet_rows) * packet_bytes {
                 bail!("inline artifact tensor has invalid stream length");
             }
             let mut split_data = Vec::with_capacity(entry.rows as usize * groups * group_bytes);
             let mut split_scales = Vec::with_capacity(entry.rows as usize * groups);
             for row in 0..entry.rows as usize {
+                let packet = row / packet_rows;
+                let row_in_packet = row % packet_rows;
+                let packet_start = packet * packet_bytes;
                 for group in 0..groups {
-                    let start = row * stride + group * (group_bytes + 2);
+                    let start =
+                        packet_start + (group * packet_rows + row_in_packet) * (group_bytes + 2);
                     split_data.extend_from_slice(&data[start..start + group_bytes]);
                     split_scales.push(f16::from_bits(u16::from_le_bytes(
                         data[start + group_bytes..start + group_bytes + 2]
@@ -666,7 +694,15 @@ fn write_artifact_internal(
     let mut physical_order = (0..tensors.len()).collect::<Vec<_>>();
     physical_order.sort_by_key(|index| {
         let tensor = &tensors[*index];
-        (tensor.layer, tensor.kind as u8, tensor.expert)
+        // Typed expert slabs are compact only when equal representations are
+        // adjacent. Uniform artifacts retain their historical order because
+        // quant_code is identical in that case.
+        (
+            tensor.layer,
+            tensor.kind as u8,
+            quant_code(tensor.tensor.quant_type),
+            tensor.expert,
+        )
     });
     let mut group_start = 0;
     while group_start < physical_order.len() {
@@ -674,18 +710,23 @@ fn write_artifact_internal(
         let mut group_end = group_start + 1;
         while group_end < physical_order.len() {
             let next = &tensors[physical_order[group_end]];
-            if next.layer != first.layer || next.kind != first.kind {
+            if next.layer != first.layer
+                || next.kind != first.kind
+                || quant_code(next.tensor.quant_type) != quant_code(first.tensor.quant_type)
+            {
                 break;
             }
             group_end += 1;
         }
         let group = &physical_order[group_start..group_end];
-        if first.tensor.layout == PackingLayout::Q4RowInline {
+        if first.tensor.layout.is_q4_row_inline() {
             for index in group {
                 let compiled = &tensors[*index];
                 let inline = compiled
                     .tensor
-                    .row_inline_bytes()
+                    .row_inline_packet_bytes(
+                        compiled.tensor.layout.row_inline_packet_rows().unwrap(),
+                    )
                     .map_err(|error| anyhow::anyhow!(error))?;
                 let offset = data_offset + blobs.len() as u64;
                 blobs.extend_from_slice(&inline);
@@ -1150,6 +1191,76 @@ mod tests {
             "payload slabs must be adjacent"
         );
         assert!(second.0.end <= first.1.start, "all scales precede payloads");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn artifact_v2_keeps_per_expert_quant_types_in_typed_slabs() {
+        let path = std::env::temp_dir().join(format!(
+            "qx-artifact-typed-{}-{}.qx",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let tensors = [
+            (0_u8, QuantType::Q4),
+            (1_u8, QuantType::Q3),
+            (2_u8, QuantType::Q4),
+            (3_u8, QuantType::Q3),
+        ]
+        .into_iter()
+        .map(|(expert, quant_type)| CompiledTensor {
+            layer: 0,
+            expert,
+            kind: TensorKind::GateUp,
+            tensor: QuantizedTensor::quantize(
+                &[1.0 + expert as f32, -0.5, 0.25, 0.0],
+                2,
+                2,
+                quant_type,
+                2,
+            ),
+        })
+        .collect::<Vec<_>>();
+        write_artifact(
+            &path,
+            "granite",
+            "apple-m5-pro",
+            512,
+            MemoryPlan::default(),
+            &tensors,
+        )
+        .unwrap();
+        let artifact = MappedArtifact::open(&path).unwrap();
+        let q3 = artifact
+            .info()
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.quant_type == QuantType::Q3)
+            .collect::<Vec<_>>();
+        let q4 = artifact
+            .info()
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.quant_type == QuantType::Q4)
+            .collect::<Vec<_>>();
+        assert_eq!(q3.len(), 2);
+        assert_eq!(q4.len(), 2);
+        for typed in [q3, q4] {
+            let mut scales = typed
+                .iter()
+                .map(|(index, _)| artifact.tensor_slab_ranges(*index).unwrap().0)
+                .collect::<Vec<_>>();
+            scales.sort_by_key(|range| range.start);
+            assert_eq!(scales[0].end, scales[1].start);
+            let mut data = typed
+                .iter()
+                .map(|(index, _)| artifact.tensor_slab_ranges(*index).unwrap().1)
+                .collect::<Vec<_>>();
+            data.sort_by_key(|range| range.start);
+            assert_eq!(data[0].end, data[1].start);
+        }
         std::fs::remove_file(path).unwrap();
     }
 }

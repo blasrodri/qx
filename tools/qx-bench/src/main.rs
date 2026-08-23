@@ -5588,6 +5588,7 @@ fn benchmark_v2_parity(
     context_length: usize,
 ) -> Result<()> {
     use std::rc::Rc;
+    qx_runtime_v2::activate_artifact_execution_plan(artifact_path).map_err(anyhow::Error::msg)?;
     let tokenizer = qx_tokenizer::Tokenizer::from_dir(model_path)?;
     let tokens = tokenizer.encode(prompt)?;
     const CHECKPOINTS: [usize; 8] = [0, 1, 7, 31, 63, 127, 255, 511];

@@ -134,6 +134,12 @@ pub struct ExpertSensitivity {
     pub q2_cosine: f32,
     pub q3_cosine: f32,
     pub q4_cosine: f32,
+    /// Per-tensor weight errors for representation candidate generation.
+    /// They are not a substitute for the full teacher-forced quality gate.
+    pub gate_up_q3_error: f32,
+    pub down_q3_error: f32,
+    pub gate_up_q4_error: f32,
+    pub down_q4_error: f32,
     pub activation_frequency: f32,
     pub mean_router_weight: f32,
     pub gate_up_rows: usize,
@@ -228,6 +234,10 @@ pub fn measure_sensitivity(
                 (errors, mses, cosines, left.3 + right.3)
             },
         );
+    let gate_up_q3_error = quantized[1].gate_up.relative_l2(&weights.gate_up);
+    let down_q3_error = quantized[1].down.relative_l2(&weights.down);
+    let gate_up_q4_error = quantized[2].gate_up.relative_l2(&weights.gate_up);
+    let down_q4_error = quantized[2].down.relative_l2(&weights.down);
     let divisor = weight_sum.max(f32::EPSILON);
     let frequency = if total_tokens == 0 {
         0.0
@@ -246,6 +256,10 @@ pub fn measure_sensitivity(
         q2_cosine: cosines[0] / divisor,
         q3_cosine: cosines[1] / divisor,
         q4_cosine: cosines[2] / divisor,
+        gate_up_q3_error,
+        down_q3_error,
+        gate_up_q4_error,
+        down_q4_error,
         activation_frequency: frequency,
         mean_router_weight: if samples.is_empty() {
             0.0

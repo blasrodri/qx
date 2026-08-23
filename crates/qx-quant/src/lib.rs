@@ -29,6 +29,12 @@ pub enum PackingLayout {
     /// following its packed codes. The logical values and byte count are
     /// unchanged; artifact/runtime consumers must use the inline kernel.
     Q4RowInline = 3,
+    /// Exact-Q4 row-inline packets containing two complete rows per packet.
+    Q4RowInlineRows2 = 4,
+    /// Exact-Q4 row-inline packets containing four complete rows per packet.
+    Q4RowInlineRows4 = 5,
+    /// Exact-Q4 row-inline packets containing eight complete rows per packet.
+    Q4RowInlineRows8 = 6,
 }
 
 impl PackingLayout {
@@ -38,8 +44,25 @@ impl PackingLayout {
             1 => Some(Self::MetalTile32),
             2 => Some(Self::MetalTile32Paired),
             3 => Some(Self::Q4RowInline),
+            4 => Some(Self::Q4RowInlineRows2),
+            5 => Some(Self::Q4RowInlineRows4),
+            6 => Some(Self::Q4RowInlineRows8),
             _ => None,
         }
+    }
+
+    pub const fn row_inline_packet_rows(self) -> Option<usize> {
+        match self {
+            Self::Q4RowInline => Some(1),
+            Self::Q4RowInlineRows2 => Some(2),
+            Self::Q4RowInlineRows4 => Some(4),
+            Self::Q4RowInlineRows8 => Some(8),
+            _ => None,
+        }
+    }
+
+    pub const fn is_q4_row_inline(self) -> bool {
+        self.row_inline_packet_rows().is_some()
     }
 }
 
@@ -230,11 +253,14 @@ impl QuantizedTensor {
                 self.layout = PackingLayout::MetalTile32;
                 Ok(())
             }
-            PackingLayout::Q4RowInline => {
+            PackingLayout::Q4RowInline
+            | PackingLayout::Q4RowInlineRows2
+            | PackingLayout::Q4RowInlineRows4
+            | PackingLayout::Q4RowInlineRows8 => {
                 if self.quant_type != QuantType::Q4 || self.group_size != 32 {
                     return Err("Q4RowInline requires group-32 Q4".to_owned());
                 }
-                self.layout = PackingLayout::Q4RowInline;
+                self.layout = layout;
                 Ok(())
             }
         }
@@ -244,23 +270,42 @@ impl QuantizedTensor {
     /// transport candidate: 16 code bytes followed by one FP16 scale for
     /// every group-32 block. No quantized value is changed.
     pub fn row_inline_bytes(&self) -> Result<Vec<u8>, String> {
+        self.row_inline_packet_bytes(1)
+    }
+
+    /// Return a packetized exact-Q4 row-inline stream. Each packet contains
+    /// `packet_rows` complete rows for one group, with every row encoded as
+    /// `[16 packed codes][FP16 scale]`. The byte count is identical to the
+    /// ordinary row-inline stream; only the traversal order changes.
+    pub fn row_inline_packet_bytes(&self, packet_rows: usize) -> Result<Vec<u8>, String> {
         if self.quant_type != QuantType::Q4 || self.group_size != 32 {
             return Err("row-inline transport requires group-32 Q4".to_owned());
         }
+        if !matches!(packet_rows, 1 | 2 | 4 | 8) || !self.rows.is_multiple_of(packet_rows) {
+            return Err(format!(
+                "row-inline packet width must be 1, 2, 4, or 8 and divide rows; got {packet_rows} for {} rows",
+                self.rows
+            ));
+        }
         let groups = self.cols.div_ceil(self.group_size);
         let group_bytes = packed_len(self.group_size, self.quant_type);
-        let row_bytes = groups * (group_bytes + 2);
-        let mut output = Vec::with_capacity(self.rows * row_bytes);
-        for row in 0..self.rows {
+        let row_packet_bytes = group_bytes + 2;
+        let packet_bytes = groups * packet_rows * row_packet_bytes;
+        let mut output = Vec::with_capacity(self.rows * groups * row_packet_bytes);
+        for packet in (0..self.rows).step_by(packet_rows) {
             for group in 0..groups {
-                // `data` and `scales` remain in their normal row-major
-                // split form until the artifact writer emits this stream.
-                let data_offset = row * groups * group_bytes + group * group_bytes;
-                let scale_offset = row * groups + group;
-                output.extend_from_slice(&self.data[data_offset..data_offset + group_bytes]);
-                output.extend_from_slice(&self.scales[scale_offset].to_bits().to_le_bytes());
+                for row_in_packet in 0..packet_rows {
+                    let row = packet + row_in_packet;
+                    // `data` and `scales` remain in their normal row-major
+                    // split form until the artifact writer emits this stream.
+                    let data_offset = row * groups * group_bytes + group * group_bytes;
+                    let scale_offset = row * groups + group;
+                    output.extend_from_slice(&self.data[data_offset..data_offset + group_bytes]);
+                    output.extend_from_slice(&self.scales[scale_offset].to_bits().to_le_bytes());
+                }
             }
         }
+        debug_assert_eq!(output.len(), (self.rows / packet_rows) * packet_bytes);
         Ok(output)
     }
 
@@ -327,12 +372,14 @@ impl QuantizedTensor {
                 };
                 self.group_location_for_tile32(physical_row, group)
             }
-            PackingLayout::Q4RowInline => {
-                let row_bytes = groups * (group_bytes + 2);
-                (
-                    row * row_bytes + group * (group_bytes + 2),
-                    row * groups + group,
-                )
+            PackingLayout::Q4RowInline
+            | PackingLayout::Q4RowInlineRows2
+            | PackingLayout::Q4RowInlineRows4
+            | PackingLayout::Q4RowInlineRows8 => {
+                // QuantizedTensor keeps the split row-major backing vectors;
+                // packetization is materialized only by the artifact writer.
+                let row_bytes = groups * group_bytes;
+                (row * row_bytes + group * group_bytes, row * groups + group)
             }
         }
     }
@@ -1007,6 +1054,34 @@ mod tests {
                     &stream[start + 16..start + 18],
                     &split.scales[row * 32 + group].to_bits().to_le_bytes()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn row_inline_packets_preserve_codes_scales_and_byte_count() {
+        let rows = 16;
+        let cols = 64;
+        let values = (0..rows * cols)
+            .map(|index| (index as f32 - 100.0) / 17.0)
+            .collect::<Vec<_>>();
+        let split = QuantizedTensor::quantize(&values, rows, cols, QuantType::Q4, 32);
+        let single = split.row_inline_packet_bytes(1).unwrap();
+        for packet_rows in [2, 4, 8] {
+            let packet = split.row_inline_packet_bytes(packet_rows).unwrap();
+            assert_eq!(packet.len(), single.len());
+            for row in 0..rows {
+                for group in 0..2 {
+                    let packet_index = row / packet_rows;
+                    let row_in_packet = row % packet_rows;
+                    let packet_start =
+                        (packet_index * 2 * packet_rows + group * packet_rows + row_in_packet) * 18;
+                    let single_start = (row * 2 + group) * 18;
+                    assert_eq!(
+                        &packet[packet_start..packet_start + 18],
+                        &single[single_start..single_start + 18]
+                    );
+                }
             }
         }
     }
