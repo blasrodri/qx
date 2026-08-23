@@ -347,6 +347,19 @@ pub mod platform {
         )
     }
 
+    /// Enables the exact-Q4 cooperative packet consumer. It keeps row-inline
+    /// storage but assigns one packed code byte per SIMD lane and broadcasts
+    /// each packet scale within the two-lane halves.
+    pub fn moe_unique_packet_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            matches!(
+                std::env::var("QX_V2_MOE_UNIQUE_PACKET").ok().as_deref(),
+                Some("1") | Some("true") | Some("yes") | Some("on")
+            )
+        })
+    }
+
     /// Experimental decode-specific Q4 row-inline mapping candidate. It uses
     /// two SIMD groups per 64-thread threadgroup and computes two output rows
     /// per SIMD group, matching the batch-1 work shape used by the llama audit.
@@ -835,6 +848,8 @@ pub mod platform {
         inline_gate_up_vec4_norm_pipeline: Pipeline,
         inline_gate_up_nocache_pipeline: Pipeline,
         inline_gate_up_nocache_norm_pipeline: Pipeline,
+        unique_packet_gate_up_pipeline: Pipeline,
+        unique_packet_gate_up_norm_pipeline: Pipeline,
         cross_expert_gate_up_pipeline: Pipeline,
         cross_expert_gate_up_norm_pipeline: Pipeline,
         cross_expert_tile8_gate_up_pipeline: Pipeline,
@@ -2588,6 +2603,10 @@ pub mod platform {
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none();
+            let unique_packet = moe_unique_packet_enabled()
+                && prepared.inline_layout
+                && prepared.gate_up_layout == PackingLayout::Q4RowInline
+                && q3_block_bytes.is_none();
             let is_q4k = prepared.gate_up_packed.length == 32 * 1024 * 4 * 140
                 && prepared.gate_up_scales.length == 32 * 1024 * 4 * 2 * 2
                 && prepared.down_packed.length == 32 * 1024 * 2 * 140
@@ -2644,7 +2663,12 @@ pub mod platform {
                 && !row_inline_streaming;
 
             if let Some((norm_weights, inverse_rms)) = norm {
-                if gate_up_instrument && self.select_gate_up_instrument_pipeline(prepared, true)? {
+                if unique_packet {
+                    self.encoder
+                        .setComputePipelineState(&prepared.unique_packet_gate_up_norm_pipeline);
+                } else if gate_up_instrument
+                    && self.select_gate_up_instrument_pipeline(prepared, true)?
+                {
                 } else if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
                     self.encoder.setComputePipelineState(pipeline);
                 } else if q4k_mature_gate_up {
@@ -2736,7 +2760,12 @@ pub mod platform {
                     );
                 }
             } else {
-                if gate_up_instrument && self.select_gate_up_instrument_pipeline(prepared, false)? {
+                if unique_packet {
+                    self.encoder
+                        .setComputePipelineState(&prepared.unique_packet_gate_up_pipeline);
+                } else if gate_up_instrument
+                    && self.select_gate_up_instrument_pipeline(prepared, false)?
+                {
                 } else if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
                     self.encoder.setComputePipelineState(pipeline);
                 } else if q4k_mature_gate_up {
@@ -3929,6 +3958,10 @@ pub mod platform {
                     norm,
                 );
             }
+            let unique_packet = moe_unique_packet_enabled()
+                && prepared.inline_layout
+                && prepared.gate_up_layout == PackingLayout::Q4RowInline
+                && prepared.q3_gate_up_block_bytes.is_none();
             if input.length < 1024 * 4
                 || expert_ids.length < 8 * 4
                 || expert_weights.length < 8 * 4
@@ -3978,7 +4011,11 @@ pub mod platform {
             match stage {
                 0 => {
                     if let Some((norm_weights, inverse_rms)) = norm {
-                        if gate_up_instrument
+                        if unique_packet {
+                            self.encoder.setComputePipelineState(
+                                &prepared.unique_packet_gate_up_norm_pipeline,
+                            );
+                        } else if gate_up_instrument
                             && self.select_gate_up_instrument_pipeline(prepared, true)?
                         {
                         } else if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
@@ -4057,7 +4094,10 @@ pub mod platform {
                             );
                         }
                     } else {
-                        if gate_up_instrument
+                        if unique_packet {
+                            self.encoder
+                                .setComputePipelineState(&prepared.unique_packet_gate_up_pipeline);
+                        } else if gate_up_instrument
                             && self.select_gate_up_instrument_pipeline(prepared, false)?
                         {
                         } else if prepared.gate_up_layout.is_q4_transaction() {
@@ -7645,6 +7685,12 @@ pub mod platform {
                 "qx_dynamic_q4_moe_down_simd"
             };
             Ok(PreparedDynamicQ4Moe {
+                unique_packet_gate_up_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_unique_packet_simd",
+                )?,
+                unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd",
+                )?,
                 gate_up_instrument_load_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_simd",
                 )?,
@@ -7977,6 +8023,12 @@ pub mod platform {
                 "qx_dynamic_q4_moe_down_simd"
             };
             let mut prepared = PreparedDynamicQ4Moe {
+                unique_packet_gate_up_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_unique_packet_simd",
+                )?,
+                unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd",
+                )?,
                 gate_up_instrument_load_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_simd",
                 )?,
@@ -8265,6 +8317,12 @@ pub mod platform {
             let q3_down_packed = q3_down_packed.unwrap_or_else(|| dummy.clone());
             let q3_down_scales = q3_down_scales.unwrap_or_else(|| dummy.clone());
             let prepared = PreparedDynamicQ4Moe {
+                unique_packet_gate_up_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_unique_packet_simd",
+                )?,
+                unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd",
+                )?,
                 gate_up_instrument_load_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_simd",
                 )?,
@@ -8633,6 +8691,12 @@ pub mod platform {
                 return Err("split dynamic Q4 MoE buffers have an invalid Granite shape".to_owned());
             }
             Ok(PreparedDynamicQ4Moe {
+                unique_packet_gate_up_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_unique_packet_simd",
+                )?,
+                unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd",
+                )?,
                 gate_up_instrument_contiguous_load_only_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_contiguous_load_only_simd",
                 )?,

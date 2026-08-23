@@ -261,6 +261,84 @@ kernel void qx_dynamic_q4_moe_gate_up_inline_norm_simd(
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
+// Exact-Q4 semantic candidate corresponding to the load-unique-packet
+// diagnostic. Each SIMD group processes two adjacent 32-weight groups:
+// lanes 0..15 load one code byte for group 0, lanes 16..31 load one code byte
+// for group 1. Lanes 0 and 16 load the corresponding FP16 scale, which is
+// broadcast within each half. Each lane then evaluates both nibbles in its
+// byte and participates in the normal SIMD reduction.
+inline void qx_dynamic_q4_gate_up_inline_unique_packet_body(
+    device const uchar* stream,
+    device const uint* expert_ids,
+    device float* output,
+    threadgroup float* cached_input,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint row = (threadgroup_id % threadgroups_per_expert) * rows_per_threadgroup + simdgroup;
+    uint expert = expert_ids[slot];
+    float sum = 0.0f;
+    if (expert < 32) {
+        uint row_base = expert * expert_stride + row * row_stride;
+        for (uint group = 0; group < groups; group += 2) {
+            uint local = lane & 15u;
+            uint selected_group = group + (lane >= 16u ? 1u : 0u);
+            uint group_base = row_base + selected_group * group_stride;
+            uint packed = uint(stream[group_base + local]);
+            float scale = 0.0f;
+            if (local == 0u) {
+                scale = qx_q4_inline_scale(stream, group_base + 16u);
+            }
+            float scale0 = simd_broadcast(lane == 0u ? scale : 0.0f, 0);
+            float scale1 = simd_broadcast(lane == 16u ? scale : 0.0f, 16);
+            float selected_scale = lane < 16u ? scale0 : scale1;
+            uint input_base = selected_group * 32u + local * 2u;
+            uint lo = packed & 0xfu;
+            uint hi = (packed >> 4u) & 0xfu;
+            sum += float(int(lo) - 7) * selected_scale * cached_input[input_base];
+            sum += float(int(hi) - 7) * selected_scale * cached_input[input_base + 1u];
+        }
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) output[slot * hidden + row] = sum;
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_inline_unique_packet_simd(
+    device const uchar* stream [[buffer(0)]], device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]], device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]], uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    for (uint column = thread_index; column < 1024; column += 256) cached_input[column] = input[column];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_gate_up_inline_unique_packet_body(stream, expert_ids, output, cached_input,
+        lane, simdgroup, threadgroup_id);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd(
+    device const uchar* stream [[buffer(0)]], device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]], device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]], device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]], uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    float inverse = inverse_rms[0];
+    for (uint column = thread_index; column < 1024; column += 256) {
+        cached_input[column] = input[column] * inverse * norm_weights[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_gate_up_inline_unique_packet_body(stream, expert_ids, output, cached_input,
+        lane, simdgroup, threadgroup_id);
+}
+
 // Production-path instrumentation variants. These intentionally preserve the
 // row-inline address calculation, 256-thread dispatch, row ownership, and
 // activation staging of qx_dynamic_q4_moe_gate_up_inline_simd. They are

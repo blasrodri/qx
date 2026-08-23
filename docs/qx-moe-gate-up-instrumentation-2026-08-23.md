@@ -267,6 +267,42 @@ That kernel must decode both nibbles from each uniquely loaded code byte,
 broadcast one scale per packet, accumulate the corresponding activation pair,
 and pass the full sequential parity gate before any promotion decision.
 
+## Exact semantic cooperative packet consumer
+
+The feature-flagged semantic candidate is enabled with
+`QX_V2_MOE_UNIQUE_PACKET=1`. It uses the same row-inline Q4 bytes, expert IDs,
+256-thread dispatch, activation staging, and one output row per SIMD group.
+For every pair of 32-weight groups, each lane loads one unique packed code
+byte; lanes 0 and 16 load the two packet scales, which are broadcast within
+their respective 16-lane halves. Each lane decodes both nibbles and performs
+the corresponding two activation products before the normal SIMD reduction.
+
+The long sequential parity gate passed:
+
+```text
+checkpoint positions:   0, 1, 7, 31, 63, 127, 255, 511
+max KV key error:        0.009853
+max KV value error:      0.001048
+max attention error:     0.000127
+max absolute logit:      0.009898
+minimum logit cosine:    1.000000
+argmax agreement:        8/8
+```
+
+Same-workload release throughput measurements were:
+
+| Plan | Wall ms/token | GPU ms/token | Equivalent tok/s | CBs | Dispatches |
+|---|---:|---:|---:|---:|---:|
+| canonical row-inline | 4.830 | 4.340 | 207.02 | 1 | 461 |
+| unique packet | 4.437 | 3.977 | 225.38 | 1 | 461 |
+| unique packet, repeat | 4.374 | 3.908 | 228.64 | 1 | 461 |
+
+The two candidate runs are approximately 9–10% faster than the immediately
+paired canonical run. This is the first load-level result that survives into
+the complete semantic graph. It is still not canonical: the feature flag must
+be represented as a compiler plan candidate and selected through the normal
+multi-tier benchmark/quality/memory promotion process.
+
 Result records:
 
 - `benchmarks/results/gateup-instrument-canonical-general-2026-08-23.json`
@@ -286,3 +322,6 @@ Result records:
 - `benchmarks/results/gateup-instrument-averaged-contiguous-load-only-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-averaged-load-two-groups-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-averaged-load-unique-packet-2026-08-23.json`
+- `benchmarks/results/unique-packet-v2-token-2026-08-23.json`
+- `benchmarks/results/unique-packet-v2-token-r2-2026-08-23.json`
+- `benchmarks/results/canonical-v2-token-after-unique-packet-2026-08-23.json`
