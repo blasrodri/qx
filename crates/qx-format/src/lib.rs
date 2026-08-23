@@ -87,6 +87,10 @@ pub enum MoeTopology {
     /// an install-time candidate; it is intentionally distinct from the
     /// canonical 8-rows-per-threadgroup mapping.
     FourStageWideExpert,
+    /// Four-stage MoE with one eight-row output tile walking the eight
+    /// selected experts. This shares activation staging across the route set
+    /// and remains a complete-model candidate until measured.
+    FourStageCrossExpertActivation,
     SplitGateUp,
 }
 

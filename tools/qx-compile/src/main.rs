@@ -131,6 +131,7 @@ enum ExpertLayout {
 enum MoeVariant {
     FourStage,
     WideExpert,
+    CrossExpertActivation,
 }
 
 impl From<ExpertLayout> for PackingLayout {
@@ -1008,6 +1009,7 @@ fn main() -> Result<()> {
     execution_plan.topology.moe = match args.moe_variant {
         MoeVariant::FourStage => qx_format::MoeTopology::FourStage,
         MoeVariant::WideExpert => qx_format::MoeTopology::FourStageWideExpert,
+        MoeVariant::CrossExpertActivation => qx_format::MoeTopology::FourStageCrossExpertActivation,
     };
     write_artifact_with_raw_and_plan(
         &args.output,
