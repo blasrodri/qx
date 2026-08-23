@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "mode": "v2_moe_contextual_profile",
+  "candidate": "averaged-load-two-groups",
+  "artifact": "external/models/granite-m5-pro-q4-factorial-rowinline.qx",
+  "artifact_hash": "e3f2940482d5999d",
+  "fixture_name": "general-systems",
+  "fixture_domain": "general",
+  "context": 512,
+  "position": 384,
+  "iterations": 10,
+  "warmup": 2,
+  "routes_frozen": true,
+  "route_source": "canonical top-8 captured once after fixture prefill",
+  "topology": [
+    "qkv=fused",
+    "rope_kv_split=true",
+    "attention_3stage=true",
+    "rms_scalar_qkv=true",
+    "rms_scalar_router=true",
+    "moe_layout=artifact"
+  ],
+  "os_version": "26.5.2",
+  "power_state": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=23199843)\t66%; charging; 1:22 remaining present: true",
+  "thermal_state": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+  "memory_pressure": "The system has 25769803776 (1572864 pages with a page size of 16384).\nSystem-wide memory free percentage: 47%",
+  "levels": [
+    {
+      "level": "gate_up_boundary_24_layers",
+      "timing": {
+        "gpu_us_per_sample": 1434.500009054318,
+        "wall_us_per_sample": 1693.542,
+        "dispatches_per_sample": 24.0,
+        "command_buffers_per_sample": 1.0,
+        "encoders_per_sample": 1.0
+      },
+      "memory": {
+        "artifact_bytes": 751009792,
+        "mapped_artifact_bytes": 751009792,
+        "known_metal_allocated_bytes": 802373632,
+        "recommended_metal_working_set_bytes": 19069665280,
+        "current_rss_bytes": 39796736,
+        "peak_rss_bytes": 39796736,
+        "current_physical_footprint_bytes": 139870880,
+        "peak_physical_footprint_bytes": 139870880
+      }
+    },
+    {
+      "level": "fixed_route_moe_24_layers",
+      "timing": {
+        "gpu_us_per_sample": 2243.6250001192093,
+        "wall_us_per_sample": 2475.666,
+        "dispatches_per_sample": 96.0,
+        "command_buffers_per_sample": 1.0,
+        "encoders_per_sample": 1.0
+      },
+      "memory": {
+        "artifact_bytes": 751009792,
+        "mapped_artifact_bytes": 751009792,
+        "known_metal_allocated_bytes": 802373632,
+        "recommended_metal_working_set_bytes": 19069665280,
+        "current_rss_bytes": 39796736,
+        "peak_rss_bytes": 39796736,
+        "current_physical_footprint_bytes": 139870880,
+        "peak_physical_footprint_bytes": 139870880
+      }
+    },
+    {
+      "level": "complete_token_fixed_route",
+      "timing": {
+        "gpu_us_per_sample": 4979.83320383355,
+        "wall_us_per_sample": 5196.084,
+        "dispatches_per_sample": 461.0,
+        "command_buffers_per_sample": 147.0,
+        "encoders_per_sample": 147.0
+      },
+      "memory": {
+        "artifact_bytes": 751009792,
+        "mapped_artifact_bytes": 751009792,
+        "known_metal_allocated_bytes": 802373632,
+        "recommended_metal_working_set_bytes": 19069665280,
+        "current_rss_bytes": 39796736,
+        "peak_rss_bytes": 39796736,
+        "current_physical_footprint_bytes": 139870880,
+        "peak_physical_footprint_bytes": 139870880
+      }
+    }
+  ]
+}

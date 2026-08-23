@@ -401,6 +401,7 @@ pub mod platform {
         StagingOnly,
         AddressOnly,
         ContiguousLoadOnly,
+        LoadTwoGroups,
         LoadOnly,
         LoadDecode,
         DotNoReduction,
@@ -421,6 +422,9 @@ pub mod platform {
             Some("contiguous-load-only")
             | Some("contiguous_load_only")
             | Some("contiguous-load") => Some(MoeGateUpInstrumentVariant::ContiguousLoadOnly),
+            Some("load-two-groups") | Some("load_two_groups") => {
+                Some(MoeGateUpInstrumentVariant::LoadTwoGroups)
+            }
             Some("load-only") | Some("load_only") => Some(MoeGateUpInstrumentVariant::LoadOnly),
             Some("load-decode") | Some("load_decode") => {
                 Some(MoeGateUpInstrumentVariant::LoadDecode)
@@ -843,12 +847,14 @@ pub mod platform {
         gate_up_instrument_staging_only_pipeline: Pipeline,
         gate_up_instrument_address_only_pipeline: Pipeline,
         gate_up_instrument_contiguous_load_only_pipeline: Pipeline,
+        gate_up_instrument_load_two_groups_pipeline: Pipeline,
         gate_up_instrument_load_decode_pipeline: Pipeline,
         gate_up_instrument_dot_no_reduce_pipeline: Pipeline,
         gate_up_instrument_load_only_norm_pipeline: Pipeline,
         gate_up_instrument_staging_only_norm_pipeline: Pipeline,
         gate_up_instrument_address_only_norm_pipeline: Pipeline,
         gate_up_instrument_contiguous_load_only_norm_pipeline: Pipeline,
+        gate_up_instrument_load_two_groups_norm_pipeline: Pipeline,
         gate_up_instrument_load_decode_norm_pipeline: Pipeline,
         gate_up_instrument_dot_no_reduce_norm_pipeline: Pipeline,
         q4k_mature_gate_up_pipeline: Pipeline,
@@ -2432,6 +2438,9 @@ pub mod platform {
                 (MoeGateUpInstrumentVariant::ContiguousLoadOnly, false) => {
                     &prepared.gate_up_instrument_contiguous_load_only_pipeline
                 }
+                (MoeGateUpInstrumentVariant::LoadTwoGroups, false) => {
+                    &prepared.gate_up_instrument_load_two_groups_pipeline
+                }
                 (MoeGateUpInstrumentVariant::LoadOnly, false) => {
                     &prepared.gate_up_instrument_load_only_pipeline
                 }
@@ -2452,6 +2461,9 @@ pub mod platform {
                 }
                 (MoeGateUpInstrumentVariant::ContiguousLoadOnly, true) => {
                     &prepared.gate_up_instrument_contiguous_load_only_norm_pipeline
+                }
+                (MoeGateUpInstrumentVariant::LoadTwoGroups, true) => {
+                    &prepared.gate_up_instrument_load_two_groups_norm_pipeline
                 }
                 (MoeGateUpInstrumentVariant::LoadDecode, true) => {
                     &prepared.gate_up_instrument_load_decode_norm_pipeline
@@ -7621,6 +7633,12 @@ pub mod platform {
                 "qx_dynamic_q4_moe_down_simd"
             };
             Ok(PreparedDynamicQ4Moe {
+                gate_up_instrument_load_two_groups_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_two_groups_simd",
+                )?,
+                gate_up_instrument_load_two_groups_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_two_groups_norm_simd",
+                )?,
                 pipeline: self.dynamic_moe_pipeline()?,
                 simd_pipeline: self.dynamic_moe_simd_pipeline()?,
                 batched_gate_up_pipeline: self.dynamic_moe_named_pipeline(gate_up_pipeline)?,
@@ -7940,6 +7958,12 @@ pub mod platform {
                 "qx_dynamic_q4_moe_down_simd"
             };
             let mut prepared = PreparedDynamicQ4Moe {
+                gate_up_instrument_load_two_groups_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_two_groups_simd",
+                )?,
+                gate_up_instrument_load_two_groups_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_two_groups_norm_simd",
+                )?,
                 gate_up_instrument_contiguous_load_only_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_contiguous_load_only_simd",
                 )?,
@@ -8215,6 +8239,12 @@ pub mod platform {
             let q3_down_packed = q3_down_packed.unwrap_or_else(|| dummy.clone());
             let q3_down_scales = q3_down_scales.unwrap_or_else(|| dummy.clone());
             let prepared = PreparedDynamicQ4Moe {
+                gate_up_instrument_load_two_groups_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_two_groups_simd",
+                )?,
+                gate_up_instrument_load_two_groups_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_two_groups_norm_simd",
+                )?,
                 gate_up_instrument_contiguous_load_only_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_contiguous_load_only_simd",
                 )?,
@@ -8577,6 +8607,12 @@ pub mod platform {
                     .dynamic_moe_named_pipeline(
                         "qx_dynamic_q4_moe_gate_up_inline_contiguous_load_only_norm_simd",
                     )?,
+                gate_up_instrument_load_two_groups_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_two_groups_simd",
+                )?,
+                gate_up_instrument_load_two_groups_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_two_groups_norm_simd",
+                )?,
                 pipeline: self.dynamic_moe_pipeline()?,
                 simd_pipeline: self.dynamic_moe_simd_pipeline()?,
                 batched_gate_up_pipeline: self

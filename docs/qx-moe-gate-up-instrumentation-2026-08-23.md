@@ -7,7 +7,7 @@ Artifact hash: `e3f2940482d5999d`
 
 ## What was added
 
-The existing row-inline Q4 gate/up dispatch now has six diagnostic variants,
+The existing row-inline Q4 gate/up dispatch now has seven diagnostic variants,
 selected with `QX_V2_MOE_GATE_UP_INSTRUMENT`:
 
 ```text
@@ -22,6 +22,8 @@ address-only          calculate production routed row/group/byte addresses,
                       but do not dereference expert weights
 contiguous-load-only  keep the production mapping and load count, but use a
                       unique contiguous per-threadgroup stream
+load-two-groups       keep the real routed stream but interleave two
+                      independent group-load sequences per lane
 ```
 
 The variants preserve the production path's:
@@ -215,6 +217,30 @@ shape, independent outstanding loads, and dependency-chain/ILP behavior in the
 production decoder. A new representation is justified only if it changes one
 of those properties, not merely because it makes expert regions adjacent.
 
+## Load-issue interleaving control
+
+`load-two-groups` preserves the real routed row-inline addresses, activation
+staging, 256-thread dispatch, and total code/scale reads. It changes only the
+inner diagnostic loop to process two independent 32-weight groups per
+iteration, testing whether a wider in-flight load window hides memory latency.
+
+| Variant | 24-layer gate/up GPU µs | µs / layer |
+|---|---:|---:|
+| load-only | 1,263.42 | 52.64 |
+| load-two-groups | 1,434.50 | 59.77 |
+
+The candidate is slower by 171.08 µs over 24 layers. The simple interleaving
+strategy therefore does not improve load-level parallelism on this production
+mapping; its extra loop/control/register work outweighs any latency hiding.
+This closes the low-cost “process two groups per lane” hypothesis without
+changing the canonical runtime.
+
+The remaining open low-level work is a more fundamental load/decode dataflow:
+vector transaction width, pointer progression, independent rows in flight, or
+a representation whose decoder can consume multiple Q4 packets with fewer
+address and conversion dependencies. Those should be tested with complete
+production-shaped controls, not inferred from this rejected diagnostic.
+
 Result records:
 
 - `benchmarks/results/gateup-instrument-canonical-general-2026-08-23.json`
@@ -232,3 +258,4 @@ Result records:
 - `benchmarks/results/gateup-instrument-averaged-staging-only-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-averaged-address-only-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-averaged-contiguous-load-only-2026-08-23.json`
+- `benchmarks/results/gateup-instrument-averaged-load-two-groups-2026-08-23.json`
