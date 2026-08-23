@@ -352,7 +352,7 @@ kernel void qx_dynamic_q4_moe_gate_up_llama_like_norm_simd(
 }
 
 // Decode-direct exact-Q4 row-inline mapping. Each 64-thread threadgroup owns
-// four rows: two rows are evaluated serially by each of its two SIMD groups.
+// two rows: one row is evaluated by each of its two SIMD groups.
 // Unlike the older llama-like candidate, this path never stages the complete
 // activation vector; every lane reads its QX input element directly while it
 // consumes the row-inline [codes][FP16 scale] packets.
@@ -372,7 +372,7 @@ inline void qx_dynamic_q4_gate_up_decode_direct_body(
     constexpr uint group_stride = 18;
     constexpr uint row_stride = groups * group_stride;
     constexpr uint expert_stride = hidden * row_stride;
-    constexpr uint rows_per_simdgroup = 2;
+    constexpr uint rows_per_simdgroup = 1;
     constexpr uint simdgroups_per_threadgroup = 2;
     constexpr uint rows_per_threadgroup = rows_per_simdgroup * simdgroups_per_threadgroup;
     constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
@@ -2537,7 +2537,7 @@ kernel void qx_dynamic_q4_moe_down_inline_simd(
 }
 
 // Decode-direct exact-Q4 down projection. It mirrors the gate/up geometry:
-// two SIMD groups per 64-thread threadgroup and two rows serially per group.
+// two SIMD groups per 64-thread threadgroup and one row per group.
 // Activated values and row-inline QX packets are consumed directly; no
 // threadgroup activation staging or route compaction is introduced.
 kernel void qx_dynamic_q4_moe_down_decode_direct_simd(
@@ -2554,7 +2554,7 @@ kernel void qx_dynamic_q4_moe_down_decode_direct_simd(
     constexpr uint group_stride = 18;
     constexpr uint row_stride = groups * group_stride;
     constexpr uint expert_stride = hidden * row_stride;
-    constexpr uint rows_per_simdgroup = 2;
+    constexpr uint rows_per_simdgroup = 1;
     constexpr uint simdgroups_per_threadgroup = 2;
     constexpr uint rows_per_threadgroup = rows_per_simdgroup * simdgroups_per_threadgroup;
     constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
