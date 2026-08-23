@@ -494,11 +494,30 @@ pub enum PromotionTier {
     CompleteModel,
 }
 
+impl PromotionTier {
+    /// The evidence ladder required before a plan can be selected.
+    pub const REQUIRED: [Self; 4] = [
+        Self::Kernel,
+        Self::ProducerConsumer,
+        Self::MultiLayer,
+        Self::CompleteModel,
+    ];
+
+    pub const SCREENING: [Self; 3] = [Self::Kernel, Self::ProducerConsumer, Self::MultiLayer];
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TierMeasurement {
     pub tier: PromotionTier,
     pub wall_ms_per_token: f64,
     pub gpu_ms_per_token: f64,
+}
+
+pub fn missing_promotion_tier(tiers: &[TierMeasurement]) -> Option<PromotionTier> {
+    PromotionTier::REQUIRED
+        .iter()
+        .copied()
+        .find(|tier| !tiers.iter().any(|measurement| measurement.tier == *tier))
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -566,21 +585,10 @@ pub fn select_execution_plan(
     candidates: &[PlanCandidateEvidence],
     constraints: PlanSelectionConstraints,
 ) -> Result<PlanSelection> {
-    let required_tiers = [
-        PromotionTier::Kernel,
-        PromotionTier::ProducerConsumer,
-        PromotionTier::MultiLayer,
-        PromotionTier::CompleteModel,
-    ];
     let mut eligible = Vec::<(&PlanCandidateEvidence, f64)>::new();
     let mut rejected = Vec::new();
     for candidate in candidates {
-        if let Some(missing) = required_tiers.iter().copied().find(|tier| {
-            !candidate
-                .tiers
-                .iter()
-                .any(|measurement| measurement.tier == *tier)
-        }) {
+        if let Some(missing) = missing_promotion_tier(&candidate.tiers) {
             rejected.push((
                 candidate.plan.plan_id.clone(),
                 CandidateRejection::MissingTier(missing),
@@ -932,5 +940,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.selected.plan_id, "row-inline");
+    }
+
+    #[test]
+    fn promotion_tier_contract_reports_missing_evidence() {
+        let tiers = PromotionTier::REQUIRED[..3]
+            .iter()
+            .map(|&tier| TierMeasurement {
+                tier,
+                wall_ms_per_token: 1.0,
+                gpu_ms_per_token: 1.0,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            missing_promotion_tier(&tiers),
+            Some(PromotionTier::CompleteModel)
+        );
     }
 }
