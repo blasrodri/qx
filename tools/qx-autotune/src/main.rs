@@ -54,6 +54,7 @@ struct SelectionReport<'a> {
 #[derive(Serialize)]
 struct CandidateSummary {
     plan_id: String,
+    candidate_family: String,
     interaction: Option<PlanInteraction>,
     exact_semantics_verified: bool,
     complete_model_wall_ms_per_token: f64,
@@ -96,6 +97,10 @@ const fn default_warmup() -> usize {
 #[derive(Debug, Deserialize)]
 struct CandidateRun {
     artifact: PathBuf,
+    /// Declarative family label recorded in evidence and reports. Families
+    /// are open-ended so a new structural candidate needs no planner code.
+    #[serde(default, alias = "family")]
+    candidate_family: String,
     /// Environment variables applied to every command run for this candidate.
     /// The field is optional so existing suite JSON remains valid.
     #[serde(default, alias = "environment")]
@@ -142,6 +147,8 @@ struct QualityGateRecord {
 
 #[derive(Debug, Deserialize)]
 struct BenchRecord {
+    artifact: String,
+    plan_id: String,
     wall_ms_per_token: f64,
     gpu_ms_per_token: f64,
     current_rss_bytes: u64,
@@ -211,6 +218,7 @@ fn main() -> Result<()> {
                     .expect("complete-model tier is added by run_suite or required by evidence");
                 CandidateSummary {
                     plan_id: candidate.plan.plan_id.clone(),
+                    candidate_family: candidate.candidate_family.clone(),
                     interaction: candidate.interaction.clone(),
                     exact_semantics_verified: candidate.exact_semantics_verified,
                     complete_model_wall_ms_per_token: complete.wall_ms_per_token,
@@ -258,6 +266,23 @@ fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
     }
     if suite.candidates.is_empty() {
         bail!("candidate suite has no artifacts");
+    }
+    let mut plan_ids = std::collections::BTreeSet::new();
+    for candidate in &suite.candidates {
+        if candidate.candidate_family.trim().is_empty() {
+            bail!(
+                "candidate {} has no family; declare a stable structural family label",
+                candidate.artifact.display()
+            );
+        }
+        // The plan ID is read from the sealed artifact below, but duplicate
+        // artifact entries are also unsafe and make evidence ambiguous.
+        if !plan_ids.insert(candidate.artifact.clone()) {
+            bail!(
+                "candidate suite contains duplicate artifact {}",
+                candidate.artifact.display()
+            );
+        }
     }
     if suite.interaction_matrix.is_some() && suite.schema_version < 2 {
         bail!("interaction_matrix requires candidate suite schema 2");
@@ -348,6 +373,36 @@ fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
                         .with_context(|| format!("read {}", result_path.display()))?,
                 )?;
                 let _ = fs::remove_file(&result_path);
+                let expected_artifact = candidate.artifact.canonicalize().with_context(|| {
+                    format!("canonicalize candidate {}", candidate.artifact.display())
+                })?;
+                let reported_artifact = PathBuf::from(&record.artifact)
+                    .canonicalize()
+                    .with_context(|| {
+                        format!("canonicalize reported artifact {}", record.artifact)
+                    })?;
+                if expected_artifact != reported_artifact {
+                    bail!(
+                        "candidate {} produced evidence for {}",
+                        candidate.artifact.display(),
+                        record.artifact
+                    );
+                }
+                let expected_plan = qx_format::MappedArtifact::open(&candidate.artifact)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                    .info()
+                    .execution_plan
+                    .as_ref()
+                    .map(|plan| plan.plan_id.clone())
+                    .ok_or_else(|| anyhow::anyhow!("candidate artifact has no sealed plan"))?;
+                if record.plan_id != expected_plan {
+                    bail!(
+                        "candidate {} reported plan {}, expected {}",
+                        candidate.artifact.display(),
+                        record.plan_id,
+                        expected_plan
+                    );
+                }
                 if record.internal_cpu_waits != 0 {
                     bail!(
                         "candidate {} performed internal CPU waits",
@@ -441,6 +496,7 @@ fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
             });
             Ok(PlanCandidateEvidence {
                 plan,
+                candidate_family: candidate.candidate_family.clone(),
                 tiers,
                 quality: QualityMeasurement {
                     accepted: quality_gate.accepted,
@@ -753,6 +809,7 @@ mod tests {
         };
         let candidate = CandidateRun {
             artifact: PathBuf::from("candidate.qx"),
+            candidate_family: "test-family".to_owned(),
             env: BTreeMap::new(),
             interaction: None,
             screening_tiers: Vec::new(),
@@ -789,6 +846,7 @@ mod tests {
         };
         let candidate = CandidateRun {
             artifact: PathBuf::from("candidate.qx"),
+            candidate_family: "test-family".to_owned(),
             env: [("QX_V2_MOE_FUSED_TRANSACTION_BLOCK", "qx/llama")]
                 .into_iter()
                 .map(|(key, value)| (key.to_owned(), value.to_owned()))

@@ -550,6 +550,11 @@ pub struct ResidentMemoryMeasurement {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PlanCandidateEvidence {
     pub plan: qx_format::ExecutionPlanManifest,
+    /// Declarative structural family label supplied by the benchmark suite.
+    /// The planner treats this as provenance only; it never ranks families
+    /// directly or embeds a preferred winner.
+    #[serde(default)]
+    pub candidate_family: String,
     pub tiers: Vec<TierMeasurement>,
     pub quality: QualityMeasurement,
     pub memory: ResidentMemoryMeasurement,
@@ -1004,6 +1009,7 @@ mod tests {
         plan.plan_id = id.to_owned();
         PlanCandidateEvidence {
             plan,
+            candidate_family: String::new(),
             tiers: [
                 PromotionTier::Kernel,
                 PromotionTier::ProducerConsumer,

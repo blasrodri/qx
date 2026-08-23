@@ -1997,6 +1997,7 @@ fn benchmark_v2_differential_profile(
 ) -> Result<()> {
     use std::rc::Rc;
 
+    let (_artifact_bytes, artifact_hash) = artifact_fingerprint(artifact_path)?;
     let context = Rc::new(
         qx_metal::platform::MetalContext::system_default()
             .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
@@ -2098,9 +2099,20 @@ fn benchmark_v2_differential_profile(
         );
     }
     if let Some(path) = result_json {
+        let mapped = MappedArtifact::open(artifact_path)?;
         let report = DifferentialProfileReport {
             schema_version: 2,
+            qx_revision: option_env!("QX_GIT_REVISION").unwrap_or("unknown"),
             artifact: artifact_path.display().to_string(),
+            artifact_hash: format!("{artifact_hash:016x}"),
+            artifact_version: mapped.info().header.version,
+            plan_id: mapped
+                .info()
+                .execution_plan
+                .as_ref()
+                .map(|plan| plan.plan_id.clone())
+                .unwrap_or_else(|| "legacy-v1-unsealed".to_owned()),
+            target_id: mapped.info().header.target_id.clone(),
             fixture_name: fixture.map(|value| value.name.clone()),
             fixture_domain: fixture.map(|value| value.domain.clone()),
             context: context_length,
@@ -2136,7 +2148,12 @@ struct DifferentialProfileRow {
 #[derive(Serialize)]
 struct DifferentialProfileReport {
     schema_version: u32,
+    qx_revision: &'static str,
     artifact: String,
+    artifact_hash: String,
+    artifact_version: u32,
+    plan_id: String,
+    target_id: String,
     fixture_name: Option<String>,
     fixture_domain: Option<String>,
     context: usize,
@@ -2706,9 +2723,20 @@ fn benchmark_v2_moe_differential_profile(
         );
     }
     if let Some(path) = result_json {
+        let mapped = MappedArtifact::open(artifact_path)?;
         let report = DifferentialProfileReport {
             schema_version: 2,
+            qx_revision: option_env!("QX_GIT_REVISION").unwrap_or("unknown"),
             artifact: artifact_path.display().to_string(),
+            artifact_hash: format!("{artifact_hash:016x}"),
+            artifact_version: mapped.info().header.version,
+            plan_id: mapped
+                .info()
+                .execution_plan
+                .as_ref()
+                .map(|plan| plan.plan_id.clone())
+                .unwrap_or_else(|| "legacy-v1-unsealed".to_owned()),
+            target_id: mapped.info().header.target_id.clone(),
             fixture_name: fixture.map(|value| value.name.clone()),
             fixture_domain: fixture.map(|value| value.domain.clone()),
             context: context_length,
