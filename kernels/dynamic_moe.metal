@@ -1542,6 +1542,224 @@ kernel void qx_dynamic_q4k_moe_gate_up_norm_simd(
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
+// Q4_K batch-1 control using the same 2-row/SIMD-group mapping as llama's
+// decode mat-vec kernel. QX's artifact keeps the 12-byte Q4_K scale metadata
+// in the packed stream and stores d/m as two FP16 values per block in the
+// companion scale stream, so this is an execution control rather than an
+// artifact conversion. Four SIMD groups per 128-thread threadgroup cover
+// eight output rows while every lane reads the activation vector directly.
+inline void qx_dynamic_q4k_mature_body_simple(
+    device const uchar* packed,
+    device const half* scales,
+    device const float* input,
+    device const float* norm_weights,
+    float inverse_rms,
+    uint normalized,
+    device const uint* expert_ids,
+    device float* output,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id,
+    uint rows,
+    uint blocks,
+    uint columns) {
+    constexpr uint rows_per_simdgroup = 2;
+    constexpr uint simdgroups_per_threadgroup = 4;
+    constexpr uint rows_per_threadgroup = rows_per_simdgroup * simdgroups_per_threadgroup;
+    uint threadgroups_per_expert = rows / rows_per_threadgroup;
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint tile = threadgroup_id % threadgroups_per_expert;
+    uint first_row = (tile * simdgroups_per_threadgroup + simdgroup) * rows_per_simdgroup;
+    uint expert = expert_ids[slot];
+    if (expert >= 32 || first_row >= rows) return;
+    uint packed_base = expert * rows * blocks * 140;
+    uint scale_base = expert * rows * blocks * 2;
+    for (uint row_offset = 0; row_offset < rows_per_simdgroup; ++row_offset) {
+        uint row = first_row + row_offset;
+        if (row >= rows) continue;
+        float sum = 0.0f;
+        for (uint column = lane; column < columns; column += 32) {
+            float value = input[column];
+            if (normalized) {
+                value *= inverse_rms * norm_weights[column];
+            }
+            sum += qx_q4k_weight(
+                packed, scales, packed_base, scale_base, row, blocks, column) * value;
+        }
+        sum = simd_sum(sum);
+        if (lane == 0) output[slot * rows + row] = sum;
+    }
+}
+
+inline void qx_dynamic_q4k_mature_body(
+    device const uchar* packed,
+    device const half* scales,
+    device const float* input,
+    device const float* norm_weights,
+    float inverse_rms,
+    uint normalized,
+    device const uint* expert_ids,
+    device float* output,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id,
+    uint rows,
+    uint blocks) {
+    constexpr uint rows_per_simdgroup = 2;
+    constexpr uint simdgroups_per_threadgroup = 4;
+    constexpr uint rows_per_threadgroup = rows_per_simdgroup * simdgroups_per_threadgroup;
+    constexpr uint block_bytes = 140;
+    uint threadgroups_per_expert = rows / rows_per_threadgroup;
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint tile = threadgroup_id % threadgroups_per_expert;
+    uint first_row = (tile * simdgroups_per_threadgroup + simdgroup) * rows_per_simdgroup;
+    uint expert = expert_ids[slot];
+    uint packed_stride = rows * blocks * block_bytes;
+    uint scale_stride = rows * blocks * 2;
+    const uint16_t kmask1 = 0x3f3f;
+    const uint16_t kmask2 = 0x0f0f;
+    const uint16_t kmask3 = 0xc0c0;
+
+    if (expert >= 32 || first_row >= rows) return;
+    uint packed_expert = expert * packed_stride;
+    uint scale_expert = expert * scale_stride;
+    uint ix = lane / 8;
+    uint it = lane % 8;
+    uint iq = it / 4;
+    uint ir = it % 4;
+    for (uint row_offset = 0; row_offset < rows_per_simdgroup; ++row_offset) {
+        uint row = first_row + row_offset;
+        if (row >= rows) continue;
+        float sum = 0.0f;
+        for (uint ib = ix; ib < blocks; ib += 4) {
+            float yl[16];
+            float yh[16];
+            float4 sumy = float4(0.0f);
+            uint input_base = ix * 256 + 64 * iq + 8 * ir;
+            for (uint i = 0; i < 8; ++i) {
+                float v0 = input[input_base + i];
+                float v1 = input[input_base + 32 + i];
+                float v2 = input[input_base + 128 + i];
+                float v3 = input[input_base + 160 + i];
+                if (normalized) {
+                    v0 *= inverse_rms * norm_weights[input_base + i];
+                    v1 *= inverse_rms * norm_weights[input_base + 32 + i];
+                    v2 *= inverse_rms * norm_weights[input_base + 128 + i];
+                    v3 *= inverse_rms * norm_weights[input_base + 160 + i];
+                }
+                yl[i] = v0;
+                yl[i + 8] = v1;
+                yh[i] = v2;
+                yh[i + 8] = v3;
+                sumy[0] += v0;
+                sumy[1] += v1;
+                sumy[2] += v2;
+                sumy[3] += v3;
+            }
+
+            uint block_base = packed_expert + (row * blocks + ib) * block_bytes;
+            device const uint16_t* sc = (device const uint16_t*)(packed + block_base);
+            device const uint16_t* q1 = (device const uint16_t*)(packed + block_base + 12)
+                + 16 * iq + 4 * ir;
+            device const half* dm = scales + scale_expert + (row * blocks + ib) * 2;
+            uint16_t sc16[4];
+            uint8_t sc8[8];
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            device const uint16_t* q2 = q1 + 32;
+            float4 acc1 = float4(0.0f);
+            float4 acc2 = float4(0.0f);
+            for (uint i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000f);
+                acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0f00);
+                acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00f0);
+                acc1[3] += yl[2 * i + 9] * (q1[i] & 0xf000);
+                acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000f);
+                acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0f00);
+                acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00f0);
+                acc2[3] += yh[2 * i + 9] * (q2[i] & 0xf000);
+            }
+            sum += float(dm[0]) * ((acc1[0] + 1.0f / 256.0f * acc1[1]) * sc8[0]
+                + (acc1[2] + 1.0f / 256.0f * acc1[3]) * sc8[1] / 16.0f
+                + (acc2[0] + 1.0f / 256.0f * acc2[1]) * sc8[4]
+                + (acc2[2] + 1.0f / 256.0f * acc2[3]) * sc8[5] / 16.0f)
+                - float(dm[1]) * (sumy[0] * sc8[2] + sumy[1] * sc8[3]
+                + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        }
+        sum = simd_sum(sum);
+        if (lane == 0) output[slot * rows + row] = sum;
+    }
+}
+
+kernel void qx_dynamic_q4k_moe_gate_up_mature_simd(
+    device const uchar* packed [[buffer(0)]], device const half* scales [[buffer(1)]],
+    device const float* input [[buffer(4)]], device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]], uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]], uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    qx_dynamic_q4k_mature_body_simple(packed, scales, input, input, 1.0f, 0, expert_ids, output,
+        lane, simdgroup, threadgroup_id, 1024, 4, 1024);
+}
+
+kernel void qx_dynamic_q4k_moe_gate_up_mature_norm_simd(
+    device const uchar* packed [[buffer(0)]], device const half* scales [[buffer(1)]],
+    device const float* input [[buffer(4)]], device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]], device const float* norm_weights [[buffer(8)]],
+    device const float* inverse_rms [[buffer(9)]], uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]], uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    qx_dynamic_q4k_mature_body_simple(packed, scales, input, norm_weights, inverse_rms[0], 1, expert_ids, output,
+        lane, simdgroup, threadgroup_id, 1024, 4, 1024);
+}
+
+inline void qx_dynamic_q4k_mature_down_body(
+    device const uchar* packed,
+    device const half* scales,
+    device const float* input,
+    device float* output,
+    device const uint* expert_ids,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id) {
+    constexpr uint rows = 1024;
+    constexpr uint blocks = 2;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint threadgroups_per_expert = rows / rows_per_threadgroup;
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint tile = threadgroup_id % threadgroups_per_expert;
+    uint row = tile * rows_per_threadgroup + simdgroup;
+    uint expert = expert_ids[slot];
+    if (expert >= 32 || row >= rows) return;
+    uint packed_base = expert * rows * blocks * 140;
+    uint scale_base = expert * rows * blocks * 2;
+    float sum = 0.0f;
+    for (uint column = lane; column < 512; column += 32) {
+        sum += qx_q4k_weight(
+            packed, scales, packed_base, scale_base, row, blocks, column) * input[slot * 512 + column];
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) output[slot * rows + row] = sum;
+}
+
+kernel void qx_dynamic_q4k_moe_down_mature_simd(
+    device const uchar* packed [[buffer(0)]], device const half* scales [[buffer(1)]],
+    device const float* input [[buffer(4)]], device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]], uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]], uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    qx_dynamic_q4k_mature_down_body(
+        packed, scales, input, output, expert_ids, lane, simdgroup, threadgroup_id);
+}
+
+kernel void qx_dynamic_q4k_moe_down_mature_norm_simd(
+    device const uchar* packed [[buffer(0)]], device const half* scales [[buffer(1)]],
+    device const float* input [[buffer(4)]], device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]], device const float* norm_weights [[buffer(8)]],
+    device const float* inverse_rms [[buffer(9)]], uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]], uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    qx_dynamic_q4k_mature_down_body(
+        packed, scales, input, output, expert_ids, lane, simdgroup, threadgroup_id);
+}
+
 // Experimental Granite gate/up Q3 path.  The logical format is row-major,
 // group-32: twelve bytes of packed 3-bit codes followed by an FP16 scale in
 // the separate scale buffer.  `block_bytes` is either 12 (dense) or 16

@@ -281,6 +281,38 @@ pub mod platform {
         )
     }
 
+    pub fn moe_q4k_mature_gate_up_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            match std::env::var("QX_V2_MOE_Q4K_MATURE")
+                .ok()
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("gate") => true,
+                Some("down") => false,
+                Some("1") | Some("true") | Some("yes") | Some("on") => true,
+                _ => false,
+            }
+        })
+    }
+
+    pub fn moe_q4k_mature_down_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            match std::env::var("QX_V2_MOE_Q4K_MATURE")
+                .ok()
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("gate") => false,
+                Some("down") => true,
+                Some("1") | Some("true") | Some("yes") | Some("on") => true,
+                _ => false,
+            }
+        })
+    }
+
     /// Opt-in factorial candidate for the exact-Q4 row-inline stream. The
     /// representation API does not yet expose a distinct fused transaction
     /// block, so this selects temporary kernels that consume the existing
@@ -317,6 +349,27 @@ pub mod platform {
                     )
                 })
                 .unwrap_or(false)
+        })
+    }
+
+    /// Limit the number of routed experts exposed to each exact-Q4 row-inline
+    /// dispatch. A value of 1, 2, 4, or 8 is accepted; 8 preserves the
+    /// canonical single-dispatch path. The wave path reuses the validated
+    /// kernels and offsets the expert/input/output views, so it changes only
+    /// memory-stream concurrency.
+    pub fn moe_expert_wave_width() -> usize {
+        static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *WIDTH.get_or_init(|| {
+            match std::env::var("QX_V2_MOE_WAVE_WIDTH")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                Some(1) | Some(2) | Some(4) | Some(8) => std::env::var("QX_V2_MOE_WAVE_WIDTH")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap(),
+                _ => 8,
+            }
         })
     }
 
@@ -632,6 +685,8 @@ pub mod platform {
         llama_like_gate_up_norm_pipeline: Pipeline,
         decode_direct_gate_up_pipeline: Pipeline,
         decode_direct_gate_up_norm_pipeline: Pipeline,
+        q4k_mature_gate_up_pipeline: Pipeline,
+        q4k_mature_gate_up_norm_pipeline: Pipeline,
         fused_block_qx_gate_up_pipeline: Option<Pipeline>,
         fused_block_qx_gate_up_norm_pipeline: Option<Pipeline>,
         fused_block_llama_gate_up_pipeline: Option<Pipeline>,
@@ -687,6 +742,7 @@ pub mod platform {
         batched_down_pipeline: Pipeline,
         inline_down_pipeline: Pipeline,
         decode_direct_down_pipeline: Pipeline,
+        q4k_mature_down_pipeline: Pipeline,
         cross_expert_tile8_down_pipeline: Pipeline,
         inline_layout: bool,
         down_inline_layout: bool,
@@ -1998,6 +2054,13 @@ pub mod platform {
             let gate_up_layout = prepared.gate_up_layout as u32;
             let down_layout = prepared.down_layout as u32;
             let q3_block_bytes = prepared.q3_gate_up_block_bytes;
+            let is_q4k = prepared.gate_up_packed.length == 32 * 1024 * 4 * 140
+                && prepared.gate_up_scales.length == 32 * 1024 * 4 * 2 * 2
+                && prepared.down_packed.length == 32 * 1024 * 2 * 140
+                && prepared.down_scales.length == 32 * 1024 * 2 * 2 * 2;
+            let q4k_mature_gate_up = is_q4k && moe_q4k_mature_gate_up_enabled();
+            let q4k_mature_down = is_q4k && moe_q4k_mature_down_enabled();
+            let expert_wave_width = moe_expert_wave_width();
             let wide_expert =
                 moe_wide_expert_enabled() && prepared.wide_supported && q3_block_bytes.is_none();
             let inline_input_cache = moe_inline_input_cache_enabled();
@@ -2032,10 +2095,21 @@ pub mod platform {
             let cross_expert_tile8_down = moe_cross_expert_tile8_enabled()
                 && prepared.down_layout == PackingLayout::Q4CrossExpertTile8
                 && q3_block_bytes.is_none();
+            let expert_wave = expert_wave_width < 8
+                && prepared.inline_layout
+                && prepared.down_inline_layout
+                && prepared.gate_up_layout == PackingLayout::Q4RowInline
+                && prepared.down_layout == PackingLayout::Q4RowInline
+                && q3_block_bytes.is_none()
+                && !decode_direct
+                && !row_inline_streaming;
 
             if let Some((norm_weights, inverse_rms)) = norm {
                 if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
                     self.encoder.setComputePipelineState(pipeline);
+                } else if q4k_mature_gate_up {
+                    self.encoder
+                        .setComputePipelineState(&prepared.q4k_mature_gate_up_norm_pipeline);
                 } else if decode_direct {
                     self.encoder
                         .setComputePipelineState(&prepared.decode_direct_gate_up_norm_pipeline);
@@ -2117,6 +2191,9 @@ pub mod platform {
             } else {
                 if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
                     self.encoder.setComputePipelineState(pipeline);
+                } else if q4k_mature_gate_up {
+                    self.encoder
+                        .setComputePipelineState(&prepared.q4k_mature_gate_up_pipeline);
                 } else if decode_direct {
                     self.encoder
                         .setComputePipelineState(&prepared.decode_direct_gate_up_pipeline);
@@ -2222,53 +2299,86 @@ pub mod platform {
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&gate_up.buffer), gate_up.offset, 6);
             }
-            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: if fused_block_active && fused_block_mapping == Some(true) {
-                        8 * (1024 / 4)
-                    } else if fused_block_active {
-                        8 * (1024 / 8)
-                    } else if llama_like_mapping {
-                        8 * (1024 / 4)
-                    } else if decode_direct {
-                        8 * (1024 / 2)
-                    } else if cross_expert_tile8 {
-                        1024 / 8
-                    } else if cross_expert_activation {
-                        1024 / 8
-                    } else if row_inline_streaming {
-                        1024 / 8
-                    } else if wide_expert {
-                        8
-                    } else if prepared.inline_layout
-                        && inline_input_cache
-                        && moe_inline_vec4_enabled()
-                    {
-                        8 * (1024 / 8)
-                    } else {
-                        8 * (1024 / 8)
+            if expert_wave {
+                for slot_base in (0..8).step_by(expert_wave_width) {
+                    unsafe {
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&expert_ids.buffer),
+                            expert_ids.offset + slot_base * std::mem::size_of::<u32>(),
+                            5,
+                        );
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&gate_up.buffer),
+                            gate_up.offset + slot_base * 1024 * std::mem::size_of::<f32>(),
+                            6,
+                        );
+                    }
+                    self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                        MTLSize {
+                            width: expert_wave_width * (1024 / 8),
+                            height: 1,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: 256,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
+            } else {
+                self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: if q4k_mature_gate_up {
+                            8 * (1024 / 8)
+                        } else if fused_block_active && fused_block_mapping == Some(true) {
+                            8 * (1024 / 4)
+                        } else if fused_block_active {
+                            8 * (1024 / 8)
+                        } else if llama_like_mapping {
+                            8 * (1024 / 4)
+                        } else if decode_direct {
+                            8 * (1024 / 2)
+                        } else if cross_expert_tile8 {
+                            1024 / 8
+                        } else if cross_expert_activation {
+                            1024 / 8
+                        } else if row_inline_streaming {
+                            1024 / 8
+                        } else if wide_expert {
+                            8
+                        } else if prepared.inline_layout
+                            && inline_input_cache
+                            && moe_inline_vec4_enabled()
+                        {
+                            8 * (1024 / 8)
+                        } else {
+                            8 * (1024 / 8)
+                        },
+                        height: 1,
+                        depth: 1,
                     },
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: if fused_block_active && fused_block_mapping == Some(true) {
-                        64
-                    } else if fused_block_active {
-                        256
-                    } else if llama_like_mapping {
-                        64
-                    } else if decode_direct {
-                        64
-                    } else if wide_expert {
-                        1024
-                    } else {
-                        256
+                    MTLSize {
+                        width: if q4k_mature_gate_up {
+                            128
+                        } else if fused_block_active && fused_block_mapping == Some(true) {
+                            64
+                        } else if fused_block_active {
+                            256
+                        } else if llama_like_mapping {
+                            64
+                        } else if decode_direct {
+                            64
+                        } else if wide_expert {
+                            1024
+                        } else {
+                            256
+                        },
+                        height: 1,
+                        depth: 1,
                     },
-                    height: 1,
-                    depth: 1,
-                },
-            );
+                );
+            }
             self.sample_stage_boundary();
 
             self.encoder
@@ -2295,6 +2405,9 @@ pub mod platform {
 
             if let Some(pipeline) = prepared.q3_down_pipeline.as_ref() {
                 self.encoder.setComputePipelineState(pipeline);
+            } else if q4k_mature_down {
+                self.encoder
+                    .setComputePipelineState(&prepared.q4k_mature_down_pipeline);
             } else if decode_direct {
                 self.encoder
                     .setComputePipelineState(&prepared.decode_direct_down_pipeline);
@@ -2366,30 +2479,68 @@ pub mod platform {
                     6,
                 );
             }
-            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: if decode_direct {
-                        8 * (1024 / 2)
-                    } else if wide_expert {
-                        8
-                    } else {
-                        8 * (1024 / 8)
+            if expert_wave {
+                for slot_base in (0..8).step_by(expert_wave_width) {
+                    unsafe {
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&activated.buffer),
+                            activated.offset + slot_base * 512 * std::mem::size_of::<f32>(),
+                            4,
+                        );
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&expert_ids.buffer),
+                            expert_ids.offset + slot_base * std::mem::size_of::<u32>(),
+                            5,
+                        );
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&expert_output.buffer),
+                            expert_output.offset + slot_base * 1024 * std::mem::size_of::<f32>(),
+                            6,
+                        );
+                    }
+                    self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                        MTLSize {
+                            width: expert_wave_width * (1024 / 8),
+                            height: 1,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: 256,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
+            } else {
+                self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: if q4k_mature_down {
+                            8 * (1024 / 8)
+                        } else if decode_direct {
+                            8 * (1024 / 2)
+                        } else if wide_expert {
+                            8
+                        } else {
+                            8 * (1024 / 8)
+                        },
+                        height: 1,
+                        depth: 1,
                     },
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: if decode_direct {
-                        64
-                    } else if wide_expert {
-                        1024
-                    } else {
-                        256
+                    MTLSize {
+                        width: if q4k_mature_down {
+                            256
+                        } else if decode_direct {
+                            64
+                        } else if wide_expert {
+                            1024
+                        } else {
+                            256
+                        },
+                        height: 1,
+                        depth: 1,
                     },
-                    height: 1,
-                    depth: 1,
-                },
-            );
+                );
+            }
             self.sample_stage_boundary();
 
             self.encoder
@@ -2421,7 +2572,11 @@ pub mod platform {
                 },
             );
             self.sample_stage_boundary();
-            self.dispatches += 4;
+            self.dispatches += (if expert_wave {
+                2 * (8 / expert_wave_width) + 2
+            } else {
+                4
+            }) as u64;
             Ok(())
         }
 
@@ -3229,6 +3384,12 @@ pub mod platform {
             let gate_up_layout = prepared.gate_up_layout as u32;
             let down_layout = prepared.down_layout as u32;
             let q3_block_bytes = prepared.q3_gate_up_block_bytes;
+            let is_q4k = prepared.gate_up_packed.length == 32 * 1024 * 4 * 140
+                && prepared.gate_up_scales.length == 32 * 1024 * 4 * 2 * 2
+                && prepared.down_packed.length == 32 * 1024 * 2 * 140
+                && prepared.down_scales.length == 32 * 1024 * 2 * 2 * 2;
+            let q4k_mature_gate_up = is_q4k && moe_q4k_mature_gate_up_enabled();
+            let q4k_mature_down = is_q4k && moe_q4k_mature_down_enabled();
             let wide_expert =
                 moe_wide_expert_enabled() && prepared.wide_supported && q3_block_bytes.is_none();
             let row_inline_streaming = moe_row_inline_streaming_enabled()
@@ -3252,6 +3413,10 @@ pub mod platform {
                     if let Some((norm_weights, inverse_rms)) = norm {
                         if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
                             self.encoder.setComputePipelineState(pipeline);
+                        } else if q4k_mature_gate_up {
+                            self.encoder.setComputePipelineState(
+                                &prepared.q4k_mature_gate_up_norm_pipeline,
+                            );
                         } else if decode_direct {
                             self.encoder.setComputePipelineState(
                                 &prepared.decode_direct_gate_up_norm_pipeline,
@@ -3324,6 +3489,9 @@ pub mod platform {
                             );
                         } else if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
                             self.encoder.setComputePipelineState(pipeline);
+                        } else if q4k_mature_gate_up {
+                            self.encoder
+                                .setComputePipelineState(&prepared.q4k_mature_gate_up_pipeline);
                         } else if decode_direct {
                             self.encoder
                                 .setComputePipelineState(&prepared.decode_direct_gate_up_pipeline);
@@ -3425,7 +3593,9 @@ pub mod platform {
                     }
                     self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: if decode_direct {
+                            width: if q4k_mature_gate_up {
+                                8 * (1024 / 8)
+                            } else if decode_direct {
                                 8 * (1024 / 2)
                             } else if cross_expert_tile8 || row_inline_streaming {
                                 1024 / 8
@@ -3443,7 +3613,9 @@ pub mod platform {
                             depth: 1,
                         },
                         MTLSize {
-                            width: if decode_direct {
+                            width: if q4k_mature_gate_up {
+                                128
+                            } else if decode_direct {
                                 64
                             } else if wide_expert {
                                 1024
@@ -3486,6 +3658,9 @@ pub mod platform {
                 2 => {
                     if let Some(pipeline) = prepared.q3_down_pipeline.as_ref() {
                         self.encoder.setComputePipelineState(pipeline);
+                    } else if q4k_mature_down {
+                        self.encoder
+                            .setComputePipelineState(&prepared.q4k_mature_down_pipeline);
                     } else if decode_direct {
                         self.encoder
                             .setComputePipelineState(&prepared.decode_direct_down_pipeline);
@@ -3580,7 +3755,9 @@ pub mod platform {
                     }
                     self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: if decode_direct {
+                            width: if q4k_mature_down {
+                                8 * (1024 / 8)
+                            } else if decode_direct {
                                 8 * (1024 / 2)
                             } else if wide_expert {
                                 8
@@ -3591,7 +3768,9 @@ pub mod platform {
                             depth: 1,
                         },
                         MTLSize {
-                            width: if decode_direct {
+                            width: if q4k_mature_down {
+                                256
+                            } else if decode_direct {
                                 64
                             } else if wide_expert {
                                 1024
@@ -6662,6 +6841,10 @@ pub mod platform {
                 decode_direct_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd",
                 )?,
+                q4k_mature_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_simd")?,
+                q4k_mature_gate_up_norm_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_norm_simd")?,
                 fused_block_qx_gate_up_pipeline: Some(
                     self.dynamic_moe_named_pipeline(
                         "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
@@ -6753,6 +6936,8 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_inline_simd")?,
                 decode_direct_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_decode_direct_simd")?,
+                q4k_mature_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_down_mature_simd")?,
                 cross_expert_tile8_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cross_expert_tile8_simd")?,
                 inline_layout: gate_up_layout == PackingLayout::Q4RowInline,
@@ -6932,6 +7117,10 @@ pub mod platform {
                 decode_direct_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd",
                 )?,
+                q4k_mature_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_simd")?,
+                q4k_mature_gate_up_norm_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_norm_simd")?,
                 fused_block_qx_gate_up_pipeline: Some(
                     self.dynamic_moe_named_pipeline(
                         "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
@@ -7023,6 +7212,8 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_inline_simd")?,
                 decode_direct_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_decode_direct_simd")?,
+                q4k_mature_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_down_mature_simd")?,
                 cross_expert_tile8_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cross_expert_tile8_simd")?,
                 inline_layout: gate_up_layout == PackingLayout::Q4RowInline,
@@ -7155,6 +7346,10 @@ pub mod platform {
                 decode_direct_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd",
                 )?,
+                q4k_mature_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_simd")?,
+                q4k_mature_gate_up_norm_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_norm_simd")?,
                 row_stream_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_row_stream_simd")?,
                 row_stream_gate_up_norm_pipeline: self
@@ -7253,6 +7448,8 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_inline_simd")?,
                 decode_direct_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_decode_direct_simd")?,
+                q4k_mature_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_down_mature_simd")?,
                 cross_expert_tile8_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cross_expert_tile8_simd")?,
                 inline_layout: false,
@@ -7461,6 +7658,10 @@ pub mod platform {
                 decode_direct_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd",
                 )?,
+                q4k_mature_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_simd")?,
+                q4k_mature_gate_up_norm_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_norm_simd")?,
                 fused_block_qx_gate_up_pipeline: Some(
                     self.dynamic_moe_named_pipeline(
                         "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
@@ -7553,6 +7754,8 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_inline_simd")?,
                 decode_direct_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_decode_direct_simd")?,
+                q4k_mature_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_down_mature_simd")?,
                 cross_expert_tile8_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cross_expert_tile8_simd")?,
                 inline_layout: gate_up_layout == PackingLayout::Q4RowInline,
