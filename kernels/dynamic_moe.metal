@@ -5,6 +5,15 @@ inline uint qx_dynamic_group_offset(uint row, uint group, uint groups, uint byte
     if (layout == 0) {
         return row * groups * bytes_per_group + group * bytes_per_group;
     }
+    if (layout == 7 || layout == 8) {
+        // Transaction streams contain eight [16-byte codes + FP16 scale]
+        // groups per block. Q4Transaction160 adds a sixteen-byte alignment
+        // tail after each block; the tail is never consumed.
+        uint block_bytes = layout == 8 ? 160 : 144;
+        return row * (groups / 8) * block_bytes
+            + (group / 8) * block_bytes
+            + (group % 8) * 18;
+    }
     // Paired gate/up layout interleaves logical gate row r and up row r.
     // Down matrices use the ordinary tile layout even when the enclosing
     // MoE preparation carries layout=2, hence the groups==32 guard.
@@ -23,11 +32,25 @@ inline uint qx_dynamic_scale_offset(uint row, uint group, uint groups, uint layo
     if (layout == 0) {
         return row * groups + group;
     }
+    if (layout == 7 || layout == 8) {
+        return qx_dynamic_group_offset(row, group, groups, 16, layout) / 2 + 8;
+    }
     uint physical_row = row;
     if (layout == 2 && groups == 32) {
         physical_row = row < 512 ? row * 2 : (row - 512) * 2 + 1;
     }
     return (physical_row / 32) * 32 * groups + group * 32 + physical_row % 32;
+}
+
+inline uint qx_dynamic_packed_stride(uint rows, uint groups, uint layout) {
+    return qx_dynamic_group_offset(rows, 0, groups, 16, layout);
+}
+
+inline uint qx_dynamic_scale_stride(uint rows, uint groups, uint layout) {
+    if (layout == 7 || layout == 8) {
+        return qx_dynamic_group_offset(rows, 0, groups, 16, layout) / 2;
+    }
+    return rows * groups;
 }
 
 inline float qx_q4_inline_scale(device const uchar* stream, uint offset) {
@@ -328,20 +351,20 @@ kernel void qx_dynamic_q4_moe_gate_up_llama_like_norm_simd(
         stream, expert_ids, output, cached_input, lane, simdgroup, threadgroup_id);
 }
 
-// Temporary factorial-lane contract (until qx-format exposes a distinct
-// representation): consume the existing exact-Q4 row-inline stream, whose
-// logical group is [16 packed code bytes][FP16 scale].  The fused transaction
-// candidate addresses eight consecutive groups as one 144-byte transaction
-// block.  It is deliberately a separate entry point so Metal can optimize
-// this address pattern independently of the canonical row-inline kernels.
+// Fused gate/up consumer for exact-Q4 transaction streams. The same body also
+// accepts the legacy row-inline stream when its factorial mapping is enabled;
+// keeping that path here preserves its existing address contract.
 inline uint qx_dynamic_q4_fused_block_group_offset(
-    uint row_base, uint group) {
+    uint row, uint group, uint layout) {
+    constexpr uint groups = 32;
+    if (layout == 7 || layout == 8) {
+        uint block_bytes = layout == 8 ? 160 : 144;
+        return row * (groups / 8) * block_bytes
+            + (group / 8) * block_bytes
+            + (group % 8) * 18;
+    }
     constexpr uint group_bytes = 18;
-    constexpr uint groups_per_transaction = 8;
-    uint transaction = group / groups_per_transaction;
-    uint group_in_transaction = group % groups_per_transaction;
-    return row_base + transaction * (groups_per_transaction * group_bytes)
-        + group_in_transaction * group_bytes;
+    return row * groups * group_bytes + group * group_bytes;
 }
 
 inline void qx_dynamic_q4_gate_up_fused_block_body(
@@ -353,12 +376,14 @@ inline void qx_dynamic_q4_gate_up_fused_block_body(
     uint simdgroup,
     uint threadgroup_id,
     uint rows_per_simdgroup,
-    uint simdgroups_per_threadgroup) {
+    uint simdgroups_per_threadgroup,
+    uint layout) {
     constexpr uint hidden = 1024;
     constexpr uint groups = 32;
-    constexpr uint group_bytes = 18;
-    constexpr uint row_stride = groups * group_bytes;
-    constexpr uint expert_stride = hidden * row_stride;
+    uint row_stride = (layout == 7 || layout == 8)
+        ? (groups / 8) * (layout == 8 ? 160 : 144)
+        : groups * 18;
+    uint expert_stride = hidden * row_stride;
     uint rows_per_threadgroup = rows_per_simdgroup * simdgroups_per_threadgroup;
     uint threadgroups_per_expert = hidden / rows_per_threadgroup;
     uint slot = threadgroup_id / threadgroups_per_expert;
@@ -371,9 +396,10 @@ inline void qx_dynamic_q4_gate_up_fused_block_body(
         uint row = first_row + row_offset;
         float sum = 0.0f;
         if (expert < 32 && row < hidden) {
-            uint row_base = expert * expert_stride + row * row_stride;
+            uint expert_base = expert * expert_stride;
             for (uint group = 0; group < groups; ++group) {
-                uint group_base = qx_dynamic_q4_fused_block_group_offset(row_base, group);
+                uint group_base = expert_base
+                    + qx_dynamic_q4_fused_block_group_offset(row, group, layout);
                 uint local = lane;
                 uint code = (uint(stream[group_base + local / 2])
                     >> ((local % 2) * 4)) & 0xf;
@@ -396,6 +422,7 @@ kernel void qx_dynamic_q4_moe_gate_up_fused_block_qx_simd(
     device const float* input [[buffer(4)]],
     device const uint* expert_ids [[buffer(5)]],
     device float* output [[buffer(6)]],
+    constant uint& layout [[buffer(7)]],
     uint lane [[thread_index_in_simdgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint threadgroup_id [[threadgroup_position_in_grid]],
@@ -407,7 +434,7 @@ kernel void qx_dynamic_q4_moe_gate_up_fused_block_qx_simd(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     qx_dynamic_q4_gate_up_fused_block_body(
         stream, expert_ids, output, cached_input, lane, simdgroup,
-        threadgroup_id, 1, 8);
+        threadgroup_id, 1, 8, layout);
 }
 
 // Factorial B: the same transaction-block contract with the decode-specific
@@ -417,6 +444,7 @@ kernel void qx_dynamic_q4_moe_gate_up_fused_block_llama_simd(
     device const float* input [[buffer(4)]],
     device const uint* expert_ids [[buffer(5)]],
     device float* output [[buffer(6)]],
+    constant uint& layout [[buffer(7)]],
     uint lane [[thread_index_in_simdgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint threadgroup_id [[threadgroup_position_in_grid]],
@@ -428,7 +456,7 @@ kernel void qx_dynamic_q4_moe_gate_up_fused_block_llama_simd(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     qx_dynamic_q4_gate_up_fused_block_body(
         stream, expert_ids, output, cached_input, lane, simdgroup,
-        threadgroup_id, 2, 2);
+        threadgroup_id, 2, 2, layout);
 }
 
 kernel void qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd(
@@ -438,6 +466,7 @@ kernel void qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd(
     device float* output [[buffer(6)]],
     device const float* norm_weights [[buffer(8)]],
     device const float* inverse_rms [[buffer(9)]],
+    constant uint& layout [[buffer(7)]],
     uint lane [[thread_index_in_simdgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint threadgroup_id [[threadgroup_position_in_grid]],
@@ -450,7 +479,7 @@ kernel void qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     qx_dynamic_q4_gate_up_fused_block_body(
         stream, expert_ids, output, cached_input, lane, simdgroup,
-        threadgroup_id, 1, 8);
+        threadgroup_id, 1, 8, layout);
 }
 
 kernel void qx_dynamic_q4_moe_gate_up_fused_block_llama_norm_simd(
@@ -460,6 +489,7 @@ kernel void qx_dynamic_q4_moe_gate_up_fused_block_llama_norm_simd(
     device float* output [[buffer(6)]],
     device const float* norm_weights [[buffer(8)]],
     device const float* inverse_rms [[buffer(9)]],
+    constant uint& layout [[buffer(7)]],
     uint lane [[thread_index_in_simdgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint threadgroup_id [[threadgroup_position_in_grid]],
@@ -472,7 +502,7 @@ kernel void qx_dynamic_q4_moe_gate_up_fused_block_llama_norm_simd(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     qx_dynamic_q4_gate_up_fused_block_body(
         stream, expert_ids, output, cached_input, lane, simdgroup,
-        threadgroup_id, 2, 2);
+        threadgroup_id, 2, 2, layout);
 }
 
 // Cross-expert activation-chunk candidate. A threadgroup owns one eight-row
@@ -769,10 +799,10 @@ kernel void qx_dynamic_q4_moe(
     constexpr uint bytes_per_group = 16;
     constexpr uint groups_up = 32;
     constexpr uint groups_down = 16;
-    constexpr uint gate_up_packed_stride = 1024 * 1024 / 2;
-    constexpr uint gate_up_scale_stride = 1024 * 32;
-    constexpr uint down_packed_stride = 1024 * 512 / 2;
-    constexpr uint down_scale_stride = 1024 * 16;
+    uint gate_up_packed_stride = qx_dynamic_packed_stride(hidden, groups_up, layout);
+    uint gate_up_scale_stride = qx_dynamic_scale_stride(hidden, groups_up, layout);
+    uint down_packed_stride = qx_dynamic_packed_stride(hidden, groups_down, layout);
+    uint down_scale_stride = qx_dynamic_scale_stride(hidden, groups_down, layout);
     threadgroup float gate_up[hidden];
     threadgroup float activated[intermediate];
     float accumulated = 0.0f;
@@ -844,10 +874,10 @@ kernel void qx_dynamic_q4_moe_simd(
     constexpr uint bytes_per_group = 16;
     constexpr uint groups_up = 32;
     constexpr uint groups_down = 16;
-    constexpr uint gate_up_packed_stride = 1024 * 1024 / 2;
-    constexpr uint gate_up_scale_stride = 1024 * 32;
-    constexpr uint down_packed_stride = 1024 * 512 / 2;
-    constexpr uint down_scale_stride = 1024 * 16;
+    uint gate_up_packed_stride = qx_dynamic_packed_stride(hidden, groups_up, layout);
+    uint gate_up_scale_stride = qx_dynamic_scale_stride(hidden, groups_up, layout);
+    uint down_packed_stride = qx_dynamic_packed_stride(hidden, groups_down, layout);
+    uint down_scale_stride = qx_dynamic_scale_stride(hidden, groups_down, layout);
     threadgroup float cached_input[hidden];
     threadgroup float gate_up[hidden];
     threadgroup float activated[intermediate];

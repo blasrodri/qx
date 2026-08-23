@@ -826,7 +826,7 @@ pub mod platform {
                 self.encoder.setBytes_length_atIndex(
                     NonNull::from(&columns).cast(),
                     std::mem::size_of_val(&columns),
-                    3,
+                    2,
                 );
             }
             self.encoder.dispatchThreads_threadsPerThreadgroup(
@@ -1820,10 +1820,12 @@ pub mod platform {
                 moe_wide_expert_enabled() && prepared.wide_supported && q3_block_bytes.is_none();
             let inline_input_cache = moe_inline_input_cache_enabled();
             let fused_block_mapping = moe_fused_transaction_block_mapping();
-            let fused_block_active = fused_block_mapping.is_some()
-                && prepared.inline_layout
-                && prepared.gate_up_layout == PackingLayout::Q4RowInline
-                && q3_block_bytes.is_none();
+            let transaction_gate_up = prepared.gate_up_layout.is_q4_transaction();
+            let fused_block_active = q3_block_bytes.is_none()
+                && (transaction_gate_up
+                    || (fused_block_mapping.is_some()
+                        && prepared.inline_layout
+                        && prepared.gate_up_layout == PackingLayout::Q4RowInline));
             let llama_like_mapping = moe_llama_like_mapping_enabled()
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
@@ -3024,7 +3026,16 @@ pub mod platform {
                             );
                         }
                     } else {
-                        if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
+                        if prepared.gate_up_layout.is_q4_transaction() {
+                            self.encoder.setComputePipelineState(
+                                prepared
+                                    .fused_block_qx_gate_up_pipeline
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        "fused transaction-block pipeline is missing".to_owned()
+                                    })?,
+                            );
+                        } else if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
                             self.encoder.setComputePipelineState(pipeline);
                         } else if prepared
                             .gate_up_layout
@@ -6077,15 +6088,47 @@ pub mod platform {
             const Q4K_GATE_UP_SCALES: usize = 1024 * 4 * 2 * 2;
             const Q4K_DOWN_PACKED: usize = 1024 * 2 * 140;
             const Q4K_DOWN_SCALES: usize = 1024 * 2 * 2 * 2;
-            let is_q4 = gate_up_packed.len() == EXPERTS * GATE_UP_PACKED
+            const Q4_TRANSACTION_GATE_UP_144: usize = 1024 * 4 * 144;
+            const Q4_TRANSACTION_GATE_UP_160: usize = 1024 * 4 * 160;
+            const Q4_TRANSACTION_DOWN_144: usize = 1024 * 2 * 144;
+            const Q4_TRANSACTION_DOWN_160: usize = 1024 * 2 * 160;
+            let is_q4_gate = gate_up_packed.len() == EXPERTS * GATE_UP_PACKED
                 && gate_up_scales.len() == EXPERTS * GATE_UP_SCALES
-                && down_packed.len() == EXPERTS * DOWN_PACKED
-                && down_scales.len() == EXPERTS * DOWN_SCALES;
+                || gate_up_packed.len() == EXPERTS * 1024 * 32 * 18
+                    && gate_up_scales.len() == EXPERTS * 1024 * 32 * 18;
+            let is_q4_down = down_packed.len() == EXPERTS * DOWN_PACKED
+                && down_scales.len() == EXPERTS * DOWN_SCALES
+                || down_packed.len() == EXPERTS * 1024 * 16 * 18
+                    && down_scales.len() == EXPERTS * 1024 * 16 * 18;
+            let is_q4_transaction_gate = gate_up_layout.is_q4_transaction()
+                && gate_up_packed.len()
+                    == EXPERTS
+                        * match gate_up_layout {
+                            PackingLayout::Q4Transaction144 => Q4_TRANSACTION_GATE_UP_144,
+                            PackingLayout::Q4Transaction160 => Q4_TRANSACTION_GATE_UP_160,
+                            _ => 0,
+                        }
+                && gate_up_scales.len() == gate_up_packed.len();
+            let is_q4_transaction_down = down_layout.is_q4_transaction()
+                && down_packed.len()
+                    == EXPERTS
+                        * match down_layout {
+                            PackingLayout::Q4Transaction144 => Q4_TRANSACTION_DOWN_144,
+                            PackingLayout::Q4Transaction160 => Q4_TRANSACTION_DOWN_160,
+                            _ => 0,
+                        }
+                && down_scales.len() == down_packed.len();
+            let is_q4_gate = is_q4_gate || is_q4_transaction_gate;
+            let is_q4_down = is_q4_down || is_q4_transaction_down;
+            let is_q4 = is_q4_gate && is_q4_down;
             let is_q4k = gate_up_packed.len() == EXPERTS * Q4K_GATE_UP_PACKED
                 && gate_up_scales.len() == EXPERTS * Q4K_GATE_UP_SCALES
                 && down_packed.len() == EXPERTS * Q4K_DOWN_PACKED
                 && down_scales.len() == EXPERTS * Q4K_DOWN_SCALES;
-            if !is_q4 && !is_q4k {
+            if (!is_q4 && !is_q4k)
+                || (gate_up_layout.is_q4_transaction() && !is_q4_transaction_gate)
+                || (down_layout.is_q4_transaction() && !is_q4_transaction_down)
+            {
                 return Err("dynamic Q4 MoE buffers have an invalid Granite shape".to_owned());
             }
             let gate_up_pipeline = if is_q4k {
@@ -6264,6 +6307,10 @@ pub mod platform {
             const Q4K_DOWN_SCALES: usize = 1024 * 2 * 2 * 2;
             const Q4_INLINE_GATE_UP: usize = 1024 * 32 * 18;
             const Q4_INLINE_DOWN: usize = 1024 * 16 * 18;
+            const Q4_TRANSACTION_GATE_UP_144: usize = 1024 * 4 * 144;
+            const Q4_TRANSACTION_GATE_UP_160: usize = 1024 * 4 * 160;
+            const Q4_TRANSACTION_DOWN_144: usize = 1024 * 2 * 144;
+            const Q4_TRANSACTION_DOWN_160: usize = 1024 * 2 * 160;
             const Q3_GATE_UP_12: usize = 1024 * 32 * 12;
             const Q3_GATE_UP_16: usize = 1024 * 32 * 16;
             const Q3_DOWN_12: usize = 1024 * 16 * 12;
@@ -6276,6 +6323,26 @@ pub mod platform {
                 && down_scales.length == EXPERTS * Q4_DOWN_SCALES
                 || down_packed.length == EXPERTS * Q4_INLINE_DOWN
                     && down_scales.length == EXPERTS * Q4_INLINE_DOWN;
+            let is_q4_transaction_gate = gate_up_layout.is_q4_transaction()
+                && gate_up_packed.length
+                    == EXPERTS
+                        * match gate_up_layout {
+                            PackingLayout::Q4Transaction144 => Q4_TRANSACTION_GATE_UP_144,
+                            PackingLayout::Q4Transaction160 => Q4_TRANSACTION_GATE_UP_160,
+                            _ => 0,
+                        }
+                && gate_up_scales.length == gate_up_packed.length;
+            let is_q4_transaction_down = down_layout.is_q4_transaction()
+                && down_packed.length
+                    == EXPERTS
+                        * match down_layout {
+                            PackingLayout::Q4Transaction144 => Q4_TRANSACTION_DOWN_144,
+                            PackingLayout::Q4Transaction160 => Q4_TRANSACTION_DOWN_160,
+                            _ => 0,
+                        }
+                && down_scales.length == down_packed.length;
+            let is_q4_gate = is_q4_gate || is_q4_transaction_gate;
+            let is_q4_down = is_q4_down || is_q4_transaction_down;
             let is_q4 = is_q4_gate && is_q4_down;
             let is_q4k = gate_up_packed.length == EXPERTS * Q4K_GATE_UP_PACKED
                 && gate_up_scales.length == EXPERTS * Q4K_GATE_UP_SCALES
@@ -6294,12 +6361,14 @@ pub mod platform {
             let is_q3 = is_q3_gate && is_q3_down;
             let is_q3_gate_q4_down = is_q3_gate && is_q4_down;
             let is_q4_gate_q3_down = is_q4_gate && is_q3_down;
-            if !is_q4
+            if (!is_q4
                 && !is_q4k
                 && !is_inline
                 && !is_q3
                 && !is_q3_gate_q4_down
-                && !is_q4_gate_q3_down
+                && !is_q4_gate_q3_down)
+                || (gate_up_layout.is_q4_transaction() && !is_q4_transaction_gate)
+                || (down_layout.is_q4_transaction() && !is_q4_transaction_down)
             {
                 return Err("dynamic Q4 MoE slab views have an invalid Granite shape".to_owned());
             }
@@ -7964,7 +8033,8 @@ mod tests {
                 "missing Metal entry point: {name}"
             );
         }
-        assert!(DYNAMIC_MOE_KERNEL_SOURCE.contains("groups_per_transaction = 8"));
+        assert!(DYNAMIC_MOE_KERNEL_SOURCE.contains("layout == 7 || layout == 8"));
+        assert!(DYNAMIC_MOE_KERNEL_SOURCE.contains("layout == 8 ? 160 : 144"));
     }
 
     #[cfg(target_os = "macos")]
@@ -8317,6 +8387,146 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|value| *value == 0.0)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn transaction_144_and_160_dispatches_have_identical_projection_results() {
+        use half::f16;
+
+        fn transaction_stream(
+            experts: usize,
+            rows: usize,
+            groups: usize,
+            block_bytes: usize,
+        ) -> Vec<u8> {
+            let blocks = groups / 8;
+            let expert_bytes = rows * blocks * block_bytes;
+            let mut stream = vec![0_u8; experts * expert_bytes];
+            for expert in 0..experts {
+                for row in 0..rows {
+                    for block in 0..blocks {
+                        let block_start =
+                            expert * expert_bytes + (row * blocks + block) * block_bytes;
+                        for group in 0..8 {
+                            let group_start = block_start + group * 18;
+                            stream[group_start..group_start + 16].fill(0x88);
+                            stream[group_start + 16..group_start + 18]
+                                .copy_from_slice(&f16::from_f32(1.0).to_bits().to_le_bytes());
+                        }
+                    }
+                }
+            }
+            stream
+        }
+
+        let context = platform::MetalContext::system_default().expect("Metal device");
+        let input_values = [1.0_f32; 1024];
+        let ids_values = [0_u32, 1, 2, 3, 4, 5, 6, 7];
+        let weights_values = [0.125_f32; 8];
+        let run = |layout, block_bytes| {
+            let gate_up = transaction_stream(32, 1024, 32, block_bytes);
+            let down = transaction_stream(32, 1024, 16, block_bytes);
+            let prepared = context
+                .prepare_dynamic_q4_moe_with_layouts(
+                    &gate_up, &gate_up, &down, &down, layout, layout,
+                )
+                .unwrap();
+            let input = context.allocate_runtime_buffer(1024 * 4).unwrap();
+            let ids = context.allocate_runtime_buffer(8 * 4).unwrap();
+            let weights = context.allocate_runtime_buffer(8 * 4).unwrap();
+            let output = context.allocate_runtime_buffer(1024 * 4).unwrap();
+            for (buffer, values) in [
+                (&input, unsafe {
+                    std::slice::from_raw_parts(
+                        input_values.as_ptr() as *const u8,
+                        std::mem::size_of_val(&input_values),
+                    )
+                }),
+                (&ids, unsafe {
+                    std::slice::from_raw_parts(
+                        ids_values.as_ptr() as *const u8,
+                        std::mem::size_of_val(&ids_values),
+                    )
+                }),
+                (&weights, unsafe {
+                    std::slice::from_raw_parts(
+                        weights_values.as_ptr() as *const u8,
+                        std::mem::size_of_val(&weights_values),
+                    )
+                }),
+            ] {
+                context.write_runtime_buffer(buffer, values).unwrap();
+            }
+            let scratch = context
+                .allocate_runtime_buffer(8 * 1024 * 4 + 8 * 512 * 4 + 8 * 1024 * 4)
+                .unwrap();
+            let mut stage_graph = context.begin_decode().unwrap();
+            stage_graph
+                .encode_dynamic_q4_moe_batched_stage(
+                    &prepared, &input, &ids, &weights, &scratch, &output, 0,
+                )
+                .unwrap();
+            stage_graph
+                .encode_dynamic_q4_moe_batched_stage(
+                    &prepared, &input, &ids, &weights, &scratch, &output, 1,
+                )
+                .unwrap();
+            stage_graph
+                .encode_dynamic_q4_moe_batched_stage(
+                    &prepared, &input, &ids, &weights, &scratch, &output, 2,
+                )
+                .unwrap();
+            stage_graph.finish(&context).unwrap();
+            let stage = context.read_runtime_f32(&scratch, 8 * 1024).unwrap();
+            let down_stage = context
+                .read_runtime_f32(
+                    &scratch
+                        .subregion(8 * 1024 * 4 + 8 * 512 * 4, 8 * 1024 * 4)
+                        .unwrap(),
+                    8 * 1024,
+                )
+                .unwrap();
+            let mut graph = context.begin_decode().unwrap();
+            graph
+                .encode_dynamic_q4_moe(&prepared, &input, &ids, &weights, &output)
+                .unwrap();
+            graph.finish(&context).unwrap();
+            (
+                stage,
+                down_stage,
+                context.read_runtime_f32(&output, 1024).unwrap(),
+            )
+        };
+
+        let (dense_stage, dense_down, dense) = run(PackingLayout::Q4Transaction144, 144);
+        let (padded_stage, padded_down, padded) = run(PackingLayout::Q4Transaction160, 160);
+        let stage_error = dense_stage
+            .iter()
+            .zip(&padded_stage)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        let max_error = dense
+            .iter()
+            .zip(&padded)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        let down_error = dense_down
+            .iter()
+            .zip(&padded_down)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(dense.iter().all(|value| value.is_finite() && *value > 0.0));
+        assert!(
+            max_error < 1.0e-2,
+            "transaction layout error: {max_error}, stage error: {stage_error}, down error: {down_error}, dense[0]={}, padded[0]={}, down dense[0]={}, down padded[0]={}, stage dense[0]={}, stage padded[0]={}",
+            dense[0],
+            padded[0],
+            dense_down[0],
+            padded_down[0],
+            dense_stage[0],
+            padded_stage[0]
         );
     }
 

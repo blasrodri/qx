@@ -790,12 +790,14 @@ fn moe_requested_layout() -> Option<qx_quant::PackingLayout> {
         Some("row-inline-8") | Some("inline-8") | Some("q4-row-inline-8") => {
             Some(qx_quant::PackingLayout::Q4RowInlineRows8)
         }
-        Some("transaction-144") | Some("transaction144") => {
-            Some(qx_quant::PackingLayout::Q4Transaction144)
-        }
-        Some("transaction-160") | Some("transaction160") => {
-            Some(qx_quant::PackingLayout::Q4Transaction160)
-        }
+        Some("transaction-144")
+        | Some("transaction144")
+        | Some("q4-transaction-144")
+        | Some("q4-transaction144") => Some(qx_quant::PackingLayout::Q4Transaction144),
+        Some("transaction-160")
+        | Some("transaction160")
+        | Some("q4-transaction-160")
+        | Some("q4-transaction160") => Some(qx_quant::PackingLayout::Q4Transaction160),
         Some("tile") | Some("tile32") | Some("lane") | Some("lane-native") => {
             Some(qx_quant::PackingLayout::MetalTile32)
         }
@@ -925,6 +927,10 @@ fn quantized_bytes_for_layout(
     let mut tensor = artifact
         .quantized_tensor(index)
         .map_err(|error| error.to_string())?;
+    if let Some(block_bytes) = layout.transaction_block_bytes() {
+        let stream = tensor.transaction_block_bytes(block_bytes == 160)?;
+        return Ok((stream.clone(), stream));
+    }
     tensor.repack(layout)?;
     let scales = unsafe {
         std::slice::from_raw_parts(
@@ -947,6 +953,10 @@ fn quantized_row_range_bytes_for_layout(
         .quantized_tensor(index)
         .map_err(|error| error.to_string())?
         .row_range(start, count)?;
+    if let Some(block_bytes) = layout.transaction_block_bytes() {
+        let stream = tensor.transaction_block_bytes(block_bytes == 160)?;
+        return Ok((stream.clone(), stream));
+    }
     tensor.repack(layout)?;
     let scales = unsafe {
         std::slice::from_raw_parts(
