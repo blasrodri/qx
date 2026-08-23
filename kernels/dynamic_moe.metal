@@ -973,8 +973,8 @@ kernel void qx_dynamic_q4_moe_gate_up_simd(
     constexpr uint hidden = 1024;
     constexpr uint groups = 32;
     constexpr uint bytes_per_group = 16;
-    constexpr uint packed_stride = 1024 * 1024 / 2;
-    constexpr uint scale_stride = 1024 * 32;
+    uint packed_stride = qx_dynamic_packed_stride(hidden, groups, layout);
+    uint scale_stride = qx_dynamic_scale_stride(hidden, groups, layout);
     constexpr uint rows_per_threadgroup = 8;
     constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
     threadgroup float cached_input[hidden];
@@ -1022,8 +1022,8 @@ kernel void qx_dynamic_q4_moe_gate_up_norm_simd(
     constexpr uint hidden = 1024;
     constexpr uint groups = 32;
     constexpr uint bytes_per_group = 16;
-    constexpr uint packed_stride = 1024 * 1024 / 2;
-    constexpr uint scale_stride = 1024 * 32;
+    uint packed_stride = qx_dynamic_packed_stride(hidden, groups, layout);
+    uint scale_stride = qx_dynamic_scale_stride(hidden, groups, layout);
     constexpr uint rows_per_threadgroup = 8;
     constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
     threadgroup float cached_input[hidden];
@@ -1072,8 +1072,8 @@ kernel void qx_dynamic_q4_moe_gate_up_wide_simd(
     constexpr uint hidden = 1024;
     constexpr uint groups = 32;
     constexpr uint bytes_per_group = 16;
-    constexpr uint packed_stride = 1024 * 1024 / 2;
-    constexpr uint scale_stride = 1024 * 32;
+    uint packed_stride = qx_dynamic_packed_stride(hidden, groups, layout);
+    uint scale_stride = qx_dynamic_scale_stride(hidden, groups, layout);
     threadgroup float cached_input[hidden];
     for (uint column = thread_index; column < hidden; column += 1024) {
         cached_input[column] = input[column];
@@ -1117,8 +1117,8 @@ kernel void qx_dynamic_q4_moe_gate_up_wide_norm_simd(
     constexpr uint hidden = 1024;
     constexpr uint groups = 32;
     constexpr uint bytes_per_group = 16;
-    constexpr uint packed_stride = 1024 * 1024 / 2;
-    constexpr uint scale_stride = 1024 * 32;
+    uint packed_stride = qx_dynamic_packed_stride(hidden, groups, layout);
+    uint scale_stride = qx_dynamic_scale_stride(hidden, groups, layout);
     threadgroup float cached_input[hidden];
     float inverse = inverse_rms[0];
     for (uint column = thread_index; column < hidden; column += 1024) {
@@ -2190,8 +2190,8 @@ kernel void qx_dynamic_q4_moe_down_simd(
     constexpr uint intermediate = 512;
     constexpr uint groups = 16;
     constexpr uint bytes_per_group = 16;
-    constexpr uint packed_stride = 1024 * 512 / 2;
-    constexpr uint scale_stride = 1024 * 16;
+    uint packed_stride = qx_dynamic_packed_stride(hidden, groups, layout);
+    uint scale_stride = qx_dynamic_scale_stride(hidden, groups, layout);
     constexpr uint rows_per_threadgroup = 8;
     constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
     uint slot = threadgroup_id / threadgroups_per_expert;
@@ -2267,8 +2267,8 @@ kernel void qx_dynamic_q4_moe_down_wide_simd(
     constexpr uint intermediate = 512;
     constexpr uint groups = 16;
     constexpr uint bytes_per_group = 16;
-    constexpr uint packed_stride = 1024 * 512 / 2;
-    constexpr uint scale_stride = 1024 * 16;
+    uint packed_stride = qx_dynamic_packed_stride(hidden, groups, layout);
+    uint scale_stride = qx_dynamic_scale_stride(hidden, groups, layout);
     threadgroup float cached_activated[intermediate];
     uint slot = threadgroup_id;
     for (uint column = thread_index; column < intermediate; column += 1024) {
