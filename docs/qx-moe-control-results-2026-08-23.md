@@ -99,3 +99,21 @@ token differential profile, with the remaining non-MoE components measured
 against the same workload. The immediate conclusion is to stop treating MoE
 as an unexplained 2x system deficit and investigate the largest remaining
 absolute live-token gaps.
+
+The same grouped probe was also run during the context-384 / 128-token llama
+benchmark contract. Across 897 decode-graph samples, the medians were:
+
+| llama grouped replay | median | p10–p90 |
+|---|---:|---:|
+| gate/up | 638.5 us | 603.4–670.6 us |
+| down | 376.3 us | 375.3–378.7 us |
+| complete MoE replay | 1455.2 us | 1449.4–1484.5 us |
+
+The profiling replay changes llama's benchmark execution, so its throughput
+is not used as a headline result. These values are the matched context
+reference for operation cost only. Against QX's 2.213 ms gate/up+down stage
+differential and 2.245 ms fixed-route MoE CB2, QX is about 1.5x slower for the
+complete MoE stage, not 2x–3x slower. MoE remains a high-value target, but it
+cannot by itself explain the full QX-versus-llama GPU gap; the next action is a
+fresh complete-token differential profile and matched attribution of the
+remaining non-MoE blocks.
