@@ -3,9 +3,12 @@ use clap::Parser;
 use half::f16;
 use qx_compiler::QuantizedExpert;
 use qx_format::{MappedArtifact, TensorKind};
-use qx_model::{EMBEDDING_MULTIPLIER, HIDDEN, LAYERS, LOGITS_SCALING, RESIDUAL_MULTIPLIER, VOCAB};
+use qx_model::{
+    EMBEDDING_MULTIPLIER, HEAD_DIM, HIDDEN, KV_HEADS, LAYERS, LOGITS_SCALING, RESIDUAL_MULTIPLIER,
+    VOCAB,
+};
 use qx_runtime::{GenerationStats, GenerationTrace, GraniteModel, RuntimeProfile};
-use qx_runtime_v2::ExecutionPlan;
+use qx_runtime_v2::{BufferId, ExecutionPlan};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -29,7 +32,7 @@ struct Args {
     /// JSON fixture containing canonical prompt token IDs and benchmark settings.
     #[arg(long)]
     fixture: Option<PathBuf>,
-    /// Write a machine-readable benchmark record (currently supported by --v2-token).
+    /// Write a machine-readable benchmark or memory-attribution record.
     #[arg(long)]
     result_json: Option<PathBuf>,
     #[arg(long, default_value_t = 512)]
@@ -63,6 +66,9 @@ struct Args {
     /// Print the V2 static memory/dispatch audit and exit.
     #[arg(long)]
     v2_plan: bool,
+    /// Attribute V2 memory ownership across load and steady-state phases.
+    #[arg(long)]
+    v2_memory_profile: bool,
     /// Benchmark the real 24-layer V2 attention graph without MoE/logits.
     #[arg(long, requires = "model")]
     v2_attention_stack: bool,
@@ -223,6 +229,19 @@ fn main() -> Result<()> {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--v2-full-stack requires an artifact path"))?;
         return benchmark_v2_full_stack(artifact, args.context, args.warmup, args.iterations);
+    }
+    if args.v2_memory_profile {
+        let artifact = args
+            .artifact
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--v2-memory-profile requires an artifact path"))?;
+        return benchmark_v2_memory_profile(
+            artifact,
+            args.context,
+            args.warmup,
+            args.iterations,
+            args.result_json.as_deref(),
+        );
     }
     if args.v2_token {
         let artifact = args
@@ -5076,6 +5095,291 @@ struct V2TokenBenchmarkRecord {
     thermal_state: String,
     memory_pressure: String,
     last_token_id: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, Serialize)]
+struct MemorySnapshot {
+    label: String,
+    current_rss_bytes: u64,
+    peak_rss_bytes: u64,
+    current_physical_footprint_bytes: u64,
+    peak_physical_footprint_bytes: u64,
+    known_metal_allocated_bytes: u64,
+    recommended_metal_working_set_bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Serialize)]
+struct MemoryOwnership {
+    artifact_file_bytes: u64,
+    mapped_artifact_bytes: u64,
+    arena_bytes: u64,
+    arena_region_bytes: u64,
+    arena_alignment_bytes: u64,
+    activation_and_small_buffers_bytes: u64,
+    attention_scratch_bytes: u64,
+    moe_scratch_bytes: u64,
+    logits_bytes: u64,
+    kv_cache_bytes: u64,
+    pipeline_state_bytes: u64,
+    pipeline_state_bytes_known: bool,
+    duplicate_cpu_weight_bytes: u64,
+    duplicate_cpu_weight_bytes_known: bool,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Serialize)]
+struct V2MemoryProfileReport {
+    schema_version: u32,
+    implementation: &'static str,
+    qx_revision: &'static str,
+    artifact: String,
+    artifact_hash: String,
+    artifact_version: u32,
+    plan_id: String,
+    target_id: String,
+    context: usize,
+    warmup: usize,
+    iterations: usize,
+    ownership: MemoryOwnership,
+    phases: Vec<MemorySnapshot>,
+    os_version: String,
+    power_state: String,
+    thermal_state: String,
+    memory_pressure: String,
+    limitations: Vec<&'static str>,
+}
+
+#[cfg(target_os = "macos")]
+fn benchmark_v2_memory_profile(
+    artifact_path: &std::path::Path,
+    context_length: usize,
+    warmup: usize,
+    iterations: usize,
+    result_json: Option<&std::path::Path>,
+) -> Result<()> {
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    let sealed_plan = qx_runtime_v2::activate_artifact_execution_plan(artifact_path)
+        .map_err(anyhow::Error::msg)?;
+    if let Some(plan) = &sealed_plan {
+        if plan.workload.context_limit as usize != context_length {
+            bail!(
+                "context {context_length} does not match sealed plan context {}",
+                plan.workload.context_limit
+            );
+        }
+    }
+    let (artifact_bytes, artifact_hash) = artifact_fingerprint(artifact_path)?;
+    let mapped_artifact = Arc::new(MappedArtifact::open(artifact_path)?);
+    let target_id = mapped_artifact.info().header.target_id.clone();
+    let plan_id = sealed_plan
+        .as_ref()
+        .map(|plan| plan.plan_id.clone())
+        .unwrap_or_else(|| "legacy-v1-unsealed".to_owned());
+    let plan = ExecutionPlan::granite(context_length).map_err(anyhow::Error::msg)?;
+    let metal = Rc::new(
+        qx_metal::platform::MetalContext::system_default()
+            .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
+    );
+    let mut phases = vec![memory_snapshot("baseline", &metal)];
+    phases.push(memory_snapshot("artifact_mapped", &metal));
+
+    let buffers = qx_runtime_v2::GpuRuntimeBuffers::new(metal.clone(), plan.clone())
+        .map_err(anyhow::Error::msg)?;
+    phases.push(memory_snapshot("runtime_arena_and_kv", &metal));
+    let stack = qx_runtime_v2::PreparedAttentionStack::load_from_mapped_artifact(
+        &metal,
+        mapped_artifact.clone(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    phases.push(memory_snapshot("attention_weights_and_pipelines", &metal));
+    let moe = qx_runtime_v2::PreparedMoeStack::load_from_mapped_artifact(&metal, mapped_artifact)
+        .map_err(anyhow::Error::msg)?;
+    phases.push(memory_snapshot("all_weights_and_pipelines", &metal));
+
+    let token_bytes = 0_u32.to_le_bytes();
+    for _ in 0..warmup {
+        metal
+            .write_runtime_buffer(
+                buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+                &token_bytes,
+            )
+            .map_err(anyhow::Error::msg)?;
+        let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+        stack
+            .encode_token(&mut graph, &buffers, &moe, 0)
+            .map_err(anyhow::Error::msg)?;
+        buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+    }
+    phases.push(memory_snapshot("steady_state_after_warmup", &metal));
+    for position in 0..iterations {
+        let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+        stack
+            .encode_token(&mut graph, &buffers, &moe, position % context_length)
+            .map_err(anyhow::Error::msg)?;
+        buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+    }
+    phases.push(memory_snapshot("steady_state_after_measurement", &metal));
+
+    let ownership = memory_ownership(&plan, artifact_bytes);
+    let final_metal_allocated_bytes = phases
+        .last()
+        .map(|phase| phase.known_metal_allocated_bytes)
+        .unwrap_or(0);
+    let report = V2MemoryProfileReport {
+        schema_version: 1,
+        implementation: "qx-v2-memory-profile",
+        qx_revision: option_env!("QX_GIT_REVISION").unwrap_or("unknown"),
+        artifact: artifact_path.display().to_string(),
+        artifact_hash: format!("{artifact_hash:016x}"),
+        artifact_version: mapped_artifact_version(artifact_path)?,
+        plan_id,
+        target_id,
+        context: context_length,
+        warmup,
+        iterations,
+        ownership,
+        phases,
+        os_version: command_output("sw_vers", &["-productVersion"]),
+        power_state: command_output("pmset", &["-g", "batt"]),
+        thermal_state: command_output("pmset", &["-g", "therm"]),
+        memory_pressure: command_output("memory_pressure", &["-Q"]),
+        limitations: vec![
+            "Metal currentAllocatedSize is aggregate; Metal does not expose per-buffer ownership through the current qx-metal API.",
+            "mapped_artifact_bytes is the file-backed mapping extent, not resident mapped pages.",
+            "pipeline_state_bytes and duplicate_cpu_weight_bytes are unknown because their allocations are not exposed by the current runtime API.",
+            "peak RSS/physical footprint are process lifetime maxima and cannot be reset between phases.",
+        ],
+    };
+    println!("QX V2 memory ownership profile");
+    println!("artifact:                 {}", report.artifact);
+    println!(
+        "artifact bytes/mapped:    {} / {}",
+        artifact_bytes, ownership.mapped_artifact_bytes
+    );
+    println!("arena bytes:              {}", ownership.arena_bytes);
+    println!("KV cache bytes:           {}", ownership.kv_cache_bytes);
+    println!(
+        "attention scratch bytes:  {}",
+        ownership.attention_scratch_bytes
+    );
+    println!("MoE scratch bytes:        {}", ownership.moe_scratch_bytes);
+    println!("known Metal allocations:  {final_metal_allocated_bytes}");
+    for phase in &report.phases {
+        println!(
+            "phase {:<34} rss {:>12} physical {:>12} metal {:>12}",
+            phase.label,
+            phase.current_rss_bytes,
+            phase.current_physical_footprint_bytes,
+            phase.known_metal_allocated_bytes
+        );
+    }
+    if let Some(path) = result_json {
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
+        println!("memory report JSON:       {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn memory_snapshot(label: &str, metal: &qx_metal::platform::MetalContext) -> MemorySnapshot {
+    let (current_physical_footprint_bytes, peak_physical_footprint_bytes) = physical_footprint();
+    MemorySnapshot {
+        label: label.to_owned(),
+        current_rss_bytes: current_rss_bytes(),
+        peak_rss_bytes: peak_rss_bytes(),
+        current_physical_footprint_bytes,
+        peak_physical_footprint_bytes,
+        known_metal_allocated_bytes: metal.current_allocated_bytes(),
+        recommended_metal_working_set_bytes: metal.recommended_working_set_bytes(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn memory_ownership(plan: &ExecutionPlan, artifact_bytes: u64) -> MemoryOwnership {
+    let region_bytes = |id: BufferId| {
+        plan.regions
+            .iter()
+            .find(|region| region.id == id)
+            .map(|region| region.length as u64)
+            .unwrap_or(0)
+    };
+    let arena_region_bytes = plan.regions.iter().map(|region| region.length as u64).sum();
+    let activation_and_small_buffers_bytes = [
+        BufferId::HiddenA,
+        BufferId::HiddenB,
+        BufferId::Query,
+        BufferId::Key,
+        BufferId::Value,
+        BufferId::Attention,
+        BufferId::MoeInput,
+        BufferId::RouterScores,
+        BufferId::TopKIds,
+        BufferId::TopKWeights,
+        BufferId::MoeOutput,
+        BufferId::TokenOutput,
+    ]
+    .into_iter()
+    .map(region_bytes)
+    .sum();
+    let attention_scratch_bytes = region_bytes(BufferId::AttentionScratch);
+    let moe_scratch_bytes = region_bytes(BufferId::MoeScratch);
+    let logits_bytes = region_bytes(BufferId::Logits);
+    let kv_cache_bytes = (0..LAYERS)
+        .map(|layer| {
+            let key_bytes = if qx_metal::platform::kv_key_fp16_for_layer(layer) {
+                std::mem::size_of::<u16>()
+            } else {
+                std::mem::size_of::<f32>()
+            };
+            let value_bytes = if qx_metal::platform::kv_value_fp16_for_layer(layer) {
+                std::mem::size_of::<u16>()
+            } else {
+                std::mem::size_of::<f32>()
+            };
+            context_kv_bytes(plan.context, key_bytes + value_bytes)
+        })
+        .sum();
+    MemoryOwnership {
+        artifact_file_bytes: artifact_bytes,
+        mapped_artifact_bytes: artifact_bytes,
+        arena_bytes: plan.arena_bytes as u64,
+        arena_region_bytes,
+        arena_alignment_bytes: plan.arena_bytes as u64 - arena_region_bytes,
+        activation_and_small_buffers_bytes,
+        attention_scratch_bytes,
+        moe_scratch_bytes,
+        logits_bytes,
+        kv_cache_bytes,
+        pipeline_state_bytes: 0,
+        pipeline_state_bytes_known: false,
+        duplicate_cpu_weight_bytes: 0,
+        duplicate_cpu_weight_bytes_known: false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn context_kv_bytes(context: usize, element_bytes: usize) -> u64 {
+    (context * KV_HEADS * HEAD_DIM * element_bytes) as u64
+}
+
+#[cfg(target_os = "macos")]
+fn mapped_artifact_version(path: &std::path::Path) -> Result<u32> {
+    Ok(MappedArtifact::open(path)?.info().header.version)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn benchmark_v2_memory_profile(
+    _artifact_path: &std::path::Path,
+    _context_length: usize,
+    _warmup: usize,
+    _iterations: usize,
+    _result_json: Option<&std::path::Path>,
+) -> Result<()> {
+    bail!("--v2-memory-profile requires macOS Metal")
 }
 
 #[cfg(target_os = "macos")]

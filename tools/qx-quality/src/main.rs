@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use qx_eval::{QualityTrace, TokenCorpus, read_quality_trace, write_token_corpus};
+use qx_eval::{
+    BlockBootstrapEstimate, QualityTrace, TokenCorpus, bootstrap_relative_ppl,
+    read_quality_corpus_manifest, read_quality_trace, write_token_corpus,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fs, path::PathBuf};
@@ -34,6 +37,10 @@ enum Command {
     Compare {
         #[arg(long)]
         corpus: PathBuf,
+        /// Optional sealed corpus manifest. When supplied, provenance and the
+        /// processed corpus hash are checked before comparing traces.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
         #[arg(long)]
         reference: PathBuf,
         #[arg(long)]
@@ -42,6 +49,10 @@ enum Command {
         candidate: PathBuf,
         #[arg(long)]
         output: PathBuf,
+        #[arg(long, default_value_t = 10_000)]
+        bootstrap_iterations: usize,
+        #[arg(long, default_value_t = 0x7151_5eed_d15c_a11e_u64)]
+        bootstrap_seed: u64,
     },
     Gate {
         #[arg(long = "report", required = true)]
@@ -86,11 +97,14 @@ struct DistributionComparison {
     top10_overlap: f64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct BootstrapComparison {
     relative_ppl_delta: f64,
     lower_95: f64,
     upper_95: f64,
+    iterations: usize,
+    blocks: usize,
+    block_positions: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,10 +114,16 @@ struct DomainQualityReport {
     split: String,
     source_hash: String,
     tokenizer_hash: String,
+    #[serde(default)]
+    manifest: Option<String>,
     reference: TraceSummary,
     llama: TraceSummary,
     candidate: TraceSummary,
     candidate_vs_llama: BootstrapComparison,
+    #[serde(default)]
+    llama_vs_reference: BootstrapComparison,
+    #[serde(default)]
+    candidate_vs_reference: BootstrapComparison,
     llama_vs_reference_logits: DistributionComparison,
     candidate_vs_reference_logits: DistributionComparison,
     candidate_vs_llama_logits: DistributionComparison,
@@ -153,11 +173,23 @@ fn main() -> Result<()> {
         } => prepare(model, source, domain, split, tokens, output),
         Command::Compare {
             corpus,
+            manifest,
             reference,
             llama,
             candidate,
             output,
-        } => compare(corpus, reference, llama, candidate, output),
+            bootstrap_iterations,
+            bootstrap_seed,
+        } => compare(
+            corpus,
+            manifest,
+            reference,
+            llama,
+            candidate,
+            output,
+            bootstrap_iterations,
+            bootstrap_seed,
+        ),
         Command::Gate {
             reports,
             tasks,
@@ -177,7 +209,8 @@ fn prepare(
     if tokens < 513 {
         bail!("quality corpora require at least 513 tokens");
     }
-    let source_bytes = fs::read(&source).with_context(|| format!("read {}", source.display()))?;
+    ensure_model_inputs(&model)?;
+    let source_bytes = read_required(&source, "quality source")?;
     let text = String::from_utf8(source_bytes.clone())?;
     let tokenizer = qx_tokenizer::Tokenizer::from_dir(&model)?;
     let mut token_ids = tokenizer.encode(&text)?;
@@ -207,29 +240,66 @@ fn prepare(
 
 fn compare(
     corpus_path: PathBuf,
+    manifest_path: Option<PathBuf>,
     reference_path: PathBuf,
     llama_path: PathBuf,
     candidate_path: PathBuf,
     output: PathBuf,
+    bootstrap_iterations: usize,
+    bootstrap_seed: u64,
 ) -> Result<()> {
     let corpus = qx_eval::read_token_corpus(&corpus_path)?;
+    let manifest_block_tokens = manifest_path
+        .as_ref()
+        .map(|path| validate_manifest(path, &corpus_path, &corpus))
+        .transpose()?;
     let reference = read_quality_trace(&reference_path)?;
     let llama = read_quality_trace(&llama_path)?;
     let candidate = read_quality_trace(&candidate_path)?;
     validate_aligned(&reference, &llama, &candidate, corpus.tokens.len() - 1)?;
+    if let Some(block_tokens) = manifest_block_tokens {
+        if reference.block_tokens != block_tokens
+            || llama.block_tokens != block_tokens
+            || candidate.block_tokens != block_tokens
+        {
+            bail!(
+                "quality traces use block size {}, but sealed manifest requires {}",
+                reference.block_tokens,
+                block_tokens
+            );
+        }
+    }
     let reference_nll = mean_nll(&reference);
     let llama_nll = mean_nll(&llama);
     let candidate_nll = mean_nll(&candidate);
     let report = DomainQualityReport {
-        schema_version: 1,
+        schema_version: 2,
         domain: corpus.domain,
         split: corpus.split,
         source_hash: corpus.source_hash,
         tokenizer_hash: corpus.tokenizer_hash,
+        manifest: manifest_path.map(|path| path.display().to_string()),
         reference: summary(&reference, reference_nll, reference_nll),
         llama: summary(&llama, llama_nll, reference_nll),
         candidate: summary(&candidate, candidate_nll, reference_nll),
-        candidate_vs_llama: bootstrap_relative_ppl(&llama, &candidate, 10_000),
+        candidate_vs_llama: bootstrap_report(bootstrap_relative_ppl(
+            &llama,
+            &candidate,
+            bootstrap_iterations,
+            bootstrap_seed,
+        )?),
+        llama_vs_reference: bootstrap_report(bootstrap_relative_ppl(
+            &reference,
+            &llama,
+            bootstrap_iterations,
+            bootstrap_seed ^ 0x11_aa_22_bb_33_cc_44_dd,
+        )?),
+        candidate_vs_reference: bootstrap_report(bootstrap_relative_ppl(
+            &reference,
+            &candidate,
+            bootstrap_iterations,
+            bootstrap_seed ^ 0xdd_44_cc_33_bb_22_aa_11,
+        )?),
         llama_vs_reference_logits: compare_samples(&reference, &llama)?,
         candidate_vs_reference_logits: compare_samples(&reference, &candidate)?,
         candidate_vs_llama_logits: compare_samples(&llama, &candidate)?,
@@ -241,6 +311,12 @@ fn compare(
         report.candidate_vs_llama.relative_ppl_delta * 100.0,
         report.candidate_vs_llama.lower_95 * 100.0,
         report.candidate_vs_llama.upper_95 * 100.0
+    );
+    println!(
+        "{}: llama/ref {:+.3}%, QX/ref {:+.3}%",
+        report.domain,
+        report.llama_vs_reference.relative_ppl_delta * 100.0,
+        report.candidate_vs_reference.relative_ppl_delta * 100.0
     );
     Ok(())
 }
@@ -414,37 +490,54 @@ fn summary(trace: &QualityTrace, nll: f64, reference_nll: f64) -> TraceSummary {
     }
 }
 
-fn bootstrap_relative_ppl(
-    baseline: &QualityTrace,
-    candidate: &QualityTrace,
-    iterations: usize,
-) -> BootstrapComparison {
-    let mut random = Lcg(0x7151_5eed_d15c_a11e);
-    let deltas = baseline
-        .blocks
-        .iter()
-        .zip(&candidate.blocks)
-        .map(|(left, right)| (right.nll_sum - left.nll_sum, left.positions as u64))
-        .collect::<Vec<_>>();
-    let total_delta = deltas.iter().map(|value| value.0).sum::<f64>();
-    let total_positions = deltas.iter().map(|value| value.1).sum::<u64>();
-    let mut samples = Vec::with_capacity(iterations);
-    for _ in 0..iterations {
-        let mut delta = 0.0;
-        let mut positions = 0_u64;
-        for _ in 0..deltas.len() {
-            let value = deltas[random.next() as usize % deltas.len()];
-            delta += value.0;
-            positions += value.1;
-        }
-        samples.push((delta / positions as f64).exp() - 1.0);
-    }
-    samples.sort_by(f64::total_cmp);
+fn bootstrap_report(estimate: BlockBootstrapEstimate) -> BootstrapComparison {
     BootstrapComparison {
-        relative_ppl_delta: (total_delta / total_positions as f64).exp() - 1.0,
-        lower_95: samples[samples.len() * 25 / 1000],
-        upper_95: samples[samples.len() * 975 / 1000],
+        relative_ppl_delta: estimate.relative_ppl_delta,
+        lower_95: estimate.lower_95,
+        upper_95: estimate.upper_95,
+        iterations: estimate.iterations,
+        blocks: estimate.blocks,
+        block_positions: estimate.block_positions,
     }
+}
+
+fn validate_manifest(
+    manifest_path: &std::path::Path,
+    corpus_path: &std::path::Path,
+    corpus: &TokenCorpus,
+) -> Result<u32> {
+    let manifest = read_quality_corpus_manifest(manifest_path)?;
+    let entry = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.domain == corpus.domain && entry.kind == "token-corpus")
+        .with_context(|| {
+            format!(
+                "manifest {} has no token-corpus entry for domain {}",
+                manifest_path.display(),
+                corpus.domain
+            )
+        })?;
+    if entry.source_split != corpus.split
+        || entry.records_or_tokens != corpus.tokens.len() as u64
+        || entry.scored_positions != Some(corpus.tokens.len().saturating_sub(1) as u64)
+        || entry.raw_source_sha256 != corpus.source_hash
+        || manifest.tokenizer_hash != corpus.tokenizer_hash
+    {
+        bail!(
+            "corpus {} does not match sealed manifest provenance for {}",
+            corpus_path.display(),
+            corpus.domain
+        );
+    }
+    let processed_hash = sha256_file(corpus_path)?;
+    if processed_hash != entry.processed_corpus_sha256 {
+        bail!(
+            "corpus {} hash does not match sealed manifest",
+            corpus_path.display()
+        );
+    }
+    Ok(manifest.bootstrap_block_tokens)
 }
 
 fn compare_samples(left: &QualityTrace, right: &QualityTrace) -> Result<DistributionComparison> {
@@ -544,20 +637,49 @@ fn tokenizer_hash(model: &std::path::Path) -> Result<String> {
         "merges.txt",
     ] {
         digest.update(name.as_bytes());
-        digest.update(fs::read(model.join(name))?);
+        digest.update(read_required(&model.join(name), "tokenizer input")?);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+fn ensure_model_inputs(model: &std::path::Path) -> Result<()> {
+    let required = [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt",
+    ];
+    let missing = required
+        .iter()
+        .map(|name| model.join(name))
+        .filter(|path| !path.is_file())
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "quality inputs unavailable: missing tokenizer files: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn read_required(path: &std::path::Path, kind: &str) -> Result<Vec<u8>> {
+    if !path.is_file() {
+        bail!(
+            "quality inputs unavailable: missing {kind} {}",
+            path.display()
+        );
+    }
+    fs::read(path).with_context(|| format!("read {kind} {}", path.display()))
 }
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-struct Lcg(u64);
-
-impl Lcg {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
-        self.0
-    }
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    Ok(sha256(
+        &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    ))
 }

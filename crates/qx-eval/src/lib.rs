@@ -5,6 +5,58 @@ use std::{fs, path::Path};
 const TOKEN_MAGIC: &[u8; 8] = b"QXTOKN\0\0";
 const TRACE_MAGIC: &[u8; 8] = b"QXQUAL\0\0";
 const VERSION: u32 = 1;
+pub const QUALITY_CORPUS_MANIFEST_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QualityCorpusManifest {
+    pub schema_version: u32,
+    pub source_revision: String,
+    pub split: String,
+    pub sampling_seed: u64,
+    pub text_tokens_requested: usize,
+    pub bootstrap_block_tokens: u32,
+    pub tokenizer_hash: String,
+    pub entries: Vec<QualityCorpusManifestEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QualityCorpusManifestEntry {
+    pub domain: String,
+    pub kind: String,
+    pub source_path: String,
+    pub output_path: String,
+    pub source_split: String,
+    pub sampling_strategy: String,
+    pub sampling_offset: Option<usize>,
+    pub raw_source_sha256: String,
+    pub processed_corpus_sha256: String,
+    pub records_or_tokens: u64,
+    pub scored_positions: Option<u64>,
+}
+
+pub fn read_quality_corpus_manifest(path: &Path) -> Result<QualityCorpusManifest> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let manifest = serde_json::from_slice::<QualityCorpusManifest>(&bytes)
+        .with_context(|| format!("parse quality corpus manifest {}", path.display()))?;
+    if manifest.schema_version != QUALITY_CORPUS_MANIFEST_SCHEMA_VERSION {
+        bail!(
+            "unsupported quality corpus manifest schema {} (expected {})",
+            manifest.schema_version,
+            QUALITY_CORPUS_MANIFEST_SCHEMA_VERSION
+        );
+    }
+    if manifest.source_revision.trim().is_empty()
+        || manifest.split.trim().is_empty()
+        || manifest.tokenizer_hash.trim().is_empty()
+        || manifest.bootstrap_block_tokens == 0
+    {
+        bail!("quality corpus manifest has incomplete provenance metadata");
+    }
+    if manifest.entries.is_empty() {
+        bail!("quality corpus manifest contains no entries");
+    }
+    Ok(manifest)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenCorpus {
@@ -168,6 +220,97 @@ pub fn token_nll(logits: &[f32], target: usize) -> f64 {
     log_sum + max as f64 - logits[target] as f64
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlockBootstrapEstimate {
+    pub relative_ppl_delta: f64,
+    pub lower_95: f64,
+    pub upper_95: f64,
+    pub iterations: usize,
+    pub blocks: usize,
+    pub block_positions: u32,
+}
+
+/// Estimate a relative PPL delta by resampling complete contiguous trace
+/// blocks. Blocks are the unit of resampling so positions within a block are
+/// not treated as independent observations.
+pub fn bootstrap_relative_ppl(
+    baseline: &QualityTrace,
+    candidate: &QualityTrace,
+    iterations: usize,
+    seed: u64,
+) -> Result<BlockBootstrapEstimate> {
+    validate_bootstrap_traces(baseline, candidate)?;
+    if iterations < 1_000 {
+        bail!("block bootstrap requires at least 1,000 iterations");
+    }
+    let deltas = baseline
+        .blocks
+        .iter()
+        .zip(&candidate.blocks)
+        .map(|(left, right)| (right.nll_sum - left.nll_sum, left.positions))
+        .collect::<Vec<_>>();
+    let total_delta = deltas.iter().map(|value| value.0).sum::<f64>();
+    let total_positions = deltas.iter().map(|value| value.1 as u64).sum::<u64>();
+    let mut random = Lcg(seed);
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let mut delta = 0.0;
+        let mut positions = 0_u64;
+        for _ in 0..deltas.len() {
+            let value = deltas[random.next() as usize % deltas.len()];
+            delta += value.0;
+            positions += value.1 as u64;
+        }
+        samples.push((delta / positions as f64).exp() - 1.0);
+    }
+    samples.sort_by(f64::total_cmp);
+    let low = iterations * 25 / 1_000;
+    let high = (iterations * 975 / 1_000).min(iterations - 1);
+    Ok(BlockBootstrapEstimate {
+        relative_ppl_delta: (total_delta / total_positions as f64).exp() - 1.0,
+        lower_95: samples[low],
+        upper_95: samples[high],
+        iterations,
+        blocks: deltas.len(),
+        block_positions: baseline.block_tokens,
+    })
+}
+
+fn validate_bootstrap_traces(baseline: &QualityTrace, candidate: &QualityTrace) -> Result<()> {
+    if baseline.blocks.is_empty()
+        || baseline.blocks.len() != candidate.blocks.len()
+        || baseline.total_positions != candidate.total_positions
+        || baseline.block_tokens != candidate.block_tokens
+    {
+        bail!("quality traces do not have aligned non-empty bootstrap blocks");
+    }
+    if baseline.blocks.iter().any(|block| block.positions == 0)
+        || baseline
+            .blocks
+            .iter()
+            .map(|block| block.positions as u64)
+            .sum::<u64>()
+            != baseline.total_positions
+    {
+        bail!("quality trace bootstrap blocks do not cover scored positions");
+    }
+    for (left, right) in baseline.blocks.iter().zip(&candidate.blocks) {
+        if left.start_position != right.start_position || left.positions != right.positions {
+            bail!("quality traces have different contiguous bootstrap blocks");
+        }
+    }
+    Ok(())
+}
+
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.0
+    }
+}
+
 fn expect_version(version: u32) -> Result<()> {
     if version != VERSION {
         bail!("unsupported QX evaluation format version {version}");
@@ -258,5 +401,33 @@ mod tests {
     #[test]
     fn nll_is_low_for_target_maximum() {
         assert!(token_nll(&[0.0, 10.0, -2.0], 1) < 0.001);
+    }
+
+    #[test]
+    fn block_bootstrap_is_reproducible_and_uses_contiguous_blocks() {
+        let trace = |values: &[f64]| QualityTrace {
+            vocab: 2,
+            total_positions: values.len() as u64 * 4,
+            block_tokens: 4,
+            sample_stride: 4,
+            blocks: values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| QualityBlock {
+                    start_position: index as u64 * 4,
+                    positions: 4,
+                    nll_sum: *value,
+                })
+                .collect(),
+            samples: Vec::new(),
+        };
+        let baseline = trace(&[4.0, 8.0, 12.0]);
+        let candidate = trace(&[5.0, 9.0, 13.0]);
+        let left = bootstrap_relative_ppl(&baseline, &candidate, 1_000, 7).unwrap();
+        let right = bootstrap_relative_ppl(&baseline, &candidate, 1_000, 7).unwrap();
+        assert_eq!(left.relative_ppl_delta, right.relative_ppl_delta);
+        assert_eq!(left.lower_95, right.lower_95);
+        assert_eq!(left.blocks, 3);
+        assert!((left.relative_ppl_delta - (0.25_f64).exp_m1()).abs() < 1e-12);
     }
 }

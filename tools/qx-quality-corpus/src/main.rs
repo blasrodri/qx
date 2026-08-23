@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use qx_eval::{TokenCorpus, write_token_corpus};
-use serde::Serialize;
+use qx_eval::{
+    QUALITY_CORPUS_MANIFEST_SCHEMA_VERSION, QualityCorpusManifest, QualityCorpusManifestEntry,
+    TokenCorpus, write_token_corpus,
+};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -34,32 +36,8 @@ struct Args {
     sampling_seed: u64,
     #[arg(long, default_value_t = 32_769)]
     text_tokens: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct Manifest {
-    schema_version: u32,
-    source_revision: String,
-    split: String,
-    sampling_seed: u64,
-    text_tokens_requested: usize,
-    tokenizer_hash: String,
-    entries: Vec<ManifestEntry>,
-}
-
-#[derive(Debug, Serialize)]
-struct ManifestEntry {
-    domain: String,
-    kind: String,
-    source_path: String,
-    output_path: String,
-    source_split: String,
-    sampling_strategy: String,
-    sampling_offset: Option<usize>,
-    raw_source_sha256: String,
-    processed_corpus_sha256: String,
-    records_or_tokens: u64,
-    scored_positions: Option<u64>,
+    #[arg(long, default_value_t = 512)]
+    bootstrap_block_tokens: u32,
 }
 
 fn main() -> Result<()> {
@@ -67,8 +45,33 @@ fn main() -> Result<()> {
     if args.text_tokens < 2 {
         bail!("--text-tokens must be at least 2");
     }
+    if args.bootstrap_block_tokens == 0 {
+        bail!("--bootstrap-block-tokens must be positive");
+    }
+    if args.bootstrap_block_tokens as usize >= args.text_tokens {
+        bail!(
+            "--bootstrap-block-tokens must be smaller than --text-tokens so held-out traces contain multiple positions"
+        );
+    }
     if args.split.trim().is_empty() || args.source_revision.trim().is_empty() {
         bail!("--split and --source-revision must be non-empty");
+    }
+    let missing = [
+        ("model tokenizer directory", args.model.clone()),
+        ("WikiText source", args.wikitext.clone()),
+        ("Dolly source", args.dolly.clone()),
+        ("HumanEval source", args.humaneval.clone()),
+        ("GSM8K source", args.gsm8k.clone()),
+    ]
+    .into_iter()
+    .filter(|(_, path)| !path.exists())
+    .map(|(kind, path)| format!("{kind}: {}", path.display()))
+    .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "quality corpus inputs unavailable:\n  {}",
+            missing.join("\n  ")
+        );
     }
     fs::create_dir_all(&args.output)
         .with_context(|| format!("create output directory {}", args.output.display()))?;
@@ -110,12 +113,13 @@ fn main() -> Result<()> {
         &args.split,
     )?);
 
-    let manifest = Manifest {
-        schema_version: 1,
+    let manifest = QualityCorpusManifest {
+        schema_version: QUALITY_CORPUS_MANIFEST_SCHEMA_VERSION,
         source_revision: args.source_revision,
         split: args.split,
         sampling_seed: args.sampling_seed,
         text_tokens_requested: args.text_tokens,
+        bootstrap_block_tokens: args.bootstrap_block_tokens,
         tokenizer_hash,
         entries,
     };
@@ -138,8 +142,8 @@ fn build_text_entry(
     requested_tokens: usize,
     tokenizer: &qx_tokenizer::Tokenizer,
     tokenizer_hash: &str,
-) -> Result<ManifestEntry> {
-    let raw = fs::read(source).with_context(|| format!("read {}", source.display()))?;
+) -> Result<QualityCorpusManifestEntry> {
+    let raw = read_required(source, "text corpus")?;
     let text = String::from_utf8(raw.clone())
         .with_context(|| format!("decode {} as UTF-8", source.display()))?;
     let tokens = tokenizer.encode(&text)?;
@@ -162,7 +166,7 @@ fn build_text_entry(
         tokens: selected,
     };
     write_token_corpus(output, &corpus)?;
-    Ok(ManifestEntry {
+    Ok(QualityCorpusManifestEntry {
         domain: domain.to_owned(),
         kind: "token-corpus".to_owned(),
         source_path: source.display().to_string(),
@@ -182,8 +186,8 @@ fn build_jsonl_entry(
     source: &Path,
     output: &Path,
     split: &str,
-) -> Result<ManifestEntry> {
-    let raw = fs::read(source).with_context(|| format!("read {}", source.display()))?;
+) -> Result<QualityCorpusManifestEntry> {
+    let raw = read_required(source, "task corpus")?;
     let text = String::from_utf8(raw.clone())
         .with_context(|| format!("decode {} as UTF-8", source.display()))?;
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -206,7 +210,7 @@ fn build_jsonl_entry(
     }
     fs::write(output, normalized.as_bytes())
         .with_context(|| format!("write {}", output.display()))?;
-    Ok(ManifestEntry {
+    Ok(QualityCorpusManifestEntry {
         domain: domain.to_owned(),
         kind: "task-jsonl".to_owned(),
         source_path: source.display().to_string(),
@@ -230,9 +234,21 @@ fn tokenizer_hash(model: &Path) -> Result<String> {
         "merges.txt",
     ] {
         digest.update(name.as_bytes());
-        digest.update(fs::read(model.join(name))?);
+        let path = model.join(name);
+        let bytes = read_required(&path, "tokenizer input")?;
+        digest.update(bytes);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+fn read_required(path: &Path, kind: &str) -> Result<Vec<u8>> {
+    if !path.exists() {
+        bail!(
+            "quality corpus input unavailable: missing {kind} {}",
+            path.display()
+        );
+    }
+    fs::read(path).with_context(|| format!("read {kind} {}", path.display()))
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
