@@ -42,6 +42,21 @@ tested geometries were 205–211 tok/s, including `2:8:0` at 210.09 tok/s.
 No candidate met the 0.10 ms/token promotion threshold; the branch is
 rejected and remains non-canonical.
 
+## Exact fused final-head candidate
+
+Candidate A, enabled with `QX_V2_FINAL_ARGMAX_FUSED=1`, computes the Q4
+vocabulary projection and emits only per-threadgroup maxima before a
+hierarchical reduction. The reduction was extended for the 6,144 partial
+maxima produced by the 49k vocabulary; the original 256-entry reducer cannot
+consume that output directly.
+
+The 128-token generated stream was identical to the control. The candidate
+measured 212.03 tok/s and 4.239 ms GPU/token, versus the same-session control
+at 213.76 tok/s and 4.225 ms GPU/token. It is therefore rejected for
+performance. Because it intentionally does not materialize logits, full-logit
+parity and quality tools must continue to run with the default path; this
+candidate is currently generation-only.
+
 ## Matched llama reference replay
 
 Using the instrumented llama Metal replay at `-p 384 -n 128 -b 1 -ub 1

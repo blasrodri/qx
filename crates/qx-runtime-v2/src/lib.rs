@@ -662,19 +662,30 @@ impl PreparedAttentionStack {
             &self.final_norm,
             buffers.buffer(BufferId::MoeInput),
         )?;
-        graph.encode_prepared_q4_dense_simd_scaled(
-            &self.embedding,
-            buffers.buffer(BufferId::MoeInput),
-            buffers.buffer(BufferId::Logits),
-            1.0 / qx_model::LOGITS_SCALING,
-        )?;
-        graph.encode_argmax(
-            context,
-            buffers.buffer(BufferId::Logits),
-            buffers.buffer(BufferId::MoeScratch),
-            buffers.buffer(BufferId::TokenOutput),
-            VOCAB,
-        )?;
+        if qx_metal::platform::final_argmax_fused_enabled() {
+            graph.encode_prepared_q4_dense_argmax(
+                context,
+                &self.embedding,
+                buffers.buffer(BufferId::MoeInput),
+                buffers.buffer(BufferId::MoeScratch),
+                buffers.buffer(BufferId::TokenOutput),
+                1.0 / qx_model::LOGITS_SCALING,
+            )?;
+        } else {
+            graph.encode_prepared_q4_dense_simd_scaled(
+                &self.embedding,
+                buffers.buffer(BufferId::MoeInput),
+                buffers.buffer(BufferId::Logits),
+                1.0 / qx_model::LOGITS_SCALING,
+            )?;
+            graph.encode_argmax(
+                context,
+                buffers.buffer(BufferId::Logits),
+                buffers.buffer(BufferId::MoeScratch),
+                buffers.buffer(BufferId::TokenOutput),
+                VOCAB,
+            )?;
+        }
         Ok(())
     }
 }

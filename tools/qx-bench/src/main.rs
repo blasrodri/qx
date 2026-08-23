@@ -1847,30 +1847,43 @@ fn encode_differential_token(
                 )
                 .map_err(anyhow::Error::msg)?;
         }
-        if skip == Some(DifferentialBlock::FinalLmHead) {
-            noop(graph, 1)?;
-        } else {
+        if qx_metal::platform::final_argmax_fused_enabled() && skip.is_none() {
             graph
-                .encode_prepared_q4_dense_simd_scaled(
+                .encode_prepared_q4_dense_argmax(
+                    context,
                     &stack.embedding,
                     buffers.buffer(qx_runtime_v2::BufferId::MoeInput),
-                    buffers.buffer(qx_runtime_v2::BufferId::Logits),
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeScratch),
+                    buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
                     1.0 / LOGITS_SCALING,
                 )
                 .map_err(anyhow::Error::msg)?;
-        }
-        if skip == Some(DifferentialBlock::FinalArgmax) {
-            noop(graph, 2)?;
         } else {
-            graph
-                .encode_argmax(
-                    context,
-                    buffers.buffer(qx_runtime_v2::BufferId::Logits),
-                    buffers.buffer(qx_runtime_v2::BufferId::MoeScratch),
-                    buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
-                    VOCAB,
-                )
-                .map_err(anyhow::Error::msg)?;
+            if skip == Some(DifferentialBlock::FinalLmHead) {
+                noop(graph, 1)?;
+            } else {
+                graph
+                    .encode_prepared_q4_dense_simd_scaled(
+                        &stack.embedding,
+                        buffers.buffer(qx_runtime_v2::BufferId::MoeInput),
+                        buffers.buffer(qx_runtime_v2::BufferId::Logits),
+                        1.0 / LOGITS_SCALING,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+            }
+            if skip == Some(DifferentialBlock::FinalArgmax) {
+                noop(graph, 2)?;
+            } else {
+                graph
+                    .encode_argmax(
+                        context,
+                        buffers.buffer(qx_runtime_v2::BufferId::Logits),
+                        buffers.buffer(qx_runtime_v2::BufferId::MoeScratch),
+                        buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+                        VOCAB,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+            }
         }
     }
     graph.stage_boundary(context).map_err(anyhow::Error::msg)?;

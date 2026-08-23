@@ -86,3 +86,43 @@ kernel void qx_argmax_reduce(
         token_output[0] = indices[0];
     }
 }
+
+// Reduce one 256-entry window into one compact partial. This supports
+// producers such as the fused Q4 vocabulary kernel that emit more than 256
+// partial maxima.
+kernel void qx_argmax_reduce_partials(
+    device const qx_argmax_partial_t* partials [[buffer(0)]],
+    device qx_argmax_partial_t* reduced [[buffer(1)]],
+    constant uint& partial_count [[buffer(2)]],
+    uint local_tid [[thread_position_in_threadgroup]],
+    uint group_id [[threadgroup_position_in_grid]]) {
+    threadgroup float values[256];
+    threadgroup uint indices[256];
+
+    uint index = group_id * 256 + local_tid;
+    if (index < partial_count) {
+        values[local_tid] = partials[index].value;
+        indices[local_tid] = partials[index].index;
+    } else {
+        values[local_tid] = -3.402823466e+38f;
+        indices[local_tid] = 0xffffffffu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (local_tid < stride && qx_better(
+                values[local_tid + stride],
+                indices[local_tid + stride],
+                values[local_tid],
+                indices[local_tid])) {
+            values[local_tid] = values[local_tid + stride];
+            indices[local_tid] = indices[local_tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (local_tid == 0) {
+        reduced[group_id].value = values[0];
+        reduced[group_id].index = indices[0];
+    }
+}

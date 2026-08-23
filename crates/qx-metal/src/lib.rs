@@ -197,6 +197,22 @@ pub mod platform {
         })
     }
 
+    /// Exact greedy-decode final-head fusion. It is disabled by default so
+    /// quality and diagnostic callers can continue to receive full logits.
+    pub fn final_argmax_fused_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("QX_V2_FINAL_ARGMAX_FUSED")
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
     /// Exact-Q4 row-inline candidate: skip per-threadgroup activation staging
     /// when the 4 KiB vector is already hot from the preceding router/RMS path.
     /// Set `QX_V2_MOE_INLINE_INPUT_CACHE=0` to evaluate the no-cache mapping.
@@ -1027,6 +1043,7 @@ pub mod platform {
         q4_dense_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_sweep_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_argmax_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_simd_norm_pipeline: Mutex<Option<Pipeline>>,
@@ -1040,6 +1057,7 @@ pub mod platform {
         q4_embedding_pipeline: Mutex<Option<Pipeline>>,
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
+        argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
         v2_pipelines: Mutex<[Option<Pipeline>; 27]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
@@ -1246,6 +1264,140 @@ pub mod platform {
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
                     width: prepared.rows.div_ceil(8),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        /// Encode an exact vocabulary projection that produces only partial
+        /// maxima, then reduce those partials to the greedy token ID.
+        pub fn encode_prepared_q4_dense_argmax(
+            &mut self,
+            context: &MetalContext,
+            prepared: &PreparedQuantizedDense,
+            input: &RuntimeBuffer,
+            partials: &RuntimeBuffer,
+            token_output: &RuntimeBuffer,
+            multiplier: f32,
+        ) -> Result<(), String> {
+            if input.length < prepared.columns * std::mem::size_of::<f32>()
+                || token_output.length < std::mem::size_of::<u32>()
+            {
+                return Err("V2 fused final head buffer is smaller than its fixed shape".to_owned());
+            }
+            let partial_count = prepared.rows.div_ceil(8);
+            let partial_bytes = partial_count * 2 * std::mem::size_of::<u32>();
+            if partials.length < partial_bytes {
+                return Err(
+                    "V2 fused final head partial buffer is smaller than its fixed shape".to_owned(),
+                );
+            }
+            let columns = prepared.columns as u32;
+            let rows = prepared.rows as u32;
+            let partial_count_u32 = partial_count as u32;
+            let pipeline = context.q4_dense_argmax_pipeline()?;
+            self.encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.packed.buffer),
+                    prepared.packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.scales.buffer),
+                    prepared.scales.offset,
+                    1,
+                );
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 2);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&partials.buffer), partials.offset, 3);
+                for (value, index) in [(&columns, 4), (&rows, 5)] {
+                    self.encoder.setBytes_length_atIndex(
+                        NonNull::from(value).cast(),
+                        std::mem::size_of_val(value),
+                        index,
+                    );
+                }
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&multiplier).cast(),
+                    std::mem::size_of_val(&multiplier),
+                    6,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: partial_count,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+
+            let reduced =
+                partials.subregion(partial_bytes, 256 * 2 * std::mem::size_of::<u32>())?;
+            let reduced_count = partial_count.div_ceil(256);
+            let reduced_count_u32 = reduced_count as u32;
+            let reduce_partials_pipeline = context.argmax_reduce_partials_pipeline()?;
+            self.encoder
+                .setComputePipelineState(&reduce_partials_pipeline);
+            unsafe {
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&partials.buffer), partials.offset, 0);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&reduced.buffer), reduced.offset, 1);
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&partial_count_u32).cast(),
+                    std::mem::size_of_val(&partial_count_u32),
+                    2,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: reduced_count,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+
+            let reduce_pipeline = context.argmax_reduce_pipeline()?;
+            self.encoder.setComputePipelineState(&reduce_pipeline);
+            unsafe {
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&reduced.buffer), reduced.offset, 0);
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&token_output.buffer),
+                    token_output.offset,
+                    1,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&reduced_count_u32).cast(),
+                    std::mem::size_of_val(&reduced_count_u32),
+                    2,
+                );
+            }
+            self.encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: 256,
                     height: 1,
                     depth: 1,
                 },
@@ -5281,6 +5433,7 @@ pub mod platform {
                 q4_dense_pipeline: Mutex::new(None),
                 q4_dense_simd_pipeline: Mutex::new(None),
                 q4_dense_sweep_pipeline: Mutex::new(None),
+                q4_dense_argmax_pipeline: Mutex::new(None),
                 q4_qkv_pipeline: Mutex::new(None),
                 q4_qkv_simd_pipeline: Mutex::new(None),
                 q4_qkv_simd_norm_pipeline: Mutex::new(None),
@@ -5294,6 +5447,7 @@ pub mod platform {
                 q4_embedding_pipeline: Mutex::new(None),
                 argmax_partial_pipeline: Mutex::new(None),
                 argmax_reduce_pipeline: Mutex::new(None),
+                argmax_reduce_partials_pipeline: Mutex::new(None),
                 v2_pipelines: Mutex::new([
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
@@ -5906,6 +6060,27 @@ pub mod platform {
             Ok(value)
         }
 
+        fn q4_dense_argmax_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_argmax_pipeline
+                .lock()
+                .map_err(|_| "Metal Q4 argmax pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_argmax_partial");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal Q4 argmax function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal Q4 argmax pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
         fn q4_qkv_pipeline(&self) -> Result<Pipeline, String> {
             let mut pipeline = self
                 .q4_qkv_pipeline
@@ -6130,6 +6305,33 @@ pub mod platform {
                 .device
                 .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|_| "Metal argmax reduce pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn argmax_reduce_partials_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .argmax_reduce_partials_pipeline
+                .lock()
+                .map_err(|_| "Metal argmax partial-reduction cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let source = NSString::from_str(ARGMAX_KERNEL_SOURCE);
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&source, None)
+                .map_err(|_| "Metal argmax library compilation failed".to_owned())?;
+            let name = NSString::from_str("qx_argmax_reduce_partials");
+            let function = library.newFunctionWithName(&name).ok_or_else(|| {
+                "Metal argmax partial-reduction function was not found".to_owned()
+            })?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| {
+                    "Metal argmax partial-reduction pipeline creation failed".to_owned()
+                })?;
             *pipeline = Some(value.clone());
             Ok(value)
         }
