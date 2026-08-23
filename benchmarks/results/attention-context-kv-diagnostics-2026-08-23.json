@@ -1,0 +1,33 @@
+{
+  "date": "2026-08-23",
+  "workload": {
+    "model": "Granite 1B",
+    "batch": 1,
+    "hardware": "Apple M5 Pro",
+    "binary": "target/release/qx-bench"
+  },
+  "qx_attention_gpu_us_by_context": {
+    "32": [53.88, 37.63, 37.75],
+    "64": [55.21, 30.46, 39.00],
+    "128": [40.25, 25.50, 40.25],
+    "256": [34.37, 23.00, 44.12],
+    "512": [30.92, 24.87, 47.83]
+  },
+  "qx_stage_reference_context_512_gpu_us": {
+    "qk": 17.21,
+    "softmax": 11.00,
+    "v": 30.79,
+    "combined": 47.75,
+    "live": 47.62
+  },
+  "kv_diagnostics": {
+    "K_FP16": "no stable performance benefit established",
+    "V_FP16": "no stable performance benefit established"
+  },
+  "llama": {
+    "production_attention_substages": null,
+    "complete_attention_per_layer_us": "approximately 10-12; clean context-slope contract pending",
+    "reason": "production attention is fused FlashAttention and current profiling invocation emits multiple configurations"
+  },
+  "decision": "stabilize the GPU timing harness before selecting a new attention kernel"
+}
