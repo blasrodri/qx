@@ -238,6 +238,28 @@ pub mod platform {
         })
     }
 
+    /// Opt-in factorial candidate for the exact-Q4 row-inline stream. The
+    /// representation API does not yet expose a distinct fused transaction
+    /// block, so this selects temporary kernels that consume the existing
+    /// 18-byte group packets in compile-time eight-group (144-byte) blocks.
+    /// Values are `qx`/`canonical` for the QX mapping or `llama` for the
+    /// two-SIMD-group decode mapping. Unset/false disables the candidate.
+    pub fn moe_fused_transaction_block_mapping() -> Option<bool> {
+        static MAPPING: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+        MAPPING
+            .get_or_init(
+                || match std::env::var("QX_V2_MOE_FUSED_TRANSACTION_BLOCK") {
+                    Ok(value) => match value.to_ascii_lowercase().as_str() {
+                        "qx" | "canonical" | "1" | "true" | "yes" | "on" => Some(false),
+                        "llama" | "llama-like" | "llama_like" => Some(true),
+                        _ => None,
+                    },
+                    Err(_) => None,
+                },
+            )
+            .to_owned()
+    }
+
     /// Experimental four-stage MoE topology: one 1024-threadgroup owns each
     /// selected expert projection. It reduces repeated staging of the small
     /// batch-1 activation vector. The canonical path remains the default.
@@ -561,6 +583,10 @@ pub mod platform {
         cross_expert_gate_up_norm_pipeline: Pipeline,
         llama_like_gate_up_pipeline: Pipeline,
         llama_like_gate_up_norm_pipeline: Pipeline,
+        fused_block_qx_gate_up_pipeline: Option<Pipeline>,
+        fused_block_qx_gate_up_norm_pipeline: Option<Pipeline>,
+        fused_block_llama_gate_up_pipeline: Option<Pipeline>,
+        fused_block_llama_gate_up_norm_pipeline: Option<Pipeline>,
         inline_gate_up_rows2_pipeline: Option<Pipeline>,
         inline_gate_up_rows2_norm_pipeline: Option<Pipeline>,
         inline_gate_up_rows4_pipeline: Option<Pipeline>,
@@ -1793,6 +1819,11 @@ pub mod platform {
             let wide_expert =
                 moe_wide_expert_enabled() && prepared.wide_supported && q3_block_bytes.is_none();
             let inline_input_cache = moe_inline_input_cache_enabled();
+            let fused_block_mapping = moe_fused_transaction_block_mapping();
+            let fused_block_active = fused_block_mapping.is_some()
+                && prepared.inline_layout
+                && prepared.gate_up_layout == PackingLayout::Q4RowInline
+                && q3_block_bytes.is_none();
             let llama_like_mapping = moe_llama_like_mapping_enabled()
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
@@ -1804,6 +1835,14 @@ pub mod platform {
 
             if let Some((norm_weights, inverse_rms)) = norm {
                 if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
+                    self.encoder.setComputePipelineState(pipeline);
+                } else if fused_block_active {
+                    let pipeline = if fused_block_mapping == Some(true) {
+                        prepared.fused_block_llama_gate_up_norm_pipeline.as_ref()
+                    } else {
+                        prepared.fused_block_qx_gate_up_norm_pipeline.as_ref()
+                    }
+                    .ok_or_else(|| "fused transaction-block pipeline is missing".to_owned())?;
                     self.encoder.setComputePipelineState(pipeline);
                 } else if llama_like_mapping {
                     self.encoder
@@ -1867,6 +1906,14 @@ pub mod platform {
                 }
             } else {
                 if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
+                    self.encoder.setComputePipelineState(pipeline);
+                } else if fused_block_active {
+                    let pipeline = if fused_block_mapping == Some(true) {
+                        prepared.fused_block_llama_gate_up_pipeline.as_ref()
+                    } else {
+                        prepared.fused_block_qx_gate_up_pipeline.as_ref()
+                    }
+                    .ok_or_else(|| "fused transaction-block pipeline is missing".to_owned())?;
                     self.encoder.setComputePipelineState(pipeline);
                 } else if llama_like_mapping {
                     self.encoder
@@ -1956,7 +2003,11 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: if llama_like_mapping {
+                    width: if fused_block_active && fused_block_mapping == Some(true) {
+                        8 * (1024 / 4)
+                    } else if fused_block_active {
+                        8 * (1024 / 8)
+                    } else if llama_like_mapping {
                         8 * (1024 / 4)
                     } else if cross_expert_activation {
                         1024 / 8
@@ -1974,7 +2025,11 @@ pub mod platform {
                     depth: 1,
                 },
                 MTLSize {
-                    width: if llama_like_mapping {
+                    width: if fused_block_active && fused_block_mapping == Some(true) {
+                        64
+                    } else if fused_block_active {
+                        256
+                    } else if llama_like_mapping {
                         64
                     } else if wide_expert {
                         1024
@@ -6077,6 +6132,20 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
                 llama_like_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_norm_simd")?,
+                fused_block_qx_gate_up_pipeline: Some(
+                    self.dynamic_moe_named_pipeline(
+                        "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
+                    )?,
+                ),
+                fused_block_qx_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd",
+                )?),
+                fused_block_llama_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_fused_block_llama_simd",
+                )?),
+                fused_block_llama_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_fused_block_llama_norm_simd",
+                )?),
                 inline_gate_up_rows2_pipeline: Some(
                     self.dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_inline_rows2_simd")?,
                 ),
@@ -6278,6 +6347,20 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
                 llama_like_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_norm_simd")?,
+                fused_block_qx_gate_up_pipeline: Some(
+                    self.dynamic_moe_named_pipeline(
+                        "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
+                    )?,
+                ),
+                fused_block_qx_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd",
+                )?),
+                fused_block_llama_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_fused_block_llama_simd",
+                )?),
+                fused_block_llama_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_fused_block_llama_norm_simd",
+                )?),
                 inline_gate_up_rows2_pipeline: Some(
                     self.dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_inline_rows2_simd")?,
                 ),
@@ -6472,6 +6555,10 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
                 llama_like_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_norm_simd")?,
+                fused_block_qx_gate_up_pipeline: None,
+                fused_block_qx_gate_up_norm_pipeline: None,
+                fused_block_llama_gate_up_pipeline: None,
+                fused_block_llama_gate_up_norm_pipeline: None,
                 inline_gate_up_rows2_pipeline: None,
                 inline_gate_up_rows2_norm_pipeline: None,
                 inline_gate_up_rows4_pipeline: None,
@@ -6755,6 +6842,20 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
                 llama_like_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_norm_simd")?,
+                fused_block_qx_gate_up_pipeline: Some(
+                    self.dynamic_moe_named_pipeline(
+                        "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
+                    )?,
+                ),
+                fused_block_qx_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd",
+                )?),
+                fused_block_llama_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_fused_block_llama_simd",
+                )?),
+                fused_block_llama_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_fused_block_llama_norm_simd",
+                )?),
                 inline_gate_up_rows2_pipeline: Some(
                     self.dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_inline_rows2_simd")?,
                 ),
@@ -7848,6 +7949,22 @@ mod tests {
         for quant_type in [QuantType::Q2, QuantType::Q3, QuantType::Q4] {
             assert!(kernel_source(quant_type).contains("kernel"));
         }
+    }
+
+    #[test]
+    fn fused_transaction_block_factorial_kernels_are_present() {
+        for name in [
+            "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
+            "qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd",
+            "qx_dynamic_q4_moe_gate_up_fused_block_llama_simd",
+            "qx_dynamic_q4_moe_gate_up_fused_block_llama_norm_simd",
+        ] {
+            assert!(
+                DYNAMIC_MOE_KERNEL_SOURCE.contains(name),
+                "missing Metal entry point: {name}"
+            );
+        }
+        assert!(DYNAMIC_MOE_KERNEL_SOURCE.contains("groups_per_transaction = 8"));
     }
 
     #[cfg(target_os = "macos")]

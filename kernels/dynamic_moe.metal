@@ -328,6 +328,153 @@ kernel void qx_dynamic_q4_moe_gate_up_llama_like_norm_simd(
         stream, expert_ids, output, cached_input, lane, simdgroup, threadgroup_id);
 }
 
+// Temporary factorial-lane contract (until qx-format exposes a distinct
+// representation): consume the existing exact-Q4 row-inline stream, whose
+// logical group is [16 packed code bytes][FP16 scale].  The fused transaction
+// candidate addresses eight consecutive groups as one 144-byte transaction
+// block.  It is deliberately a separate entry point so Metal can optimize
+// this address pattern independently of the canonical row-inline kernels.
+inline uint qx_dynamic_q4_fused_block_group_offset(
+    uint row_base, uint group) {
+    constexpr uint group_bytes = 18;
+    constexpr uint groups_per_transaction = 8;
+    uint transaction = group / groups_per_transaction;
+    uint group_in_transaction = group % groups_per_transaction;
+    return row_base + transaction * (groups_per_transaction * group_bytes)
+        + group_in_transaction * group_bytes;
+}
+
+inline void qx_dynamic_q4_gate_up_fused_block_body(
+    device const uchar* stream,
+    device const uint* expert_ids,
+    device float* output,
+    threadgroup float* cached_input,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id,
+    uint rows_per_simdgroup,
+    uint simdgroups_per_threadgroup) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_bytes = 18;
+    constexpr uint row_stride = groups * group_bytes;
+    constexpr uint expert_stride = hidden * row_stride;
+    uint rows_per_threadgroup = rows_per_simdgroup * simdgroups_per_threadgroup;
+    uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint tile = threadgroup_id % threadgroups_per_expert;
+    uint first_row = tile * rows_per_threadgroup
+        + simdgroup * rows_per_simdgroup;
+    uint expert = expert_ids[slot];
+
+    for (uint row_offset = 0; row_offset < rows_per_simdgroup; ++row_offset) {
+        uint row = first_row + row_offset;
+        float sum = 0.0f;
+        if (expert < 32 && row < hidden) {
+            uint row_base = expert * expert_stride + row * row_stride;
+            for (uint group = 0; group < groups; ++group) {
+                uint group_base = qx_dynamic_q4_fused_block_group_offset(row_base, group);
+                uint local = lane;
+                uint code = (uint(stream[group_base + local / 2])
+                    >> ((local % 2) * 4)) & 0xf;
+                sum += float(int(code) - 7)
+                    * qx_q4_inline_scale(stream, group_base + 16)
+                    * cached_input[group * 32 + local];
+            }
+        }
+        sum = simd_sum(sum);
+        if (lane == 0 && expert < 32 && row < hidden) {
+            output[slot * hidden + row] = sum;
+        }
+    }
+}
+
+// Factorial A: fused transaction-block representation with the canonical QX
+// mapping (256 threads, eight SIMD groups, eight rows per threadgroup).
+kernel void qx_dynamic_q4_moe_gate_up_fused_block_qx_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    for (uint column = thread_index; column < 1024; column += 256) {
+        cached_input[column] = input[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_gate_up_fused_block_body(
+        stream, expert_ids, output, cached_input, lane, simdgroup,
+        threadgroup_id, 1, 8);
+}
+
+// Factorial B: the same transaction-block contract with the decode-specific
+// llama-like mapping (64 threads, two SIMD groups, two rows per SIMD group).
+kernel void qx_dynamic_q4_moe_gate_up_fused_block_llama_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    for (uint column = thread_index; column < 1024; column += 64) {
+        cached_input[column] = input[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_gate_up_fused_block_body(
+        stream, expert_ids, output, cached_input, lane, simdgroup,
+        threadgroup_id, 2, 2);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]],
+    device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    float inverse = inverse_rms[0];
+    for (uint column = thread_index; column < 1024; column += 256) {
+        cached_input[column] = input[column] * inverse * norm_weights[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_gate_up_fused_block_body(
+        stream, expert_ids, output, cached_input, lane, simdgroup,
+        threadgroup_id, 1, 8);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_fused_block_llama_norm_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]],
+    device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    float inverse = inverse_rms[0];
+    for (uint column = thread_index; column < 1024; column += 64) {
+        cached_input[column] = input[column] * inverse * norm_weights[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_gate_up_fused_block_body(
+        stream, expert_ids, output, cached_input, lane, simdgroup,
+        threadgroup_id, 2, 2);
+}
+
 // Cross-expert activation-chunk candidate. A threadgroup owns one eight-row
 // tile and walks all eight selected experts, so the 4 KiB normalized/input
 // vector is staged once for the complete route set instead of once per
