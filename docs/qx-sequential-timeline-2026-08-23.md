@@ -46,3 +46,24 @@ The next measurement should therefore be a smaller boundary experiment around
 the MoE entry/exit (rather than another kernel redesign), followed by a matched
 sequential llama measurement. Do not use the fallback stage values as
 production latency or add them to predict throughput.
+
+## Live llama command-buffer control
+
+The existing llama replay profiler was not used for attribution. A separate
+`GGML_METAL_PROFILE_LIVE=1` hook was added locally to report the normal graph's
+actual command buffers after completion. With `-p 384 -n 1 -b 1 -ub 1 -ngl -1`,
+the steady decode tail had a median of approximately:
+
+| llama command-buffer range | GPU us | MoE nodes | gate/up | down |
+| --- | ---: | ---: | ---: | ---: |
+| nodes 147..1471 | 2,370 | 594 | 44 | 22 |
+| nodes 0..147 | 257 | 54 | 4 | 2 |
+| total normal graph | **~2,627** | 648 | 48 | 24 |
+
+The benchmark reported 311.09 tok/s for the single measured decode token in
+that run. This is a live command-buffer control, not a per-kernel MoE timing:
+the large command buffer contains other transformer work as well. It does,
+however, establish a real scheduling difference versus QX's ~4.22 ms GPU/token
+on the same context-512 class of workload. The next useful experiment is to
+split the llama graph only at its existing node-range boundaries or obtain a
+hardware trace, rather than compare replayed node sums to QX stages.
