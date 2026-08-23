@@ -173,6 +173,30 @@ pub mod platform {
         })
     }
 
+    /// Optional final LM-head geometry candidate. The value is parsed once
+    /// per process as `rows_per_simd:simd_groups:cache_input`, for example
+    /// `2:8:0`. It is intentionally an experiment knob: the planner can
+    /// later materialize the selected constants in an artifact plan.
+    pub fn final_head_sweep_geometry() -> Option<(usize, usize, bool)> {
+        static GEOMETRY: std::sync::OnceLock<Option<(usize, usize, bool)>> =
+            std::sync::OnceLock::new();
+        *GEOMETRY.get_or_init(|| {
+            let value = std::env::var("QX_V2_FINAL_HEAD_SWEEP").ok()?;
+            let mut fields = value.split(':');
+            let rows = fields.next()?.parse().ok()?;
+            let groups = fields.next()?.parse().ok()?;
+            let cache = match fields.next()?.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => return None,
+            };
+            if !matches!(rows, 1 | 2 | 4 | 8) || !matches!(groups, 1 | 2 | 4 | 8) {
+                return None;
+            }
+            Some((rows, groups, cache))
+        })
+    }
+
     /// Exact-Q4 row-inline candidate: skip per-threadgroup activation staging
     /// when the 4 KiB vector is already hot from the preceding router/RMS path.
     /// Set `QX_V2_MOE_INLINE_INPUT_CACHE=0` to evaluate the no-cache mapping.
@@ -609,6 +633,7 @@ pub mod platform {
     pub struct PreparedQuantizedDense {
         pipeline: Pipeline,
         simd_pipeline: Pipeline,
+        sweep_pipeline: Pipeline,
         simd_norm_pipeline: Pipeline,
         packed: RuntimeBuffer,
         scales: RuntimeBuffer,
@@ -1169,6 +1194,20 @@ pub mod platform {
             {
                 return Err("V2 SIMD Q4 dense buffer is smaller than its fixed shape".to_owned());
             }
+            if prepared.rows >= 16_384 {
+                if let Some((rows_per_simd, simd_groups, cache_input)) = final_head_sweep_geometry()
+                {
+                    return self.encode_prepared_q4_dense_sweep_scaled(
+                        prepared,
+                        input,
+                        output,
+                        multiplier,
+                        rows_per_simd,
+                        simd_groups,
+                        cache_input,
+                    );
+                }
+            }
             self.encoder
                 .setComputePipelineState(&prepared.simd_pipeline);
             let columns = prepared.columns as u32;
@@ -1212,6 +1251,77 @@ pub mod platform {
                 },
                 MTLSize {
                     width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        fn encode_prepared_q4_dense_sweep_scaled(
+            &mut self,
+            prepared: &PreparedQuantizedDense,
+            input: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            multiplier: f32,
+            rows_per_simd: usize,
+            simd_groups: usize,
+            cache_input: bool,
+        ) -> Result<(), String> {
+            let rows_per_threadgroup = rows_per_simd * simd_groups;
+            let threads_per_threadgroup = simd_groups * 32;
+            self.encoder
+                .setComputePipelineState(&prepared.sweep_pipeline);
+            let columns = prepared.columns as u32;
+            let rows = prepared.rows as u32;
+            let rows_per_simd = rows_per_simd as u32;
+            let rows_per_threadgroup = rows_per_threadgroup as u32;
+            let cache_input = u32::from(cache_input);
+            let threads_per_threadgroup = threads_per_threadgroup as u32;
+            unsafe {
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.packed.buffer),
+                    prepared.packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.scales.buffer),
+                    prepared.scales.offset,
+                    1,
+                );
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 2);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&output.buffer), output.offset, 3);
+                for (value, index) in [
+                    (&columns, 4),
+                    (&rows, 6),
+                    (&rows_per_simd, 7),
+                    (&rows_per_threadgroup, 8),
+                    (&cache_input, 9),
+                    (&threads_per_threadgroup, 10),
+                ] {
+                    self.encoder.setBytes_length_atIndex(
+                        NonNull::from(value).cast(),
+                        std::mem::size_of_val(value),
+                        index,
+                    );
+                }
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&multiplier).cast(),
+                    std::mem::size_of_val(&multiplier),
+                    5,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: prepared.rows.div_ceil(rows_per_threadgroup as usize),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: threads_per_threadgroup as usize,
                     height: 1,
                     depth: 1,
                 },
@@ -6249,6 +6359,7 @@ pub mod platform {
             Ok(PreparedQuantizedDense {
                 pipeline: self.q4_dense_pipeline()?,
                 simd_pipeline: self.q4_dense_simd_pipeline()?,
+                sweep_pipeline: self.q4_dense_sweep_pipeline()?,
                 simd_norm_pipeline: self.q4_simd_norm_gemv_pipeline()?,
                 packed,
                 scales,
@@ -6280,6 +6391,7 @@ pub mod platform {
             Ok(PreparedQuantizedDense {
                 pipeline: self.q4_dense_pipeline()?,
                 simd_pipeline: self.q4_dense_simd_pipeline()?,
+                sweep_pipeline: self.q4_dense_sweep_pipeline()?,
                 simd_norm_pipeline: self.q4_simd_norm_gemv_pipeline()?,
                 packed,
                 scales,

@@ -1345,6 +1345,9 @@ enum DifferentialBlock {
     OutputResidual,
     RouterTopK,
     Moe,
+    FinalRmsNorm,
+    FinalLmHead,
+    FinalArgmax,
     FinalHead,
 }
 
@@ -1832,31 +1835,43 @@ fn encode_differential_token(
         // final RMSNorm + LM head + the two-pass argmax reduction
         noop(graph, 4)?;
     } else {
-        graph
-            .encode_rmsnorm(
-                context,
-                buffers.buffer(final_hidden),
-                &stack.final_norm,
-                buffers.buffer(qx_runtime_v2::BufferId::MoeInput),
-            )
-            .map_err(anyhow::Error::msg)?;
-        graph
-            .encode_prepared_q4_dense_simd_scaled(
-                &stack.embedding,
-                buffers.buffer(qx_runtime_v2::BufferId::MoeInput),
-                buffers.buffer(qx_runtime_v2::BufferId::Logits),
-                1.0 / LOGITS_SCALING,
-            )
-            .map_err(anyhow::Error::msg)?;
-        graph
-            .encode_argmax(
-                context,
-                buffers.buffer(qx_runtime_v2::BufferId::Logits),
-                buffers.buffer(qx_runtime_v2::BufferId::MoeScratch),
-                buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
-                VOCAB,
-            )
-            .map_err(anyhow::Error::msg)?;
+        if skip == Some(DifferentialBlock::FinalRmsNorm) {
+            noop(graph, 1)?;
+        } else {
+            graph
+                .encode_rmsnorm(
+                    context,
+                    buffers.buffer(final_hidden),
+                    &stack.final_norm,
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeInput),
+                )
+                .map_err(anyhow::Error::msg)?;
+        }
+        if skip == Some(DifferentialBlock::FinalLmHead) {
+            noop(graph, 1)?;
+        } else {
+            graph
+                .encode_prepared_q4_dense_simd_scaled(
+                    &stack.embedding,
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeInput),
+                    buffers.buffer(qx_runtime_v2::BufferId::Logits),
+                    1.0 / LOGITS_SCALING,
+                )
+                .map_err(anyhow::Error::msg)?;
+        }
+        if skip == Some(DifferentialBlock::FinalArgmax) {
+            noop(graph, 2)?;
+        } else {
+            graph
+                .encode_argmax(
+                    context,
+                    buffers.buffer(qx_runtime_v2::BufferId::Logits),
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeScratch),
+                    buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+                    VOCAB,
+                )
+                .map_err(anyhow::Error::msg)?;
+        }
     }
     graph.stage_boundary(context).map_err(anyhow::Error::msg)?;
     Ok(())
@@ -2121,6 +2136,12 @@ fn benchmark_v2_differential_profile(
         ),
         ("without router/top-k", Some(DifferentialBlock::RouterTopK)),
         ("without MoE", Some(DifferentialBlock::Moe)),
+        (
+            "without final RMSNorm",
+            Some(DifferentialBlock::FinalRmsNorm),
+        ),
+        ("without LM head", Some(DifferentialBlock::FinalLmHead)),
+        ("without argmax", Some(DifferentialBlock::FinalArgmax)),
         ("without final head", Some(DifferentialBlock::FinalHead)),
     ];
 
