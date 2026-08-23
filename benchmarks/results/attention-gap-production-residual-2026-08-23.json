@@ -1,0 +1,38 @@
+{
+  "date": "2026-08-23",
+  "workload": {
+    "model": "Granite 1B",
+    "batch": 1,
+    "context": 512,
+    "positions": "384..511",
+    "hardware": "Apple M5 Pro"
+  },
+  "qx_attention_stages_gpu_us": {
+    "qk": 17.21,
+    "softmax": 11.0,
+    "v": 30.79,
+    "combined": 47.75,
+    "live": 47.62,
+    "iterations": 20
+  },
+  "llama_attention": {
+    "complete_grouped_gpu_us_per_layer": 10.68,
+    "qk": null,
+    "softmax": null,
+    "v": null,
+    "note": "Production FlashAttention is fused; substages are not separately instrumented."
+  },
+  "grouped_replay_gpu_ms_per_token": {
+    "qx": 4.31633,
+    "llama": 3.64166
+  },
+  "production_reference_gpu_ms_per_token": {
+    "qx": 4.22458,
+    "llama": 2.59
+  },
+  "production_minus_grouped_replay_ms_per_token": {
+    "qx": -0.09175,
+    "llama": -1.05166
+  },
+  "interpretation": "Grouped replays are diagnostic and have different overlap/scheduling semantics; residuals are not optimization targets."
+}

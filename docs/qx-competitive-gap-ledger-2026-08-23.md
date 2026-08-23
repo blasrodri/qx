@@ -53,3 +53,19 @@ The QX production reference remains approximately 4.23 ms GPU/token and the
 llama reference approximately 2.59 ms GPU/token. The ledger is an attribution
 tool, not a claim that replacing every listed boundary would subtract its
 rows linearly.
+
+## Attention substage and production-residual follow-up
+
+The QX attention-stage benchmark measured 17.21 µs QK, 11.00 µs max/sum/softmax,
+30.79 µs V accumulation, and 47.62 µs live attention at context 512. The
+three-stage sum agrees with the live result. llama emits fused FlashAttention,
+so its QK/softmax/V substages are unavailable; its matched grouped complete
+attention boundary is 10.68 µs/layer. The detailed result is recorded in
+[`qx-attention-gap-and-production-residual-2026-08-23.md`](qx-attention-gap-and-production-residual-2026-08-23.md).
+
+The grouped replay totals are approximately 4.316 ms/token for QX and 3.642
+ms/token for llama, versus production references of 4.225 and 2.590 ms/token.
+Thus production minus grouped replay is -0.092 ms/token for QX and -1.052
+ms/token for llama. This is replay overhead/overlap mismatch, not an
+unattributed kernel cost. The production-vs-grouped residual must not be
+converted directly into an optimization target.
