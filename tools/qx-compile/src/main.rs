@@ -134,6 +134,8 @@ enum ExpertLayout {
     Transaction144,
     #[value(name = "transaction-160", alias = "transaction160")]
     Transaction160,
+    #[value(name = "cross-expert-tile8", alias = "cross-expert")]
+    CrossExpertTile8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -161,6 +163,7 @@ impl From<ExpertLayout> for PackingLayout {
             ExpertLayout::RowInline8 => Self::Q4RowInlineRows8,
             ExpertLayout::Transaction144 => Self::Q4Transaction144,
             ExpertLayout::Transaction160 => Self::Q4Transaction160,
+            ExpertLayout::CrossExpertTile8 => Self::Q4CrossExpertTile8,
         }
     }
 }
@@ -329,6 +332,18 @@ fn main() -> Result<()> {
     {
         bail!(
             "transaction-block candidates require uniform exact group-32 Q4 experts and --group-size 32"
+        );
+    }
+    if matches!(args.expert_layout, ExpertLayout::CrossExpertTile8)
+        && (args.expert_format != ExpertFormat::QxQ4
+            || args.uniform_expert_bits.is_some()
+            || args.layerwise_q3
+            || args.tensorwise_q3
+            || args.expertwise_q3
+            || args.group_size != 32)
+    {
+        bail!(
+            "cross-expert tile candidates require uniform exact group-32 Q4 experts and --group-size 32"
         );
     }
 
@@ -1047,6 +1062,16 @@ fn main() -> Result<()> {
         MoeMappingArg::Qx => "qx".to_owned(),
         MoeMappingArg::LlamaLike => "llama-like".to_owned(),
     });
+    execution_plan.expert_traversal = if args.expert_layout == ExpertLayout::CrossExpertTile8 {
+        Some(qx_format::ExpertTraversalPlan {
+            kind: qx_format::ExpertTraversalKind::CrossExpertTile,
+            tile_rows: 8,
+            expert_count: EXPERTS as u16,
+            active_k: TOP_K as u8,
+        })
+    } else {
+        None
+    };
     write_artifact_with_raw_and_plan(
         &args.output,
         Granite3A400M::MODEL_ID,
@@ -1151,6 +1176,14 @@ fn representation_for(tensors: &[CompiledTensor], kind: TensorKind) -> ExpertRep
             && tensor.tensor.layout == PackingLayout::Q4Transaction160
     }) {
         ExpertRepresentation::Group32Q4Transaction160
+    } else if matching.iter().all(|tensor| {
+        tensor.tensor.quant_type == QuantType::Q4
+            && tensor.tensor.layout == PackingLayout::Q4CrossExpertTile8
+    }) {
+        // Keep the legacy logical representation enum exhaustive for the
+        // existing runtime crates. The physical traversal contract is
+        // carried by `expert_traversal` in the execution-plan manifest.
+        ExpertRepresentation::Group32Q4RowMajor
     } else {
         ExpertRepresentation::MixedQ2Q3Q4
     }

@@ -42,6 +42,10 @@ pub enum PackingLayout {
     /// Exact-Q4 transaction blocks as above, padded to 160 bytes per block.
     /// The sixteen-byte tail is physical alignment only and is not decoded.
     Q4Transaction160 = 8,
+    /// Exact-Q4 cross-expert row-tile stream. A tile is ordered as
+    /// `[group][row-in-tile][expert]`, so one activation group can be reused
+    /// while traversing the selected experts.
+    Q4CrossExpertTile8 = 9,
 }
 
 impl PackingLayout {
@@ -56,6 +60,7 @@ impl PackingLayout {
             6 => Some(Self::Q4RowInlineRows8),
             7 => Some(Self::Q4Transaction144),
             8 => Some(Self::Q4Transaction160),
+            9 => Some(Self::Q4CrossExpertTile8),
             _ => None,
         }
     }
@@ -76,6 +81,17 @@ impl PackingLayout {
 
     pub const fn is_q4_transaction(self) -> bool {
         matches!(self, Self::Q4Transaction144 | Self::Q4Transaction160)
+    }
+
+    pub const fn is_q4_cross_expert_tile(self) -> bool {
+        matches!(self, Self::Q4CrossExpertTile8)
+    }
+
+    pub const fn cross_expert_tile_rows(self) -> Option<usize> {
+        match self {
+            Self::Q4CrossExpertTile8 => Some(8),
+            _ => None,
+        }
     }
 
     pub const fn transaction_block_bytes(self) -> Option<usize> {
@@ -279,7 +295,8 @@ impl QuantizedTensor {
             | PackingLayout::Q4RowInlineRows4
             | PackingLayout::Q4RowInlineRows8
             | PackingLayout::Q4Transaction144
-            | PackingLayout::Q4Transaction160 => {
+            | PackingLayout::Q4Transaction160
+            | PackingLayout::Q4CrossExpertTile8 => {
                 if self.quant_type != QuantType::Q4 || self.group_size != 32 {
                     return Err("Q4 transport requires group-32 Q4".to_owned());
                 }
@@ -367,6 +384,87 @@ impl QuantizedTensor {
         Ok(output)
     }
 
+    /// Pack a set of same-shaped exact-Q4 expert tensors into a cross-expert
+    /// row-tile stream. The stream order is
+    /// `[row tile][group][row in tile][expert][codes][FP16 scale]`.
+    ///
+    /// The input tensors retain their normal split row-major backing vectors;
+    /// this function only changes physical traversal order. In particular,
+    /// codes and FP16 scales are copied byte-for-byte and are never
+    /// requantized.
+    pub fn cross_expert_tile_bytes(experts: &[&Self], tile_rows: usize) -> Result<Vec<u8>, String> {
+        let first = experts
+            .first()
+            .ok_or_else(|| "cross-expert stream needs at least one expert".to_owned())?;
+        if first.quant_type != QuantType::Q4 || first.group_size != 32 {
+            return Err("cross-expert transport requires group-32 Q4".to_owned());
+        }
+        if tile_rows != 8 || !first.rows.is_multiple_of(tile_rows) {
+            return Err(format!(
+                "cross-expert tile width must be 8 and divide rows; got {tile_rows} for {} rows",
+                first.rows
+            ));
+        }
+        let groups = first.cols.div_ceil(first.group_size);
+        let row_bytes = row_packed_bytes(first.cols, first.group_size, first.quant_type);
+        let expected_data = first.rows * row_bytes;
+        let expected_scales = first.rows * groups;
+        for expert in experts {
+            if expert.quant_type != first.quant_type
+                || expert.group_size != first.group_size
+                || expert.rows != first.rows
+                || expert.cols != first.cols
+                || expert.data.len() != expected_data
+                || expert.scales.len() != expected_scales
+            {
+                return Err(
+                    "cross-expert tensors must have identical Q4 shape and backing lengths"
+                        .to_owned(),
+                );
+            }
+        }
+
+        let item_bytes = (0..groups)
+            .map(|group| {
+                packed_len(
+                    (first.cols - group * first.group_size).min(first.group_size),
+                    first.quant_type,
+                ) + 2
+            })
+            .sum::<usize>()
+            * experts.len();
+        let mut output = Vec::with_capacity(first.rows / tile_rows * tile_rows * item_bytes);
+        for tile in (0..first.rows).step_by(tile_rows) {
+            for group in 0..groups {
+                let group_bytes = packed_len(
+                    (first.cols - group * first.group_size).min(first.group_size),
+                    first.quant_type,
+                );
+                let group_offset = (0..group)
+                    .map(|prior| {
+                        packed_len(
+                            (first.cols - prior * first.group_size).min(first.group_size),
+                            first.quant_type,
+                        )
+                    })
+                    .sum::<usize>();
+                for row_in_tile in 0..tile_rows {
+                    let row = tile + row_in_tile;
+                    for expert in experts {
+                        let data_offset = row * row_bytes + group_offset;
+                        output.extend_from_slice(
+                            &expert.data[data_offset..data_offset + group_bytes],
+                        );
+                        output.extend_from_slice(
+                            &expert.scales[row * groups + group].to_bits().to_le_bytes(),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+
     /// Number of bytes emitted by the artifact writer for this tensor.
     pub fn serialized_bytes(&self) -> usize {
         if let Some(block_bytes) = self.layout.transaction_block_bytes() {
@@ -445,7 +543,8 @@ impl QuantizedTensor {
             | PackingLayout::Q4RowInlineRows4
             | PackingLayout::Q4RowInlineRows8
             | PackingLayout::Q4Transaction144
-            | PackingLayout::Q4Transaction160 => {
+            | PackingLayout::Q4Transaction160
+            | PackingLayout::Q4CrossExpertTile8 => {
                 // QuantizedTensor keeps the split row-major backing vectors;
                 // packetization is materialized only by the artifact writer.
                 let row_bytes = groups * group_bytes;
@@ -688,6 +787,80 @@ impl QuantizedTensor {
             numerator / denominator
         }
     }
+}
+
+/// Decode one expert from a cross-expert row-tile stream into the split
+/// row-major backing vectors used by `QuantizedTensor`.
+pub fn unpack_cross_expert_tile_bytes(
+    stream: &[u8],
+    expert_index: usize,
+    expert_count: usize,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    tile_rows: usize,
+) -> Result<(Vec<f16>, Vec<u8>), String> {
+    if expert_count == 0 || expert_index >= expert_count {
+        return Err("cross-expert expert index is out of range".to_owned());
+    }
+    if tile_rows != 8 || rows == 0 || !rows.is_multiple_of(tile_rows) {
+        return Err(
+            "cross-expert stream requires nonzero rows divisible by tile width 8".to_owned(),
+        );
+    }
+    if group_size != 32 {
+        return Err("cross-expert stream requires group size 32".to_owned());
+    }
+    let quant_type = QuantType::Q4;
+    let groups = cols.div_ceil(group_size);
+    let row_bytes = row_packed_bytes(cols, group_size, quant_type);
+    let expected = rows / tile_rows
+        * tile_rows
+        * expert_count
+        * (0..groups)
+            .map(|group| packed_len((cols - group * group_size).min(group_size), quant_type) + 2)
+            .sum::<usize>();
+    if stream.len() != expected {
+        return Err(format!(
+            "cross-expert stream length {} does not match expected {expected}",
+            stream.len()
+        ));
+    }
+    let mut scales = vec![f16::from_f32(0.0); rows * groups];
+    let mut data = vec![0_u8; rows * row_bytes];
+    let mut cursor = 0;
+    for tile in (0..rows).step_by(tile_rows) {
+        for group in 0..groups {
+            let group_bytes = packed_len((cols - group * group_size).min(group_size), quant_type);
+            let group_offset = (0..group)
+                .map(|prior| packed_len((cols - prior * group_size).min(group_size), quant_type))
+                .sum::<usize>();
+            for row_in_tile in 0..tile_rows {
+                let row = tile + row_in_tile;
+                for expert in 0..expert_count {
+                    let codes = &stream[cursor..cursor + group_bytes];
+                    let scale = f16::from_bits(u16::from_le_bytes(
+                        stream[cursor + group_bytes..cursor + group_bytes + 2]
+                            .try_into()
+                            .unwrap(),
+                    ));
+                    cursor += group_bytes + 2;
+                    if expert == expert_index {
+                        let data_offset = row * row_bytes + group_offset;
+                        data[data_offset..data_offset + group_bytes].copy_from_slice(codes);
+                        scales[row * groups + group] = scale;
+                    }
+                }
+            }
+        }
+    }
+    Ok((scales, data))
+}
+
+fn row_packed_bytes(cols: usize, group_size: usize, quant_type: QuantType) -> usize {
+    (0..cols.div_ceil(group_size))
+        .map(|group| packed_len((cols - group * group_size).min(group_size), quant_type))
+        .sum()
 }
 
 fn packed_len(values: usize, quant_type: QuantType) -> usize {
@@ -1034,7 +1207,7 @@ mod tests {
     #[test]
     fn row_range_preserves_quantized_rows() {
         let rows = 16;
-        let cols = 64;
+        let cols = 50;
         let values = (0..rows * cols)
             .map(|index| (index as f32 - 32.0) / 11.0)
             .collect::<Vec<_>>();
@@ -1203,5 +1376,54 @@ mod tests {
         let mut padded_layout = split;
         padded_layout.layout = PackingLayout::Q4Transaction160;
         assert_eq!(padded_layout.serialized_bytes(), padded.len());
+    }
+
+    #[test]
+    fn cross_expert_tile_stream_changes_traversal_without_changing_values() {
+        let rows = 16;
+        let cols = 64;
+        let experts = (0..3)
+            .map(|expert| {
+                let values = (0..rows * cols)
+                    .map(|index| (index as f32 - 100.0 + expert as f32 * 0.25) / 17.0)
+                    .collect::<Vec<_>>();
+                QuantizedTensor::quantize(&values, rows, cols, QuantType::Q4, 32)
+            })
+            .collect::<Vec<_>>();
+        let refs = experts.iter().collect::<Vec<_>>();
+        let stream = QuantizedTensor::cross_expert_tile_bytes(&refs, 8).unwrap();
+        assert_eq!(
+            stream.len(),
+            experts.iter().map(QuantizedTensor::bytes).sum()
+        );
+
+        // The first tile starts with group zero, row zero, then every expert;
+        // this is distinct from the historical expert-major row stream.
+        assert_eq!(&stream[..16], &experts[0].data[..16]);
+        assert_eq!(&stream[18..34], &experts[1].data[..16]);
+        assert_eq!(&stream[36..52], &experts[2].data[..16]);
+
+        for (expert_index, original) in experts.iter().enumerate() {
+            let (scales, data) = unpack_cross_expert_tile_bytes(
+                &stream,
+                expert_index,
+                experts.len(),
+                rows,
+                cols,
+                32,
+                8,
+            )
+            .unwrap();
+            let decoded = QuantizedTensor {
+                quant_type: QuantType::Q4,
+                layout: PackingLayout::RowMajor,
+                rows,
+                cols,
+                group_size: 32,
+                scales,
+                data,
+            };
+            assert_eq!(decoded.dequantize(), original.dequantize());
+        }
     }
 }

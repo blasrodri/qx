@@ -4,7 +4,7 @@
 use anyhow::{Result, bail};
 use half::f16;
 use memmap2::{Mmap, UncheckedAdvice};
-use qx_quant::{PackingLayout, QuantType, QuantizedTensor};
+use qx_quant::{PackingLayout, QuantType, QuantizedTensor, unpack_cross_expert_tile_bytes};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -173,6 +173,21 @@ pub struct RepresentationPlan {
     pub dense: ExpertRepresentation,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpertTraversalKind {
+    PerExpert,
+    CrossExpertTile,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExpertTraversalPlan {
+    pub kind: ExpertTraversalKind,
+    pub tile_rows: u16,
+    pub expert_count: u16,
+    pub active_k: u8,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TopologyPlan {
     pub qkv: QkvTopology,
@@ -233,6 +248,11 @@ pub struct ExecutionPlanManifest {
     /// mapping so selection is reproducible without an environment override.
     #[serde(default)]
     pub moe_mapping: Option<String>,
+    /// Optional physical expert traversal metadata. It is absent on legacy
+    /// artifacts and present only when a structural cross-expert stream is
+    /// selected by the compiler.
+    #[serde(default)]
+    pub expert_traversal: Option<ExpertTraversalPlan>,
     pub schedule: DispatchSchedule,
     #[serde(default)]
     pub arena: ArenaPlan,
@@ -289,6 +309,7 @@ impl ExecutionPlanManifest {
                 kv_precision: KvPrecision::Fp32,
             },
             moe_mapping: None,
+            expert_traversal: None,
             schedule: DispatchSchedule {
                 command_buffers_per_token: 1,
                 encoders_per_token: 1,
@@ -509,6 +530,53 @@ impl MappedArtifact {
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("QX tensor index out of range"))?;
         let (scales, data) = self.tensor_bytes(index)?;
+        if entry.layout.is_q4_cross_expert_tile() {
+            if entry.quant_type != QuantType::Q4 || entry.group_size != 32 {
+                bail!("cross-expert artifact tensor is not group-32 Q4");
+            }
+            let mut peers = self
+                .info
+                .entries
+                .iter()
+                .filter(|peer| {
+                    peer.is_expert()
+                        && peer.layer == entry.layer
+                        && peer.kind == entry.kind
+                        && peer.quant_type == entry.quant_type
+                        && peer.layout == entry.layout
+                        && peer.rows == entry.rows
+                        && peer.cols == entry.cols
+                        && peer.group_size == entry.group_size
+                        && peer.data_offset == entry.data_offset
+                        && peer.data_length == entry.data_length
+                })
+                .collect::<Vec<_>>();
+            peers.sort_by_key(|peer| peer.expert);
+            let expert_index = peers
+                .iter()
+                .position(|peer| peer.expert == entry.expert)
+                .ok_or_else(|| anyhow::anyhow!("cross-expert entry is not in its shared stream"))?;
+            let tile_rows = entry.layout.cross_expert_tile_rows().unwrap();
+            let (split_scales, split_data) = unpack_cross_expert_tile_bytes(
+                data,
+                expert_index,
+                peers.len(),
+                entry.rows as usize,
+                entry.cols as usize,
+                entry.group_size as usize,
+                tile_rows,
+            )
+            .map_err(anyhow::Error::msg)?;
+            return Ok(QuantizedTensor {
+                quant_type: entry.quant_type,
+                layout: PackingLayout::RowMajor,
+                rows: entry.rows as usize,
+                cols: entry.cols as usize,
+                group_size: entry.group_size as usize,
+                scales: split_scales,
+                data: split_data,
+            });
+        }
         if entry.layout.is_q4_row_inline() {
             if entry.quant_type != QuantType::Q4 || entry.group_size != 32 {
                 bail!("inline artifact tensor is not group-32 Q4");
@@ -828,6 +896,41 @@ fn write_artifact_internal(
                     // Transaction entries deliberately point both views at
                     // one fused stream. The scale bytes are decoded from
                     // their per-group position by `quantized_tensor`.
+                    scale_offset: offset,
+                    scale_length: stream.len() as u64,
+                    data_offset: offset,
+                    data_length: stream.len() as u64,
+                });
+            }
+            group_start = group_end;
+            continue;
+        }
+        if first.tensor.layout.is_q4_cross_expert_tile() {
+            let experts = group
+                .iter()
+                .map(|index| &tensors[*index].tensor)
+                .collect::<Vec<_>>();
+            let stream = QuantizedTensor::cross_expert_tile_bytes(
+                &experts,
+                first.tensor.layout.cross_expert_tile_rows().unwrap(),
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+            let offset = data_offset + blobs.len() as u64;
+            blobs.extend_from_slice(&stream);
+            for index in group {
+                let compiled = &tensors[*index];
+                quantized_entries[*index] = Some(TensorDirectoryEntry {
+                    layer: compiled.layer,
+                    expert: compiled.expert,
+                    quant_type: compiled.tensor.quant_type,
+                    layout: compiled.tensor.layout,
+                    kind: compiled.kind,
+                    rows: compiled.tensor.rows as u32,
+                    cols: compiled.tensor.cols as u32,
+                    group_size: compiled.tensor.group_size as u16,
+                    // Every expert directory entry names the same physical
+                    // stream. Its expert ID selects the lane during decode;
+                    // the manifest carries the traversal contract.
                     scale_offset: offset,
                     scale_length: stream.len() as u64,
                     data_offset: offset,
@@ -1396,5 +1499,75 @@ mod tests {
             assert_eq!(data[0].end, data[1].start);
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cross_expert_artifact_shares_one_lossless_tile_stream() {
+        let path = std::env::temp_dir().join(format!(
+            "qx-artifact-cross-expert-{}-{}.qx",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let tensors = (0_u8..3)
+            .map(|expert| {
+                let values = (0..16 * 64)
+                    .map(|index| (index as f32 + expert as f32) / 19.0)
+                    .collect::<Vec<_>>();
+                let mut tensor = QuantizedTensor::quantize(&values, 16, 64, QuantType::Q4, 32);
+                tensor.layout = PackingLayout::Q4CrossExpertTile8;
+                CompiledTensor {
+                    layer: 0,
+                    expert,
+                    kind: TensorKind::GateUp,
+                    tensor,
+                }
+            })
+            .collect::<Vec<_>>();
+        let expected = tensors
+            .iter()
+            .map(|tensor| tensor.tensor.dequantize())
+            .collect::<Vec<_>>();
+        write_artifact(
+            &path,
+            "granite",
+            "apple-m5-pro",
+            512,
+            MemoryPlan::default(),
+            &tensors,
+        )
+        .unwrap();
+
+        let artifact = MappedArtifact::open(&path).unwrap();
+        assert!(artifact.info().entries.iter().all(|entry| {
+            entry.layout == PackingLayout::Q4CrossExpertTile8
+                && entry.data_offset == artifact.info().entries[0].data_offset
+                && entry.data_length == artifact.info().entries[0].data_length
+        }));
+        for (index, expected) in expected.iter().enumerate() {
+            assert_eq!(
+                artifact.quantized_tensor(index).unwrap().dequantize(),
+                *expected
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn manifest_round_trip_records_cross_expert_traversal() {
+        let mut manifest = ExecutionPlanManifest::granite_m5_canonical(
+            "granite",
+            "apple-m5-pro",
+            512,
+            MemoryPlan::default(),
+        );
+        manifest.expert_traversal = Some(ExpertTraversalPlan {
+            kind: ExpertTraversalKind::CrossExpertTile,
+            tile_rows: 8,
+            expert_count: 32,
+            active_k: 8,
+        });
+        let encoded = serde_json::to_vec(&manifest).unwrap();
+        let decoded: ExecutionPlanManifest = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, manifest);
     }
 }
