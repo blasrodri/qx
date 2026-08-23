@@ -882,6 +882,7 @@ pub mod platform {
         AttentionSoftmaxMax,
         AttentionSoftmaxSimd,
         TopKMask,
+        AttentionQkKMajor,
     }
 
     fn bytes_of<T>(value: &T) -> &[u8] {
@@ -1074,7 +1075,7 @@ pub mod platform {
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
-        v2_pipelines: Mutex<[Option<Pipeline>; 27]>,
+        v2_pipelines: Mutex<[Option<Pipeline>; 28]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
         stage_counters: Mutex<bool>,
@@ -4959,6 +4960,41 @@ pub mod platform {
             )
         }
 
+        /// Benchmark-only QK variant for a synthetic KV-head-major cache:
+        /// [kv_head][position][head_dim]. Production remains position-major.
+        pub fn encode_attention_qk_kmajor(
+            &mut self,
+            context: &MetalContext,
+            query: &RuntimeBuffer,
+            key_cache: &RuntimeBuffer,
+            scores: &RuntimeBuffer,
+            length: usize,
+        ) -> Result<(), String> {
+            #[repr(C)]
+            struct Params {
+                length: u32,
+            }
+            let params = Params {
+                length: length as u32,
+            };
+            self.encode_decode_kernel(
+                context,
+                DecodeKernel::AttentionQkKMajor,
+                &[query, key_cache, scores],
+                bytes_of(&params),
+                MTLSize {
+                    width: 16 * 512,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+        }
+
         pub fn encode_attention_qk_for_layer(
             &mut self,
             context: &MetalContext,
@@ -5532,7 +5568,7 @@ pub mod platform {
                 v2_pipelines: Mutex::new([
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
-                    None,
+                    None, None,
                 ]),
                 scratch: Mutex::new(MetalScratch {
                     input_f32: None,
@@ -6467,6 +6503,7 @@ pub mod platform {
                 DecodeKernel::RopeQuerySimd => 24,
                 DecodeKernel::RopeKvSimd => 25,
                 DecodeKernel::TopKMask => 26,
+                DecodeKernel::AttentionQkKMajor => 27,
             };
             let mut pipelines = self
                 .v2_pipelines
@@ -6508,6 +6545,7 @@ pub mod platform {
                 DecodeKernel::RopeQuerySimd => "qx_v2_rope_query_simd",
                 DecodeKernel::RopeKvSimd => "qx_v2_rope_kv_simd",
                 DecodeKernel::TopKMask => "qx_v2_topk_mask",
+                DecodeKernel::AttentionQkKMajor => "qx_v2_attention_qk_kmajor",
             });
             let function = library
                 .newFunctionWithName(&name)

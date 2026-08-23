@@ -19,5 +19,12 @@
     "fp16_k_fp32_v": {"qk": 14.04, "v": 43.38, "live": 65.87},
     "fp32_k_fp16_v": {"qk": 15.88, "v": 43.13, "live": 67.25}
   },
-  "decision": "K-cache layout/access is the next diagnostic; V kernel work is deferred"
+  "k_major_control_context_512_gpu_us": {
+    "position_major_qk_repeats": [15.79, 15.83, 15.83],
+    "k_major_qk_repeats": [15.88, 15.87, 15.83],
+    "position_major_live_repeats": [68.00, 67.87, 67.42],
+    "k_major_live_repeats": [68.04, 67.71, 67.71],
+    "decision": "rejected; no repeatable complete-stage improvement"
+  },
+  "decision": "K precision is traffic-sensitive diagnostically; K-major layout is not yet a production candidate"
 }

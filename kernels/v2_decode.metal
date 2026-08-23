@@ -536,6 +536,34 @@ kernel void qx_v2_attention_qk_f16(
     scores[tid] = score * scale;
 }
 
+// Benchmark-only synthetic K-cache layout control. The buffer has the same
+// dimensions as production but is consumed as [kv_head][position][dim].
+kernel void qx_v2_attention_qk_kmajor(
+    device const float* query [[buffer(0)]],
+    device const float* key_cache [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant AttentionParams& params [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]) {
+    constexpr uint head_dim = 64;
+    constexpr uint kv_heads = 8;
+    constexpr uint q_heads = 16;
+    constexpr uint max_context = 512;
+    constexpr float scale = 0.015625f;
+    uint total = q_heads * max_context;
+    if (tid >= total) return;
+    uint q_head = tid / max_context;
+    uint position = tid % max_context;
+    if (position >= params.length) return;
+    uint kv_head = q_head / 2;
+    uint query_offset = q_head * head_dim;
+    uint cache_offset = (kv_head * max_context + position) * head_dim;
+    float score = 0.0f;
+    for (uint d = 0; d < head_dim; ++d) {
+        score += query[query_offset + d] * key_cache[cache_offset + d];
+    }
+    scores[tid] = score * scale;
+}
+
 kernel void qx_v2_attention_softmax(
     device float* scores [[buffer(0)]],
     constant AttentionParams& params [[buffer(1)]],

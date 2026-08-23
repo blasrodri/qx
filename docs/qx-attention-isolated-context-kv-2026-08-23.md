@@ -52,3 +52,10 @@ control:  [kv_head][position][head_dim]
 The control must be measured with the same QK work and direct GPU timestamps.
 Only if the layout control improves complete attention by at least 0.10
 ms/token in the full decode graph should it become a production candidate.
+
+The benchmark-only K-major control was implemented and tested. One cold
+sample reported 11.21 µs QK, but three repeated fresh-process samples reported
+15.88, 15.87, and 15.83 µs versus 15.79, 15.83, and 15.83 µs for the
+position-major control. Combined attention remained approximately 67.7–68.1
+µs in both cases. The apparent QK win therefore does not survive repeated
+complete-stage measurement and is rejected as a production direction.

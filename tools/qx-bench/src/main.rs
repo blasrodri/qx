@@ -153,6 +153,9 @@ struct Args {
     /// Run one attention stage in isolation; use qk, softmax, v, combined, or live.
     #[arg(long, value_name = "qk|softmax|v|combined|live")]
     v2_attention_stage: Option<String>,
+    /// Use the benchmark-only synthetic [kv_head][position][dim] K layout.
+    #[arg(long)]
+    v2_attention_k_major: bool,
     /// Emit an all-token NLL plus sampled-logit quality trace from V2.
     #[arg(long)]
     v2_quality_trace: bool,
@@ -555,6 +558,7 @@ fn main() -> Result<()> {
             args.context,
             args.iterations,
             args.v2_attention_stage.as_deref(),
+            args.v2_attention_k_major,
         );
     }
     if let Some(model) = args.model {
@@ -6287,6 +6291,7 @@ fn benchmark_v2_attention_stages(
     context_length: usize,
     iterations: usize,
     requested_stage: Option<&str>,
+    k_major: bool,
 ) -> Result<()> {
     use std::rc::Rc;
 
@@ -6331,9 +6336,27 @@ fn benchmark_v2_attention_stages(
     for (name, stage) in stages {
         let encode = |graph: &mut qx_metal::platform::DecodeGraph| -> Result<()> {
             if stage == 0 || stage == 3 {
-                graph
-                    .encode_attention_qk(decode_context, query, &key_cache, scores, context_length)
-                    .map_err(anyhow::Error::msg)?;
+                if k_major {
+                    graph
+                        .encode_attention_qk_kmajor(
+                            decode_context,
+                            query,
+                            &key_cache,
+                            scores,
+                            context_length,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                } else {
+                    graph
+                        .encode_attention_qk(
+                            decode_context,
+                            query,
+                            &key_cache,
+                            scores,
+                            context_length,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                }
             }
             if stage == 1 || stage == 3 {
                 graph
