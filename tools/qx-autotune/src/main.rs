@@ -7,7 +7,7 @@ use qx_compiler::{
     validate_interaction_candidates,
 };
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf, process::Command};
+use std::{collections::BTreeMap, fs, path::PathBuf, process::Command};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -96,6 +96,10 @@ const fn default_warmup() -> usize {
 #[derive(Debug, Deserialize)]
 struct CandidateRun {
     artifact: PathBuf,
+    /// Environment variables applied to every command run for this candidate.
+    /// The field is optional so existing suite JSON remains valid.
+    #[serde(default, alias = "environment")]
+    env: BTreeMap<String, String>,
     #[serde(default)]
     interaction: Option<PlanInteraction>,
     /// Legacy hand-recorded screening evidence. New suites should omit this
@@ -324,6 +328,7 @@ fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
                 ));
                 run_index += 1;
                 let status = Command::new(&suite.qx_bench)
+                    .envs(&candidate.env)
                     .arg(&candidate.artifact)
                     .args(["--v2-token", "--fixture"])
                     .arg(fixture)
@@ -505,6 +510,7 @@ fn run_tier_commands(
                     })
                     .collect::<Vec<_>>();
                 let output = Command::new(&tier_command.command)
+                    .envs(&candidate.env)
                     .args(&expanded_args)
                     .output()
                     .with_context(|| format!("run {:?} promotion probe", tier_command.tier))?;
@@ -747,6 +753,7 @@ mod tests {
         };
         let candidate = CandidateRun {
             artifact: PathBuf::from("candidate.qx"),
+            env: BTreeMap::new(),
             interaction: None,
             screening_tiers: Vec::new(),
             tier_commands: vec![TierCommand {
@@ -765,6 +772,50 @@ mod tests {
         assert_eq!(evidence[0].tier, PromotionTier::Kernel);
         assert_eq!(evidence[0].wall_ms_per_token, 1.5);
         assert_eq!(evidence[0].gpu_ms_per_token, 1.25);
+    }
+
+    #[test]
+    fn candidate_environment_is_applied_to_tier_commands() {
+        let suite = CandidateSuite {
+            schema_version: 1,
+            qx_bench: PathBuf::from("qx-bench"),
+            fixtures: vec![PathBuf::from("fixture.json")],
+            rounds: 1,
+            warmup: 0,
+            interaction_matrix: None,
+            baseline_plan_id: None,
+            minimum_improvement_ms_per_token: None,
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateRun {
+            artifact: PathBuf::from("candidate.qx"),
+            env: [("QX_V2_MOE_FUSED_TRANSACTION_BLOCK", "qx/llama")]
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect(),
+            interaction: None,
+            screening_tiers: Vec::new(),
+            tier_commands: vec![TierCommand {
+                tier: PromotionTier::Kernel,
+                command: PathBuf::from("/bin/sh"),
+                args: vec![
+                    "-c".to_owned(),
+                    r#"test "$QX_V2_MOE_FUSED_TRANSACTION_BLOCK" = "qx/llama" && printf '%s' '{"tier":"kernel","wall_ms_per_token":1.5,"gpu_ms_per_token":1.25}'"#.to_owned(),
+                ],
+            }],
+            quality_gate: None,
+            exact_equivalent_to: None,
+        };
+
+        let evidence = run_tier_commands(&suite, &candidate).unwrap();
+        assert_eq!(evidence[0].wall_ms_per_token, 1.5);
+    }
+
+    #[test]
+    fn candidate_environment_is_optional_in_suite_json() {
+        let candidate: CandidateRun =
+            serde_json::from_str(r#"{"artifact":"candidate.qx","screening_tiers":[]}"#).unwrap();
+        assert!(candidate.env.is_empty());
     }
 
     #[test]
