@@ -351,6 +351,92 @@ kernel void qx_dynamic_q4_moe_gate_up_llama_like_norm_simd(
         stream, expert_ids, output, cached_input, lane, simdgroup, threadgroup_id);
 }
 
+// Decode-direct exact-Q4 row-inline mapping. Each 64-thread threadgroup owns
+// four rows: two rows are evaluated serially by each of its two SIMD groups.
+// Unlike the older llama-like candidate, this path never stages the complete
+// activation vector; every lane reads its QX input element directly while it
+// consumes the row-inline [codes][FP16 scale] packets.
+inline void qx_dynamic_q4_gate_up_decode_direct_body(
+    device const uchar* stream,
+    device const float* input,
+    device const float* norm_weights,
+    float inverse_rms,
+    uint normalized,
+    device const uint* expert_ids,
+    device float* output,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_simdgroup = 2;
+    constexpr uint simdgroups_per_threadgroup = 2;
+    constexpr uint rows_per_threadgroup = rows_per_simdgroup * simdgroups_per_threadgroup;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint tile = threadgroup_id % threadgroups_per_expert;
+    uint first_row = tile * rows_per_threadgroup + simdgroup * rows_per_simdgroup;
+    uint expert = expert_ids[slot];
+
+    for (uint row_offset = 0; row_offset < rows_per_simdgroup; ++row_offset) {
+        uint row = first_row + row_offset;
+        float sum = 0.0f;
+        if (expert < 32 && row < hidden) {
+            uint row_base = expert * expert_stride + row * row_stride;
+            for (uint column = lane; column < hidden; column += 32) {
+                uint group = column / 32;
+                uint local = column % 32;
+                uint group_base = row_base + group * group_stride;
+                uint code = (uint(stream[group_base + local / 2])
+                    >> ((local % 2) * 4)) & 0xf;
+                float value = input[column];
+                if (normalized != 0) {
+                    value *= inverse_rms * norm_weights[column];
+                }
+                sum += float(int(code) - 7)
+                    * qx_q4_inline_scale(stream, group_base + 16)
+                    * value;
+            }
+        }
+        sum = simd_sum(sum);
+        if (lane == 0 && expert < 32 && row < hidden) {
+            output[slot * hidden + row] = sum;
+        }
+    }
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_decode_direct_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    qx_dynamic_q4_gate_up_decode_direct_body(
+        stream, input, input, 1.0f, 0, expert_ids, output,
+        lane, simdgroup, threadgroup_id);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]],
+    device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    qx_dynamic_q4_gate_up_decode_direct_body(
+        stream, input, norm_weights, inverse_rms[0], 1, expert_ids, output,
+        lane, simdgroup, threadgroup_id);
+}
+
 // Fused gate/up consumer for exact-Q4 transaction streams. The same body also
 // accepts the legacy row-inline stream when its factorial mapping is enabled;
 // keeping that path here preserves its existing address contract.
@@ -2448,6 +2534,57 @@ kernel void qx_dynamic_q4_moe_down_inline_simd(
     }
     sum = simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
+}
+
+// Decode-direct exact-Q4 down projection. It mirrors the gate/up geometry:
+// two SIMD groups per 64-thread threadgroup and two rows serially per group.
+// Activated values and row-inline QX packets are consumed directly; no
+// threadgroup activation staging or route compaction is introduced.
+kernel void qx_dynamic_q4_moe_down_decode_direct_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* activated [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint intermediate = 512;
+    constexpr uint groups = 16;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_simdgroup = 2;
+    constexpr uint simdgroups_per_threadgroup = 2;
+    constexpr uint rows_per_threadgroup = rows_per_simdgroup * simdgroups_per_threadgroup;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint tile = threadgroup_id % threadgroups_per_expert;
+    uint first_row = tile * rows_per_threadgroup + simdgroup * rows_per_simdgroup;
+    uint expert = expert_ids[slot];
+
+    for (uint row_offset = 0; row_offset < rows_per_simdgroup; ++row_offset) {
+        uint row = first_row + row_offset;
+        float sum = 0.0f;
+        if (expert < 32 && row < hidden) {
+            uint row_base = expert * expert_stride + row * row_stride;
+            for (uint column = lane; column < intermediate; column += 32) {
+                uint group = column / 32;
+                uint local = column % 32;
+                uint group_base = row_base + group * group_stride;
+                uint code = (uint(stream[group_base + local / 2])
+                    >> ((local % 2) * 4)) & 0xf;
+                sum += float(int(code) - 7)
+                    * qx_q4_inline_scale(stream, group_base + 16)
+                    * activated[slot * intermediate + column];
+            }
+        }
+        sum = simd_sum(sum);
+        if (lane == 0 && expert < 32 && row < hidden) {
+            output[slot * hidden + row] = sum;
+        }
+    }
 }
 
 // Down-projection consumer for the same shared cross-expert tile-8 stream.

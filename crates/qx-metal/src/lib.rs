@@ -266,6 +266,19 @@ pub mod platform {
         })
     }
 
+    /// Exact-Q4 row-inline decode candidate. Set `QX_V2_MOE_DECODE_DIRECT=1`
+    /// to use two SIMD groups per 64-thread threadgroup, with two rows
+    /// computed serially per SIMD group and direct activation reads.
+    pub fn moe_decode_direct_enabled() -> bool {
+        matches!(
+            std::env::var("QX_V2_MOE_DECODE_DIRECT")
+                .ok()
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    }
+
     /// Opt-in factorial candidate for the exact-Q4 row-inline stream. The
     /// representation API does not yet expose a distinct fused transaction
     /// block, so this selects temporary kernels that consume the existing
@@ -615,6 +628,8 @@ pub mod platform {
         row_stream_gate_up_norm_pipeline: Pipeline,
         llama_like_gate_up_pipeline: Pipeline,
         llama_like_gate_up_norm_pipeline: Pipeline,
+        decode_direct_gate_up_pipeline: Pipeline,
+        decode_direct_gate_up_norm_pipeline: Pipeline,
         fused_block_qx_gate_up_pipeline: Option<Pipeline>,
         fused_block_qx_gate_up_norm_pipeline: Option<Pipeline>,
         fused_block_llama_gate_up_pipeline: Option<Pipeline>,
@@ -669,6 +684,7 @@ pub mod platform {
         batched_silu_pipeline: Pipeline,
         batched_down_pipeline: Pipeline,
         inline_down_pipeline: Pipeline,
+        decode_direct_down_pipeline: Pipeline,
         cross_expert_tile8_down_pipeline: Pipeline,
         inline_layout: bool,
         down_inline_layout: bool,
@@ -1863,6 +1879,12 @@ pub mod platform {
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none();
+            let decode_direct = moe_decode_direct_enabled()
+                && prepared.inline_layout
+                && prepared.down_inline_layout
+                && prepared.gate_up_layout == PackingLayout::Q4RowInline
+                && prepared.down_layout == PackingLayout::Q4RowInline
+                && q3_block_bytes.is_none();
             let cross_expert_activation = moe_cross_expert_activation_enabled()
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
@@ -1881,6 +1903,9 @@ pub mod platform {
             if let Some((norm_weights, inverse_rms)) = norm {
                 if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
                     self.encoder.setComputePipelineState(pipeline);
+                } else if decode_direct {
+                    self.encoder
+                        .setComputePipelineState(&prepared.decode_direct_gate_up_norm_pipeline);
                 } else if fused_block_active {
                     let pipeline = if fused_block_mapping == Some(true) {
                         prepared.fused_block_llama_gate_up_norm_pipeline.as_ref()
@@ -1959,6 +1984,9 @@ pub mod platform {
             } else {
                 if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
                     self.encoder.setComputePipelineState(pipeline);
+                } else if decode_direct {
+                    self.encoder
+                        .setComputePipelineState(&prepared.decode_direct_gate_up_pipeline);
                 } else if fused_block_active {
                     let pipeline = if fused_block_mapping == Some(true) {
                         prepared.fused_block_llama_gate_up_pipeline.as_ref()
@@ -2038,16 +2066,18 @@ pub mod platform {
                         prepared.gate_up_packed.offset,
                         0,
                     );
-                    self.encoder.setBuffer_offset_atIndex(
-                        Some(&prepared.gate_up_scales.buffer),
-                        prepared.gate_up_scales.offset,
-                        1,
-                    );
-                    self.encoder.setBytes_length_atIndex(
-                        NonNull::from(&gate_up_layout).cast(),
-                        std::mem::size_of_val(&gate_up_layout),
-                        7,
-                    );
+                    if !decode_direct {
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&prepared.gate_up_scales.buffer),
+                            prepared.gate_up_scales.offset,
+                            1,
+                        );
+                        self.encoder.setBytes_length_atIndex(
+                            NonNull::from(&gate_up_layout).cast(),
+                            std::mem::size_of_val(&gate_up_layout),
+                            7,
+                        );
+                    }
                 }
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 4);
@@ -2066,6 +2096,8 @@ pub mod platform {
                     } else if fused_block_active {
                         8 * (1024 / 8)
                     } else if llama_like_mapping {
+                        8 * (1024 / 4)
+                    } else if decode_direct {
                         8 * (1024 / 4)
                     } else if cross_expert_tile8 {
                         1024 / 8
@@ -2092,6 +2124,8 @@ pub mod platform {
                     } else if fused_block_active {
                         256
                     } else if llama_like_mapping {
+                        64
+                    } else if decode_direct {
                         64
                     } else if wide_expert {
                         1024
@@ -2126,6 +2160,9 @@ pub mod platform {
 
             if let Some(pipeline) = prepared.q3_down_pipeline.as_ref() {
                 self.encoder.setComputePipelineState(pipeline);
+            } else if decode_direct {
+                self.encoder
+                    .setComputePipelineState(&prepared.decode_direct_down_pipeline);
             } else if cross_expert_tile8_down {
                 self.encoder
                     .setComputePipelineState(&prepared.cross_expert_tile8_down_pipeline);
@@ -2160,24 +2197,26 @@ pub mod platform {
                         prepared.down_packed.offset,
                         0,
                     );
-                    self.encoder.setBuffer_offset_atIndex(
-                        Some(if cross_expert_tile8_down {
-                            &prepared.down_packed.buffer
-                        } else {
-                            &prepared.down_scales.buffer
-                        }),
-                        if cross_expert_tile8_down {
-                            prepared.down_packed.offset
-                        } else {
-                            prepared.down_scales.offset
-                        },
-                        1,
-                    );
-                    self.encoder.setBytes_length_atIndex(
-                        NonNull::from(&down_layout).cast(),
-                        std::mem::size_of_val(&down_layout),
-                        7,
-                    );
+                    if !decode_direct {
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(if cross_expert_tile8_down {
+                                &prepared.down_packed.buffer
+                            } else {
+                                &prepared.down_scales.buffer
+                            }),
+                            if cross_expert_tile8_down {
+                                prepared.down_packed.offset
+                            } else {
+                                prepared.down_scales.offset
+                            },
+                            1,
+                        );
+                        self.encoder.setBytes_length_atIndex(
+                            NonNull::from(&down_layout).cast(),
+                            std::mem::size_of_val(&down_layout),
+                            7,
+                        );
+                    }
                 }
                 self.encoder
                     .setBuffer_offset_atIndex(Some(&activated.buffer), activated.offset, 4);
@@ -2194,12 +2233,24 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: if wide_expert { 8 } else { 8 * (1024 / 8) },
+                    width: if decode_direct {
+                        8 * (1024 / 4)
+                    } else if wide_expert {
+                        8
+                    } else {
+                        8 * (1024 / 8)
+                    },
                     height: 1,
                     depth: 1,
                 },
                 MTLSize {
-                    width: if wide_expert { 1024 } else { 256 },
+                    width: if decode_direct {
+                        64
+                    } else if wide_expert {
+                        1024
+                    } else {
+                        256
+                    },
                     height: 1,
                     depth: 1,
                 },
@@ -3047,6 +3098,12 @@ pub mod platform {
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none();
+            let decode_direct = moe_decode_direct_enabled()
+                && prepared.inline_layout
+                && prepared.down_inline_layout
+                && prepared.gate_up_layout == PackingLayout::Q4RowInline
+                && prepared.down_layout == PackingLayout::Q4RowInline
+                && q3_block_bytes.is_none();
             let cross_expert_tile8 = moe_cross_expert_tile8_enabled()
                 && prepared.gate_up_layout == PackingLayout::Q4CrossExpertTile8
                 && q3_block_bytes.is_none();
@@ -3058,6 +3115,10 @@ pub mod platform {
                     if let Some((norm_weights, inverse_rms)) = norm {
                         if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
                             self.encoder.setComputePipelineState(pipeline);
+                        } else if decode_direct {
+                            self.encoder.setComputePipelineState(
+                                &prepared.decode_direct_gate_up_norm_pipeline,
+                            );
                         } else if cross_expert_tile8 {
                             self.encoder.setComputePipelineState(
                                 &prepared.cross_expert_tile8_gate_up_norm_pipeline,
@@ -3126,6 +3187,9 @@ pub mod platform {
                             );
                         } else if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
                             self.encoder.setComputePipelineState(pipeline);
+                        } else if decode_direct {
+                            self.encoder
+                                .setComputePipelineState(&prepared.decode_direct_gate_up_pipeline);
                         } else if cross_expert_tile8 {
                             self.encoder.setComputePipelineState(
                                 &prepared.cross_expert_tile8_gate_up_pipeline,
@@ -3196,16 +3260,18 @@ pub mod platform {
                                 prepared.gate_up_packed.offset,
                                 0,
                             );
-                            self.encoder.setBuffer_offset_atIndex(
-                                Some(&prepared.gate_up_scales.buffer),
-                                prepared.gate_up_scales.offset,
-                                1,
-                            );
-                            self.encoder.setBytes_length_atIndex(
-                                NonNull::from(&gate_up_layout).cast(),
-                                4,
-                                7,
-                            );
+                            if !decode_direct {
+                                self.encoder.setBuffer_offset_atIndex(
+                                    Some(&prepared.gate_up_scales.buffer),
+                                    prepared.gate_up_scales.offset,
+                                    1,
+                                );
+                                self.encoder.setBytes_length_atIndex(
+                                    NonNull::from(&gate_up_layout).cast(),
+                                    4,
+                                    7,
+                                );
+                            }
                         }
                         self.encoder
                             .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 4);
@@ -3222,7 +3288,9 @@ pub mod platform {
                     }
                     self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: if cross_expert_tile8 || row_inline_streaming {
+                            width: if decode_direct {
+                                8 * (1024 / 4)
+                            } else if cross_expert_tile8 || row_inline_streaming {
                                 1024 / 8
                             } else if wide_expert {
                                 8
@@ -3238,7 +3306,13 @@ pub mod platform {
                             depth: 1,
                         },
                         MTLSize {
-                            width: if wide_expert { 1024 } else { 256 },
+                            width: if decode_direct {
+                                64
+                            } else if wide_expert {
+                                1024
+                            } else {
+                                256
+                            },
                             height: 1,
                             depth: 1,
                         },
@@ -3275,6 +3349,9 @@ pub mod platform {
                 2 => {
                     if let Some(pipeline) = prepared.q3_down_pipeline.as_ref() {
                         self.encoder.setComputePipelineState(pipeline);
+                    } else if decode_direct {
+                        self.encoder
+                            .setComputePipelineState(&prepared.decode_direct_down_pipeline);
                     } else if cross_expert_tile8_down {
                         self.encoder
                             .setComputePipelineState(&prepared.cross_expert_tile8_down_pipeline);
@@ -3308,6 +3385,12 @@ pub mod platform {
                                 NonNull::from(&block_bytes).cast(),
                                 4,
                                 7,
+                            );
+                        } else if decode_direct {
+                            self.encoder.setBuffer_offset_atIndex(
+                                Some(&prepared.down_packed.buffer),
+                                prepared.down_packed.offset,
+                                0,
                             );
                         } else if cross_expert_tile8_down {
                             self.encoder.setBuffer_offset_atIndex(
@@ -3360,12 +3443,24 @@ pub mod platform {
                     }
                     self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: if wide_expert { 8 } else { 1024 },
+                            width: if decode_direct {
+                                8 * (1024 / 4)
+                            } else if wide_expert {
+                                8
+                            } else {
+                                1024
+                            },
                             height: 1,
                             depth: 1,
                         },
                         MTLSize {
-                            width: if wide_expert { 1024 } else { 256 },
+                            width: if decode_direct {
+                                64
+                            } else if wide_expert {
+                                1024
+                            } else {
+                                256
+                            },
                             height: 1,
                             depth: 1,
                         },
@@ -6319,6 +6414,11 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
                 llama_like_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_norm_simd")?,
+                decode_direct_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_decode_direct_simd")?,
+                decode_direct_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd",
+                )?,
                 fused_block_qx_gate_up_pipeline: Some(
                     self.dynamic_moe_named_pipeline(
                         "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
@@ -6408,6 +6508,8 @@ pub mod platform {
                 batched_down_pipeline: self.dynamic_moe_named_pipeline(down_pipeline)?,
                 inline_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_inline_simd")?,
+                decode_direct_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_decode_direct_simd")?,
                 cross_expert_tile8_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cross_expert_tile8_simd")?,
                 inline_layout: gate_up_layout == PackingLayout::Q4RowInline,
@@ -6582,6 +6684,11 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
                 llama_like_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_norm_simd")?,
+                decode_direct_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_decode_direct_simd")?,
+                decode_direct_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd",
+                )?,
                 fused_block_qx_gate_up_pipeline: Some(
                     self.dynamic_moe_named_pipeline(
                         "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
@@ -6671,6 +6778,8 @@ pub mod platform {
                 batched_down_pipeline: self.dynamic_moe_named_pipeline(down_pipeline)?,
                 inline_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_inline_simd")?,
+                decode_direct_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_decode_direct_simd")?,
                 cross_expert_tile8_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cross_expert_tile8_simd")?,
                 inline_layout: gate_up_layout == PackingLayout::Q4RowInline,
@@ -6798,6 +6907,11 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
                 llama_like_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_norm_simd")?,
+                decode_direct_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_decode_direct_simd")?,
+                decode_direct_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd",
+                )?,
                 row_stream_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_row_stream_simd")?,
                 row_stream_gate_up_norm_pipeline: self
@@ -6894,6 +7008,8 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_simd")?,
                 inline_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_inline_simd")?,
+                decode_direct_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_decode_direct_simd")?,
                 cross_expert_tile8_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cross_expert_tile8_simd")?,
                 inline_layout: false,
@@ -7097,6 +7213,11 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
                 llama_like_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_norm_simd")?,
+                decode_direct_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_decode_direct_simd")?,
+                decode_direct_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd",
+                )?,
                 fused_block_qx_gate_up_pipeline: Some(
                     self.dynamic_moe_named_pipeline(
                         "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
@@ -7187,6 +7308,8 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_simd")?,
                 inline_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_inline_simd")?,
+                decode_direct_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_decode_direct_simd")?,
                 cross_expert_tile8_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cross_expert_tile8_simd")?,
                 inline_layout: gate_up_layout == PackingLayout::Q4RowInline,
@@ -8669,6 +8792,147 @@ mod tests {
             .map(|(left, right)| (left - right).abs())
             .fold(0.0_f32, f32::max);
         assert!(max_error < 1.0e-5, "row-stream gate/up error: {max_error}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decode_direct_matches_canonical_gate_up_and_down() {
+        const EXPERTS: usize = 32;
+        const HIDDEN: usize = 1024;
+        const GATE_GROUPS: usize = 32;
+        const DOWN_GROUPS: usize = 16;
+        const GROUP_BYTES: usize = 18;
+        const SCRATCH_FLOATS: usize = 8 * HIDDEN + 8 * 512 + 8 * HIDDEN;
+        let context = platform::MetalContext::system_default().expect("Metal device");
+        let mut gate_up = vec![0_u8; EXPERTS * HIDDEN * GATE_GROUPS * GROUP_BYTES];
+        for expert in 0..EXPERTS {
+            for row in 0..HIDDEN {
+                for group in 0..GATE_GROUPS {
+                    let offset =
+                        (expert * HIDDEN * GATE_GROUPS + row * GATE_GROUPS + group) * GROUP_BYTES;
+                    let nibble = ((expert * 3 + row + group * 5) & 0xf) as u8;
+                    gate_up[offset..offset + 16].fill(nibble | (nibble << 4));
+                    gate_up[offset + 16..offset + 18].copy_from_slice(&[0x00, 0x3c]);
+                }
+            }
+        }
+        let mut down = vec![0_u8; EXPERTS * HIDDEN * DOWN_GROUPS * GROUP_BYTES];
+        for expert in 0..EXPERTS {
+            for row in 0..HIDDEN {
+                for group in 0..DOWN_GROUPS {
+                    let offset =
+                        (expert * HIDDEN * DOWN_GROUPS + row * DOWN_GROUPS + group) * GROUP_BYTES;
+                    let nibble = ((expert + row * 3 + group * 7) & 0xf) as u8;
+                    down[offset..offset + 16].fill(nibble | (nibble << 4));
+                    down[offset + 16..offset + 18].copy_from_slice(&[0x00, 0x3c]);
+                }
+            }
+        }
+        let prepared = context
+            .prepare_dynamic_q4_moe_with_layouts(
+                &gate_up,
+                &gate_up,
+                &down,
+                &down,
+                PackingLayout::Q4RowInline,
+                PackingLayout::Q4RowInline,
+            )
+            .unwrap();
+        let input = context.allocate_runtime_buffer(HIDDEN * 4).unwrap();
+        let ids = context.allocate_runtime_buffer(8 * 4).unwrap();
+        let weights = context.allocate_runtime_buffer(8 * 4).unwrap();
+        let input_values: Vec<f32> = (0..HIDDEN)
+            .map(|index| (index as f32 % 19.0 - 9.0) * 0.125)
+            .collect();
+        let ids_values = [31_u32, 7, 13, 2, 24, 5, 18, 0];
+        let weights_values = [0.125_f32; 8];
+        for (buffer, bytes) in [
+            (&input, unsafe {
+                std::slice::from_raw_parts(
+                    input_values.as_ptr() as *const u8,
+                    std::mem::size_of_val(input_values.as_slice()),
+                )
+            }),
+            (&ids, unsafe {
+                std::slice::from_raw_parts(
+                    ids_values.as_ptr() as *const u8,
+                    std::mem::size_of_val(&ids_values),
+                )
+            }),
+            (&weights, unsafe {
+                std::slice::from_raw_parts(
+                    weights_values.as_ptr() as *const u8,
+                    std::mem::size_of_val(&weights_values),
+                )
+            }),
+        ] {
+            context.write_runtime_buffer(buffer, bytes).unwrap();
+        }
+
+        let run_stage = |stage: u8, direct: bool| {
+            if direct {
+                unsafe { std::env::set_var("QX_V2_MOE_DECODE_DIRECT", "1") };
+            } else {
+                unsafe { std::env::remove_var("QX_V2_MOE_DECODE_DIRECT") };
+            }
+            let scratch = context.allocate_runtime_buffer(SCRATCH_FLOATS * 4).unwrap();
+            let output = context.allocate_runtime_buffer(HIDDEN * 4).unwrap();
+            let mut graph = context.begin_decode().unwrap();
+            graph
+                .encode_dynamic_q4_moe_batched_stage(
+                    &prepared, &input, &ids, &weights, &scratch, &output, stage,
+                )
+                .unwrap();
+            graph.finish(&context).unwrap();
+            context.read_runtime_f32(&scratch, SCRATCH_FLOATS).unwrap()
+        };
+
+        let canonical_gate_up = run_stage(0, false);
+        let direct_gate_up = run_stage(0, true);
+        let gate_up_error = canonical_gate_up
+            .iter()
+            .zip(&direct_gate_up)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            gate_up_error < 1.0e-5,
+            "decode-direct gate/up error: {gate_up_error}"
+        );
+
+        let run_down = |direct: bool| {
+            unsafe { std::env::remove_var("QX_V2_MOE_DECODE_DIRECT") };
+            let scratch = context.allocate_runtime_buffer(SCRATCH_FLOATS * 4).unwrap();
+            let output = context.allocate_runtime_buffer(HIDDEN * 4).unwrap();
+            let mut graph = context.begin_decode().unwrap();
+            graph
+                .encode_dynamic_q4_moe_batched_stage(
+                    &prepared, &input, &ids, &weights, &scratch, &output, 1,
+                )
+                .unwrap();
+            if direct {
+                unsafe { std::env::set_var("QX_V2_MOE_DECODE_DIRECT", "1") };
+            }
+            graph
+                .encode_dynamic_q4_moe_batched_stage(
+                    &prepared, &input, &ids, &weights, &scratch, &output, 2,
+                )
+                .unwrap();
+            graph.finish(&context).unwrap();
+            context.read_runtime_f32(&scratch, SCRATCH_FLOATS).unwrap()
+        };
+        let canonical_down = run_down(false);
+        let direct_down = run_down(true);
+        let down_offset = 8 * HIDDEN + 8 * 512;
+        let down_error = canonical_down[down_offset..down_offset + 8 * HIDDEN]
+            .iter()
+            .zip(&direct_down[down_offset..down_offset + 8 * HIDDEN])
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            down_error < 1.0e-5,
+            "decode-direct down error: {down_error}"
+        );
+        unsafe { std::env::remove_var("QX_V2_MOE_DECODE_DIRECT") };
     }
 
     #[cfg(target_os = "macos")]
