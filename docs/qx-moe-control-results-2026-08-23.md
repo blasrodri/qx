@@ -69,3 +69,33 @@ This closes the predecessor/cache-poisoning branch. The next comparison must
 be a matched live llama MoE measurement or a complete-program attribution;
 more predecessor, wave-width, or speculative-residency experiments are not
 currently justified.
+
+## llama.cpp grouped MoE reference
+
+The existing llama Metal profiler was extended with an opt-in grouped replay.
+It waits for the normal graph, then places all 48 gate/up nodes in one
+diagnostic command buffer, all 24 down nodes in another, and the complete MoE
+blocks in a third. This avoids the distortion of replaying one node per
+command buffer. Five short batch-1 decode runs produced:
+
+| llama grouped replay | GPU time |
+|---|---:|
+| gate/up, 48 nodes in one CB | 1.00–1.03 ms |
+| down, 24 nodes in one CB | 0.746–0.765 ms |
+| complete MoE block replay | 2.664–2.723 ms |
+
+The current QX fixed-route MoE CB2 is 2.244–2.257 ms. Its full-token stage
+differential decomposes into gate/up 1.444 ms and down 0.769 ms, or 2.213 ms
+before the small activation/accumulation terms. Thus QX is approximately
+0.45 ms slower than llama on the grouped matrix work, but the available
+evidence does **not** support a claim that QX's MoE explains the entire
+approximately 1.65 ms GPU-token gap. The llama complete-block replay also
+includes router, routing transforms, and weighted-output graph work, so it is
+not directly additive with either number.
+
+The grouped profiler is intentionally diagnostic rather than a production
+graph substitution. The next trusted decision is therefore a fresh complete
+token differential profile, with the remaining non-MoE components measured
+against the same workload. The immediate conclusion is to stop treating MoE
+as an unexplained 2x system deficit and investigate the largest remaining
+absolute live-token gaps.

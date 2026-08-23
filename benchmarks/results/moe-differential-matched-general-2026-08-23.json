@@ -1,0 +1,48 @@
+{
+  "schema_version": 2,
+  "qx_revision": "unknown",
+  "artifact": "external/models/granite-m5-pro-q4-factorial-rowinline.qx",
+  "artifact_hash": "e3f2940482d5999d",
+  "artifact_version": 2,
+  "plan_id": "factorial-rowinline-qx",
+  "target_id": "m5-pro",
+  "fixture_name": "general-systems",
+  "fixture_domain": "general",
+  "context": 512,
+  "position": 384,
+  "routes_frozen": true,
+  "iterations": 5,
+  "warmup": 2,
+  "rows": [
+    {
+      "name": "canonical MoE",
+      "gpu_us_per_token": 4373.291623778641,
+      "dispatches": 461,
+      "marginal_saved_us": 0.0
+    },
+    {
+      "name": "without gate/up",
+      "gpu_us_per_token": 2929.499838501215,
+      "dispatches": 461,
+      "marginal_saved_us": 1443.7917852774262
+    },
+    {
+      "name": "without SiLU",
+      "gpu_us_per_token": 4363.666521385312,
+      "dispatches": 461,
+      "marginal_saved_us": 9.625102393329144
+    },
+    {
+      "name": "without down",
+      "gpu_us_per_token": 3604.416735470295,
+      "dispatches": 461,
+      "marginal_saved_us": 768.8748883083463
+    },
+    {
+      "name": "without accumulation",
+      "gpu_us_per_token": 4352.708347141743,
+      "dispatches": 461,
+      "marginal_saved_us": 20.583276636898518
+    }
+  ]
+}
