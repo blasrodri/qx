@@ -31,10 +31,17 @@ pub fn activate_artifact_execution_plan(
             plan.schedule.command_buffers_per_token
         ));
     }
-    set_plan_env(
-        "QX_V2_COMMAND_BUFFERS",
-        &plan.schedule.command_buffers_per_token.to_string(),
-    );
+    // The sealed plan remains authoritative for normal execution. A
+    // benchmark-only override lets the planner measure alternative GPU
+    // schedules without rebuilding the artifact. It never introduces a CPU
+    // wait: DecodeGraph preserves queue ordering and the final token read is
+    // still the only host readback.
+    let command_buffers = std::env::var("QX_V2_COMMAND_BUFFERS_OVERRIDE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&count| (1..=LAYERS).contains(&count))
+        .unwrap_or(plan.schedule.command_buffers_per_token as usize);
+    set_plan_env("QX_V2_COMMAND_BUFFERS", &command_buffers.to_string());
     set_plan_env(
         "QX_V2_QKV_TOPOLOGY",
         match plan.topology.qkv {
@@ -497,6 +504,11 @@ impl PreparedAttentionStack {
                 "layer range {start_layer}..{end_layer} is outside 0..{LAYERS}"
             ));
         }
+        // These diagnostic schedules are intentionally constrained to the
+        // canonical one-buffer layer plan. If a caller is already testing a
+        // layer-sliced schedule, adding MoE boundaries would confound the
+        // comparison with accidental empty/duplicate boundaries.
+        let isolate_moe = command_buffers_per_token() == 1;
         for (layer, weights) in self
             .layers
             .iter()
@@ -564,6 +576,15 @@ impl PreparedAttentionStack {
                     active_k as u32,
                 )?;
             }
+            if isolate_moe && moe_boundary_enabled("cb-entry") {
+                // GPU queue ordering makes the router/top-k results visible
+                // to the next command buffer. No CPU wait or intermediate
+                // readback is introduced.
+                graph.begin_next_command_buffer(context)?;
+            }
+            if isolate_moe && moe_boundary_enabled("encoder-entry") {
+                graph.begin_next_encoder()?;
+            }
             if qx_metal::platform::rms_scalar_router_enabled() {
                 graph.encode_dynamic_q4_moe_batched_simd_normalized(
                     &moe.layers[layer],
@@ -594,6 +615,15 @@ impl PreparedAttentionStack {
                 buffers.buffer(output),
                 qx_model::RESIDUAL_MULTIPLIER,
             )?;
+            if isolate_moe && layer + 1 < LAYERS && moe_boundary_enabled("cb-exit") {
+                // Keep the routed expert block separate from the next dense
+                // block, so the experiment measures command-boundary effects
+                // rather than merely changing a dispatch count.
+                graph.begin_next_command_buffer(context)?;
+            }
+            if isolate_moe && layer + 1 < LAYERS && moe_boundary_enabled("encoder-exit") {
+                graph.begin_next_encoder()?;
+            }
         }
         Ok(())
     }
@@ -2381,6 +2411,27 @@ fn command_buffers_per_token() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&count| (1..=LAYERS).contains(&count))
         .unwrap_or(1)
+}
+
+/// Diagnostic schedule selector. Values are deliberately not part of the
+/// sealed artifact vocabulary yet; they distinguish kernel cost from command
+/// buffer/encoder boundary effects. Example values are `cb-entry`,
+/// `cb-exit`, `encoder-entry`, `encoder-exit`, or the comma-separated
+/// `cb-entry-exit`/`encoder-entry-exit` forms.
+#[cfg(target_os = "macos")]
+fn moe_boundary_enabled(boundary: &str) -> bool {
+    let Ok(value) = std::env::var("QX_V2_MOE_BOUNDARY") else {
+        return false;
+    };
+    if value == "1" || value == "isolate" || value == "entry-exit" {
+        return true;
+    }
+    if value == "cb-entry-exit" || value == "encoder-entry-exit" {
+        return boundary.starts_with(value.split('-').next().unwrap_or_default());
+    }
+    value
+        .split([',', '+'])
+        .any(|candidate| candidate.trim() == boundary)
 }
 
 #[cfg(target_os = "macos")]

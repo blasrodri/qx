@@ -975,7 +975,8 @@ pub mod platform {
         encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         dispatches: u64,
         counter_timeline: Option<CounterTimeline>,
-        committed: Vec<(Retained<ProtocolObject<dyn MTLCommandBuffer>>, u64)>,
+        committed: Vec<(Retained<ProtocolObject<dyn MTLCommandBuffer>>, u64, u64)>,
+        encoders: u64,
         encode_started_at: Instant,
     }
 
@@ -4875,8 +4876,24 @@ pub mod platform {
                 std::mem::replace(&mut self.command_buffer, next_command_buffer);
             previous_command_buffer.commit();
             self.committed
-                .push((previous_command_buffer, self.dispatches));
+                .push((previous_command_buffer, self.dispatches, self.encoders));
             self.dispatches = 0;
+            self.encoders = 1;
+            Ok(())
+        }
+
+        /// End the current compute encoder while keeping the command buffer
+        /// open. This is a scheduling-only boundary: all resources remain in
+        /// the same GPU command buffer and no host synchronization occurs.
+        pub fn begin_next_encoder(&mut self) -> Result<(), String> {
+            self.encoder.endEncoding();
+            let next_encoder = self
+                .command_buffer
+                .computeCommandEncoder()
+                .ok_or_else(|| "Runtime V2 encoder allocation failed".to_owned())?;
+            let previous_encoder = std::mem::replace(&mut self.encoder, next_encoder);
+            drop(previous_encoder);
+            self.encoders += 1;
             Ok(())
         }
 
@@ -4885,8 +4902,9 @@ pub mod platform {
             self.command_buffer.commit();
             let wait_start = Instant::now();
             self.command_buffer.waitUntilCompleted();
-            self.committed.push((self.command_buffer, self.dispatches));
-            for (command_buffer, _) in &self.committed {
+            self.committed
+                .push((self.command_buffer, self.dispatches, self.encoders));
+            for (command_buffer, _, _) in &self.committed {
                 if command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
                     return Err("Runtime V2 command buffer execution failed".to_owned());
                 }
@@ -4898,7 +4916,7 @@ pub mod platform {
             let gpu_duration_seconds = self
                 .committed
                 .iter()
-                .map(|(command_buffer, _)| {
+                .map(|(command_buffer, _, _)| {
                     (command_buffer.GPUEndTime() - command_buffer.GPUStartTime()).max(0.0)
                 })
                 .sum::<f64>();
@@ -4912,7 +4930,7 @@ pub mod platform {
                     segment_gpu_seconds: self
                         .committed
                         .iter()
-                        .map(|(command_buffer, _)| {
+                        .map(|(command_buffer, _, _)| {
                             (command_buffer.GPUEndTime() - command_buffer.GPUStartTime()).max(0.0)
                         })
                         .collect(),
@@ -4922,7 +4940,7 @@ pub mod platform {
                 stage_timeline.segment_gpu_seconds = self
                     .committed
                     .iter()
-                    .map(|(command_buffer, _)| {
+                    .map(|(command_buffer, _, _)| {
                         (command_buffer.GPUEndTime() - command_buffer.GPUStartTime()).max(0.0)
                     })
                     .collect();
@@ -4932,16 +4950,20 @@ pub mod platform {
                 .lock()
                 .map_err(|_| "Metal stage timeline cache is poisoned".to_owned())? = stage_timeline;
             metrics.command_buffers += self.committed.len() as u64;
-            metrics.encoders += self.committed.len() as u64;
+            metrics.encoders += self
+                .committed
+                .iter()
+                .map(|(_, _, encoders)| *encoders)
+                .sum::<u64>();
             metrics.dispatches += self
                 .committed
                 .iter()
-                .map(|(_, dispatches)| *dispatches)
+                .map(|(_, dispatches, _)| *dispatches)
                 .sum::<u64>();
             metrics.gpu_time_seconds += self
                 .committed
                 .iter()
-                .map(|(command_buffer, _)| {
+                .map(|(command_buffer, _, _)| {
                     (command_buffer.GPUEndTime() - command_buffer.GPUStartTime()).max(0.0)
                 })
                 .sum::<f64>();
@@ -5065,6 +5087,7 @@ pub mod platform {
                     None
                 },
                 committed: Vec::new(),
+                encoders: 1,
                 encode_started_at: Instant::now(),
             })
         }

@@ -114,6 +114,9 @@ struct Args {
     /// Capture contextual gate/up, fixed-route MoE, and complete-token timings.
     #[arg(long)]
     v2_moe_contextual_profile: bool,
+    /// Measure fixed-route MoE after controlled GPU predecessor workloads.
+    #[arg(long)]
+    v2_moe_predecessor_profile: bool,
     /// Label for the candidate being measured in a contextual profile.
     #[arg(long, default_value = "canonical")]
     contextual_candidate: String,
@@ -429,6 +432,24 @@ fn main() -> Result<()> {
             args.iterations,
             fixture.as_ref(),
             &args.contextual_candidate,
+            args.result_json.as_deref(),
+        );
+    }
+    if args.v2_moe_predecessor_profile {
+        let artifact = args.artifact.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--v2-moe-predecessor-profile requires an artifact path")
+        })?;
+        let fixture = args.fixture.as_deref().map(load_fixture).transpose()?;
+        let context = fixture
+            .as_ref()
+            .and_then(|fixture| fixture.context)
+            .unwrap_or(args.context);
+        return benchmark_v2_moe_predecessor_profile(
+            artifact,
+            context,
+            args.warmup,
+            args.iterations,
+            fixture.as_ref(),
             args.result_json.as_deref(),
         );
     }
@@ -2602,6 +2623,144 @@ fn benchmark_v2_moe_contextual_profile(
 }
 
 #[cfg(target_os = "macos")]
+fn encode_moe_predecessor(
+    graph: &mut qx_metal::platform::DecodeGraph,
+    context: &qx_metal::platform::MetalContext,
+    buffers: &qx_runtime_v2::GpuRuntimeBuffers,
+    moe: &qx_runtime_v2::PreparedMoeStack,
+    route_trace: &RouteTrace,
+    mode: &str,
+) -> Result<()> {
+    match mode {
+        "none" => Ok(()),
+        "noop-24" => differential_noops(graph, context, LAYERS),
+        "compute-24" => {
+            for layer in 0..LAYERS {
+                let ids = route_trace.ids_for(layer)?;
+                graph
+                    .encode_dynamic_q4_moe_gate_up_synthetic(
+                        &moe.layers[layer],
+                        buffers.buffer(qx_runtime_v2::BufferId::MoeInput),
+                        &ids,
+                        buffers.buffer(qx_runtime_v2::BufferId::MoeOutput),
+                    )
+                    .map_err(anyhow::Error::msg)?;
+            }
+            Ok(())
+        }
+        "memory-24" => {
+            for layer in 0..LAYERS {
+                let ids = route_trace.ids_for(layer)?;
+                graph
+                    .encode_dynamic_q4_moe_gate_up_touch(
+                        &moe.layers[layer],
+                        &ids,
+                        buffers.buffer(qx_runtime_v2::BufferId::MoeInput),
+                        buffers.buffer(qx_runtime_v2::BufferId::MoeScratch),
+                        0,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+            }
+            Ok(())
+        }
+        other => bail!(
+            "unknown MoE predecessor {other}; expected none, noop-24, compute-24, or memory-24"
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn benchmark_v2_moe_predecessor_profile(
+    artifact_path: &std::path::Path,
+    context_length: usize,
+    warmup: usize,
+    iterations: usize,
+    fixture: Option<&BenchmarkFixture>,
+    result_json: Option<&std::path::Path>,
+) -> Result<()> {
+    use std::rc::Rc;
+    if iterations == 0 {
+        bail!("MoE predecessor profile iterations must be positive");
+    }
+    let context = Rc::new(
+        qx_metal::platform::MetalContext::system_default()
+            .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
+    );
+    let plan = ExecutionPlan::granite(context_length).map_err(anyhow::Error::msg)?;
+    let buffers =
+        qx_runtime_v2::GpuRuntimeBuffers::new(context.clone(), plan).map_err(anyhow::Error::msg)?;
+    let mapped_artifact = std::sync::Arc::new(MappedArtifact::open(artifact_path)?);
+    let stack = qx_runtime_v2::PreparedAttentionStack::load_from_mapped_artifact(
+        context.as_ref(),
+        mapped_artifact.clone(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let moe = qx_runtime_v2::PreparedMoeStack::load_from_mapped_artifact(
+        context.as_ref(),
+        mapped_artifact,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let position = replay_contextual_fixture(
+        context.as_ref(),
+        &buffers,
+        &stack,
+        &moe,
+        fixture,
+        context_length,
+    )?;
+    let route_trace = capture_route_trace(context.as_ref(), &buffers, &stack, &moe, position)?;
+    let modes = ["none", "noop-24", "compute-24", "memory-24"];
+    let mut rows = Vec::with_capacity(modes.len());
+    println!("QX fixed-route MoE predecessor perturbation");
+    println!("artifact:         {}", artifact_path.display());
+    println!("context/position: {context_length}/{position}");
+    println!("routes frozen:    true");
+    println!("predecessor                         GPU us       wall us  dispatches");
+    for mode in modes {
+        let timing =
+            profile_graph_stage_contextual(context.as_ref(), warmup, iterations, |graph| {
+                encode_moe_predecessor(
+                    graph,
+                    context.as_ref(),
+                    &buffers,
+                    &moe,
+                    &route_trace,
+                    mode,
+                )?;
+                encode_fixed_route_moe(graph, &buffers, &stack, &moe, &route_trace, false)
+            })?;
+        println!(
+            "{mode:<34} {:>10.2}  {:>10.2}  {:>10.2}",
+            timing.gpu_us_per_sample, timing.wall_us_per_sample, timing.dispatches_per_sample
+        );
+        rows.push(serde_json::json!({
+            "predecessor": mode,
+            "timing": timing,
+        }));
+    }
+    if let Some(path) = result_json {
+        let (artifact_bytes, artifact_hash) = artifact_fingerprint(artifact_path)?;
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "mode": "v2_moe_predecessor_profile",
+            "artifact": artifact_path.display().to_string(),
+            "artifact_bytes": artifact_bytes,
+            "artifact_hash": format!("{artifact_hash:016x}"),
+            "fixture": fixture.map(|value| value.name.clone()),
+            "context": context_length,
+            "position": position,
+            "iterations": iterations,
+            "warmup": warmup,
+            "routes_frozen": true,
+            "rows": rows,
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
+        println!("result JSON: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn artifact_fingerprint(path: &std::path::Path) -> Result<(u64, u64)> {
     use std::hash::Hasher;
     use std::io::Read;
@@ -4402,6 +4561,18 @@ fn benchmark_v2_moe_contextual_profile(
     _result_json: Option<&std::path::Path>,
 ) -> Result<()> {
     bail!("--v2-moe-contextual-profile requires macOS Metal")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn benchmark_v2_moe_predecessor_profile(
+    _artifact_path: &std::path::Path,
+    _context_length: usize,
+    _warmup: usize,
+    _iterations: usize,
+    _fixture: Option<&BenchmarkFixture>,
+    _result_json: Option<&std::path::Path>,
+) -> Result<()> {
+    bail!("--v2-moe-predecessor-profile requires macOS Metal")
 }
 
 #[cfg(not(target_os = "macos"))]
