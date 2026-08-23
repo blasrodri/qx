@@ -656,35 +656,57 @@ impl PreparedAttentionStack {
         } else {
             BufferId::HiddenB
         };
-        graph.encode_rmsnorm(
-            context,
-            buffers.buffer(final_hidden),
-            &self.final_norm,
-            buffers.buffer(BufferId::MoeInput),
-        )?;
-        if qx_metal::platform::final_argmax_fused_enabled() {
-            graph.encode_prepared_q4_dense_argmax(
+        if qx_metal::platform::final_argmax_normalized_enabled() {
+            let inverse_rms = buffers
+                .buffer(BufferId::MoeScratch)
+                .subregion(81_916, std::mem::size_of::<f32>())?;
+            graph.encode_rmsnorm_scalar(
+                context,
+                buffers.buffer(final_hidden),
+                &self.final_norm,
+                &inverse_rms,
+            )?;
+            graph.encode_prepared_q4_dense_argmax_normalized(
                 context,
                 &self.embedding,
-                buffers.buffer(BufferId::MoeInput),
+                buffers.buffer(final_hidden),
+                &self.final_norm,
+                &inverse_rms,
                 buffers.buffer(BufferId::MoeScratch),
                 buffers.buffer(BufferId::TokenOutput),
                 1.0 / qx_model::LOGITS_SCALING,
             )?;
         } else {
-            graph.encode_prepared_q4_dense_simd_scaled(
-                &self.embedding,
-                buffers.buffer(BufferId::MoeInput),
-                buffers.buffer(BufferId::Logits),
-                1.0 / qx_model::LOGITS_SCALING,
-            )?;
-            graph.encode_argmax(
+            graph.encode_rmsnorm(
                 context,
-                buffers.buffer(BufferId::Logits),
-                buffers.buffer(BufferId::MoeScratch),
-                buffers.buffer(BufferId::TokenOutput),
-                VOCAB,
+                buffers.buffer(final_hidden),
+                &self.final_norm,
+                buffers.buffer(BufferId::MoeInput),
             )?;
+            if qx_metal::platform::final_argmax_fused_enabled() {
+                graph.encode_prepared_q4_dense_argmax(
+                    context,
+                    &self.embedding,
+                    buffers.buffer(BufferId::MoeInput),
+                    buffers.buffer(BufferId::MoeScratch),
+                    buffers.buffer(BufferId::TokenOutput),
+                    1.0 / qx_model::LOGITS_SCALING,
+                )?;
+            } else {
+                graph.encode_prepared_q4_dense_simd_scaled(
+                    &self.embedding,
+                    buffers.buffer(BufferId::MoeInput),
+                    buffers.buffer(BufferId::Logits),
+                    1.0 / qx_model::LOGITS_SCALING,
+                )?;
+                graph.encode_argmax(
+                    context,
+                    buffers.buffer(BufferId::Logits),
+                    buffers.buffer(BufferId::MoeScratch),
+                    buffers.buffer(BufferId::TokenOutput),
+                    VOCAB,
+                )?;
+            }
         }
         Ok(())
     }

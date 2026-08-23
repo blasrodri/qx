@@ -1835,7 +1835,22 @@ fn encode_differential_token(
         // final RMSNorm + LM head + the two-pass argmax reduction
         noop(graph, 4)?;
     } else {
-        if skip == Some(DifferentialBlock::FinalRmsNorm) {
+        let normalized_fused =
+            qx_metal::platform::final_argmax_normalized_enabled() && skip.is_none();
+        let inverse_rms = buffers
+            .buffer(qx_runtime_v2::BufferId::MoeScratch)
+            .subregion(81_916, std::mem::size_of::<f32>())
+            .map_err(anyhow::Error::msg)?;
+        if normalized_fused {
+            graph
+                .encode_rmsnorm_scalar(
+                    context,
+                    buffers.buffer(final_hidden),
+                    &stack.final_norm,
+                    &inverse_rms,
+                )
+                .map_err(anyhow::Error::msg)?;
+        } else if skip == Some(DifferentialBlock::FinalRmsNorm) {
             noop(graph, 1)?;
         } else {
             graph
@@ -1847,7 +1862,20 @@ fn encode_differential_token(
                 )
                 .map_err(anyhow::Error::msg)?;
         }
-        if qx_metal::platform::final_argmax_fused_enabled() && skip.is_none() {
+        if normalized_fused {
+            graph
+                .encode_prepared_q4_dense_argmax_normalized(
+                    context,
+                    &stack.embedding,
+                    buffers.buffer(final_hidden),
+                    &stack.final_norm,
+                    &inverse_rms,
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeScratch),
+                    buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+                    1.0 / LOGITS_SCALING,
+                )
+                .map_err(anyhow::Error::msg)?;
+        } else if qx_metal::platform::final_argmax_fused_enabled() && skip.is_none() {
             graph
                 .encode_prepared_q4_dense_argmax(
                     context,

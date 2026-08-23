@@ -135,6 +135,75 @@ kernel void qx_q4_dense_argmax_partial(
     }
 }
 
+// Projection-aware variant of the exact greedy vocabulary path. The final
+// RMS scalar and norm weights are consumed while reading the raw hidden
+// vector, so no normalized hidden activation buffer is materialized.
+kernel void qx_q4_dense_argmax_norm_partial(
+    device const uchar* packed [[buffer(0)]],
+    device const half* scales [[buffer(1)]],
+    device const float* input [[buffer(2)]],
+    device qx_q4_argmax_partial_t* partials [[buffer(3)]],
+    constant uint& columns [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant float& multiplier [[buffer(6)]],
+    device const float* norm_weights [[buffer(7)]],
+    device const float* inverse_rms [[buffer(8)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint local_tid [[thread_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    constexpr uint group_size = 32;
+    constexpr uint bytes_per_group = 16;
+    constexpr int qmax = 7;
+    constexpr uint rows_per_threadgroup = 8;
+    threadgroup float values[rows_per_threadgroup];
+    threadgroup uint indices[rows_per_threadgroup];
+
+    if (local_tid < rows_per_threadgroup) {
+        values[local_tid] = -3.402823466e+38f;
+        indices[local_tid] = 0xffffffffu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row = threadgroup_id * rows_per_threadgroup + simdgroup;
+    float sum = 0.0f;
+    float inverse = inverse_rms[0];
+    if (row < rows) {
+        uint groups = (columns + group_size - 1) / group_size;
+        for (uint column = lane; column < columns; column += 32) {
+            uint group = column / group_size;
+            uint local = column % group_size;
+            uchar byte = packed[row * groups * bytes_per_group
+                + group * bytes_per_group + local / 2];
+            uint code = (byte >> ((local % 2) * 4)) & 0xf;
+            float weight = float(int(code) - qmax) * float(scales[row * groups + group]);
+            float activation = input[column] * inverse * norm_weights[column];
+            sum += weight * activation;
+        }
+        sum = simd_sum(sum) * multiplier;
+    }
+    if (lane == 0) {
+        values[simdgroup] = row < rows ? sum : -3.402823466e+38f;
+        indices[simdgroup] = row < rows ? row : 0xffffffffu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (local_tid == 0) {
+        float best_value = values[0];
+        uint best_index = indices[0];
+        for (uint i = 1; i < rows_per_threadgroup; ++i) {
+            float value = values[i];
+            uint index = indices[i];
+            if (value > best_value || (value == best_value && index < best_index)) {
+                best_value = value;
+                best_index = index;
+            }
+        }
+        partials[threadgroup_id].value = best_value;
+        partials[threadgroup_id].index = best_index;
+    }
+}
+
 // SIMD Q4 GEMV that applies RMSNorm projection-wise while consuming the raw
 // activation vector. This is used for the post-attention router boundary.
 kernel void qx_q4_simd_norm_gemv(

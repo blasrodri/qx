@@ -57,6 +57,12 @@ performance. Because it intentionally does not materialize logits, full-logit
 parity and quality tools must continue to run with the default path; this
 candidate is currently generation-only.
 
+Candidate B, enabled with `QX_V2_FINAL_ARGMAX_NORMALIZED=1`, computes a
+scalar final RMS and applies the norm weights inside the vocabulary argmax
+kernel. Its 128-token generated stream also matched the control exactly, but
+it measured 209.75 tok/s and 4.310 ms GPU/token. It is slower than both the
+control and candidate A, so the final-head structural lane is now closed.
+
 ## Matched llama reference replay
 
 Using the instrumented llama Metal replay at `-p 384 -n 128 -b 1 -ub 1

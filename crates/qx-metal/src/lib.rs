@@ -213,6 +213,21 @@ pub mod platform {
         })
     }
 
+    /// Projection-aware final RMS plus greedy vocabulary reduction.
+    pub fn final_argmax_normalized_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("QX_V2_FINAL_ARGMAX_NORMALIZED")
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
     /// Exact-Q4 row-inline candidate: skip per-threadgroup activation staging
     /// when the 4 KiB vector is already hot from the preceding router/RMS path.
     /// Set `QX_V2_MOE_INLINE_INPUT_CACHE=0` to evaluate the no-cache mapping.
@@ -1044,6 +1059,7 @@ pub mod platform {
         q4_dense_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_sweep_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_argmax_norm_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_simd_norm_pipeline: Mutex<Option<Pipeline>>,
@@ -1288,6 +1304,54 @@ pub mod platform {
             token_output: &RuntimeBuffer,
             multiplier: f32,
         ) -> Result<(), String> {
+            self.encode_prepared_q4_dense_argmax_impl(
+                context,
+                prepared,
+                input,
+                None,
+                None,
+                partials,
+                token_output,
+                multiplier,
+            )
+        }
+
+        /// Projection-aware exact vocabulary projection. The raw input is
+        /// normalized inside the consumer using the scalar inverse RMS.
+        pub fn encode_prepared_q4_dense_argmax_normalized(
+            &mut self,
+            context: &MetalContext,
+            prepared: &PreparedQuantizedDense,
+            input: &RuntimeBuffer,
+            norm_weights: &RuntimeBuffer,
+            inverse_rms: &RuntimeBuffer,
+            partials: &RuntimeBuffer,
+            token_output: &RuntimeBuffer,
+            multiplier: f32,
+        ) -> Result<(), String> {
+            self.encode_prepared_q4_dense_argmax_impl(
+                context,
+                prepared,
+                input,
+                Some(norm_weights),
+                Some(inverse_rms),
+                partials,
+                token_output,
+                multiplier,
+            )
+        }
+
+        fn encode_prepared_q4_dense_argmax_impl(
+            &mut self,
+            context: &MetalContext,
+            prepared: &PreparedQuantizedDense,
+            input: &RuntimeBuffer,
+            norm_weights: Option<&RuntimeBuffer>,
+            inverse_rms: Option<&RuntimeBuffer>,
+            partials: &RuntimeBuffer,
+            token_output: &RuntimeBuffer,
+            multiplier: f32,
+        ) -> Result<(), String> {
             if input.length < prepared.columns * std::mem::size_of::<f32>()
                 || token_output.length < std::mem::size_of::<u32>()
             {
@@ -1303,7 +1367,11 @@ pub mod platform {
             let columns = prepared.columns as u32;
             let rows = prepared.rows as u32;
             let partial_count_u32 = partial_count as u32;
-            let pipeline = context.q4_dense_argmax_pipeline()?;
+            let pipeline = if norm_weights.is_some() {
+                context.q4_dense_argmax_norm_pipeline()?
+            } else {
+                context.q4_dense_argmax_pipeline()?
+            };
             self.encoder.setComputePipelineState(&pipeline);
             unsafe {
                 self.encoder.setBuffer_offset_atIndex(
@@ -1332,6 +1400,18 @@ pub mod platform {
                     std::mem::size_of_val(&multiplier),
                     6,
                 );
+                if let (Some(norm_weights), Some(inverse_rms)) = (norm_weights, inverse_rms) {
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&norm_weights.buffer),
+                        norm_weights.offset,
+                        7,
+                    );
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&inverse_rms.buffer),
+                        inverse_rms.offset,
+                        8,
+                    );
+                }
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
@@ -5434,6 +5514,7 @@ pub mod platform {
                 q4_dense_simd_pipeline: Mutex::new(None),
                 q4_dense_sweep_pipeline: Mutex::new(None),
                 q4_dense_argmax_pipeline: Mutex::new(None),
+                q4_dense_argmax_norm_pipeline: Mutex::new(None),
                 q4_qkv_pipeline: Mutex::new(None),
                 q4_qkv_simd_pipeline: Mutex::new(None),
                 q4_qkv_simd_norm_pipeline: Mutex::new(None),
@@ -6332,6 +6413,27 @@ pub mod platform {
                 .map_err(|_| {
                     "Metal argmax partial-reduction pipeline creation failed".to_owned()
                 })?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_dense_argmax_norm_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_argmax_norm_pipeline
+                .lock()
+                .map_err(|_| "Metal normalized Q4 argmax pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_argmax_norm_partial");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal normalized Q4 argmax function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal normalized Q4 argmax pipeline creation failed".to_owned())?;
             *pipeline = Some(value.clone());
             Ok(value)
         }
