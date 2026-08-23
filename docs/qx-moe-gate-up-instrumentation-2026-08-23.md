@@ -7,7 +7,7 @@ Artifact hash: `e3f2940482d5999d`
 
 ## What was added
 
-The existing row-inline Q4 gate/up dispatch now has seven diagnostic variants,
+The existing row-inline Q4 gate/up dispatch now has eight diagnostic variants,
 selected with `QX_V2_MOE_GATE_UP_INSTRUMENT`:
 
 ```text
@@ -24,6 +24,8 @@ contiguous-load-only  keep the production mapping and load count, but use a
                       unique contiguous per-threadgroup stream
 load-two-groups       keep the real routed stream but interleave two
                       independent group-load sequences per lane
+load-unique-packet    cooperatively load each packet's 16 code bytes and
+                      2 scale bytes once across the SIMD group
 ```
 
 The variants preserve the production path's:
@@ -241,6 +243,30 @@ a representation whose decoder can consume multiple Q4 packets with fewer
 address and conversion dependencies. Those should be tested with complete
 production-shaped controls, not inferred from this rejected diagnostic.
 
+## Cooperative packet-load diagnostic
+
+The static count showed that the canonical load-only diagnostic repeatedly
+reads the same 16 code bytes and 2-byte scale across the 32 lanes of each
+group. `load-unique-packet` keeps the same expert/row/group addresses and
+activation staging, but assigns the 16 code bytes of two adjacent groups to
+lanes 0..31 and loads each group's scale from only two lanes. It still sinks a
+checksum and performs no model arithmetic, so it is diagnostic only.
+
+| Variant | 24-layer gate/up GPU µs | µs / layer |
+|---|---:|---:|
+| load-only | 1,263.42 | 52.64 |
+| load-two-groups | 1,434.50 | 59.77 |
+| load-unique-packet | **92.21** | **3.84** |
+
+This is the first result that isolates a large, concrete low-level mechanism:
+the current production-shaped load path is issuing redundant code/scale reads
+across lanes. The result is not directly convertible into end-to-end speedup,
+because the candidate omits Q4 decode, FMA, SIMD reduction, and model stores.
+It does justify building an exact semantic cooperative packet consumer next.
+That kernel must decode both nibbles from each uniquely loaded code byte,
+broadcast one scale per packet, accumulate the corresponding activation pair,
+and pass the full sequential parity gate before any promotion decision.
+
 Result records:
 
 - `benchmarks/results/gateup-instrument-canonical-general-2026-08-23.json`
@@ -259,3 +285,4 @@ Result records:
 - `benchmarks/results/gateup-instrument-averaged-address-only-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-averaged-contiguous-load-only-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-averaged-load-two-groups-2026-08-23.json`
+- `benchmarks/results/gateup-instrument-averaged-load-unique-packet-2026-08-23.json`

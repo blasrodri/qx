@@ -402,6 +402,7 @@ pub mod platform {
         AddressOnly,
         ContiguousLoadOnly,
         LoadTwoGroups,
+        LoadUniquePacket,
         LoadOnly,
         LoadDecode,
         DotNoReduction,
@@ -424,6 +425,9 @@ pub mod platform {
             | Some("contiguous-load") => Some(MoeGateUpInstrumentVariant::ContiguousLoadOnly),
             Some("load-two-groups") | Some("load_two_groups") => {
                 Some(MoeGateUpInstrumentVariant::LoadTwoGroups)
+            }
+            Some("load-unique-packet") | Some("load_unique_packet") => {
+                Some(MoeGateUpInstrumentVariant::LoadUniquePacket)
             }
             Some("load-only") | Some("load_only") => Some(MoeGateUpInstrumentVariant::LoadOnly),
             Some("load-decode") | Some("load_decode") => {
@@ -848,6 +852,7 @@ pub mod platform {
         gate_up_instrument_address_only_pipeline: Pipeline,
         gate_up_instrument_contiguous_load_only_pipeline: Pipeline,
         gate_up_instrument_load_two_groups_pipeline: Pipeline,
+        gate_up_instrument_load_unique_packet_pipeline: Pipeline,
         gate_up_instrument_load_decode_pipeline: Pipeline,
         gate_up_instrument_dot_no_reduce_pipeline: Pipeline,
         gate_up_instrument_load_only_norm_pipeline: Pipeline,
@@ -855,6 +860,7 @@ pub mod platform {
         gate_up_instrument_address_only_norm_pipeline: Pipeline,
         gate_up_instrument_contiguous_load_only_norm_pipeline: Pipeline,
         gate_up_instrument_load_two_groups_norm_pipeline: Pipeline,
+        gate_up_instrument_load_unique_packet_norm_pipeline: Pipeline,
         gate_up_instrument_load_decode_norm_pipeline: Pipeline,
         gate_up_instrument_dot_no_reduce_norm_pipeline: Pipeline,
         q4k_mature_gate_up_pipeline: Pipeline,
@@ -2441,6 +2447,9 @@ pub mod platform {
                 (MoeGateUpInstrumentVariant::LoadTwoGroups, false) => {
                     &prepared.gate_up_instrument_load_two_groups_pipeline
                 }
+                (MoeGateUpInstrumentVariant::LoadUniquePacket, false) => {
+                    &prepared.gate_up_instrument_load_unique_packet_pipeline
+                }
                 (MoeGateUpInstrumentVariant::LoadOnly, false) => {
                     &prepared.gate_up_instrument_load_only_pipeline
                 }
@@ -2464,6 +2473,9 @@ pub mod platform {
                 }
                 (MoeGateUpInstrumentVariant::LoadTwoGroups, true) => {
                     &prepared.gate_up_instrument_load_two_groups_norm_pipeline
+                }
+                (MoeGateUpInstrumentVariant::LoadUniquePacket, true) => {
+                    &prepared.gate_up_instrument_load_unique_packet_norm_pipeline
                 }
                 (MoeGateUpInstrumentVariant::LoadDecode, true) => {
                     &prepared.gate_up_instrument_load_decode_norm_pipeline
@@ -7633,6 +7645,13 @@ pub mod platform {
                 "qx_dynamic_q4_moe_down_simd"
             };
             Ok(PreparedDynamicQ4Moe {
+                gate_up_instrument_load_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_simd",
+                )?,
+                gate_up_instrument_load_unique_packet_norm_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_norm_simd",
+                    )?,
                 gate_up_instrument_load_two_groups_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_two_groups_simd",
                 )?,
@@ -7958,6 +7977,13 @@ pub mod platform {
                 "qx_dynamic_q4_moe_down_simd"
             };
             let mut prepared = PreparedDynamicQ4Moe {
+                gate_up_instrument_load_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_simd",
+                )?,
+                gate_up_instrument_load_unique_packet_norm_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_norm_simd",
+                    )?,
                 gate_up_instrument_load_two_groups_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_two_groups_simd",
                 )?,
@@ -8239,6 +8265,13 @@ pub mod platform {
             let q3_down_packed = q3_down_packed.unwrap_or_else(|| dummy.clone());
             let q3_down_scales = q3_down_scales.unwrap_or_else(|| dummy.clone());
             let prepared = PreparedDynamicQ4Moe {
+                gate_up_instrument_load_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_simd",
+                )?,
+                gate_up_instrument_load_unique_packet_norm_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_norm_simd",
+                    )?,
                 gate_up_instrument_load_two_groups_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_two_groups_simd",
                 )?,
@@ -8613,6 +8646,13 @@ pub mod platform {
                 gate_up_instrument_load_two_groups_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_two_groups_norm_simd",
                 )?,
+                gate_up_instrument_load_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_simd",
+                )?,
+                gate_up_instrument_load_unique_packet_norm_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_norm_simd",
+                    )?,
                 pipeline: self.dynamic_moe_pipeline()?,
                 simd_pipeline: self.dynamic_moe_simd_pipeline()?,
                 batched_gate_up_pipeline: self
