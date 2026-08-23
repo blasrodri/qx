@@ -392,6 +392,34 @@ pub mod platform {
         )
     }
 
+    /// Selects a diagnostic variant of the production row-inline gate/up
+    /// consumer. `canonical` (or an unset variable) leaves the normal kernel
+    /// selected. The other values are intentionally non-semantic profiling
+    /// paths and must never be used for model output.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum MoeGateUpInstrumentVariant {
+        LoadOnly,
+        LoadDecode,
+        DotNoReduction,
+    }
+
+    pub fn moe_gate_up_instrument_variant() -> Option<MoeGateUpInstrumentVariant> {
+        match std::env::var("QX_V2_MOE_GATE_UP_INSTRUMENT")
+            .ok()
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("load-only") | Some("load_only") => Some(MoeGateUpInstrumentVariant::LoadOnly),
+            Some("load-decode") | Some("load_decode") => {
+                Some(MoeGateUpInstrumentVariant::LoadDecode)
+            }
+            Some("dot-no-reduction") | Some("dot_no_reduction") => {
+                Some(MoeGateUpInstrumentVariant::DotNoReduction)
+            }
+            _ => None,
+        }
+    }
+
     pub fn moe_q4k_mature_gate_up_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
@@ -799,6 +827,12 @@ pub mod platform {
         decode_direct_gate_up_norm_pipeline: Pipeline,
         two_row_dataflow_gate_up_pipeline: Option<Pipeline>,
         two_row_dataflow_gate_up_norm_pipeline: Option<Pipeline>,
+        gate_up_instrument_load_only_pipeline: Pipeline,
+        gate_up_instrument_load_decode_pipeline: Pipeline,
+        gate_up_instrument_dot_no_reduce_pipeline: Pipeline,
+        gate_up_instrument_load_only_norm_pipeline: Pipeline,
+        gate_up_instrument_load_decode_norm_pipeline: Pipeline,
+        gate_up_instrument_dot_no_reduce_norm_pipeline: Pipeline,
         q4k_mature_gate_up_pipeline: Pipeline,
         q4k_mature_gate_up_norm_pipeline: Pipeline,
         fused_block_qx_gate_up_pipeline: Option<Pipeline>,
@@ -2362,6 +2396,38 @@ pub mod platform {
             Ok(())
         }
 
+        fn select_gate_up_instrument_pipeline(
+            &mut self,
+            prepared: &PreparedDynamicQ4Moe,
+            normalized: bool,
+        ) -> Result<bool, String> {
+            let Some(variant) = moe_gate_up_instrument_variant() else {
+                return Ok(false);
+            };
+            let pipeline = match (variant, normalized) {
+                (MoeGateUpInstrumentVariant::LoadOnly, false) => {
+                    &prepared.gate_up_instrument_load_only_pipeline
+                }
+                (MoeGateUpInstrumentVariant::LoadDecode, false) => {
+                    &prepared.gate_up_instrument_load_decode_pipeline
+                }
+                (MoeGateUpInstrumentVariant::DotNoReduction, false) => {
+                    &prepared.gate_up_instrument_dot_no_reduce_pipeline
+                }
+                (MoeGateUpInstrumentVariant::LoadOnly, true) => {
+                    &prepared.gate_up_instrument_load_only_norm_pipeline
+                }
+                (MoeGateUpInstrumentVariant::LoadDecode, true) => {
+                    &prepared.gate_up_instrument_load_decode_norm_pipeline
+                }
+                (MoeGateUpInstrumentVariant::DotNoReduction, true) => {
+                    &prepared.gate_up_instrument_dot_no_reduce_norm_pipeline
+                }
+            };
+            self.encoder.setComputePipelineState(pipeline);
+            Ok(true)
+        }
+
         /// GPU-resident batched SIMD MoE. The eight selected experts remain
         /// GPU-selected, while four fixed dispatches perform gate/up, SiLU,
         /// down, and weighted accumulation without eight expert-by-expert
@@ -2458,6 +2524,10 @@ pub mod platform {
             let gate_up_layout = prepared.gate_up_layout as u32;
             let down_layout = prepared.down_layout as u32;
             let q3_block_bytes = prepared.q3_gate_up_block_bytes;
+            let gate_up_instrument = moe_gate_up_instrument_variant().is_some()
+                && prepared.inline_layout
+                && prepared.gate_up_layout == PackingLayout::Q4RowInline
+                && q3_block_bytes.is_none();
             let is_q4k = prepared.gate_up_packed.length == 32 * 1024 * 4 * 140
                 && prepared.gate_up_scales.length == 32 * 1024 * 4 * 2 * 2
                 && prepared.down_packed.length == 32 * 1024 * 2 * 140
@@ -2514,7 +2584,8 @@ pub mod platform {
                 && !row_inline_streaming;
 
             if let Some((norm_weights, inverse_rms)) = norm {
-                if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
+                if gate_up_instrument && self.select_gate_up_instrument_pipeline(prepared, true)? {
+                } else if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
                     self.encoder.setComputePipelineState(pipeline);
                 } else if q4k_mature_gate_up {
                     self.encoder
@@ -2605,7 +2676,8 @@ pub mod platform {
                     );
                 }
             } else {
-                if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
+                if gate_up_instrument && self.select_gate_up_instrument_pipeline(prepared, false)? {
+                } else if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
                     self.encoder.setComputePipelineState(pipeline);
                 } else if q4k_mature_gate_up {
                     self.encoder
@@ -3811,6 +3883,10 @@ pub mod platform {
             let gate_up_layout = prepared.gate_up_layout as u32;
             let down_layout = prepared.down_layout as u32;
             let q3_block_bytes = prepared.q3_gate_up_block_bytes;
+            let gate_up_instrument = moe_gate_up_instrument_variant().is_some()
+                && prepared.inline_layout
+                && prepared.gate_up_layout == PackingLayout::Q4RowInline
+                && q3_block_bytes.is_none();
             let is_q4k = prepared.gate_up_packed.length == 32 * 1024 * 4 * 140
                 && prepared.gate_up_scales.length == 32 * 1024 * 4 * 2 * 2
                 && prepared.down_packed.length == 32 * 1024 * 2 * 140
@@ -3842,7 +3918,10 @@ pub mod platform {
             match stage {
                 0 => {
                     if let Some((norm_weights, inverse_rms)) = norm {
-                        if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
+                        if gate_up_instrument
+                            && self.select_gate_up_instrument_pipeline(prepared, true)?
+                        {
+                        } else if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
                             self.encoder.setComputePipelineState(pipeline);
                         } else if q4k_mature_gate_up {
                             self.encoder.setComputePipelineState(
@@ -3918,7 +3997,10 @@ pub mod platform {
                             );
                         }
                     } else {
-                        if prepared.gate_up_layout.is_q4_transaction() {
+                        if gate_up_instrument
+                            && self.select_gate_up_instrument_pipeline(prepared, false)?
+                        {
+                        } else if prepared.gate_up_layout.is_q4_transaction() {
                             self.encoder.setComputePipelineState(
                                 prepared
                                     .fused_block_qx_gate_up_pipeline
@@ -7552,6 +7634,24 @@ pub mod platform {
                 two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
                 )?),
+                gate_up_instrument_load_only_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_only_simd",
+                )?,
+                gate_up_instrument_load_decode_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_decode_simd",
+                )?,
+                gate_up_instrument_dot_no_reduce_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_dot_no_reduce_simd",
+                )?,
+                gate_up_instrument_load_only_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_only_norm_simd",
+                )?,
+                gate_up_instrument_load_decode_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_decode_norm_simd",
+                )?,
+                gate_up_instrument_dot_no_reduce_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_dot_no_reduce_norm_simd",
+                )?,
                 q4k_mature_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_simd")?,
                 q4k_mature_gate_up_norm_pipeline: self
@@ -7834,6 +7934,24 @@ pub mod platform {
                 two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
                 )?),
+                gate_up_instrument_load_only_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_only_simd",
+                )?,
+                gate_up_instrument_load_decode_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_decode_simd",
+                )?,
+                gate_up_instrument_dot_no_reduce_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_dot_no_reduce_simd",
+                )?,
+                gate_up_instrument_load_only_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_only_norm_simd",
+                )?,
+                gate_up_instrument_load_decode_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_decode_norm_simd",
+                )?,
+                gate_up_instrument_dot_no_reduce_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_dot_no_reduce_norm_simd",
+                )?,
                 q4k_mature_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_simd")?,
                 q4k_mature_gate_up_norm_pipeline: self
@@ -8069,6 +8187,24 @@ pub mod platform {
                 two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
                 )?),
+                gate_up_instrument_load_only_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_only_simd",
+                )?,
+                gate_up_instrument_load_decode_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_decode_simd",
+                )?,
+                gate_up_instrument_dot_no_reduce_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_dot_no_reduce_simd",
+                )?,
+                gate_up_instrument_load_only_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_only_norm_simd",
+                )?,
+                gate_up_instrument_load_decode_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_decode_norm_simd",
+                )?,
+                gate_up_instrument_dot_no_reduce_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_dot_no_reduce_norm_simd",
+                )?,
                 q4k_mature_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_simd")?,
                 q4k_mature_gate_up_norm_pipeline: self
@@ -8387,6 +8523,24 @@ pub mod platform {
                 two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
                 )?),
+                gate_up_instrument_load_only_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_only_simd",
+                )?,
+                gate_up_instrument_load_decode_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_decode_simd",
+                )?,
+                gate_up_instrument_dot_no_reduce_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_dot_no_reduce_simd",
+                )?,
+                gate_up_instrument_load_only_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_only_norm_simd",
+                )?,
+                gate_up_instrument_load_decode_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_load_decode_norm_simd",
+                )?,
+                gate_up_instrument_dot_no_reduce_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_dot_no_reduce_norm_simd",
+                )?,
                 q4k_mature_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_simd")?,
                 q4k_mature_gate_up_norm_pipeline: self

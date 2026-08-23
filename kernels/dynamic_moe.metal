@@ -261,6 +261,171 @@ kernel void qx_dynamic_q4_moe_gate_up_inline_norm_simd(
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
+// Production-path instrumentation variants. These intentionally preserve the
+// row-inline address calculation, 256-thread dispatch, row ownership, and
+// activation staging of qx_dynamic_q4_moe_gate_up_inline_simd. They are
+// diagnostic kernels only; the non-canonical modes do not produce valid MoE
+// outputs. `mode` is compile-time constant at each entry point after inlining:
+//   0 = load packed codes/scales and sink a checksum
+//   1 = decode Q4 values and sink the decoded sum
+//   2 = decode and perform the dot loop, but omit SIMD final reduction
+inline void qx_dynamic_q4_gate_up_instrument_core(
+    device const uchar* stream,
+    device const uint* expert_ids,
+    device float* output,
+    threadgroup float* cached_input,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id,
+    uint thread_index,
+    uint mode) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint row = (threadgroup_id % threadgroups_per_expert) * rows_per_threadgroup + simdgroup;
+    uint expert = expert_ids[slot];
+    float sum = 0.0f;
+    uint checksum = 0;
+    if (expert < 32) {
+        uint row_base = expert * expert_stride + row * row_stride;
+        if (mode == 0) {
+            for (uint column = lane; column < hidden; column += 32) {
+                uint group = column / 32;
+                uint local = column % 32;
+                uint group_base = row_base + group * group_stride;
+                uint packed = uint(stream[group_base + local / 2]);
+                uint scale_bits = uint(stream[group_base + 16])
+                    | (uint(stream[group_base + 17]) << 8);
+                checksum ^= packed + scale_bits + column;
+            }
+        } else if (mode == 1) {
+            for (uint column = lane; column < hidden; column += 32) {
+                uint group = column / 32;
+                uint local = column % 32;
+                uint group_base = row_base + group * group_stride;
+                uint packed = uint(stream[group_base + local / 2]);
+                uint code = (packed >> ((local % 2) * 4)) & 0xf;
+                uint scale_bits = uint(stream[group_base + 16])
+                    | (uint(stream[group_base + 17]) << 8);
+                sum += float(int(code) - 7)
+                    * float(as_type<half>(ushort(scale_bits)));
+            }
+        } else {
+            for (uint column = lane; column < hidden; column += 32) {
+                uint group = column / 32;
+                uint local = column % 32;
+                uint group_base = row_base + group * group_stride;
+                uint packed = uint(stream[group_base + local / 2]);
+                uint code = (packed >> ((local % 2) * 4)) & 0xf;
+                uint scale_bits = uint(stream[group_base + 16])
+                    | (uint(stream[group_base + 17]) << 8);
+                sum += float(int(code) - 7)
+                    * float(as_type<half>(ushort(scale_bits)))
+                    * cached_input[column];
+            }
+        }
+    }
+    // The sink is deliberately minimal. Mode 2 writes each lane's partial
+    // independently, so no SIMD reduction is introduced into that variant.
+    if (mode == 0) {
+        if (lane == 0) output[slot * hidden + row] = float(checksum & 0xffffu);
+    } else if (mode == 1) {
+        if (lane == 0) output[slot * hidden + row] = sum;
+    } else {
+        output[slot * hidden + row] = sum;
+    }
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_inline_load_only_simd(
+    device const uchar* stream [[buffer(0)]], device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]], device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]], uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    for (uint column = thread_index; column < 1024; column += 256) cached_input[column] = input[column];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_gate_up_instrument_core(stream, expert_ids, output, cached_input,
+        lane, simdgroup, threadgroup_id, thread_index, 0);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_inline_load_decode_simd(
+    device const uchar* stream [[buffer(0)]], device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]], device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]], uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    for (uint column = thread_index; column < 1024; column += 256) cached_input[column] = input[column];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_gate_up_instrument_core(stream, expert_ids, output, cached_input,
+        lane, simdgroup, threadgroup_id, thread_index, 1);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_inline_dot_no_reduce_simd(
+    device const uchar* stream [[buffer(0)]], device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]], device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]], uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    for (uint column = thread_index; column < 1024; column += 256) cached_input[column] = input[column];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_gate_up_instrument_core(stream, expert_ids, output, cached_input,
+        lane, simdgroup, threadgroup_id, thread_index, 2);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_inline_load_only_norm_simd(
+    device const uchar* stream [[buffer(0)]], device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]], device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]], device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]], uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    float inverse = inverse_rms[0];
+    for (uint column = thread_index; column < 1024; column += 256) {
+        cached_input[column] = input[column] * inverse * norm_weights[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_gate_up_instrument_core(stream, expert_ids, output, cached_input,
+        lane, simdgroup, threadgroup_id, thread_index, 0);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_inline_load_decode_norm_simd(
+    device const uchar* stream [[buffer(0)]], device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]], device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]], device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]], uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    float inverse = inverse_rms[0];
+    for (uint column = thread_index; column < 1024; column += 256) {
+        cached_input[column] = input[column] * inverse * norm_weights[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_gate_up_instrument_core(stream, expert_ids, output, cached_input,
+        lane, simdgroup, threadgroup_id, thread_index, 1);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_inline_dot_no_reduce_norm_simd(
+    device const uchar* stream [[buffer(0)]], device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]], device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]], device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]], uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]], uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    float inverse = inverse_rms[0];
+    for (uint column = thread_index; column < 1024; column += 256) {
+        cached_input[column] = input[column] * inverse * norm_weights[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_gate_up_instrument_core(stream, expert_ids, output, cached_input,
+        lane, simdgroup, threadgroup_id, thread_index, 2);
+}
+
 // Decode-specific batch-1 mapping candidate. This follows the shape of the
 // llama.cpp mat-vec work assignment without changing the exact Q4 row-inline
 // representation: two SIMD groups (64 threads) per threadgroup, with each
