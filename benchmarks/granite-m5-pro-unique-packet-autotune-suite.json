@@ -8,7 +8,7 @@
     "benchmarks/fixtures/reasoning.json",
     "benchmarks/fixtures/chat.json"
   ],
-  "rounds": 3,
+  "rounds": 20,
   "warmup": 1,
   "baseline_plan_id": "factorial-rowinline-qx",
   "minimum_improvement_ms_per_token": 0.10,

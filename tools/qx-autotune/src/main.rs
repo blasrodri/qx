@@ -30,6 +30,10 @@ struct Args {
     /// Optional machine-readable selection report including rejected plans.
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Override the suite's round count for a smoke run without editing the
+    /// sealed benchmark contract.
+    #[arg(long)]
+    rounds: Option<usize>,
     #[arg(long, default_value_t = 0.01)]
     max_relative_ppl_delta: f64,
     #[arg(long, default_value_t = 0.02)]
@@ -48,6 +52,7 @@ struct SelectionReport<'a> {
     selected_complete_model_wall_ms_per_token: f64,
     selected_reason: &'static str,
     candidates: Vec<CandidateSummary>,
+    fixture_pairs: &'a [FixturePairSummary],
     rejected: &'a [(String, qx_compiler::CandidateRejection)],
 }
 
@@ -61,6 +66,25 @@ struct CandidateSummary {
     complete_model_gpu_ms_per_token: f64,
     peak_physical_footprint_bytes: u64,
     quality_accepted: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct FixturePairSummary {
+    fixture: String,
+    baseline_plan_id: String,
+    candidate_plan_id: String,
+    pairs: usize,
+    baseline_wall_ms_per_token: Vec<f64>,
+    candidate_wall_ms_per_token: Vec<f64>,
+    paired_wall_delta_ms_per_token: Vec<f64>,
+    median_paired_wall_delta_ms_per_token: f64,
+    bootstrap_95_ci_wall_delta_ms_per_token: [f64; 2],
+    win_rate: f64,
+}
+
+struct SuiteRun {
+    evidence: Vec<PlanCandidateEvidence>,
+    fixture_pairs: Vec<FixturePairSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,34 +184,48 @@ struct BenchRecord {
     internal_cpu_waits: u64,
 }
 
+#[derive(Debug)]
+struct BenchMeasurement {
+    fixture: String,
+    record: BenchRecord,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    let (candidates, selection_policy) = if let Some(path) = &args.evidence {
+    let (candidates, selection_policy, fixture_pairs) = if let Some(path) = &args.evidence {
         (
             serde_json::from_slice::<Vec<PlanCandidateEvidence>>(
                 &fs::read(path).with_context(|| format!("read {}", path.display()))?,
             )
             .with_context(|| format!("parse {}", path.display()))?,
             PlanSelectionPolicy::default(),
+            Vec::new(),
         )
     } else if let Some(path) = &args.suite {
-        let suite = serde_json::from_slice::<CandidateSuite>(
+        let mut suite = serde_json::from_slice::<CandidateSuite>(
             &fs::read(path).with_context(|| format!("read {}", path.display()))?,
         )
         .with_context(|| format!("parse {}", path.display()))?;
-        let evidence = run_suite(&suite)?;
+        if let Some(rounds) = args.rounds {
+            if rounds == 0 {
+                bail!("--rounds must be positive");
+            }
+            suite.rounds = rounds;
+        }
+        let suite_run = run_suite(&suite)?;
         if let Some(output) = &args.write_evidence {
-            fs::write(output, serde_json::to_vec_pretty(&evidence)?)
+            fs::write(output, serde_json::to_vec_pretty(&suite_run.evidence)?)
                 .with_context(|| format!("write {}", output.display()))?;
         }
         (
-            evidence,
+            suite_run.evidence,
             PlanSelectionPolicy {
                 baseline_plan_id: suite.baseline_plan_id,
                 minimum_improvement_ms_per_token: suite
                     .minimum_improvement_ms_per_token
                     .unwrap_or(0.10),
             },
+            suite_run.fixture_pairs,
         )
     } else {
         bail!("provide either --evidence or --suite");
@@ -250,6 +288,7 @@ fn main() -> Result<()> {
                 selected_complete_model_wall_ms_per_token,
                 selected_reason: "lowest measured complete-model wall latency after semantic-equivalence or quality, memory, and promotion-tier gates",
                 candidates: candidates_report,
+                fixture_pairs: &fixture_pairs,
                 rejected: &selection.rejected,
             })?,
         )
@@ -260,7 +299,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
+fn run_suite(suite: &CandidateSuite) -> Result<SuiteRun> {
     if !matches!(suite.schema_version, 1 | 2) || suite.rounds == 0 || suite.fixtures.is_empty() {
         bail!("candidate suite requires schema 1 or 2, positive rounds, and fixtures");
     }
@@ -332,7 +371,7 @@ fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
         }
     }
     let mut records = (0..suite.candidates.len())
-        .map(|_| Vec::<BenchRecord>::new())
+        .map(|_| Vec::<BenchMeasurement>::new())
         .collect::<Vec<_>>();
     let mut random = 0x5158_4155_544f_5455_u64;
     let mut run_index = 0_usize;
@@ -409,27 +448,34 @@ fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
                         candidate.artifact.display()
                     );
                 }
-                records[candidate_index].push(record);
+                records[candidate_index].push(BenchMeasurement {
+                    fixture: fixture.display().to_string(),
+                    record,
+                });
             }
         }
     }
-    suite
+    let fixture_pairs = build_fixture_pairs(suite, &records)?;
+    let evidence = suite
         .candidates
         .iter()
         .zip(records)
         .map(|(candidate, mut measurements)| {
-            measurements
-                .sort_by(|left, right| left.wall_ms_per_token.total_cmp(&right.wall_ms_per_token));
+            measurements.sort_by(|left, right| {
+                left.record
+                    .wall_ms_per_token
+                    .total_cmp(&right.record.wall_ms_per_token)
+            });
             let wall = median(
                 &measurements
                     .iter()
-                    .map(|record| record.wall_ms_per_token)
+                    .map(|measurement| measurement.record.wall_ms_per_token)
                     .collect::<Vec<_>>(),
             );
             let gpu = median(
                 &measurements
                     .iter()
-                    .map(|record| record.gpu_ms_per_token)
+                    .map(|measurement| measurement.record.gpu_ms_per_token)
                     .collect::<Vec<_>>(),
             );
             let artifact = qx_format::MappedArtifact::open(&candidate.artifact)
@@ -508,18 +554,23 @@ fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
                     gsm8k_delta_points_vs_llama: quality_gate.gsm8k_delta_points_vs_llama,
                 },
                 memory: ResidentMemoryMeasurement {
-                    current_rss_bytes: max_field(&measurements, |record| record.current_rss_bytes),
-                    peak_rss_bytes: max_field(&measurements, |record| record.peak_rss_bytes),
-                    current_physical_footprint_bytes: max_field(&measurements, |record| {
-                        record.current_physical_footprint_bytes
+                    current_rss_bytes: max_measurement_field(&measurements, |record| {
+                        record.current_rss_bytes
                     }),
-                    peak_physical_footprint_bytes: max_field(&measurements, |record| {
+                    peak_rss_bytes: max_measurement_field(&measurements, |record| {
+                        record.peak_rss_bytes
+                    }),
+                    current_physical_footprint_bytes: max_measurement_field(
+                        &measurements,
+                        |record| record.current_physical_footprint_bytes,
+                    ),
+                    peak_physical_footprint_bytes: max_measurement_field(&measurements, |record| {
                         record.peak_physical_footprint_bytes
                     }),
-                    known_metal_bytes: max_field(&measurements, |record| {
+                    known_metal_bytes: max_measurement_field(&measurements, |record| {
                         record.known_metal_allocated_bytes
                     }),
-                    mapped_model_bytes: max_field(&measurements, |record| {
+                    mapped_model_bytes: max_measurement_field(&measurements, |record| {
                         record.mapped_artifact_bytes
                     }),
                 },
@@ -527,7 +578,11 @@ fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
                 interaction: candidate.interaction.clone(),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(SuiteRun {
+        evidence,
+        fixture_pairs,
+    })
 }
 
 fn run_tier_commands(
@@ -775,6 +830,99 @@ fn verify_exact_semantics(candidate_path: &PathBuf, reference_path: &PathBuf) ->
     Ok(())
 }
 
+fn build_fixture_pairs(
+    suite: &CandidateSuite,
+    records: &[Vec<BenchMeasurement>],
+) -> Result<Vec<FixturePairSummary>> {
+    let Some(baseline_plan_id) = suite.baseline_plan_id.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let baseline_index = records
+        .iter()
+        .position(|measurements| {
+            measurements
+                .first()
+                .is_some_and(|measurement| measurement.record.plan_id == baseline_plan_id)
+        })
+        .ok_or_else(|| anyhow::anyhow!("baseline plan {baseline_plan_id} has no measurements"))?;
+    let mut summaries = Vec::new();
+    for (candidate_index, candidate_measurements) in records.iter().enumerate() {
+        if candidate_index == baseline_index {
+            continue;
+        }
+        let candidate_plan_id = candidate_measurements
+            .first()
+            .map(|measurement| measurement.record.plan_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("candidate has no measurements"))?;
+        for fixture in &suite.fixtures {
+            let fixture_name = fixture.display().to_string();
+            let baseline = records[baseline_index]
+                .iter()
+                .filter(|measurement| measurement.fixture == fixture_name)
+                .collect::<Vec<_>>();
+            let candidate = candidate_measurements
+                .iter()
+                .filter(|measurement| measurement.fixture == fixture_name)
+                .collect::<Vec<_>>();
+            if baseline.len() != candidate.len() || baseline.is_empty() {
+                bail!(
+                    "paired fixture {} has {} baseline and {} candidate samples",
+                    fixture_name,
+                    baseline.len(),
+                    candidate.len()
+                );
+            }
+            let baseline_wall = baseline
+                .iter()
+                .map(|measurement| measurement.record.wall_ms_per_token)
+                .collect::<Vec<_>>();
+            let candidate_wall = candidate
+                .iter()
+                .map(|measurement| measurement.record.wall_ms_per_token)
+                .collect::<Vec<_>>();
+            let deltas = baseline_wall
+                .iter()
+                .zip(&candidate_wall)
+                .map(|(base, candidate)| candidate - base)
+                .collect::<Vec<_>>();
+            let wins = deltas.iter().filter(|delta| **delta < 0.0).count();
+            summaries.push(FixturePairSummary {
+                fixture: fixture_name,
+                baseline_plan_id: baseline_plan_id.to_owned(),
+                candidate_plan_id: candidate_plan_id.clone(),
+                pairs: deltas.len(),
+                baseline_wall_ms_per_token: baseline_wall,
+                candidate_wall_ms_per_token: candidate_wall,
+                paired_wall_delta_ms_per_token: deltas.clone(),
+                median_paired_wall_delta_ms_per_token: median(&deltas),
+                bootstrap_95_ci_wall_delta_ms_per_token: bootstrap_mean_ci(&deltas),
+                win_rate: wins as f64 / deltas.len() as f64,
+            });
+        }
+    }
+    Ok(summaries)
+}
+
+fn bootstrap_mean_ci(values: &[f64]) -> [f64; 2] {
+    if values.is_empty() {
+        return [f64::NAN, f64::NAN];
+    }
+    let mut rng = 0x5158_4253_5441_5055_u64;
+    let mut means = Vec::with_capacity(10_000);
+    for _ in 0..10_000 {
+        let mut sum = 0.0;
+        for _ in values {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            sum += values[rng as usize % values.len()];
+        }
+        means.push(sum / values.len() as f64);
+    }
+    means.sort_by(f64::total_cmp);
+    [means[250], means[9_749]]
+}
+
 fn median(values: &[f64]) -> f64 {
     let mut values = values.to_vec();
     values.sort_by(f64::total_cmp);
@@ -786,8 +934,12 @@ fn median(values: &[f64]) -> f64 {
     }
 }
 
-fn max_field(records: &[BenchRecord], field: impl Fn(&BenchRecord) -> u64) -> u64 {
-    records.iter().map(field).max().unwrap_or(0)
+fn max_measurement_field(records: &[BenchMeasurement], field: impl Fn(&BenchRecord) -> u64) -> u64 {
+    records
+        .iter()
+        .map(|measurement| field(&measurement.record))
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

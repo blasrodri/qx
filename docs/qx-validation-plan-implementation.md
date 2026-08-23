@@ -150,6 +150,9 @@ target/release/qx-compile MODEL \
 fixtures, combines those measurements with kernel, producer/consumer, and
 multi-layer screening evidence, reads each sealed plan from its artifact, and
 selects by measured complete-model latency subject to quality and memory.
+The selection report also retains per-fixture paired samples, candidate-minus-
+baseline deltas, bootstrap 95% intervals, and win rates. Use `--rounds N` only
+for smoke runs; the sealed promotion suite declares its required round count.
 
 For exact transport/layout candidates, a suite entry may instead provide
 `exact_equivalent_to`. The runner then compares every decoded quantized tensor
