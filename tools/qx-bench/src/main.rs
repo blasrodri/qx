@@ -120,6 +120,9 @@ struct Args {
     /// Measure top-8 expert-set overlap across sequential artifact-only tokens.
     #[arg(long)]
     v2_route_overlap: bool,
+    /// Replay hot, realistic, and low-overlap route sequences against the live MoE graph.
+    #[arg(long)]
+    v2_route_churn_profile: bool,
     /// Compare previous-route and oracle expert traffic prefetch on the live token graph.
     #[arg(long)]
     v2_moe_prefetch_profile: bool,
@@ -432,6 +435,19 @@ fn main() -> Result<()> {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--v2-route-overlap requires an artifact path"))?;
         return benchmark_v2_route_overlap(artifact, args.context, args.iterations);
+    }
+    if args.v2_route_churn_profile {
+        let artifact = args
+            .artifact
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--v2-route-churn-profile requires an artifact path"))?;
+        return benchmark_v2_route_churn_profile(
+            artifact,
+            args.context,
+            args.warmup,
+            args.iterations,
+            args.result_json.as_deref(),
+        );
     }
     if args.v2_moe_prefetch_profile {
         let artifact = args.artifact.as_deref().ok_or_else(|| {
@@ -1293,6 +1309,13 @@ enum DifferentialBlock {
 struct RouteTrace {
     ids: qx_metal::platform::RuntimeBuffer,
     weights: qx_metal::platform::RuntimeBuffer,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct HostRouteStep {
+    ids: [[u32; 8]; LAYERS],
+    weights: [[f32; 8]; LAYERS],
 }
 
 #[cfg(target_os = "macos")]
@@ -3602,6 +3625,424 @@ fn benchmark_v2_route_overlap(
             "{:>10.2}%  {hits:>4}/{selected:<8}  {layer:>5}  {expert:>6}",
             100.0 * probability
         );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn capture_sequential_route_steps(
+    artifact_path: &std::path::Path,
+    context_length: usize,
+    positions: usize,
+) -> Result<Vec<HostRouteStep>> {
+    use std::rc::Rc;
+
+    let context = Rc::new(
+        qx_metal::platform::MetalContext::system_default()
+            .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
+    );
+    let plan = ExecutionPlan::granite(context_length).map_err(anyhow::Error::msg)?;
+    let buffers =
+        qx_runtime_v2::GpuRuntimeBuffers::new(context.clone(), plan).map_err(anyhow::Error::msg)?;
+    let stack =
+        qx_runtime_v2::PreparedAttentionStack::load_from_artifact(context.as_ref(), artifact_path)
+            .map_err(anyhow::Error::msg)?;
+    let moe = qx_runtime_v2::PreparedMoeStack::load(context.as_ref(), artifact_path)
+        .map_err(anyhow::Error::msg)?;
+    context
+        .write_runtime_buffer(
+            buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+            &0_u32.to_le_bytes(),
+        )
+        .map_err(anyhow::Error::msg)?;
+
+    let mut steps = Vec::with_capacity(positions);
+    for position in 0..positions {
+        let trace = capture_route_trace(context.as_ref(), &buffers, &stack, &moe, position)?;
+        let ids = context
+            .read_runtime_u32s(&trace.ids, LAYERS * 8)
+            .map_err(anyhow::Error::msg)?;
+        let weights = context
+            .read_runtime_f32(&trace.weights, LAYERS * 8)
+            .map_err(anyhow::Error::msg)?;
+        let mut step = HostRouteStep {
+            ids: [[0; 8]; LAYERS],
+            weights: [[0.0; 8]; LAYERS],
+        };
+        for layer in 0..LAYERS {
+            step.ids[layer].copy_from_slice(&ids[layer * 8..layer * 8 + 8]);
+            step.weights[layer].copy_from_slice(&weights[layer * 8..layer * 8 + 8]);
+        }
+        steps.push(step);
+
+        // Advance the real artifact-only stream so the next capture has the
+        // next token's KV state and router decisions.
+        let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+        stack
+            .encode_token(&mut graph, &buffers, &moe, position)
+            .map_err(anyhow::Error::msg)?;
+        buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+    }
+    Ok(steps)
+}
+
+#[cfg(target_os = "macos")]
+fn route_overlap(a: &[u32; 8], b: &[u32; 8]) -> usize {
+    b.iter()
+        .filter(|expert| a.iter().any(|candidate| candidate == *expert))
+        .count()
+}
+
+#[cfg(target_os = "macos")]
+fn cold_route_sequence(realistic: &[HostRouteStep]) -> Vec<HostRouteStep> {
+    let positions = realistic.len();
+    let mut cold = vec![
+        HostRouteStep {
+            ids: [[0; 8]; LAYERS],
+            weights: [[0.0; 8]; LAYERS],
+        };
+        positions
+    ];
+    for layer in 0..LAYERS {
+        let mut remaining: Vec<usize> = (0..positions).collect();
+        let mut previous = 0;
+        for output in 0..positions {
+            let chosen_offset = if output == 0 {
+                remaining.iter().position(|&index| index == 0).unwrap_or(0)
+            } else {
+                remaining
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, &index)| {
+                        (
+                            route_overlap(
+                                &realistic[previous].ids[layer],
+                                &realistic[index].ids[layer],
+                            ),
+                            index,
+                        )
+                    })
+                    .map(|(offset, _)| offset)
+                    .unwrap_or(0)
+            };
+            let source = remaining.remove(chosen_offset);
+            cold[output].ids[layer] = realistic[source].ids[layer];
+            cold[output].weights[layer] = realistic[source].weights[layer];
+            previous = source;
+        }
+    }
+    cold
+}
+
+#[cfg(target_os = "macos")]
+fn route_sequence_bytes(sequence: &HostRouteStep) -> (Vec<u8>, Vec<u8>) {
+    let ids: Vec<u32> = sequence
+        .ids
+        .iter()
+        .flat_map(|layer| layer.iter())
+        .copied()
+        .collect();
+    let weights: Vec<f32> = sequence
+        .weights
+        .iter()
+        .flat_map(|layer| layer.iter())
+        .copied()
+        .collect();
+    let ids_bytes = unsafe {
+        std::slice::from_raw_parts(
+            ids.as_ptr() as *const u8,
+            std::mem::size_of_val(ids.as_slice()),
+        )
+        .to_vec()
+    };
+    let weights_bytes = unsafe {
+        std::slice::from_raw_parts(
+            weights.as_ptr() as *const u8,
+            std::mem::size_of_val(weights.as_slice()),
+        )
+        .to_vec()
+    };
+    (ids_bytes, weights_bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn profile_route_sequence(
+    artifact_path: &std::path::Path,
+    context_length: usize,
+    warmup: usize,
+    sequence: &[HostRouteStep],
+) -> Result<(f64, f64, f64)> {
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    let context = Rc::new(
+        qx_metal::platform::MetalContext::system_default()
+            .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
+    );
+    let plan = ExecutionPlan::granite(context_length).map_err(anyhow::Error::msg)?;
+    let buffers =
+        qx_runtime_v2::GpuRuntimeBuffers::new(context.clone(), plan).map_err(anyhow::Error::msg)?;
+    let mapped = Arc::new(MappedArtifact::open(artifact_path)?);
+    let stack = qx_runtime_v2::PreparedAttentionStack::load_from_mapped_artifact(
+        context.as_ref(),
+        mapped.clone(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let moe = qx_runtime_v2::PreparedMoeStack::load_from_mapped_artifact(context.as_ref(), mapped)
+        .map_err(anyhow::Error::msg)?;
+    context
+        .write_runtime_buffer(
+            buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+            &0_u32.to_le_bytes(),
+        )
+        .map_err(anyhow::Error::msg)?;
+    let route_ids = context
+        .allocate_runtime_buffer(LAYERS * 8 * std::mem::size_of::<u32>())
+        .map_err(anyhow::Error::msg)?;
+    let route_weights = context
+        .allocate_runtime_buffer(LAYERS * 8 * std::mem::size_of::<f32>())
+        .map_err(anyhow::Error::msg)?;
+    let trace = RouteTrace {
+        ids: route_ids,
+        weights: route_weights,
+    };
+    let (ids_bytes, weights_bytes) = route_sequence_bytes(&sequence[0]);
+    for _ in 0..warmup {
+        context
+            .write_runtime_buffer(&trace.ids, &ids_bytes)
+            .map_err(anyhow::Error::msg)?;
+        context
+            .write_runtime_buffer(&trace.weights, &weights_bytes)
+            .map_err(anyhow::Error::msg)?;
+        let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+        encode_fixed_route_moe(&mut graph, &buffers, &stack, &moe, &trace, false)?;
+        graph.finish(context.as_ref()).map_err(anyhow::Error::msg)?;
+    }
+    let before = context.metrics().map_err(anyhow::Error::msg)?;
+    let start = Instant::now();
+    for step in sequence {
+        let (ids_bytes, weights_bytes) = route_sequence_bytes(step);
+        context
+            .write_runtime_buffer(&trace.ids, &ids_bytes)
+            .map_err(anyhow::Error::msg)?;
+        context
+            .write_runtime_buffer(&trace.weights, &weights_bytes)
+            .map_err(anyhow::Error::msg)?;
+        let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+        encode_fixed_route_moe(&mut graph, &buffers, &stack, &moe, &trace, false)?;
+        graph.finish(context.as_ref()).map_err(anyhow::Error::msg)?;
+    }
+    let wall_us = start.elapsed().as_secs_f64() * 1e6 / sequence.len() as f64;
+    let after = context.metrics().map_err(anyhow::Error::msg)?;
+    let gpu_us =
+        (after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1e6 / sequence.len() as f64;
+    let dispatches = (after.dispatches - before.dispatches) as f64 / sequence.len() as f64;
+    Ok((gpu_us, wall_us, dispatches))
+}
+
+#[cfg(target_os = "macos")]
+fn profile_full_route_sequence(
+    artifact_path: &std::path::Path,
+    context_length: usize,
+    warmup: usize,
+    sequence: &[HostRouteStep],
+) -> Result<(f64, f64, f64)> {
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    let context = Rc::new(
+        qx_metal::platform::MetalContext::system_default()
+            .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
+    );
+    let plan = ExecutionPlan::granite(context_length).map_err(anyhow::Error::msg)?;
+    let buffers =
+        qx_runtime_v2::GpuRuntimeBuffers::new(context.clone(), plan).map_err(anyhow::Error::msg)?;
+    let mapped = Arc::new(MappedArtifact::open(artifact_path)?);
+    let stack = qx_runtime_v2::PreparedAttentionStack::load_from_mapped_artifact(
+        context.as_ref(),
+        mapped.clone(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let moe = qx_runtime_v2::PreparedMoeStack::load_from_mapped_artifact(context.as_ref(), mapped)
+        .map_err(anyhow::Error::msg)?;
+    context
+        .write_runtime_buffer(
+            buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+            &0_u32.to_le_bytes(),
+        )
+        .map_err(anyhow::Error::msg)?;
+    let trace = RouteTrace {
+        ids: context
+            .allocate_runtime_buffer(LAYERS * 8 * std::mem::size_of::<u32>())
+            .map_err(anyhow::Error::msg)?,
+        weights: context
+            .allocate_runtime_buffer(LAYERS * 8 * std::mem::size_of::<f32>())
+            .map_err(anyhow::Error::msg)?,
+    };
+    let run_one = |context: &qx_metal::platform::MetalContext,
+                   buffers: &qx_runtime_v2::GpuRuntimeBuffers,
+                   stack: &qx_runtime_v2::PreparedAttentionStack,
+                   moe: &qx_runtime_v2::PreparedMoeStack,
+                   trace: &RouteTrace,
+                   step: &HostRouteStep,
+                   position: usize|
+     -> Result<()> {
+        let (ids_bytes, weights_bytes) = route_sequence_bytes(step);
+        context
+            .write_runtime_buffer(&trace.ids, &ids_bytes)
+            .map_err(anyhow::Error::msg)?;
+        context
+            .write_runtime_buffer(&trace.weights, &weights_bytes)
+            .map_err(anyhow::Error::msg)?;
+        let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+        encode_differential_token(
+            &mut graph,
+            buffers,
+            stack,
+            moe,
+            position,
+            None,
+            Some(trace),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        graph.finish(context).map_err(anyhow::Error::msg)?;
+        Ok(())
+    };
+    for _ in 0..warmup {
+        run_one(
+            context.as_ref(),
+            &buffers,
+            &stack,
+            &moe,
+            &trace,
+            &sequence[0],
+            0,
+        )?;
+    }
+    let before = context.metrics().map_err(anyhow::Error::msg)?;
+    let start = Instant::now();
+    for (position, step) in sequence.iter().enumerate() {
+        run_one(
+            context.as_ref(),
+            &buffers,
+            &stack,
+            &moe,
+            &trace,
+            step,
+            position,
+        )?;
+    }
+    let wall_us = start.elapsed().as_secs_f64() * 1e6 / sequence.len() as f64;
+    let after = context.metrics().map_err(anyhow::Error::msg)?;
+    let gpu_us =
+        (after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1e6 / sequence.len() as f64;
+    let dispatches = (after.dispatches - before.dispatches) as f64 / sequence.len() as f64;
+    Ok((gpu_us, wall_us, dispatches))
+}
+
+#[cfg(target_os = "macos")]
+fn benchmark_v2_route_churn_profile(
+    artifact_path: &std::path::Path,
+    context_length: usize,
+    warmup: usize,
+    requested_positions: usize,
+    result_json: Option<&std::path::Path>,
+) -> Result<()> {
+    if requested_positions < 2 {
+        bail!("--v2-route-churn-profile requires at least two positions");
+    }
+    let positions = requested_positions.min(128).min(context_length);
+    let realistic = capture_sequential_route_steps(artifact_path, context_length, positions)?;
+    let hot = vec![realistic[0].clone(); positions];
+    let cold = cold_route_sequence(&realistic);
+    let sequences = [("hot", hot), ("realistic", realistic), ("cold", cold)];
+    let mut reports = Vec::new();
+    for (name, sequence) in sequences {
+        let mut overlaps = Vec::new();
+        let mut new_experts = Vec::new();
+        let mut unique_regions = Vec::new();
+        for (index, step) in sequence.iter().enumerate() {
+            let mut overlap_sum = 0.0;
+            let mut new_sum = 0.0;
+            let mut unique_sum = 0.0;
+            for layer in 0..LAYERS {
+                let current = &step.ids[layer];
+                let previous = if index == 0 {
+                    current
+                } else {
+                    &sequence[index - 1].ids[layer]
+                };
+                let overlap = route_overlap(previous, current);
+                overlap_sum += overlap as f64 / 8.0;
+                new_sum += (8 - overlap) as f64;
+                unique_sum += current
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len() as f64;
+            }
+            overlaps.push(overlap_sum / LAYERS as f64);
+            new_experts.push(new_sum / LAYERS as f64);
+            unique_regions.push(unique_sum / LAYERS as f64);
+        }
+        let (gpu_us, wall_us, dispatches) =
+            profile_route_sequence(artifact_path, context_length, warmup, &sequence)?;
+        let (full_gpu_us, full_wall_us, full_dispatches) =
+            profile_full_route_sequence(artifact_path, context_length, warmup, &sequence)?;
+        let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+        println!(
+            "{name:<10} GPU {:>8.2} us/token  wall {:>8.2} us/token  dispatches {:>6.1}  overlap {:>6.2}%  new {:>5.2}  regions {:>5.2}",
+            gpu_us,
+            wall_us,
+            dispatches,
+            100.0 * mean(&overlaps),
+            mean(&new_experts),
+            mean(&unique_regions),
+        );
+        println!(
+            "{name:<10} full GPU {:>8.2} us/token  full wall {:>8.2} us/token  full dispatches {:>6.1}",
+            full_gpu_us, full_wall_us, full_dispatches,
+        );
+        reports.push(serde_json::json!({
+            "name": name,
+            "gpu_us_per_token": gpu_us,
+            "wall_us_per_token": wall_us,
+            "dispatches_per_token": dispatches,
+            "mean_top8_overlap": mean(&overlaps),
+            "mean_new_experts": mean(&new_experts),
+            "mean_unique_regions": mean(&unique_regions),
+            "full_gpu_us_per_token": full_gpu_us,
+            "full_wall_us_per_token": full_wall_us,
+            "full_dispatches_per_token": full_dispatches,
+        }));
+    }
+    println!("QX V2 route-churn MoE replay");
+    println!("artifact: {}", artifact_path.display());
+    println!("positions: {positions} (captured sequential route sets)");
+    println!(
+        "candidate: {}",
+        if qx_metal::platform::moe_decode_direct_enabled() {
+            "decode-direct"
+        } else {
+            "canonical"
+        }
+    );
+    if let Some(path) = result_json {
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "mode": "v2_route_churn_profile",
+            "artifact": artifact_path.display().to_string(),
+            "context": context_length,
+            "positions": positions,
+            "warmup": warmup,
+            "routes": reports,
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
+        println!("result JSON: {}", path.display());
     }
     Ok(())
 }
