@@ -8673,6 +8673,200 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn cross_expert_tile8_matches_row_inline_gate_up_kernel() {
+        const EXPERTS: usize = 32;
+        const HIDDEN: usize = 1024;
+        const GROUPS: usize = 32;
+        const GROUP_BYTES: usize = 18;
+        let context = platform::MetalContext::system_default().expect("Metal device");
+        let mut row_inline = vec![0_u8; EXPERTS * HIDDEN * GROUPS * GROUP_BYTES];
+        for expert in 0..EXPERTS {
+            for row in 0..HIDDEN {
+                for group in 0..GROUPS {
+                    let offset = (expert * HIDDEN * GROUPS + row * GROUPS + group) * GROUP_BYTES;
+                    let nibble = ((expert + row + group) & 0xf) as u8;
+                    row_inline[offset..offset + 16].fill(nibble | (nibble << 4));
+                    row_inline[offset + 16..offset + 18].copy_from_slice(&[0x00, 0x3c]);
+                }
+            }
+        }
+        let mut cross = vec![0_u8; row_inline.len()];
+        for tile in 0..(HIDDEN / 8) {
+            for group in 0..GROUPS {
+                for row_in_tile in 0..8 {
+                    for expert in 0..EXPERTS {
+                        let source =
+                            (expert * HIDDEN * GROUPS + (tile * 8 + row_in_tile) * GROUPS + group)
+                                * GROUP_BYTES;
+                        let destination = (((tile * GROUPS + group) * 8 + row_in_tile) * EXPERTS
+                            + expert)
+                            * GROUP_BYTES;
+                        cross[destination..destination + GROUP_BYTES]
+                            .copy_from_slice(&row_inline[source..source + GROUP_BYTES]);
+                    }
+                }
+            }
+        }
+        const DOWN_GROUPS: usize = 16;
+        let mut down = vec![0_u8; EXPERTS * HIDDEN * DOWN_GROUPS * GROUP_BYTES];
+        for expert in 0..EXPERTS {
+            for row in 0..HIDDEN {
+                for group in 0..DOWN_GROUPS {
+                    let offset =
+                        (expert * HIDDEN * DOWN_GROUPS + row * DOWN_GROUPS + group) * GROUP_BYTES;
+                    let nibble = ((expert + row + group * 3) & 0xf) as u8;
+                    down[offset..offset + 16].fill(nibble | (nibble << 4));
+                    down[offset + 16..offset + 18].copy_from_slice(&[0x00, 0x3c]);
+                }
+            }
+        }
+        let mut cross_down = vec![0_u8; down.len()];
+        for tile in 0..(HIDDEN / 8) {
+            for group in 0..DOWN_GROUPS {
+                for row_in_tile in 0..8 {
+                    for expert in 0..EXPERTS {
+                        let source = (expert * HIDDEN * DOWN_GROUPS
+                            + (tile * 8 + row_in_tile) * DOWN_GROUPS
+                            + group)
+                            * GROUP_BYTES;
+                        let destination =
+                            (((tile * DOWN_GROUPS + group) * 8 + row_in_tile) * EXPERTS + expert)
+                                * GROUP_BYTES;
+                        cross_down[destination..destination + GROUP_BYTES]
+                            .copy_from_slice(&down[source..source + GROUP_BYTES]);
+                    }
+                }
+            }
+        }
+        let row_prepared = context
+            .prepare_dynamic_q4_moe_with_layouts(
+                &row_inline,
+                &row_inline,
+                &down,
+                &down,
+                PackingLayout::Q4RowInline,
+                PackingLayout::Q4RowInline,
+            )
+            .unwrap();
+        let cross_prepared = context
+            .prepare_dynamic_q4_moe_with_layouts(
+                &cross,
+                &cross,
+                &cross_down,
+                &cross_down,
+                PackingLayout::Q4CrossExpertTile8,
+                PackingLayout::Q4CrossExpertTile8,
+            )
+            .unwrap();
+        let input = context.allocate_runtime_buffer(HIDDEN * 4).unwrap();
+        let ids = context.allocate_runtime_buffer(8 * 4).unwrap();
+        let weights = context.allocate_runtime_buffer(8 * 4).unwrap();
+        let scratch = context
+            .allocate_runtime_buffer(8 * HIDDEN * 4 + 8 * 512 * 4 + 8 * HIDDEN * 4)
+            .unwrap();
+        let output = context.allocate_runtime_buffer(HIDDEN * 4).unwrap();
+        let input_values = [1.0_f32; HIDDEN];
+        let ids_values = [31_u32, 7, 13, 2, 24, 5, 18, 0];
+        let weights_values = [0.125_f32; 8];
+        for (buffer, bytes) in [
+            (&input, unsafe {
+                std::slice::from_raw_parts(
+                    input_values.as_ptr() as *const u8,
+                    std::mem::size_of_val(&input_values),
+                )
+            }),
+            (&ids, unsafe {
+                std::slice::from_raw_parts(
+                    ids_values.as_ptr() as *const u8,
+                    std::mem::size_of_val(&ids_values),
+                )
+            }),
+            (&weights, unsafe {
+                std::slice::from_raw_parts(
+                    weights_values.as_ptr() as *const u8,
+                    std::mem::size_of_val(&weights_values),
+                )
+            }),
+        ] {
+            context.write_runtime_buffer(buffer, bytes).unwrap();
+        }
+        let run = |prepared: &platform::PreparedDynamicQ4Moe, cross_enabled: bool| {
+            if cross_enabled {
+                unsafe { std::env::set_var("QX_V2_MOE_CROSS_EXPERT_TILE8", "1") };
+            } else {
+                unsafe { std::env::remove_var("QX_V2_MOE_CROSS_EXPERT_TILE8") };
+            }
+            let mut graph = context.begin_decode().unwrap();
+            graph
+                .encode_dynamic_q4_moe_batched_stage(
+                    prepared, &input, &ids, &weights, &scratch, &output, 0,
+                )
+                .unwrap();
+            graph.finish(&context).unwrap();
+            context.read_runtime_f32(&scratch, 8 * HIDDEN).unwrap()
+        };
+        let row_result = run(&row_prepared, false);
+        let cross_result = run(&cross_prepared, true);
+        unsafe { std::env::remove_var("QX_V2_MOE_CROSS_EXPERT_TILE8") };
+        let max_error = row_result
+            .iter()
+            .zip(&cross_result)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_error < 1.0e-5,
+            "cross-expert tile8 gate/up error: {max_error}"
+        );
+
+        let activated = scratch.subregion(8 * HIDDEN * 4, 8 * 512 * 4).unwrap();
+        let activated_values = [1.0_f32; 8 * 512];
+        let activated_bytes = unsafe {
+            std::slice::from_raw_parts(
+                activated_values.as_ptr() as *const u8,
+                std::mem::size_of_val(&activated_values),
+            )
+        };
+        context
+            .write_runtime_buffer(&activated, activated_bytes)
+            .unwrap();
+        let run_down = |prepared: &platform::PreparedDynamicQ4Moe, cross_enabled: bool| {
+            if cross_enabled {
+                unsafe { std::env::set_var("QX_V2_MOE_CROSS_EXPERT_TILE8", "1") };
+            } else {
+                unsafe { std::env::remove_var("QX_V2_MOE_CROSS_EXPERT_TILE8") };
+            }
+            let mut graph = context.begin_decode().unwrap();
+            graph
+                .encode_dynamic_q4_moe_batched_stage(
+                    prepared, &input, &ids, &weights, &scratch, &output, 2,
+                )
+                .unwrap();
+            graph.finish(&context).unwrap();
+            context
+                .read_runtime_f32(
+                    &scratch
+                        .subregion(8 * HIDDEN * 4 + 8 * 512 * 4, 8 * HIDDEN * 4)
+                        .unwrap(),
+                    8 * HIDDEN,
+                )
+                .unwrap()
+        };
+        let row_down = run_down(&row_prepared, false);
+        let cross_down_result = run_down(&cross_prepared, true);
+        unsafe { std::env::remove_var("QX_V2_MOE_CROSS_EXPERT_TILE8") };
+        let down_error = row_down
+            .iter()
+            .zip(&cross_down_result)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            down_error < 1.0e-5,
+            "cross-expert tile8 down error: {down_error}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn transaction_144_and_160_dispatches_have_identical_projection_results() {
         use half::f16;
 
