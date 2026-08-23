@@ -826,7 +826,7 @@ pub mod platform {
                 self.encoder.setBytes_length_atIndex(
                     NonNull::from(&columns).cast(),
                     std::mem::size_of_val(&columns),
-                    2,
+                    3,
                 );
             }
             self.encoder.dispatchThreads_threadsPerThreadgroup(

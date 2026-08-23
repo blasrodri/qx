@@ -1,0 +1,88 @@
+{
+  "selected_plan_id": "factorial-rowinline-qx",
+  "selected_interaction": {
+    "representation_id": "row-inline",
+    "mapping_id": "qx"
+  },
+  "selected_complete_model_wall_ms_per_token": 4.7415107421875,
+  "selected_reason": "lowest measured complete-model wall latency after semantic-equivalence or quality, memory, and promotion-tier gates",
+  "candidates": [
+    {
+      "plan_id": "factorial-rowinline-qx",
+      "interaction": {
+        "representation_id": "row-inline",
+        "mapping_id": "qx"
+      },
+      "exact_semantics_verified": true,
+      "complete_model_wall_ms_per_token": 4.7415107421875,
+      "complete_model_gpu_ms_per_token": 4.313527019121466,
+      "peak_physical_footprint_bytes": 112362072,
+      "quality_accepted": false
+    },
+    {
+      "plan_id": "factorial-rowinline-llama",
+      "interaction": {
+        "representation_id": "row-inline",
+        "mapping_id": "llama-like"
+      },
+      "exact_semantics_verified": true,
+      "complete_model_wall_ms_per_token": 4.8828258515625,
+      "complete_model_gpu_ms_per_token": 4.447221352847919,
+      "peak_physical_footprint_bytes": 112460424,
+      "quality_accepted": false
+    },
+    {
+      "plan_id": "factorial-transaction144-qx",
+      "interaction": {
+        "representation_id": "transaction-144",
+        "mapping_id": "qx"
+      },
+      "exact_semantics_verified": true,
+      "complete_model_wall_ms_per_token": 5.0411162109375,
+      "complete_model_gpu_ms_per_token": 4.601919271408406,
+      "peak_physical_footprint_bytes": 112575088,
+      "quality_accepted": false
+    },
+    {
+      "plan_id": "factorial-transaction144-llama",
+      "interaction": {
+        "representation_id": "transaction-144",
+        "mapping_id": "llama-like"
+      },
+      "exact_semantics_verified": true,
+      "complete_model_wall_ms_per_token": 5.1441630859375005,
+      "complete_model_gpu_ms_per_token": 4.705499672354563,
+      "peak_physical_footprint_bytes": 112476832,
+      "quality_accepted": false
+    }
+  ],
+  "rejected": [
+    [
+      "factorial-rowinline-llama",
+      {
+        "InsufficientImprovement": {
+          "improvement_micros": -141,
+          "threshold_micros": 100
+        }
+      }
+    ],
+    [
+      "factorial-transaction144-qx",
+      {
+        "InsufficientImprovement": {
+          "improvement_micros": -300,
+          "threshold_micros": 100
+        }
+      }
+    ],
+    [
+      "factorial-transaction144-llama",
+      {
+        "InsufficientImprovement": {
+          "improvement_micros": -403,
+          "threshold_micros": 100
+        }
+      }
+    ]
+  ]
+}

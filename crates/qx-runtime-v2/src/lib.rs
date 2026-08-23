@@ -156,12 +156,19 @@ pub fn activate_artifact_execution_plan(
                 plan.representations.gate_up,
                 qx_format::ExpertRepresentation::Group32Q4Transaction144
                     | qx_format::ExpertRepresentation::Group32Q4Transaction160
-            ) => set_plan_env("QX_V2_MOE_FUSED_TRANSACTION_BLOCK", "qx"),
-            "llama-like" | "llama" if matches!(
-                plan.representations.gate_up,
-                qx_format::ExpertRepresentation::Group32Q4Transaction144
-                    | qx_format::ExpertRepresentation::Group32Q4Transaction160
-            ) => set_plan_env("QX_V2_MOE_FUSED_TRANSACTION_BLOCK", "llama"),
+            ) =>
+            {
+                set_plan_env("QX_V2_MOE_FUSED_TRANSACTION_BLOCK", "qx")
+            }
+            "llama-like" | "llama"
+                if matches!(
+                    plan.representations.gate_up,
+                    qx_format::ExpertRepresentation::Group32Q4Transaction144
+                        | qx_format::ExpertRepresentation::Group32Q4Transaction160
+                ) =>
+            {
+                set_plan_env("QX_V2_MOE_FUSED_TRANSACTION_BLOCK", "llama")
+            }
             "llama-like" | "llama" => set_plan_bool_env("QX_V2_MOE_LLAMA_LIKE_MAPPING", true),
             "qx" => {}
             other => return Err(format!("unsupported sealed MoE mapping {other}")),

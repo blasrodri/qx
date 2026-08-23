@@ -11,15 +11,15 @@
   "rounds": 3,
   "warmup": 2,
   "interaction_matrix": {
-    "representations": ["row-inline", "fused-code-scale"],
+    "representations": ["row-inline", "transaction-144"],
     "mappings": ["qx", "llama-like"],
     "incompatible": []
   },
-  "baseline_plan_id": "granite-m5-row-inline-1-control",
+  "baseline_plan_id": "factorial-rowinline-qx",
   "minimum_improvement_ms_per_token": 0.10,
   "candidates": [
     {
-      "artifact": "external/models/granite-m5-pro-q4-factorial-row-inline-qx.qx",
+      "artifact": "external/models/granite-m5-pro-q4-factorial-rowinline.qx",
       "interaction": {
         "representation_id": "row-inline",
         "mapping_id": "qx"
@@ -29,10 +29,10 @@
         {"tier": "producer_consumer", "wall_ms_per_token": 0.02, "gpu_ms_per_token": 0.02},
         {"tier": "multi_layer", "wall_ms_per_token": 0.005, "gpu_ms_per_token": 0.005}
       ],
-      "exact_equivalent_to": "external/models/granite-m5-pro-q4-rowinline-1-control.qx"
+      "exact_equivalent_to": "external/models/granite-m5-pro-q4-factorial-rowinline.qx"
     },
     {
-      "artifact": "external/models/granite-m5-pro-q4-factorial-row-inline-llama-like.qx",
+      "artifact": "external/models/granite-m5-pro-q4-factorial-rowinline-llama.qx",
       "interaction": {
         "representation_id": "row-inline",
         "mapping_id": "llama-like"
@@ -42,12 +42,12 @@
         {"tier": "producer_consumer", "wall_ms_per_token": 0.02, "gpu_ms_per_token": 0.02},
         {"tier": "multi_layer", "wall_ms_per_token": 0.005, "gpu_ms_per_token": 0.005}
       ],
-      "quality_gate": "benchmarks/quality/granite-m5-pro-q4-row-inline-llama-like.json"
+      "exact_equivalent_to": "external/models/granite-m5-pro-q4-factorial-rowinline.qx"
     },
     {
-      "artifact": "external/models/granite-m5-pro-q4-factorial-fused-code-scale-qx.qx",
+      "artifact": "external/models/granite-m5-pro-q4-factorial-transaction144.qx",
       "interaction": {
-        "representation_id": "fused-code-scale",
+        "representation_id": "transaction-144",
         "mapping_id": "qx"
       },
       "screening_tiers": [
@@ -55,12 +55,12 @@
         {"tier": "producer_consumer", "wall_ms_per_token": 0.02, "gpu_ms_per_token": 0.02},
         {"tier": "multi_layer", "wall_ms_per_token": 0.005, "gpu_ms_per_token": 0.005}
       ],
-      "quality_gate": "benchmarks/quality/granite-m5-pro-q4-fused-code-scale-qx.json"
+      "exact_equivalent_to": "external/models/granite-m5-pro-q4-factorial-rowinline.qx"
     },
     {
-      "artifact": "external/models/granite-m5-pro-q4-factorial-fused-code-scale-llama-like.qx",
+      "artifact": "external/models/granite-m5-pro-q4-factorial-transaction144-llama.qx",
       "interaction": {
-        "representation_id": "fused-code-scale",
+        "representation_id": "transaction-144",
         "mapping_id": "llama-like"
       },
       "screening_tiers": [
@@ -68,7 +68,7 @@
         {"tier": "producer_consumer", "wall_ms_per_token": 0.02, "gpu_ms_per_token": 0.02},
         {"tier": "multi_layer", "wall_ms_per_token": 0.005, "gpu_ms_per_token": 0.005}
       ],
-      "quality_gate": "benchmarks/quality/granite-m5-pro-q4-fused-code-scale-llama-like.json"
+      "exact_equivalent_to": "external/models/granite-m5-pro-q4-factorial-rowinline.qx"
     }
   ]
 }
