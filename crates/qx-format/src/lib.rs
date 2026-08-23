@@ -45,6 +45,10 @@ pub enum ExpertRepresentation {
     Group32Q4RowInlineRows4,
     /// Exact-Q4 gate/up packets containing eight rows, with row-inline down.
     Group32Q4RowInlineRows8,
+    /// Exact-Q4 code/scale transaction blocks with eight groups per packet.
+    Group32Q4Transaction144,
+    /// Exact-Q4 code/scale transaction blocks padded to 160 bytes per packet.
+    Group32Q4Transaction160,
     Q4K,
 }
 
@@ -224,6 +228,11 @@ pub struct ExecutionPlanManifest {
     pub memory: CompiledMemoryPlan,
     pub representations: RepresentationPlan,
     pub topology: TopologyPlan,
+    /// Optional compiler-selected MoE mapping. Older artifacts omit this and
+    /// retain the runtime default; new factorial candidates persist the
+    /// mapping so selection is reproducible without an environment override.
+    #[serde(default)]
+    pub moe_mapping: Option<String>,
     pub schedule: DispatchSchedule,
     #[serde(default)]
     pub arena: ArenaPlan,
@@ -279,6 +288,7 @@ impl ExecutionPlanManifest {
                 moe: MoeTopology::FourStage,
                 kv_precision: KvPrecision::Fp32,
             },
+            moe_mapping: None,
             schedule: DispatchSchedule {
                 command_buffers_per_token: 1,
                 encoders_per_token: 1,

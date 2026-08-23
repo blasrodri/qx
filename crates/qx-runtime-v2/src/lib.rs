@@ -117,6 +117,12 @@ pub fn activate_artifact_execution_plan(
         qx_format::ExpertRepresentation::Group32Q4RowInlineRows8 => {
             set_plan_env("QX_V2_MOE_LAYOUT", "row-inline-8")
         }
+        qx_format::ExpertRepresentation::Group32Q4Transaction144 => {
+            set_plan_env("QX_V2_MOE_LAYOUT", "transaction-144")
+        }
+        qx_format::ExpertRepresentation::Group32Q4Transaction160 => {
+            set_plan_env("QX_V2_MOE_LAYOUT", "transaction-160")
+        }
         qx_format::ExpertRepresentation::MixedQ2Q3Q4 => set_plan_env("QX_V2_MOE_LAYOUT", "mixed"),
         qx_format::ExpertRepresentation::Q4K => set_plan_env("QX_V2_MOE_LAYOUT", "rowmajor"),
         qx_format::ExpertRepresentation::DenseQ3 | qx_format::ExpertRepresentation::PaddedQ3 => {
@@ -140,6 +146,25 @@ pub fn activate_artifact_execution_plan(
         }
         qx_format::ExpertRepresentation::PerExpertTensorQ3Q4 => {
             set_plan_env("QX_V2_MOE_LAYOUT", "q3-q4-expert");
+        }
+    }
+    clear_plan_env("QX_V2_MOE_FUSED_TRANSACTION_BLOCK");
+    clear_plan_env("QX_V2_MOE_LLAMA_LIKE_MAPPING");
+    if let Some(mapping) = plan.moe_mapping.as_deref() {
+        match mapping {
+            "qx" if matches!(
+                plan.representations.gate_up,
+                qx_format::ExpertRepresentation::Group32Q4Transaction144
+                    | qx_format::ExpertRepresentation::Group32Q4Transaction160
+            ) => set_plan_env("QX_V2_MOE_FUSED_TRANSACTION_BLOCK", "qx"),
+            "llama-like" | "llama" if matches!(
+                plan.representations.gate_up,
+                qx_format::ExpertRepresentation::Group32Q4Transaction144
+                    | qx_format::ExpertRepresentation::Group32Q4Transaction160
+            ) => set_plan_env("QX_V2_MOE_FUSED_TRANSACTION_BLOCK", "llama"),
+            "llama-like" | "llama" => set_plan_bool_env("QX_V2_MOE_LLAMA_LIKE_MAPPING", true),
+            "qx" => {}
+            other => return Err(format!("unsupported sealed MoE mapping {other}")),
         }
     }
     set_plan_bool_env("QX_V2_KV_FP16", false);
@@ -764,6 +789,12 @@ fn moe_requested_layout() -> Option<qx_quant::PackingLayout> {
         }
         Some("row-inline-8") | Some("inline-8") | Some("q4-row-inline-8") => {
             Some(qx_quant::PackingLayout::Q4RowInlineRows8)
+        }
+        Some("transaction-144") | Some("transaction144") => {
+            Some(qx_quant::PackingLayout::Q4Transaction144)
+        }
+        Some("transaction-160") | Some("transaction160") => {
+            Some(qx_quant::PackingLayout::Q4Transaction160)
         }
         Some("tile") | Some("tile32") | Some("lane") | Some("lane-native") => {
             Some(qx_quant::PackingLayout::MetalTile32)

@@ -71,6 +71,11 @@ struct Args {
     /// evidence by qx-autotune.
     #[arg(long, value_enum, default_value_t = MoeVariant::FourStage)]
     moe_variant: MoeVariant,
+    /// Compiler-selected mapping for the dynamic MoE transaction candidate.
+    /// The value is persisted in the artifact plan for reproducible runtime
+    /// activation without a process-wide environment override.
+    #[arg(long, value_enum, default_value_t = MoeMappingArg::Qx)]
+    moe_mapping: MoeMappingArg,
     #[arg(long, default_value_t = MAX_CONTEXT)]
     context: usize,
     /// Stable identifier embedded in artifact v2 for compiler/autotuner provenance.
@@ -136,6 +141,13 @@ enum MoeVariant {
     FourStage,
     WideExpert,
     CrossExpertActivation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum MoeMappingArg {
+    Qx,
+    #[value(name = "llama-like", alias = "llama")]
+    LlamaLike,
 }
 
 impl From<ExpertLayout> for PackingLayout {
@@ -1031,6 +1043,10 @@ fn main() -> Result<()> {
         MoeVariant::WideExpert => qx_format::MoeTopology::FourStageWideExpert,
         MoeVariant::CrossExpertActivation => qx_format::MoeTopology::FourStageCrossExpertActivation,
     };
+    execution_plan.moe_mapping = Some(match args.moe_mapping {
+        MoeMappingArg::Qx => "qx".to_owned(),
+        MoeMappingArg::LlamaLike => "llama-like".to_owned(),
+    });
     write_artifact_with_raw_and_plan(
         &args.output,
         Granite3A400M::MODEL_ID,
@@ -1125,6 +1141,16 @@ fn representation_for(tensors: &[CompiledTensor], kind: TensorKind) -> ExpertRep
         })
     {
         ExpertRepresentation::Group32Q4RowInlineRows8
+    } else if matching.iter().all(|tensor| {
+        tensor.tensor.quant_type == QuantType::Q4
+            && tensor.tensor.layout == PackingLayout::Q4Transaction144
+    }) {
+        ExpertRepresentation::Group32Q4Transaction144
+    } else if matching.iter().all(|tensor| {
+        tensor.tensor.quant_type == QuantType::Q4
+            && tensor.tensor.layout == PackingLayout::Q4Transaction160
+    }) {
+        ExpertRepresentation::Group32Q4Transaction160
     } else {
         ExpertRepresentation::MixedQ2Q3Q4
     }

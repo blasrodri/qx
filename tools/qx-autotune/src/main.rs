@@ -598,6 +598,8 @@ fn verify_exact_semantics(candidate_path: &PathBuf, reference_path: &PathBuf) ->
                         | qx_format::ExpertRepresentation::Group32Q4RowInlineRows2
                         | qx_format::ExpertRepresentation::Group32Q4RowInlineRows4
                         | qx_format::ExpertRepresentation::Group32Q4RowInlineRows8
+                        | qx_format::ExpertRepresentation::Group32Q4Transaction144
+                        | qx_format::ExpertRepresentation::Group32Q4Transaction160
                 )
             };
             candidate == reference
@@ -671,16 +673,19 @@ fn verify_exact_semantics(candidate_path: &PathBuf, reference_path: &PathBuf) ->
             })
             .ok_or_else(|| anyhow::anyhow!("candidate is missing a matching tensor entry"))?;
         let candidate_entry = &candidate.info().entries[candidate_index];
+        let q4_transport_layout = |layout: qx_quant::PackingLayout| {
+            layout.is_q4_row_inline() || layout.is_q4_transaction()
+        };
         let layout_compatible = candidate_entry.layout == reference_entry.layout
             || (matches!(
                 reference_entry.kind,
                 qx_format::TensorKind::GateUp | qx_format::TensorKind::Down
             ) && matches!(reference_entry.layout, qx_quant::PackingLayout::RowMajor)
-                && candidate_entry.layout.is_q4_row_inline())
-            || (candidate_entry.layout.is_q4_row_inline()
-                && reference_entry.layout.is_q4_row_inline())
+                && q4_transport_layout(candidate_entry.layout))
+            || (q4_transport_layout(candidate_entry.layout)
+                && q4_transport_layout(reference_entry.layout))
             || (matches!(candidate_entry.layout, qx_quant::PackingLayout::RowMajor)
-                && reference_entry.layout.is_q4_row_inline());
+                && q4_transport_layout(reference_entry.layout));
         if candidate_entry.quant_type != reference_entry.quant_type
             || candidate_entry.rows != reference_entry.rows
             || candidate_entry.cols != reference_entry.cols
