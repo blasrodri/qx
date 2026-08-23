@@ -127,6 +127,30 @@ numbers are classified as instrumentation validation only. The profiler must
 discard or repeat pairs spanning a power/thermal transition before deriving a
 decoder-vs-dot cost.
 
+## Averaged follow-up
+
+Using two warmup samples and ten measured samples per process reduced the
+single-sample swings enough to expose a useful provisional ordering:
+
+| Variant | 24-layer gate/up GPU µs | Difference vs canonical |
+|---|---:|---:|
+| canonical | 1,471.37 | baseline |
+| load-only | 1,263.42 | -207.95 |
+| load+decode | 1,324.29 | -147.08 |
+| dot/no-final-reduction | 1,419.37 | -52.00 |
+
+These are still diagnostic, nonsemantic kernels and were run in separate
+processes, so they are not a promotion result. Within this instrumented
+mapping, however, the bytes themselves are not the dominant incremental cost:
+adding decode to load-only costs about 61 µs per 24 layers, adding the dot
+loop costs about another 95 µs, and adding the production SIMD reduction/output
+behavior accounts for the remaining roughly 52 µs relative to canonical.
+
+The provisional implication is that another raw-weight-traffic experiment is
+unlikely to close the llama gap. The open exact lane is now the production
+kernel's coupled address-generation/vectorization/output dataflow, followed by
+a source-matched llama `MUL_MAT_ID` build when its checkout is available.
+
 Result records:
 
 - `benchmarks/results/gateup-instrument-canonical-general-2026-08-23.json`
@@ -137,3 +161,7 @@ Result records:
 - `benchmarks/results/gateup-instrument-paired-canonical-a-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-paired-canonical-b-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-paired-load-decode-a-2026-08-23.json`
+- `benchmarks/results/gateup-instrument-averaged-canonical-2026-08-23.json`
+- `benchmarks/results/gateup-instrument-averaged-load-only-2026-08-23.json`
+- `benchmarks/results/gateup-instrument-averaged-load-decode-2026-08-23.json`
+- `benchmarks/results/gateup-instrument-averaged-dot-no-reduction-2026-08-23.json`
