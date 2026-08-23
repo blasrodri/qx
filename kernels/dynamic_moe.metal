@@ -603,6 +603,106 @@ kernel void qx_dynamic_q4_moe_gate_up_cross_expert_norm_simd(
     }
 }
 
+// Fixed Granite-M5 top-8 row-stream candidate. A threadgroup owns one
+// eight-row tile and one SIMD group owns one selected expert. The eight
+// streams therefore advance through the same row/group frontier in lockstep
+// instead of serializing the route inside each SIMD group as cross_expert
+// does. Route IDs are staged once per threadgroup, and the row-inline
+// [16-byte codes][FP16 scale] address contract is unchanged.
+inline void qx_dynamic_q4_gate_up_row_stream_body(
+    device const uchar* stream,
+    device const uint* expert_ids,
+    device float* output,
+    threadgroup float* cached_input,
+    threadgroup uint* selected_experts,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id,
+    uint thread_index) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+
+    if (thread_index < 8) {
+        selected_experts[thread_index] = expert_ids[thread_index];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint expert = selected_experts[simdgroup];
+    uint first_row = threadgroup_id * rows_per_threadgroup;
+    for (uint row_offset = 0; row_offset < rows_per_threadgroup; ++row_offset) {
+        uint row = first_row + row_offset;
+        float sum = 0.0f;
+        if (expert < 32 && row < hidden) {
+            uint row_base = expert * expert_stride + row * row_stride;
+            for (uint group = 0; group < groups; ++group) {
+                uint group_base = row_base + group * group_stride;
+                // The row-inline packet is 2-byte aligned. Four lanes share
+                // each ushort load, covering the 16 code bytes with eight
+                // coalesced word transactions instead of 32 byte requests.
+                ushort packed = reinterpret_cast<device const ushort*>(stream + group_base)[lane >> 2];
+                uint byte = (uint(packed) >> (((lane >> 1) & 1) * 8)) & 0xff;
+                uint code = (byte >> ((lane & 1) * 4)) & 0xf;
+                float scale = lane == 0
+                    ? qx_q4_inline_scale(stream, group_base + 16)
+                    : 0.0f;
+                scale = simd_broadcast(scale, 0);
+                sum += float(int(code) - 7)
+                    * scale
+                    * cached_input[group * 32 + lane];
+            }
+        }
+        sum = simd_sum(sum);
+        if (lane == 0) {
+            output[simdgroup * hidden + row] = sum;
+        }
+    }
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_row_stream_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    for (uint column = thread_index; column < 1024; column += 256) {
+        cached_input[column] = input[column];
+    }
+    threadgroup uint selected_experts[8];
+    qx_dynamic_q4_gate_up_row_stream_body(
+        stream, expert_ids, output, cached_input, selected_experts,
+        lane, simdgroup, threadgroup_id, thread_index);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_row_stream_norm_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]],
+    device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    float inverse = inverse_rms[0];
+    for (uint column = thread_index; column < 1024; column += 256) {
+        cached_input[column] = input[column] * inverse * norm_weights[column];
+    }
+    threadgroup uint selected_experts[8];
+    qx_dynamic_q4_gate_up_row_stream_body(
+        stream, expert_ids, output, cached_input, selected_experts,
+        lane, simdgroup, threadgroup_id, thread_index);
+}
+
 // Vectorized exact-Q4 row-inline candidate. Each lane retains the canonical
 // row/reduction ownership, but consumes four quantization groups at a time.
 // This keeps the numerical reduction order close to the reference kernel
