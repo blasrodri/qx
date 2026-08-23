@@ -1,0 +1,55 @@
+{
+  "artifact": "external/models/granite-m5-pro-q4-factorial-rowinline.qx",
+  "artifact_bytes": 751009792,
+  "artifact_hash": "e3f2940482d5999d",
+  "candidate": "canonical",
+  "context": 512,
+  "expected_markers_per_token": 242,
+  "fixture": "general-systems",
+  "gpu_us_per_token_all_command_buffers": 4359.583341283724,
+  "iterations": 8,
+  "measurement": "artifact_only_sequential_after_prefill",
+  "mode": "v2_sequential_in_graph_timeline",
+  "prefill_tokens": 384,
+  "schema_version": 1,
+  "stages": [
+    {
+      "gpu_us_per_layer_median": 0.8125001234778514,
+      "gpu_us_per_token_median": 19.500002963468432,
+      "stage": "input_rms_qkv"
+    },
+    {
+      "gpu_us_per_layer_median": 0.16493019453870753,
+      "gpu_us_per_token_median": 3.958324668928981,
+      "stage": "rope_kv"
+    },
+    {
+      "gpu_us_per_layer_median": 0.8732640708331019,
+      "gpu_us_per_token_median": 20.958337699994445,
+      "stage": "attention"
+    },
+    {
+      "gpu_us_per_layer_median": 0.4496529678969334,
+      "gpu_us_per_token_median": 10.7916712295264,
+      "stage": "o_residual"
+    },
+    {
+      "gpu_us_per_layer_median": 0.5104169152521839,
+      "gpu_us_per_token_median": 12.250005966052413,
+      "stage": "router_topk"
+    },
+    {
+      "gpu_us_per_layer_median": 3.968749903530503,
+      "gpu_us_per_token_median": 95.24999768473208,
+      "stage": "moe_plus_residual"
+    },
+    {
+      "gpu_us_per_layer_median": 382.25000025704503,
+      "gpu_us_per_token_median": 382.25000025704503,
+      "stage": "final_head"
+    }
+  ],
+  "timeline_mode": "command_buffer_fallback",
+  "wall_us_per_token": 4634.713625,
+  "warning": "stage intervals are diagnostic; the fallback changes command-buffer boundaries and is not a production schedule"
+}
