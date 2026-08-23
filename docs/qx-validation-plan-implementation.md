@@ -127,6 +127,12 @@ command-buffer schedule, memory ownership, KV/sparse policy, target/workload,
 budgets, and provenance. Existing candidate families are represented by enums;
 diagnostic-only plans cannot be sealed as production plans.
 
+Exact MoE consumer dataflow is also sealed as `moe_consumer` in the plan. The
+current compiler-selectable values are `canonical` and `unique-packet`; the
+runtime derives the Metal feature selection from the artifact, so a candidate
+cannot win only because a benchmark process happened to carry an environment
+override.
+
 The compiler can emit copied, hybrid, or full no-copy weights and one or more
 GPU-ordered command buffers. Multiple buffers preserve queue ordering and use
 one CPU wait on the final buffer.
@@ -171,6 +177,13 @@ target/release/qx-autotune \
 The human supplies implementations, constraints, and screening measurements;
 the selector—not a hard-coded default—chooses the winner. Complete-model
 latency always outranks a microbenchmark result.
+
+The first sealed consumer selection is recorded in
+`benchmarks/results/unique-packet-selection-report-2026-08-23.json`: across
+five context-512 fixtures and three randomized interleaved rounds, the
+selector chose `granite-m5-top8-rowinline-unique-packet` over the canonical
+row-inline plan. Both artifacts passed exact Q4 code/scale equivalence; both
+kept one command buffer, 461 dispatches/token, and the same artifact size.
 
 ## Memory ownership controls
 

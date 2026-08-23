@@ -248,6 +248,11 @@ pub struct ExecutionPlanManifest {
     /// mapping so selection is reproducible without an environment override.
     #[serde(default)]
     pub moe_mapping: Option<String>,
+    /// Optional compiler-selected exact MoE consumer dataflow. Keeping this
+    /// separate from `moe_mapping` makes the representation × consumer
+    /// interaction explicit in the sealed artifact.
+    #[serde(default)]
+    pub moe_consumer: Option<String>,
     /// Optional physical expert traversal metadata. It is absent on legacy
     /// artifacts and present only when a structural cross-expert stream is
     /// selected by the compiler.
@@ -309,6 +314,7 @@ impl ExecutionPlanManifest {
                 kv_precision: KvPrecision::Fp32,
             },
             moe_mapping: None,
+            moe_consumer: None,
             expert_traversal: None,
             schedule: DispatchSchedule {
                 command_buffers_per_token: 1,

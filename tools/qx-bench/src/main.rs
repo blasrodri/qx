@@ -2627,6 +2627,11 @@ fn benchmark_v2_moe_contextual_profile(
     result_json: Option<&std::path::Path>,
 ) -> Result<()> {
     use std::rc::Rc;
+    // Contextual profiling must honor the sealed artifact plan just like the
+    // complete-token benchmark. Without activation, compiler-selected
+    // consumers (for example unique-packet Q4) are silently replaced by the
+    // process default and the attribution is not comparable.
+    qx_runtime_v2::activate_artifact_execution_plan(artifact_path).map_err(anyhow::Error::msg)?;
     if iterations == 0 {
         bail!("contextual profile iterations must be positive");
     }

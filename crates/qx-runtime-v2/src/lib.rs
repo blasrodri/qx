@@ -124,6 +124,16 @@ pub fn activate_artifact_execution_plan(
     // artifact, while the logical top-k IDs remain in the normal TopKIds
     // buffer. Keep this separate from the older activation-sharing topology.
     set_plan_bool_env("QX_V2_MOE_CROSS_EXPERT_TILE8", cross_expert_tile8);
+    // The consumer dataflow is sealed in the artifact so autotuning compares
+    // real plans rather than process-wide ad hoc environment variants.
+    set_plan_bool_env("QX_V2_MOE_UNIQUE_PACKET", false);
+    if let Some(consumer) = plan.moe_consumer.as_deref() {
+        match consumer {
+            "canonical" | "qx" => {}
+            "unique-packet" | "unique_packet" => set_plan_bool_env("QX_V2_MOE_UNIQUE_PACKET", true),
+            other => return Err(format!("unsupported sealed MoE consumer {other}")),
+        }
+    }
     match plan.representations.gate_up {
         qx_format::ExpertRepresentation::Group32Q4RowMajor => {
             set_plan_env("QX_V2_MOE_LAYOUT", "rowmajor")

@@ -1,0 +1,29 @@
+{
+  "selected_plan_id": "granite-m5-top8-rowinline-unique-packet",
+  "selected_interaction": null,
+  "selected_complete_model_wall_ms_per_token": 4.4307125625,
+  "selected_reason": "lowest measured complete-model wall latency after semantic-equivalence or quality, memory, and promotion-tier gates",
+  "candidates": [
+    {
+      "plan_id": "factorial-rowinline-qx",
+      "candidate_family": "row-inline-q4-canonical",
+      "interaction": null,
+      "exact_semantics_verified": true,
+      "complete_model_wall_ms_per_token": 4.724105140624999,
+      "complete_model_gpu_ms_per_token": 4.253693358805322,
+      "peak_physical_footprint_bytes": 114147976,
+      "quality_accepted": false
+    },
+    {
+      "plan_id": "granite-m5-top8-rowinline-unique-packet",
+      "candidate_family": "row-inline-q4-unique-packet",
+      "interaction": null,
+      "exact_semantics_verified": true,
+      "complete_model_wall_ms_per_token": 4.4307125625,
+      "complete_model_gpu_ms_per_token": 3.9580973323154462,
+      "peak_physical_footprint_bytes": 114426576,
+      "quality_accepted": false
+    }
+  ],
+  "rejected": []
+}

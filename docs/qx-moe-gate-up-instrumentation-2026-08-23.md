@@ -303,6 +303,48 @@ the complete semantic graph. It is still not canonical: the feature flag must
 be represented as a compiler plan candidate and selected through the normal
 multi-tier benchmark/quality/memory promotion process.
 
+## Compiler-selected promotion
+
+The consumer is now sealed in artifact-v2 as `moe_consumer`, rather than being
+selected only by `QX_V2_MOE_UNIQUE_PACKET`. `qx-autotune` evaluated the sealed
+canonical and unique-packet artifacts in randomized order across the five
+context-512 fixtures (`general`, `instruction`, `code`, `reasoning`, and
+`chat`) for three rounds. Exact Q4 code/scale equivalence passed for both
+artifacts, and the selector chose the unique-packet plan with no rejected
+candidates.
+
+Aggregate medians from the interleaved suite were:
+
+| Plan | Wall ms/token | GPU ms/token | Equivalent tok/s | Physical footprint | Metal allocated | CBs / dispatches |
+|---|---:|---:|---:|---:|---:|---:|
+| canonical row-inline | 4.724 | 4.254 | 211.68 | 114.15 MB | 802.37 MB | 1 / 461 |
+| unique-packet | **4.431** | **3.958** | **225.70** | 114.43 MB | 802.37 MB | 1 / 461 |
+
+The selected plan is therefore approximately 6.6% lower in wall latency and
+6.9% lower in GPU time in this suite. The small physical-footprint difference
+is measurement noise/allocator state, not a memory improvement; artifact size
+is identical at 751,009,792 bytes.
+
+The durable selector/evidence files are:
+
+- `benchmarks/granite-m5-pro-unique-packet-autotune-suite.json`
+- `benchmarks/results/unique-packet-autotune-evidence-2026-08-23.json`
+- `benchmarks/results/unique-packet-selected-plan-2026-08-23.json`
+- `benchmarks/results/unique-packet-selection-report-2026-08-23.json`
+
+The post-promotion contextual attribution must activate the sealed plan before
+constructing Metal pipelines. That activation was added to
+`--v2-moe-contextual-profile`; the corrected same-fixture profile measured:
+
+| Plan | Gate/up GPU µs / 24 layers | Full fixed-route MoE µs | Complete fixed-route token µs |
+|---|---:|---:|---:|
+| canonical | 2,617.87 | 5,173.29 | 9,957.21 |
+| unique-packet | **1,733.58** | **3,118.13** | **6,137.71** |
+
+These contextual numbers are diagnostic rather than a replacement for the
+interleaved complete-token suite; they confirm that the sealed consumer is
+actually active and materially changes the live MoE boundary.
+
 Result records:
 
 - `benchmarks/results/gateup-instrument-canonical-general-2026-08-23.json`

@@ -76,6 +76,11 @@ struct Args {
     /// activation without a process-wide environment override.
     #[arg(long, value_enum, default_value_t = MoeMappingArg::Qx)]
     moe_mapping: MoeMappingArg,
+    /// Exact-Q4 MoE consumer dataflow selected by the compiler. The
+    /// unique-packet variant is semantically identical to canonical Q4 but
+    /// changes packed code/scale load ownership on Metal.
+    #[arg(long, value_enum, default_value_t = MoeConsumerArg::Canonical)]
+    moe_consumer: MoeConsumerArg,
     #[arg(long, default_value_t = MAX_CONTEXT)]
     context: usize,
     /// Stable identifier embedded in artifact v2 for compiler/autotuner provenance.
@@ -150,6 +155,13 @@ enum MoeMappingArg {
     Qx,
     #[value(name = "llama-like", alias = "llama")]
     LlamaLike,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum MoeConsumerArg {
+    Canonical,
+    #[value(name = "unique-packet", alias = "unique_packet")]
+    UniquePacket,
 }
 
 impl From<ExpertLayout> for PackingLayout {
@@ -1061,6 +1073,10 @@ fn main() -> Result<()> {
     execution_plan.moe_mapping = Some(match args.moe_mapping {
         MoeMappingArg::Qx => "qx".to_owned(),
         MoeMappingArg::LlamaLike => "llama-like".to_owned(),
+    });
+    execution_plan.moe_consumer = Some(match args.moe_consumer {
+        MoeConsumerArg::Canonical => "canonical".to_owned(),
+        MoeConsumerArg::UniquePacket => "unique-packet".to_owned(),
     });
     execution_plan.expert_traversal = if args.expert_layout == ExpertLayout::CrossExpertTile8 {
         Some(qx_format::ExpertTraversalPlan {

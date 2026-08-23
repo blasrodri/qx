@@ -1,0 +1,72 @@
+{
+  "contract": {
+    "context": 512,
+    "generation": 128,
+    "rounds": 3,
+    "ordering": "randomized candidate order within each fixture/round",
+    "binary": "target/release/qx-bench",
+    "command_buffers_per_token": 1,
+    "dispatches_per_token": 461,
+    "artifact_bytes": 751009792,
+    "canonical_artifact_hash": "e3f2940482d5999d",
+    "unique_packet_artifact_hash": "e0891fd697f49774"
+  },
+  "fixtures": [
+    {
+      "fixture": "general",
+      "canonical_wall_ms_per_token": [5.032, 4.716, 4.724],
+      "unique_packet_wall_ms_per_token": [4.369, 4.447, 4.437],
+      "canonical_gpu_ms_per_token": [4.554, 4.238, 4.256],
+      "unique_packet_gpu_ms_per_token": [3.911, 3.972, 3.962],
+      "canonical_median_wall_ms_per_token": 4.724,
+      "unique_packet_median_wall_ms_per_token": 4.437,
+      "wall_saving_ms_per_token": 0.287,
+      "wall_improvement_percent": 6.07
+    },
+    {
+      "fixture": "instruction",
+      "canonical_wall_ms_per_token": [4.715, 4.718, 4.764],
+      "unique_packet_wall_ms_per_token": [4.408, 4.494, 4.392],
+      "canonical_gpu_ms_per_token": [4.246, 4.246, 4.288],
+      "unique_packet_gpu_ms_per_token": [3.906, 4.019, 3.917],
+      "canonical_median_wall_ms_per_token": 4.718,
+      "unique_packet_median_wall_ms_per_token": 4.408,
+      "wall_saving_ms_per_token": 0.310,
+      "wall_improvement_percent": 6.57
+    },
+    {
+      "fixture": "code",
+      "canonical_wall_ms_per_token": [4.869, 4.740, 4.864],
+      "unique_packet_wall_ms_per_token": [4.586, 4.399, 4.483],
+      "canonical_gpu_ms_per_token": [4.398, 4.236, 4.397],
+      "unique_packet_gpu_ms_per_token": [4.093, 3.927, 4.014],
+      "canonical_median_wall_ms_per_token": 4.864,
+      "unique_packet_median_wall_ms_per_token": 4.483,
+      "wall_saving_ms_per_token": 0.381,
+      "wall_improvement_percent": 7.83
+    },
+    {
+      "fixture": "reasoning",
+      "canonical_wall_ms_per_token": [4.706, 4.718, 4.900],
+      "unique_packet_wall_ms_per_token": [4.431, 4.411, 4.529],
+      "canonical_gpu_ms_per_token": [4.232, 4.254, 4.400],
+      "unique_packet_gpu_ms_per_token": [3.958, 3.932, 4.059],
+      "canonical_median_wall_ms_per_token": 4.718,
+      "unique_packet_median_wall_ms_per_token": 4.431,
+      "wall_saving_ms_per_token": 0.287,
+      "wall_improvement_percent": 6.08
+    },
+    {
+      "fixture": "chat",
+      "canonical_wall_ms_per_token": [4.706, 4.716, 6.391],
+      "unique_packet_wall_ms_per_token": [4.410, 4.388, 4.880],
+      "canonical_gpu_ms_per_token": [4.233, 4.244, 5.864],
+      "unique_packet_gpu_ms_per_token": [3.946, 3.910, 4.396],
+      "canonical_median_wall_ms_per_token": 4.716,
+      "unique_packet_median_wall_ms_per_token": 4.410,
+      "wall_saving_ms_per_token": 0.306,
+      "wall_improvement_percent": 6.49,
+      "note": "The third canonical sample crossed a noisy GPU-state transition; the median remains the paired fixture statistic."
+    }
+  ]
+}
