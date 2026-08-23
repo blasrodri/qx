@@ -7,7 +7,7 @@ Artifact hash: `e3f2940482d5999d`
 
 ## What was added
 
-The existing row-inline Q4 gate/up dispatch now has five diagnostic variants,
+The existing row-inline Q4 gate/up dispatch now has six diagnostic variants,
 selected with `QX_V2_MOE_GATE_UP_INSTRUMENT`:
 
 ```text
@@ -20,6 +20,8 @@ staging-only          preserve activation staging/barrier, but do not touch
                       expert weights
 address-only          calculate production routed row/group/byte addresses,
                       but do not dereference expert weights
+contiguous-load-only  keep the production mapping and load count, but use a
+                      unique contiguous per-threadgroup stream
 ```
 
 The variants preserve the production path's:
@@ -64,8 +66,9 @@ format is:
 For one selected top-8 layer this expands to:
 
 ```text
-weight traffic:       8 × 1024 × 32 × 18 = 589,824 bytes
-                      (576 KiB: 512 KiB codes + 64 KiB scales)
+weight traffic:       8 × 1024 × 32 × 18 = 4,718,592 bytes
+                      (4.5 MiB: 4 MiB codes + 512 KiB scales)
+                      (576 KiB per selected expert)
 output rows:           8 × 1024
 row/group units:       8 × 1024 × 32
 threadgroups:          8 × 128 = 1,024
@@ -186,6 +189,32 @@ the remaining cost is more likely coupled address/decoder/vectorization
 behavior. Neither result justifies a new format until it is confirmed in the
 complete semantic graph.
 
+## Unique contiguous production-shaped control
+
+The contiguous control keeps the 1,024 threadgroups/layer, 256 threads per
+threadgroup, activation staging, lane-to-weight mapping, 32 source code reads,
+32 scale-helper calls, and diagnostic sink. It changes only the expert base:
+each threadgroup consumes a unique sequential 18-byte-group stream region
+instead of an expert/row-derived region. The stream covers the full 4.5 MiB
+top-8 encoded traffic for the layer; groups do not alias a small repeated
+buffer.
+
+| Variant | 24-layer gate/up GPU µs | µs / layer |
+|---|---:|---:|
+| real row-inline load-only | 1,263.42 | 52.64 |
+| unique contiguous load-only | 1,259.58 | 52.48 |
+
+The difference is only 3.84 µs over 24 layers, within the scale of this
+separate-process diagnostic. Therefore removing the routed expert/row physical
+placement does not currently expose a material locality win in this mapping.
+The result does not prove that raw traffic is cheap; it says that simple
+contiguity is not the missing mechanism.
+
+The exact search now moves toward load issue width, vector/scalar transaction
+shape, independent outstanding loads, and dependency-chain/ILP behavior in the
+production decoder. A new representation is justified only if it changes one
+of those properties, not merely because it makes expert regions adjacent.
+
 Result records:
 
 - `benchmarks/results/gateup-instrument-canonical-general-2026-08-23.json`
@@ -202,3 +231,4 @@ Result records:
 - `benchmarks/results/gateup-instrument-averaged-dot-no-reduction-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-averaged-staging-only-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-averaged-address-only-2026-08-23.json`
+- `benchmarks/results/gateup-instrument-averaged-contiguous-load-only-2026-08-23.json`
