@@ -123,6 +123,9 @@ struct Args {
     /// Replay hot, realistic, and low-overlap route sequences against the live MoE graph.
     #[arg(long)]
     v2_route_churn_profile: bool,
+    /// Capture dispatch-boundary GPU timestamps during a sequential decode.
+    #[arg(long)]
+    v2_sequential_timeline: bool,
     /// Compare previous-route and oracle expert traffic prefetch on the live token graph.
     #[arg(long)]
     v2_moe_prefetch_profile: bool,
@@ -446,6 +449,25 @@ fn main() -> Result<()> {
             args.context,
             args.warmup,
             args.iterations,
+            args.result_json.as_deref(),
+        );
+    }
+    if args.v2_sequential_timeline {
+        let artifact = args
+            .artifact
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--v2-sequential-timeline requires an artifact path"))?;
+        let fixture = args.fixture.as_deref().map(load_fixture).transpose()?;
+        let context = fixture
+            .as_ref()
+            .and_then(|fixture| fixture.context)
+            .unwrap_or(args.context);
+        return benchmark_v2_sequential_timeline(
+            artifact,
+            context,
+            args.warmup,
+            args.iterations,
+            fixture.as_ref(),
             args.result_json.as_deref(),
         );
     }
@@ -1418,6 +1440,8 @@ fn encode_differential_token(
             EMBEDDING_MULTIPLIER,
         )
         .map_err(anyhow::Error::msg)?;
+    // Diagnostic marker: the next interval is input RMS/QKV for layer 0.
+    graph.stage_boundary(context).map_err(anyhow::Error::msg)?;
 
     for (layer, weights) in stack.layers.iter().enumerate() {
         let input = if layer.is_multiple_of(2) {
@@ -1474,6 +1498,7 @@ fn encode_differential_token(
                 )
                 .map_err(anyhow::Error::msg)?;
         }
+        graph.stage_boundary(context).map_err(anyhow::Error::msg)?;
 
         let key_cache = buffers.kv_key_buffer(layer).map_err(anyhow::Error::msg)?;
         let value_cache = buffers.kv_value_buffer(layer).map_err(anyhow::Error::msg)?;
@@ -1501,6 +1526,7 @@ fn encode_differential_token(
                 )
                 .map_err(anyhow::Error::msg)?;
         }
+        graph.stage_boundary(context).map_err(anyhow::Error::msg)?;
 
         if skip == Some(DifferentialBlock::Attention) {
             noop(graph, differential_attention_dispatches())?;
@@ -1529,6 +1555,7 @@ fn encode_differential_token(
                 )
                 .map_err(anyhow::Error::msg)?;
         }
+        graph.stage_boundary(context).map_err(anyhow::Error::msg)?;
 
         if skip == Some(DifferentialBlock::OutputResidual) {
             noop(graph, 2)?;
@@ -1550,6 +1577,7 @@ fn encode_differential_token(
                 )
                 .map_err(anyhow::Error::msg)?;
         }
+        graph.stage_boundary(context).map_err(anyhow::Error::msg)?;
 
         let inverse_rms = buffers
             .buffer(qx_runtime_v2::BufferId::MoeScratch)
@@ -1611,6 +1639,7 @@ fn encode_differential_token(
                 )
                 .map_err(anyhow::Error::msg)?;
         }
+        graph.stage_boundary(context).map_err(anyhow::Error::msg)?;
 
         let expert_ids = route_trace
             .map(|trace| trace.ids_for(layer))
@@ -1770,6 +1799,7 @@ fn encode_differential_token(
                 RESIDUAL_MULTIPLIER,
             )
             .map_err(anyhow::Error::msg)?;
+        graph.stage_boundary(context).map_err(anyhow::Error::msg)?;
     }
 
     let final_hidden = if LAYERS.is_multiple_of(2) {
@@ -1807,6 +1837,7 @@ fn encode_differential_token(
             )
             .map_err(anyhow::Error::msg)?;
     }
+    graph.stage_boundary(context).map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
@@ -4045,6 +4076,295 @@ fn benchmark_v2_route_churn_profile(
         println!("result JSON: {}", path.display());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn benchmark_v2_sequential_timeline(
+    artifact_path: &std::path::Path,
+    context_length: usize,
+    warmup: usize,
+    iterations: usize,
+    fixture: Option<&BenchmarkFixture>,
+    result_json: Option<&std::path::Path>,
+) -> Result<()> {
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    if iterations == 0 {
+        bail!("--v2-sequential-timeline requires positive iterations");
+    }
+    let measurement = fixture
+        .map(|value| value.measurement)
+        .unwrap_or(MeasurementMode::SeedInclusive);
+    let tokens = fixture
+        .map(|value| value.tokens.as_slice())
+        .unwrap_or(&[0_u32]);
+    if measurement == MeasurementMode::SeedInclusive && tokens.len() != 1 {
+        bail!("seed_inclusive timeline fixtures require one seed token");
+    }
+    let prefill_tokens = if measurement == MeasurementMode::PostPrefill {
+        tokens.len()
+    } else {
+        0
+    };
+    if prefill_tokens.saturating_add(iterations) > context_length {
+        bail!("prefill plus timeline positions exceed the context limit");
+    }
+
+    let context = Rc::new(
+        qx_metal::platform::MetalContext::system_default()
+            .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
+    );
+    let plan = ExecutionPlan::granite(context_length).map_err(anyhow::Error::msg)?;
+    let buffers =
+        qx_runtime_v2::GpuRuntimeBuffers::new(context.clone(), plan).map_err(anyhow::Error::msg)?;
+    let mapped_artifact = Arc::new(MappedArtifact::open(artifact_path)?);
+    let stack = qx_runtime_v2::PreparedAttentionStack::load_from_mapped_artifact(
+        context.as_ref(),
+        mapped_artifact.clone(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let moe = qx_runtime_v2::PreparedMoeStack::load_from_mapped_artifact(
+        context.as_ref(),
+        mapped_artifact,
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    let seed = tokens[0].to_le_bytes();
+    // Warm and prefill with counters disabled. The measured sequence must not
+    // include pipeline compilation, fixture replay, or counter setup.
+    for _ in 0..warmup {
+        context
+            .write_runtime_buffer(buffers.buffer(qx_runtime_v2::BufferId::TokenOutput), &seed)
+            .map_err(anyhow::Error::msg)?;
+        let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+        stack
+            .encode_token(&mut graph, &buffers, &moe, 0)
+            .map_err(anyhow::Error::msg)?;
+        buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+    }
+    if measurement == MeasurementMode::PostPrefill {
+        for (position, token) in tokens.iter().enumerate() {
+            context
+                .write_runtime_buffer(
+                    buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
+                    &token.to_le_bytes(),
+                )
+                .map_err(anyhow::Error::msg)?;
+            let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+            stack
+                .encode_token(&mut graph, &buffers, &moe, position)
+                .map_err(anyhow::Error::msg)?;
+            buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+        }
+    } else {
+        context
+            .write_runtime_buffer(buffers.buffer(qx_runtime_v2::BufferId::TokenOutput), &seed)
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    context
+        .set_stage_counters(true)
+        .map_err(anyhow::Error::msg)?;
+    let mut per_stage: Vec<Vec<f64>> = vec![Vec::with_capacity(iterations); 11];
+    let expected_markers = LAYERS * 10 + 2;
+    let expected_fallback_segments = LAYERS * 6 + 2;
+    let mut counter_mode = None;
+    let mut total_gpu_us_samples = Vec::with_capacity(iterations);
+    let start = Instant::now();
+    for offset in 0..iterations {
+        let position = prefill_tokens + offset;
+        let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+        encode_differential_token(
+            &mut graph, &buffers, &stack, &moe, position, None, None, None, None, None, None, None,
+        )?;
+        buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+        let timeline = context.last_stage_timeline().map_err(anyhow::Error::msg)?;
+        total_gpu_us_samples.push(timeline.gpu_duration_seconds * 1e6);
+        let has_counters = !timeline.timestamps.is_empty();
+        if let Some(previous) = counter_mode {
+            if previous != has_counters {
+                bail!("Metal timeline mode changed during the measured sequence");
+            }
+        } else {
+            counter_mode = Some(has_counters);
+        }
+        if has_counters {
+            if timeline.timestamps.len() != expected_markers {
+                bail!(
+                    "Metal timestamp timeline returned {} markers; expected {}",
+                    timeline.timestamps.len(),
+                    expected_markers
+                );
+            }
+            let first = *timeline.timestamps.first().unwrap() as f64;
+            let last = *timeline.timestamps.last().unwrap() as f64;
+            let tick_span = last - first;
+            if tick_span <= 0.0 || timeline.gpu_duration_seconds <= 0.0 {
+                bail!("Metal timestamp timeline is invalid for position {position}");
+            }
+            let us_per_tick = timeline.gpu_duration_seconds * 1e6 / tick_span;
+            let interval = |a: usize, b: usize| {
+                (timeline.timestamps[b] as f64 - timeline.timestamps[a] as f64) * us_per_tick
+            };
+            for layer in 0..LAYERS {
+                let base = 1 + layer * 10;
+                for (stage, (a, b)) in [
+                    (0, (base - 1, base)),
+                    (1, (base, base + 1)),
+                    (2, (base + 1, base + 2)),
+                    (3, (base + 2, base + 3)),
+                    (4, (base + 3, base + 4)),
+                    (5, (base + 4, base + 5)),
+                    (6, (base + 5, base + 6)),
+                    (7, (base + 6, base + 7)),
+                    (8, (base + 7, base + 8)),
+                    (9, (base + 8, base + 9)),
+                ] {
+                    per_stage[stage].push(interval(a, b));
+                }
+            }
+            let final_start = LAYERS * 10;
+            per_stage[10].push(interval(final_start, final_start + 1));
+        } else {
+            if timeline.segment_gpu_seconds.len() < expected_fallback_segments {
+                bail!(
+                    "Metal fallback timeline returned {} command-buffer segments; expected at least {}",
+                    timeline.segment_gpu_seconds.len(),
+                    expected_fallback_segments
+                );
+            }
+            // Segment zero is embedding and the final segment is the empty
+            // command buffer created after the last marker. The middle
+            // segments are the real logical intervals.
+            for layer in 0..LAYERS {
+                let base = 1 + layer * 6;
+                for (stage, segment) in [
+                    (0, base),
+                    (1, base + 1),
+                    (2, base + 2),
+                    (3, base + 3),
+                    (4, base + 4),
+                    (5, base + 5),
+                ] {
+                    per_stage[stage].push(timeline.segment_gpu_seconds[segment] * 1e6);
+                }
+            }
+            per_stage[6].push(timeline.segment_gpu_seconds[1 + LAYERS * 6] * 1e6);
+        }
+    }
+    context
+        .set_stage_counters(false)
+        .map_err(anyhow::Error::msg)?;
+
+    let detailed_names = [
+        "input_rms_qkv",
+        "rope_kv",
+        "attention",
+        "o_residual",
+        "router_topk",
+        "moe_gate_up",
+        "moe_silu",
+        "moe_down",
+        "moe_accumulation",
+        "moe_residual",
+        "final_head",
+    ];
+    let fallback_names = [
+        "input_rms_qkv",
+        "rope_kv",
+        "attention",
+        "o_residual",
+        "router_topk",
+        "moe_plus_residual",
+        "final_head",
+    ];
+    let names: &[&str] = if counter_mode == Some(true) {
+        &detailed_names
+    } else {
+        &fallback_names
+    };
+    let mut rows = Vec::with_capacity(names.len());
+    println!("QX V2 sequential in-graph timeline");
+    println!(
+        "candidate: {}",
+        if qx_metal::platform::moe_decode_direct_enabled() {
+            "decode-direct"
+        } else {
+            "canonical"
+        }
+    );
+    println!(
+        "fixture: {}",
+        fixture.map(|value| value.name.as_str()).unwrap_or("seed")
+    );
+    println!(
+        "positions: {}..{}",
+        prefill_tokens,
+        prefill_tokens + iterations - 1
+    );
+    println!("stage                         median us/token   median us/layer");
+    for (index, name) in names.iter().enumerate() {
+        let median = median_sample(&mut per_stage[index]);
+        let per_layer = if (counter_mode == Some(true) && index < 10)
+            || (counter_mode != Some(true) && index < 6)
+        {
+            median / LAYERS as f64
+        } else {
+            median
+        };
+        println!("{name:<28} {median:>16.2} {per_layer:>18.2}");
+        rows.push(serde_json::json!({
+            "stage": name,
+            "gpu_us_per_token_median": median,
+            "gpu_us_per_layer_median": per_layer,
+        }));
+    }
+    let wall_us_per_token = start.elapsed().as_secs_f64() * 1e6 / iterations as f64;
+    let total_gpu_us_per_token = median_sample(&mut total_gpu_us_samples);
+    let (artifact_bytes, artifact_hash) = artifact_fingerprint(artifact_path)?;
+    println!("wall us/token: {:.2}", wall_us_per_token);
+    println!(
+        "GPU us/token (all command buffers): {:.2}",
+        total_gpu_us_per_token
+    );
+    println!("artifact hash: {artifact_hash:016x}");
+    if let Some(path) = result_json {
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "mode": "v2_sequential_in_graph_timeline",
+            "candidate": if qx_metal::platform::moe_decode_direct_enabled() { "decode-direct" } else { "canonical" },
+            "artifact": artifact_path.display().to_string(),
+            "artifact_bytes": artifact_bytes,
+            "artifact_hash": format!("{artifact_hash:016x}"),
+            "fixture": fixture.map(|value| value.name.clone()),
+            "measurement": "artifact_only_sequential_after_prefill",
+            "context": context_length,
+            "prefill_tokens": prefill_tokens,
+            "iterations": iterations,
+            "expected_markers_per_token": expected_markers,
+            "stages": rows,
+            "wall_us_per_token": wall_us_per_token,
+            "gpu_us_per_token_all_command_buffers": total_gpu_us_per_token,
+            "timeline_mode": if counter_mode == Some(true) { "dispatch_counters" } else { "command_buffer_fallback" },
+            "warning": "stage intervals are diagnostic; the fallback changes command-buffer boundaries and is not a production schedule",
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
+        println!("result JSON: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn benchmark_v2_sequential_timeline(
+    _artifact_path: &std::path::Path,
+    _context_length: usize,
+    _warmup: usize,
+    _iterations: usize,
+    _fixture: Option<&BenchmarkFixture>,
+    _result_json: Option<&std::path::Path>,
+) -> Result<()> {
+    bail!("--v2-sequential-timeline requires macOS Metal")
 }
 
 #[cfg(not(target_os = "macos"))]

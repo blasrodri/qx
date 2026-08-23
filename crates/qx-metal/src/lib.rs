@@ -64,12 +64,14 @@ pub mod platform {
     use block2::RcBlock;
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
-    use objc2_foundation::NSString;
+    use objc2_foundation::{NSRange, NSString};
     pub use objc2_metal::MTLSize;
     use objc2_metal::{
         MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-        MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-        MTLLibrary, MTLResourceOptions,
+        MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePipelineState,
+        MTLCounterResultTimestamp, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor,
+        MTLCounterSamplingPoint, MTLCounterSet, MTLCreateSystemDefaultDevice, MTLDevice,
+        MTLLibrary, MTLResourceOptions, MTLStorageMode,
     };
 
     use super::{
@@ -786,6 +788,133 @@ pub mod platform {
         pub cpu_wait_seconds: f64,
     }
 
+    /// Timestamp samples recorded at dispatch-boundary markers in one decode
+    /// graph. This is intentionally separate from aggregate metrics: enabling
+    /// it changes command encoding and is reserved for diagnostic profiles.
+    #[derive(Clone, Debug, Default)]
+    pub struct StageTimeline {
+        /// GPU timestamp ticks, in the order markers were encoded.
+        pub timestamps: Vec<u64>,
+        /// Aggregate GPU duration for the command buffer sequence. Counter
+        /// ticks are normalized against this duration by the benchmark tool,
+        /// avoiding any dependency on a private timestamp frequency API.
+        pub gpu_duration_seconds: f64,
+        /// Fallback stage durations when dispatch counters are unavailable.
+        /// These are command-buffer intervals created without CPU waits.
+        pub segment_gpu_seconds: Vec<f64>,
+    }
+
+    #[derive(Debug)]
+    struct CounterTimeline {
+        sample_buffer: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
+        sample_count: usize,
+    }
+
+    impl CounterTimeline {
+        fn new(device: &ProtocolObject<dyn MTLDevice>) -> Option<Self> {
+            if !device.supportsCounterSampling(MTLCounterSamplingPoint::AtDispatchBoundary) {
+                eprintln!("QX_STAGE_COUNTERS unavailable: dispatch-boundary sampling unsupported");
+                return None;
+            }
+            let Some(sets) = device.counterSets() else {
+                eprintln!("QX_STAGE_COUNTERS unavailable: device returned no counter sets");
+                return None;
+            };
+            let mut timestamp_set: Option<Retained<ProtocolObject<dyn MTLCounterSet>>> = None;
+            for index in 0..sets.count() {
+                let set = sets.objectAtIndex(index);
+                let name = set.name().to_string().to_ascii_lowercase();
+                if name
+                    == (unsafe { MTLCommonCounterSetTimestamp })
+                        .to_string()
+                        .to_ascii_lowercase()
+                    || name.contains("timestamp")
+                {
+                    timestamp_set = Some(set);
+                    break;
+                }
+            }
+            let Some(timestamp_set) = timestamp_set else {
+                eprintln!("QX_STAGE_COUNTERS unavailable: no timestamp counter set");
+                return None;
+            };
+            let descriptor = MTLCounterSampleBufferDescriptor::new();
+            descriptor.setCounterSet(Some(&timestamp_set));
+            descriptor.setStorageMode(MTLStorageMode::Shared);
+            // A complete Granite token has several hundred dispatches. The
+            // diagnostic timeline uses one marker per logical boundary and is
+            // deliberately bounded so it cannot grow with a long run.
+            let sample_count = 512;
+            unsafe { descriptor.setSampleCount(sample_count) };
+            let sample_buffer = match device.newCounterSampleBufferWithDescriptor_error(&descriptor)
+            {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    eprintln!(
+                        "QX_STAGE_COUNTERS unavailable: counter buffer allocation failed: {error:?}"
+                    );
+                    return None;
+                }
+            };
+            Some(Self {
+                sample_buffer,
+                sample_count,
+            })
+        }
+
+        fn sample(&mut self, encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
+            if self.sample_count == 0 {
+                return;
+            }
+            let index = 512usize.saturating_sub(self.sample_count);
+            unsafe {
+                encoder.sampleCountersInBuffer_atSampleIndex_withBarrier(
+                    &self.sample_buffer,
+                    index,
+                    true,
+                );
+            }
+            self.sample_count -= 1;
+        }
+
+        fn resolve(self, gpu_duration_seconds: f64) -> StageTimeline {
+            let count = 512usize.saturating_sub(self.sample_count);
+            if count == 0 {
+                return StageTimeline {
+                    timestamps: Vec::new(),
+                    gpu_duration_seconds,
+                    segment_gpu_seconds: Vec::new(),
+                };
+            }
+            let Some(data) = (unsafe {
+                self.sample_buffer
+                    .resolveCounterRange(NSRange::new(0, count))
+            }) else {
+                return StageTimeline {
+                    timestamps: Vec::new(),
+                    gpu_duration_seconds,
+                    segment_gpu_seconds: Vec::new(),
+                };
+            };
+            let bytes = data.to_vec();
+            let stride = std::mem::size_of::<MTLCounterResultTimestamp>();
+            let timestamps = bytes
+                .chunks_exact(stride)
+                .take(count)
+                .map(|chunk| {
+                    let mut raw = [0_u8; std::mem::size_of::<u64>()];
+                    raw.copy_from_slice(&chunk[..std::mem::size_of::<u64>()]);
+                    u64::from_ne_bytes(raw)
+                })
+                .collect();
+            StageTimeline {
+                timestamps,
+                gpu_duration_seconds,
+                segment_gpu_seconds: Vec::new(),
+            }
+        }
+    }
+
     #[derive(Debug, Default)]
     struct MetalMetricsState {
         command_buffers: u64,
@@ -833,6 +962,8 @@ pub mod platform {
         v2_pipelines: Mutex<[Option<Pipeline>; 27]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
+        stage_counters: Mutex<bool>,
+        last_stage_timeline: Mutex<StageTimeline>,
         no_copy_buffers: Mutex<HashMap<(usize, usize), RuntimeBuffer>>,
     }
 
@@ -843,6 +974,7 @@ pub mod platform {
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         dispatches: u64,
+        counter_timeline: Option<CounterTimeline>,
         committed: Vec<(Retained<ProtocolObject<dyn MTLCommandBuffer>>, u64)>,
         encode_started_at: Instant,
     }
@@ -2136,6 +2268,7 @@ pub mod platform {
                     depth: 1,
                 },
             );
+            self.sample_stage_boundary();
 
             self.encoder
                 .setComputePipelineState(&prepared.batched_silu_pipeline);
@@ -2157,6 +2290,7 @@ pub mod platform {
                     depth: 1,
                 },
             );
+            self.sample_stage_boundary();
 
             if let Some(pipeline) = prepared.q3_down_pipeline.as_ref() {
                 self.encoder.setComputePipelineState(pipeline);
@@ -2255,6 +2389,7 @@ pub mod platform {
                     depth: 1,
                 },
             );
+            self.sample_stage_boundary();
 
             self.encoder
                 .setComputePipelineState(&prepared.batched_accumulate_pipeline);
@@ -2284,6 +2419,7 @@ pub mod platform {
                     depth: 1,
                 },
             );
+            self.sample_stage_boundary();
             self.dispatches += 4;
             Ok(())
         }
@@ -4687,6 +4823,26 @@ pub mod platform {
             self.dispatches += 1;
         }
 
+        /// Record a GPU timestamp at the current dispatch boundary. Markers
+        /// are no-ops unless stage diagnostics were enabled on the context.
+        pub fn sample_stage_boundary(&mut self) {
+            if let Some(timeline) = self.counter_timeline.as_mut() {
+                timeline.sample(&self.encoder);
+            }
+        }
+
+        /// Mark a logical stage boundary. On devices with Metal counters this
+        /// is an in-command-buffer sample. On devices without them, the
+        /// diagnostic mode uses an ordered command-buffer boundary instead;
+        /// there is still no CPU wait and GPU state remains resident.
+        pub fn stage_boundary(&mut self, context: &MetalContext) -> Result<(), String> {
+            if self.counter_timeline.is_some() {
+                self.sample_stage_boundary();
+                return Ok(());
+            }
+            self.begin_next_command_buffer(context)
+        }
+
         pub fn encode_noop(
             &mut self,
             context: &MetalContext,
@@ -4739,6 +4895,42 @@ pub mod platform {
                 .metrics
                 .lock()
                 .map_err(|_| "Metal metrics cache is poisoned".to_owned())?;
+            let gpu_duration_seconds = self
+                .committed
+                .iter()
+                .map(|(command_buffer, _)| {
+                    (command_buffer.GPUEndTime() - command_buffer.GPUStartTime()).max(0.0)
+                })
+                .sum::<f64>();
+            let stage_timeline = self
+                .counter_timeline
+                .take()
+                .map(|timeline| timeline.resolve(gpu_duration_seconds))
+                .unwrap_or_else(|| StageTimeline {
+                    timestamps: Vec::new(),
+                    gpu_duration_seconds,
+                    segment_gpu_seconds: self
+                        .committed
+                        .iter()
+                        .map(|(command_buffer, _)| {
+                            (command_buffer.GPUEndTime() - command_buffer.GPUStartTime()).max(0.0)
+                        })
+                        .collect(),
+                });
+            let mut stage_timeline = stage_timeline;
+            if stage_timeline.segment_gpu_seconds.is_empty() {
+                stage_timeline.segment_gpu_seconds = self
+                    .committed
+                    .iter()
+                    .map(|(command_buffer, _)| {
+                        (command_buffer.GPUEndTime() - command_buffer.GPUStartTime()).max(0.0)
+                    })
+                    .collect();
+            }
+            *context
+                .last_stage_timeline
+                .lock()
+                .map_err(|_| "Metal stage timeline cache is poisoned".to_owned())? = stage_timeline;
             metrics.command_buffers += self.committed.len() as u64;
             metrics.encoders += self.committed.len() as u64;
             metrics.dispatches += self
@@ -4806,6 +4998,8 @@ pub mod platform {
                 }),
                 metrics: Mutex::new(MetalMetricsState::default()),
                 no_copy_buffers: Mutex::new(HashMap::new()),
+                stage_counters: Mutex::new(false),
+                last_stage_timeline: Mutex::new(StageTimeline::default()),
             })
         }
 
@@ -4822,6 +5016,23 @@ pub mod platform {
                 cpu_encode_seconds: metrics.cpu_encode_seconds,
                 cpu_wait_seconds: metrics.cpu_wait_seconds,
             })
+        }
+
+        /// Enable dispatch-boundary timestamps for subsequently created
+        /// decode graphs. This is diagnostic-only and intentionally opt-in.
+        pub fn set_stage_counters(&self, enabled: bool) -> Result<(), String> {
+            *self
+                .stage_counters
+                .lock()
+                .map_err(|_| "Metal stage-counter cache is poisoned".to_owned())? = enabled;
+            Ok(())
+        }
+
+        pub fn last_stage_timeline(&self) -> Result<StageTimeline, String> {
+            self.last_stage_timeline
+                .lock()
+                .map_err(|_| "Metal stage timeline cache is poisoned".to_owned())
+                .map(|timeline| timeline.clone())
         }
 
         pub fn current_allocated_bytes(&self) -> u64 {
@@ -4844,6 +5055,15 @@ pub mod platform {
                 command_buffer,
                 encoder,
                 dispatches: 0,
+                counter_timeline: if *self
+                    .stage_counters
+                    .lock()
+                    .map_err(|_| "Metal stage-counter cache is poisoned".to_owned())?
+                {
+                    CounterTimeline::new(&self.device)
+                } else {
+                    None
+                },
                 committed: Vec::new(),
                 encode_started_at: Instant::now(),
             })
