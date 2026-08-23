@@ -220,6 +220,24 @@ pub mod platform {
         })
     }
 
+    /// Experimental decode-specific Q4 row-inline mapping candidate. It uses
+    /// two SIMD groups per 64-thread threadgroup and computes two output rows
+    /// per SIMD group, matching the batch-1 work shape used by the llama audit.
+    /// It is intentionally opt-in and only applies to the exact single-row
+    /// row-inline representation.
+    pub fn moe_llama_like_mapping_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            matches!(
+                std::env::var("QX_V2_MOE_LLAMA_LIKE_MAPPING")
+                    .ok()
+                    .map(|value| value.to_ascii_lowercase())
+                    .as_deref(),
+                Some("1") | Some("true") | Some("yes") | Some("on")
+            )
+        })
+    }
+
     /// Experimental four-stage MoE topology: one 1024-threadgroup owns each
     /// selected expert projection. It reduces repeated staging of the small
     /// batch-1 activation vector. The canonical path remains the default.
@@ -541,6 +559,8 @@ pub mod platform {
         inline_gate_up_nocache_norm_pipeline: Pipeline,
         cross_expert_gate_up_pipeline: Pipeline,
         cross_expert_gate_up_norm_pipeline: Pipeline,
+        llama_like_gate_up_pipeline: Pipeline,
+        llama_like_gate_up_norm_pipeline: Pipeline,
         inline_gate_up_rows2_pipeline: Option<Pipeline>,
         inline_gate_up_rows2_norm_pipeline: Option<Pipeline>,
         inline_gate_up_rows4_pipeline: Option<Pipeline>,
@@ -1773,6 +1793,10 @@ pub mod platform {
             let wide_expert =
                 moe_wide_expert_enabled() && prepared.wide_supported && q3_block_bytes.is_none();
             let inline_input_cache = moe_inline_input_cache_enabled();
+            let llama_like_mapping = moe_llama_like_mapping_enabled()
+                && prepared.inline_layout
+                && prepared.gate_up_layout == PackingLayout::Q4RowInline
+                && q3_block_bytes.is_none();
             let cross_expert_activation = moe_cross_expert_activation_enabled()
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
@@ -1781,6 +1805,9 @@ pub mod platform {
             if let Some((norm_weights, inverse_rms)) = norm {
                 if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
                     self.encoder.setComputePipelineState(pipeline);
+                } else if llama_like_mapping {
+                    self.encoder
+                        .setComputePipelineState(&prepared.llama_like_gate_up_norm_pipeline);
                 } else if cross_expert_activation {
                     self.encoder
                         .setComputePipelineState(&prepared.cross_expert_gate_up_norm_pipeline);
@@ -1841,6 +1868,9 @@ pub mod platform {
             } else {
                 if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
                     self.encoder.setComputePipelineState(pipeline);
+                } else if llama_like_mapping {
+                    self.encoder
+                        .setComputePipelineState(&prepared.llama_like_gate_up_pipeline);
                 } else if cross_expert_activation {
                     self.encoder
                         .setComputePipelineState(&prepared.cross_expert_gate_up_pipeline);
@@ -1926,7 +1956,9 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: if cross_expert_activation {
+                    width: if llama_like_mapping {
+                        8 * (1024 / 4)
+                    } else if cross_expert_activation {
                         1024 / 8
                     } else if wide_expert {
                         8
@@ -1942,7 +1974,13 @@ pub mod platform {
                     depth: 1,
                 },
                 MTLSize {
-                    width: if wide_expert { 1024 } else { 256 },
+                    width: if llama_like_mapping {
+                        64
+                    } else if wide_expert {
+                        1024
+                    } else {
+                        256
+                    },
                     height: 1,
                     depth: 1,
                 },
@@ -6035,6 +6073,10 @@ pub mod platform {
                 cross_expert_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_cross_expert_norm_simd",
                 )?,
+                llama_like_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
+                llama_like_gate_up_norm_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_norm_simd")?,
                 inline_gate_up_rows2_pipeline: Some(
                     self.dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_inline_rows2_simd")?,
                 ),
@@ -6232,6 +6274,10 @@ pub mod platform {
                 cross_expert_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_cross_expert_norm_simd",
                 )?,
+                llama_like_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
+                llama_like_gate_up_norm_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_norm_simd")?,
                 inline_gate_up_rows2_pipeline: Some(
                     self.dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_inline_rows2_simd")?,
                 ),
@@ -6422,6 +6468,10 @@ pub mod platform {
                 cross_expert_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_cross_expert_norm_simd",
                 )?,
+                llama_like_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
+                llama_like_gate_up_norm_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_norm_simd")?,
                 inline_gate_up_rows2_pipeline: None,
                 inline_gate_up_rows2_norm_pipeline: None,
                 inline_gate_up_rows4_pipeline: None,
@@ -6701,6 +6751,10 @@ pub mod platform {
                 cross_expert_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_cross_expert_norm_simd",
                 )?,
+                llama_like_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
+                llama_like_gate_up_norm_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_norm_simd")?,
                 inline_gate_up_rows2_pipeline: Some(
                     self.dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_inline_rows2_simd")?,
                 ),
