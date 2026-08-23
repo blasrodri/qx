@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "implementation": "qx-v2-memory-profile",
+  "qx_revision": "unknown",
+  "artifact": "external/models/granite-m5-pro-q4-rowinline-1-control.qx",
+  "artifact_hash": "327d8e72af755a0c",
+  "artifact_version": 2,
+  "plan_id": "granite-m5-row-inline-1-control",
+  "target_id": "m5-pro",
+  "context": 512,
+  "warmup": 1,
+  "iterations": 4,
+  "ownership": {
+    "artifact_file_bytes": 751009792,
+    "mapped_artifact_bytes": 751009792,
+    "arena_bytes": 406784,
+    "arena_region_bytes": 405712,
+    "arena_alignment_bytes": 1072,
+    "activation_and_small_buffers_bytes": 28868,
+    "attention_scratch_bytes": 32768,
+    "moe_scratch_bytes": 147456,
+    "logits_bytes": 196620,
+    "kv_cache_bytes": 50331648,
+    "pipeline_state_bytes": 0,
+    "pipeline_state_bytes_known": false,
+    "duplicate_cpu_weight_bytes": 0,
+    "duplicate_cpu_weight_bytes_known": false
+  },
+  "phases": [
+    {
+      "label": "baseline",
+      "current_rss_bytes": 15695872,
+      "peak_rss_bytes": 15695872,
+      "current_physical_footprint_bytes": 5734928,
+      "peak_physical_footprint_bytes": 5734928,
+      "known_metal_allocated_bytes": 458752,
+      "recommended_metal_working_set_bytes": 19069665280
+    },
+    {
+      "label": "artifact_mapped",
+      "current_rss_bytes": 15745024,
+      "peak_rss_bytes": 15745024,
+      "current_physical_footprint_bytes": 5734928,
+      "peak_physical_footprint_bytes": 5734928,
+      "known_metal_allocated_bytes": 458752,
+      "recommended_metal_working_set_bytes": 19069665280
+    },
+    {
+      "label": "runtime_arena_and_kv",
+      "current_rss_bytes": 15843328,
+      "peak_rss_bytes": 15843328,
+      "current_physical_footprint_bytes": 5734928,
+      "peak_physical_footprint_bytes": 5734928,
+      "known_metal_allocated_bytes": 51200000,
+      "recommended_metal_working_set_bytes": 19069665280
+    },
+    {
+      "label": "attention_weights_and_pipelines",
+      "current_rss_bytes": 17252352,
+      "peak_rss_bytes": 17252352,
+      "current_physical_footprint_bytes": 6652480,
+      "peak_physical_footprint_bytes": 6652480,
+      "known_metal_allocated_bytes": 802111488,
+      "recommended_metal_working_set_bytes": 19069665280
+    },
+    {
+      "label": "all_weights_and_pipelines",
+      "current_rss_bytes": 20119552,
+      "peak_rss_bytes": 20119552,
+      "current_physical_footprint_bytes": 8798808,
+      "peak_physical_footprint_bytes": 8798808,
+      "known_metal_allocated_bytes": 802111488,
+      "recommended_metal_working_set_bytes": 19069665280
+    },
+    {
+      "label": "steady_state_after_warmup",
+      "current_rss_bytes": 22331392,
+      "peak_rss_bytes": 22331392,
+      "current_physical_footprint_bytes": 112198232,
+      "peak_physical_footprint_bytes": 112198232,
+      "known_metal_allocated_bytes": 802373632,
+      "recommended_metal_working_set_bytes": 19069665280
+    },
+    {
+      "label": "steady_state_after_measurement",
+      "current_rss_bytes": 22446080,
+      "peak_rss_bytes": 22446080,
+      "current_physical_footprint_bytes": 112280152,
+      "peak_physical_footprint_bytes": 112280152,
+      "known_metal_allocated_bytes": 802373632,
+      "recommended_metal_working_set_bytes": 19069665280
+    }
+  ],
+  "os_version": "26.5.2",
+  "power_state": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23199843)\t29%; discharging; 0:46 remaining present: true",
+  "thermal_state": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+  "memory_pressure": "The system has 25769803776 (1572864 pages with a page size of 16384).\nSystem-wide memory free percentage: 66%",
+  "limitations": [
+    "Metal currentAllocatedSize is aggregate; Metal does not expose per-buffer ownership through the current qx-metal API.",
+    "mapped_artifact_bytes is the file-backed mapping extent, not resident mapped pages.",
+    "pipeline_state_bytes and duplicate_cpu_weight_bytes are unknown because their allocations are not exposed by the current runtime API.",
+    "peak RSS/physical footprint are process lifetime maxima and cannot be reset between phases."
+  ]
+}
