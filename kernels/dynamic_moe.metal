@@ -3294,6 +3294,74 @@ kernel void qx_dynamic_q4_moe_down_inline_simd(
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
+// Exact-Q4 cooperative packet consumer for the row-inline down projection.
+// Down has 512 input values (16 group-32 packets), so each SIMD group owns
+// two adjacent packets just as the proven gate/up consumer does.  Lanes 0..15
+// load one packed byte from the first packet and lanes 16..31 load the
+// corresponding byte from the second; packet scales are loaded once and
+// broadcast within each half.  The arithmetic and output ownership remain
+// identical to qx_dynamic_q4_moe_down_inline_simd.
+inline void qx_dynamic_q4_down_inline_unique_packet_body(
+    device const uchar* stream,
+    device const float* activated,
+    device const uint* expert_ids,
+    device float* output,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id) {
+    constexpr uint hidden = 1024;
+    constexpr uint intermediate = 512;
+    constexpr uint groups = 16;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint row = (threadgroup_id % threadgroups_per_expert) * rows_per_threadgroup + simdgroup;
+    uint expert = expert_ids[slot];
+    float sum = 0.0f;
+    if (expert < 32 && row < hidden) {
+        uint row_base = expert * expert_stride + row * row_stride;
+        for (uint group = 0; group < groups; group += 2) {
+            uint local = lane & 15u;
+            uint selected_group = group + (lane >= 16u ? 1u : 0u);
+            uint group_base = row_base + selected_group * group_stride;
+            uint packed = uint(stream[group_base + local]);
+            float scale = 0.0f;
+            if (local == 0u) {
+                scale = qx_q4_inline_scale(stream, group_base + 16u);
+            }
+            float scale0 = simd_broadcast(lane == 0u ? scale : 0.0f, 0);
+            float scale1 = simd_broadcast(lane == 16u ? scale : 0.0f, 16);
+            float selected_scale = lane < 16u ? scale0 : scale1;
+            uint input_base = selected_group * 32u + local * 2u;
+            uint lo = packed & 0xfu;
+            uint hi = (packed >> 4u) & 0xfu;
+            sum += float(int(lo) - 7) * selected_scale
+                * activated[slot * intermediate + input_base];
+            sum += float(int(hi) - 7) * selected_scale
+                * activated[slot * intermediate + input_base + 1u];
+        }
+    }
+    sum = simd_sum(sum);
+    if (lane == 0 && expert < 32 && row < hidden) {
+        output[slot * hidden + row] = sum;
+    }
+}
+
+kernel void qx_dynamic_q4_moe_down_inline_unique_packet_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* activated [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    qx_dynamic_q4_down_inline_unique_packet_body(
+        stream, activated, expert_ids, output, lane, simdgroup, threadgroup_id);
+}
+
 // Decode-direct exact-Q4 down projection. It mirrors the gate/up geometry:
 // two SIMD groups per 64-thread threadgroup and one row per group.
 // Activated values and row-inline QX packets are consumed directly; no

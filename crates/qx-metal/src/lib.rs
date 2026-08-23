@@ -360,6 +360,22 @@ pub mod platform {
         })
     }
 
+    /// Enables the experimental cooperative packet consumer for row-inline Q4
+    /// MoE down projections. Gate/up remains controlled by the sealed
+    /// `QX_V2_MOE_UNIQUE_PACKET` plan flag; this separate switch makes the
+    /// down follow-up measurable without changing the promoted baseline.
+    pub fn moe_unique_packet_down_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            matches!(
+                std::env::var("QX_V2_MOE_UNIQUE_PACKET_DOWN")
+                    .ok()
+                    .as_deref(),
+                Some("1") | Some("true") | Some("yes") | Some("on")
+            )
+        })
+    }
+
     /// Experimental decode-specific Q4 row-inline mapping candidate. It uses
     /// two SIMD groups per 64-thread threadgroup and computes two output rows
     /// per SIMD group, matching the batch-1 work shape used by the llama audit.
@@ -850,6 +866,7 @@ pub mod platform {
         inline_gate_up_nocache_norm_pipeline: Pipeline,
         unique_packet_gate_up_pipeline: Pipeline,
         unique_packet_gate_up_norm_pipeline: Pipeline,
+        unique_packet_down_pipeline: Pipeline,
         cross_expert_gate_up_pipeline: Pipeline,
         cross_expert_gate_up_norm_pipeline: Pipeline,
         cross_expert_tile8_gate_up_pipeline: Pipeline,
@@ -2607,6 +2624,10 @@ pub mod platform {
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none();
+            let unique_packet_down = moe_unique_packet_down_enabled()
+                && prepared.down_inline_layout
+                && prepared.down_layout == PackingLayout::Q4RowInline
+                && q3_block_bytes.is_none();
             let is_q4k = prepared.gate_up_packed.length == 32 * 1024 * 4 * 140
                 && prepared.gate_up_scales.length == 32 * 1024 * 4 * 2 * 2
                 && prepared.down_packed.length == 32 * 1024 * 2 * 140
@@ -2996,6 +3017,9 @@ pub mod platform {
             } else if q4k_mature_down {
                 self.encoder
                     .setComputePipelineState(&prepared.q4k_mature_down_pipeline);
+            } else if unique_packet_down {
+                self.encoder
+                    .setComputePipelineState(&prepared.unique_packet_down_pipeline);
             } else if decode_direct {
                 self.encoder
                     .setComputePipelineState(&prepared.decode_direct_down_pipeline);
@@ -3962,6 +3986,10 @@ pub mod platform {
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
                 && prepared.q3_gate_up_block_bytes.is_none();
+            let unique_packet_down = moe_unique_packet_down_enabled()
+                && prepared.down_inline_layout
+                && prepared.down_layout == PackingLayout::Q4RowInline
+                && prepared.q3_down_block_bytes.is_none();
             if input.length < 1024 * 4
                 || expert_ids.length < 8 * 4
                 || expert_weights.length < 8 * 4
@@ -4296,6 +4324,9 @@ pub mod platform {
                     } else if q4k_mature_down {
                         self.encoder
                             .setComputePipelineState(&prepared.q4k_mature_down_pipeline);
+                    } else if unique_packet_down {
+                        self.encoder
+                            .setComputePipelineState(&prepared.unique_packet_down_pipeline);
                     } else if decode_direct {
                         self.encoder
                             .setComputePipelineState(&prepared.decode_direct_down_pipeline);
@@ -7691,6 +7722,9 @@ pub mod platform {
                 unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd",
                 )?,
+                unique_packet_down_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_down_inline_unique_packet_simd",
+                )?,
                 gate_up_instrument_load_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_simd",
                 )?,
@@ -8029,6 +8063,9 @@ pub mod platform {
                 unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd",
                 )?,
+                unique_packet_down_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_down_inline_unique_packet_simd",
+                )?,
                 gate_up_instrument_load_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_simd",
                 )?,
@@ -8322,6 +8359,9 @@ pub mod platform {
                 )?,
                 unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd",
+                )?,
+                unique_packet_down_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_down_inline_unique_packet_simd",
                 )?,
                 gate_up_instrument_load_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_simd",
@@ -8696,6 +8736,9 @@ pub mod platform {
                 )?,
                 unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd",
+                )?,
+                unique_packet_down_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_down_inline_unique_packet_simd",
                 )?,
                 gate_up_instrument_contiguous_load_only_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_contiguous_load_only_simd",

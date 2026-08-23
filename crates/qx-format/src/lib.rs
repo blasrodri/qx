@@ -253,6 +253,11 @@ pub struct ExecutionPlanManifest {
     /// interaction explicit in the sealed artifact.
     #[serde(default)]
     pub moe_consumer: Option<String>,
+    /// Optional compiler-selected exact MoE down-projection consumer. This
+    /// is separate because gate/up and down have different matrix shapes and
+    /// may select different packet consumers on the target GPU.
+    #[serde(default)]
+    pub moe_down_consumer: Option<String>,
     /// Optional physical expert traversal metadata. It is absent on legacy
     /// artifacts and present only when a structural cross-expert stream is
     /// selected by the compiler.
@@ -315,6 +320,7 @@ impl ExecutionPlanManifest {
             },
             moe_mapping: None,
             moe_consumer: None,
+            moe_down_consumer: None,
             expert_traversal: None,
             schedule: DispatchSchedule {
                 command_buffers_per_token: 1,

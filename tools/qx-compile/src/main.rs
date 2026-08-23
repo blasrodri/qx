@@ -81,6 +81,11 @@ struct Args {
     /// changes packed code/scale load ownership on Metal.
     #[arg(long, value_enum, default_value_t = MoeConsumerArg::Canonical)]
     moe_consumer: MoeConsumerArg,
+    /// Exact-Q4 consumer for the row-inline MoE down projection. Kept
+    /// independent from gate/up because the shapes and best packet mapping
+    /// need not be identical.
+    #[arg(long, value_enum, default_value_t = MoeConsumerArg::Canonical)]
+    moe_down_consumer: MoeConsumerArg,
     #[arg(long, default_value_t = MAX_CONTEXT)]
     context: usize,
     /// Stable identifier embedded in artifact v2 for compiler/autotuner provenance.
@@ -1075,6 +1080,10 @@ fn main() -> Result<()> {
         MoeMappingArg::LlamaLike => "llama-like".to_owned(),
     });
     execution_plan.moe_consumer = Some(match args.moe_consumer {
+        MoeConsumerArg::Canonical => "canonical".to_owned(),
+        MoeConsumerArg::UniquePacket => "unique-packet".to_owned(),
+    });
+    execution_plan.moe_down_consumer = Some(match args.moe_down_consumer {
         MoeConsumerArg::Canonical => "canonical".to_owned(),
         MoeConsumerArg::UniquePacket => "unique-packet".to_owned(),
     });

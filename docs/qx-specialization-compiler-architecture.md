@@ -17,10 +17,12 @@ searchable.
 
 ## Current implementation
 
-Artifact-v2 now seals `moe_consumer` alongside representations, topology,
-scheduling, memory ownership, and provenance. Runtime activation resolves that
-field once at model load and sets the Metal pipeline selection before decode;
-the token loop does not make a per-token string or plan decision.
+Artifact-v2 now seals `moe_consumer` and the independent `moe_down_consumer`
+alongside representations, topology, scheduling, memory ownership, and
+provenance. Runtime activation resolves those fields once at model load and
+sets the Metal pipeline selection before decode; the token loop does not make a
+per-token string or plan decision. The split is intentional: gate/up and down
+have different shapes and need not select the same packet consumer.
 
 `qx-autotune` now preserves randomized per-fixture samples and emits paired
 wall-time deltas, bootstrap confidence intervals, and win rates in its
@@ -29,8 +31,8 @@ is available only as an explicit smoke-test override.
 
 ## Next IR refactor
 
-The current `moe_consumer: Option<String>` is a compatibility bridge, not the
-final compiler IR. The next stable representation should separate:
+The current string consumer fields are a compatibility bridge, not the final
+compiler IR. The next stable representation should separate:
 
 - `QuantizedStorage`: row-major, row-inline, Q4_K, or future formats;
 - `QuantizedConsumer`: canonical row, cooperative packet, or archived candidates;

@@ -127,11 +127,21 @@ pub fn activate_artifact_execution_plan(
     // The consumer dataflow is sealed in the artifact so autotuning compares
     // real plans rather than process-wide ad hoc environment variants.
     set_plan_bool_env("QX_V2_MOE_UNIQUE_PACKET", false);
+    set_plan_bool_env("QX_V2_MOE_UNIQUE_PACKET_DOWN", false);
     if let Some(consumer) = plan.moe_consumer.as_deref() {
         match consumer {
             "canonical" | "qx" => {}
             "unique-packet" | "unique_packet" => set_plan_bool_env("QX_V2_MOE_UNIQUE_PACKET", true),
             other => return Err(format!("unsupported sealed MoE consumer {other}")),
+        }
+    }
+    if let Some(consumer) = plan.moe_down_consumer.as_deref() {
+        match consumer {
+            "canonical" | "qx" => {}
+            "unique-packet" | "unique_packet" => {
+                set_plan_bool_env("QX_V2_MOE_UNIQUE_PACKET_DOWN", true)
+            }
+            other => return Err(format!("unsupported sealed MoE down consumer {other}")),
         }
     }
     match plan.representations.gate_up {
