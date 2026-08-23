@@ -150,6 +150,9 @@ struct Args {
     /// Split attention into benchmark-only QK, softmax, and V stages.
     #[arg(long)]
     v2_attention_stages: bool,
+    /// Run one attention stage in isolation; use qk, softmax, v, combined, or live.
+    #[arg(long, value_name = "qk|softmax|v|combined|live")]
+    v2_attention_stage: Option<String>,
     /// Emit an all-token NLL plus sampled-logit quality trace from V2.
     #[arg(long)]
     v2_quality_trace: bool,
@@ -542,12 +545,17 @@ fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("--v2-layer-block requires an artifact path"))?;
         return benchmark_v2_layer_block(artifact, args.context, args.iterations);
     }
-    if args.v2_attention_stages {
+    if args.v2_attention_stages || args.v2_attention_stage.is_some() {
         let artifact = args
             .artifact
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--v2-attention-stages requires an artifact path"))?;
-        return benchmark_v2_attention_stages(artifact, args.context, args.iterations);
+            .ok_or_else(|| anyhow::anyhow!("attention-stage mode requires an artifact path"))?;
+        return benchmark_v2_attention_stages(
+            artifact,
+            args.context,
+            args.iterations,
+            args.v2_attention_stage.as_deref(),
+        );
     }
     if let Some(model) = args.model {
         if args.v2_attention_stack {
@@ -6278,6 +6286,7 @@ fn benchmark_v2_attention_stages(
     _artifact_path: &std::path::Path,
     context_length: usize,
     iterations: usize,
+    requested_stage: Option<&str>,
 ) -> Result<()> {
     use std::rc::Rc;
 
@@ -6295,13 +6304,25 @@ fn benchmark_v2_attention_stages(
     let scores = buffers.buffer(qx_runtime_v2::BufferId::MoeScratch);
     let value_output = buffers.buffer(qx_runtime_v2::BufferId::Attention);
 
-    let stages = [
-        ("QK dot products", 0_u8),
-        ("max/sum/softmax", 1),
-        ("V accumulation", 2),
-        ("QK + softmax + V", 3),
-        ("live attention", 4),
-    ];
+    let stages: Vec<(&str, u8)> = match requested_stage {
+        None => vec![
+            ("QK dot products", 0_u8),
+            ("max/sum/softmax", 1),
+            ("V accumulation", 2),
+            ("QK + softmax + V", 3),
+            ("live attention", 4),
+        ],
+        Some("qk") => vec![("QK dot products", 0)],
+        Some("softmax") => vec![("max/sum/softmax", 1)],
+        Some("v") => vec![("V accumulation", 2)],
+        Some("combined") => vec![("QK + softmax + V", 3)],
+        Some("live") => vec![("live attention", 4)],
+        Some(other) => {
+            bail!(
+                "unknown --v2-attention-stage '{other}'; expected qk, softmax, v, combined, or live"
+            )
+        }
+    };
     println!("QX V2 attention-stage decomposition");
     println!("context: {context_length}, iterations: {iterations} (warmup 3)");
     println!(

@@ -1,0 +1,23 @@
+{
+  "date": "2026-08-23",
+  "workload": {
+    "model": "Granite 1B",
+    "batch": 1,
+    "hardware": "Apple M5 Pro",
+    "iterations_per_process": 50,
+    "fresh_process_per_measurement": true
+  },
+  "qx_context_gpu_us": {
+    "qk": {"64": 12.25, "128": 9.17, "256": 11.08, "512": 15.83},
+    "softmax": {"64": 14.62, "128": 14.42, "256": 14.62, "512": 15.50},
+    "v": {"64": 36.04, "128": 37.25, "256": 39.17, "512": 43.50},
+    "combined": {"64": 54.63, "128": 56.62, "256": 62.29, "512": 67.50},
+    "live": {"64": 54.63, "128": 56.50, "256": 62.25, "512": 67.75}
+  },
+  "qx_precision_context_512_gpu_us": {
+    "fp32_k_fp32_v": {"qk": 15.79, "v": 43.37, "live": 67.83},
+    "fp16_k_fp32_v": {"qk": 14.04, "v": 43.38, "live": 65.87},
+    "fp32_k_fp16_v": {"qk": 15.88, "v": 43.13, "live": 67.25}
+  },
+  "decision": "K-cache layout/access is the next diagnostic; V kernel work is deferred"
+}
