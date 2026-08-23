@@ -378,6 +378,20 @@ pub mod platform {
         )
     }
 
+    /// Exact-Q4 dataflow factorial candidate. Unlike the geometry-only
+    /// llama-like mapping, each SIMD group owns two rows and reuses each
+    /// activation load across both accumulators. It is opt-in until the full
+    /// sequential promotion ladder validates it.
+    pub fn moe_two_row_dataflow_enabled() -> bool {
+        matches!(
+            std::env::var("QX_V2_MOE_TWO_ROW_DATAFLOW")
+                .ok()
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    }
+
     pub fn moe_q4k_mature_gate_up_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
@@ -783,6 +797,8 @@ pub mod platform {
         llama_like_gate_up_norm_pipeline: Pipeline,
         decode_direct_gate_up_pipeline: Pipeline,
         decode_direct_gate_up_norm_pipeline: Pipeline,
+        two_row_dataflow_gate_up_pipeline: Option<Pipeline>,
+        two_row_dataflow_gate_up_norm_pipeline: Option<Pipeline>,
         q4k_mature_gate_up_pipeline: Pipeline,
         q4k_mature_gate_up_norm_pipeline: Pipeline,
         fused_block_qx_gate_up_pipeline: Option<Pipeline>,
@@ -2469,6 +2485,10 @@ pub mod platform {
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
                 && prepared.down_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none();
+            let two_row_dataflow = moe_two_row_dataflow_enabled()
+                && prepared.inline_layout
+                && prepared.gate_up_layout == PackingLayout::Q4RowInline
+                && q3_block_bytes.is_none();
             let cross_expert_activation = moe_cross_expert_activation_enabled()
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
@@ -2490,6 +2510,7 @@ pub mod platform {
                 && prepared.down_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none()
                 && !decode_direct
+                && !two_row_dataflow
                 && !row_inline_streaming;
 
             if let Some((norm_weights, inverse_rms)) = norm {
@@ -2498,6 +2519,13 @@ pub mod platform {
                 } else if q4k_mature_gate_up {
                     self.encoder
                         .setComputePipelineState(&prepared.q4k_mature_gate_up_norm_pipeline);
+                } else if two_row_dataflow {
+                    self.encoder.setComputePipelineState(
+                        prepared
+                            .two_row_dataflow_gate_up_norm_pipeline
+                            .as_ref()
+                            .ok_or_else(|| "two-row dataflow pipeline is missing".to_owned())?,
+                    );
                 } else if decode_direct {
                     self.encoder
                         .setComputePipelineState(&prepared.decode_direct_gate_up_norm_pipeline);
@@ -2582,6 +2610,13 @@ pub mod platform {
                 } else if q4k_mature_gate_up {
                     self.encoder
                         .setComputePipelineState(&prepared.q4k_mature_gate_up_pipeline);
+                } else if two_row_dataflow {
+                    self.encoder.setComputePipelineState(
+                        prepared
+                            .two_row_dataflow_gate_up_pipeline
+                            .as_ref()
+                            .ok_or_else(|| "two-row dataflow pipeline is missing".to_owned())?,
+                    );
                 } else if decode_direct {
                     self.encoder
                         .setComputePipelineState(&prepared.decode_direct_gate_up_pipeline);
@@ -2725,6 +2760,8 @@ pub mod platform {
                             8 * (1024 / 8)
                         } else if llama_like_mapping {
                             8 * (1024 / 4)
+                        } else if two_row_dataflow {
+                            8 * (1024 / 4)
                         } else if decode_direct {
                             8 * (1024 / 2)
                         } else if cross_expert_tile8 {
@@ -2754,6 +2791,8 @@ pub mod platform {
                         } else if fused_block_active {
                             256
                         } else if llama_like_mapping {
+                            64
+                        } else if two_row_dataflow {
                             64
                         } else if decode_direct {
                             64
@@ -3790,6 +3829,10 @@ pub mod platform {
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
                 && prepared.down_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none();
+            let two_row_dataflow = moe_two_row_dataflow_enabled()
+                && prepared.inline_layout
+                && prepared.gate_up_layout == PackingLayout::Q4RowInline
+                && q3_block_bytes.is_none();
             let cross_expert_tile8 = moe_cross_expert_tile8_enabled()
                 && prepared.gate_up_layout == PackingLayout::Q4CrossExpertTile8
                 && q3_block_bytes.is_none();
@@ -3804,6 +3847,15 @@ pub mod platform {
                         } else if q4k_mature_gate_up {
                             self.encoder.setComputePipelineState(
                                 &prepared.q4k_mature_gate_up_norm_pipeline,
+                            );
+                        } else if two_row_dataflow {
+                            self.encoder.setComputePipelineState(
+                                prepared
+                                    .two_row_dataflow_gate_up_norm_pipeline
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        "two-row dataflow pipeline is missing".to_owned()
+                                    })?,
                             );
                         } else if decode_direct {
                             self.encoder.setComputePipelineState(
@@ -3880,6 +3932,15 @@ pub mod platform {
                         } else if q4k_mature_gate_up {
                             self.encoder
                                 .setComputePipelineState(&prepared.q4k_mature_gate_up_pipeline);
+                        } else if two_row_dataflow {
+                            self.encoder.setComputePipelineState(
+                                prepared
+                                    .two_row_dataflow_gate_up_pipeline
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        "two-row dataflow pipeline is missing".to_owned()
+                                    })?,
+                            );
                         } else if decode_direct {
                             self.encoder
                                 .setComputePipelineState(&prepared.decode_direct_gate_up_pipeline);
@@ -3983,6 +4044,8 @@ pub mod platform {
                         MTLSize {
                             width: if q4k_mature_gate_up {
                                 8 * (1024 / 8)
+                            } else if two_row_dataflow {
+                                8 * (1024 / 4)
                             } else if decode_direct {
                                 8 * (1024 / 2)
                             } else if cross_expert_tile8 || row_inline_streaming {
@@ -4003,6 +4066,8 @@ pub mod platform {
                         MTLSize {
                             width: if q4k_mature_gate_up {
                                 128
+                            } else if two_row_dataflow {
+                                64
                             } else if decode_direct {
                                 64
                             } else if wide_expert {
@@ -4965,10 +5030,7 @@ pub mod platform {
             output: &RuntimeBuffer,
             length: usize,
         ) -> Result<(), String> {
-            if attention_chunked_enabled()
-                && !kv_key_fp16_enabled()
-                && !kv_value_fp16_enabled()
-            {
+            if attention_chunked_enabled() && !kv_key_fp16_enabled() && !kv_value_fp16_enabled() {
                 return self.encode_attention_chunked_gqa(
                     context,
                     query,
@@ -4979,10 +5041,7 @@ pub mod platform {
                     length,
                 );
             }
-            if attention_stream_enabled()
-                && !kv_key_fp16_enabled()
-                && !kv_value_fp16_enabled()
-            {
+            if attention_stream_enabled() && !kv_key_fp16_enabled() && !kv_value_fp16_enabled() {
                 return self.encode_attention_stream_gqa(
                     context,
                     query,
@@ -7487,6 +7546,12 @@ pub mod platform {
                 decode_direct_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd",
                 )?,
+                two_row_dataflow_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_two_row_dataflow_simd",
+                )?),
+                two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
+                )?),
                 q4k_mature_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_simd")?,
                 q4k_mature_gate_up_norm_pipeline: self
@@ -7763,6 +7828,12 @@ pub mod platform {
                 decode_direct_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd",
                 )?,
+                two_row_dataflow_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_two_row_dataflow_simd",
+                )?),
+                two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
+                )?),
                 q4k_mature_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_simd")?,
                 q4k_mature_gate_up_norm_pipeline: self
@@ -7992,6 +8063,12 @@ pub mod platform {
                 decode_direct_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd",
                 )?,
+                two_row_dataflow_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_two_row_dataflow_simd",
+                )?),
+                two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
+                )?),
                 q4k_mature_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_simd")?,
                 q4k_mature_gate_up_norm_pipeline: self
@@ -8304,6 +8381,12 @@ pub mod platform {
                 decode_direct_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd",
                 )?,
+                two_row_dataflow_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_two_row_dataflow_simd",
+                )?),
+                two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
+                )?),
                 q4k_mature_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_simd")?,
                 q4k_mature_gate_up_norm_pipeline: self

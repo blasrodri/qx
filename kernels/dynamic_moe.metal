@@ -437,6 +437,99 @@ kernel void qx_dynamic_q4_moe_gate_up_decode_direct_norm_simd(
         lane, simdgroup, threadgroup_id);
 }
 
+// Dataflow factorial candidate for exact row-inline Q4. Each SIMD group owns
+// two rows and keeps two accumulators live. The activation for a column is
+// loaded once and reused for both rows; the canonical path loads/stages the
+// same activation independently for each row. This preserves QX's physical
+// representation and top-8 work while changing only accumulator ownership,
+// input reuse, and the inner Q4 decode schedule.
+inline void qx_dynamic_q4_gate_up_two_row_dataflow_body(
+    device const uchar* stream,
+    device const float* input,
+    device const float* norm_weights,
+    float inverse_rms,
+    uint normalized,
+    device const uint* expert_ids,
+    device float* output,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_simdgroup = 2;
+    constexpr uint simdgroups_per_threadgroup = 2;
+    constexpr uint rows_per_threadgroup = rows_per_simdgroup * simdgroups_per_threadgroup;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint tile = threadgroup_id % threadgroups_per_expert;
+    uint first_row = tile * rows_per_threadgroup + simdgroup * rows_per_simdgroup;
+    uint expert = expert_ids[slot];
+    float sums[rows_per_simdgroup] = {0.0f, 0.0f};
+
+    if (expert < 32 && first_row < hidden) {
+        uint expert_base = expert * expert_stride;
+        for (uint group = 0; group < groups; ++group) {
+            uint column = group * 32 + lane;
+            float value = input[column];
+            if (normalized != 0) {
+                value *= inverse_rms * norm_weights[column];
+            }
+            for (uint row_offset = 0; row_offset < rows_per_simdgroup; ++row_offset) {
+                uint row = first_row + row_offset;
+                if (row >= hidden) {
+                    continue;
+                }
+                uint group_base = expert_base + row * row_stride + group * group_stride;
+                uint code = (uint(stream[group_base + lane / 2])
+                    >> ((lane % 2) * 4)) & 0xf;
+                sums[row_offset] += float(int(code) - 7)
+                    * qx_q4_inline_scale(stream, group_base + 16)
+                    * value;
+            }
+        }
+    }
+
+    for (uint row_offset = 0; row_offset < rows_per_simdgroup; ++row_offset) {
+        sums[row_offset] = simd_sum(sums[row_offset]);
+        uint row = first_row + row_offset;
+        if (lane == 0 && expert < 32 && row < hidden) {
+            output[slot * hidden + row] = sums[row_offset];
+        }
+    }
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_two_row_dataflow_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    qx_dynamic_q4_gate_up_two_row_dataflow_body(
+        stream, input, input, 1.0f, 0, expert_ids, output,
+        lane, simdgroup, threadgroup_id);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]],
+    device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    qx_dynamic_q4_gate_up_two_row_dataflow_body(
+        stream, input, norm_weights, inverse_rms[0], 1, expert_ids, output,
+        lane, simdgroup, threadgroup_id);
+}
+
 // Fused gate/up consumer for exact-Q4 transaction streams. The same body also
 // accepts the legacy row-inline stream when its factorial mapping is enabled;
 // keeping that path here preserves its existing address contract.
