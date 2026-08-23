@@ -2440,6 +2440,10 @@ struct ContextualProfileReport {
     routes_frozen: bool,
     route_source: &'static str,
     topology: Vec<String>,
+    os_version: String,
+    power_state: String,
+    thermal_state: String,
+    memory_pressure: String,
     levels: Vec<ContextualLevelReport>,
 }
 
@@ -2731,6 +2735,18 @@ fn benchmark_v2_moe_contextual_profile(
     println!("context/position:   {context_length}/{position}");
     println!("iterations/warmup:  {iterations}/{warmup}");
     println!("routes frozen:      true (captured once before all measurements)");
+    println!(
+        "power state:        {}",
+        command_output("pmset", &["-g", "batt"])
+    );
+    println!(
+        "thermal state:      {}",
+        command_output("pmset", &["-g", "therm"])
+    );
+    println!(
+        "memory pressure:    {}",
+        command_output("memory_pressure", &["-Q"])
+    );
     println!("level                              GPU us     wall us  dispatches  CBs");
     for level in &levels {
         let timing = level.timing;
@@ -2767,6 +2783,10 @@ fn benchmark_v2_moe_contextual_profile(
             routes_frozen: true,
             route_source: "canonical top-8 captured once after fixture prefill",
             topology,
+            os_version: command_output("sw_vers", &["-productVersion"]),
+            power_state: command_output("pmset", &["-g", "batt"]),
+            thermal_state: command_output("pmset", &["-g", "therm"]),
+            memory_pressure: command_output("memory_pressure", &["-Q"]),
             levels,
         };
         std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;

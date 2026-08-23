@@ -108,6 +108,25 @@ instrumentation. The workspace therefore does not claim a QX-vs-llama
 load/decode/dot attribution. The next valid comparison requires either the
 pinned llama source checkout or an equivalent instrumentable build.
 
+## Paired-run follow-up
+
+The randomized follow-up confirmed that machine state must be part of the
+measurement contract. In one interleaved sequence, canonical gate/up moved
+from `1,446.75 GPU µs / 24 layers` to `3,521.79 GPU µs / 24 layers` without a
+source or artifact change. The load+decode variant measured `6,025.71 GPU µs`
+in the same sequence.
+
+The host reported AC power, no recorded thermal warning, and no recorded
+performance warning, but that does not establish a constant GPU power state.
+The contextual profiler now records `sw_vers`, `pmset -g batt`,
+`pmset -g therm`, and `memory_pressure -Q` in every JSON report and prints
+them with the measurement.
+
+Until randomized paired blocks remain stable across the recorded state, these
+numbers are classified as instrumentation validation only. The profiler must
+discard or repeat pairs spanning a power/thermal transition before deriving a
+decoder-vs-dot cost.
+
 Result records:
 
 - `benchmarks/results/gateup-instrument-canonical-general-2026-08-23.json`
@@ -115,3 +134,6 @@ Result records:
 - `benchmarks/results/gateup-instrument-load-only-v4-general-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-load-decode-v3-general-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-dot-no-reduction-v2-general-2026-08-23.json`
+- `benchmarks/results/gateup-instrument-paired-canonical-a-2026-08-23.json`
+- `benchmarks/results/gateup-instrument-paired-canonical-b-2026-08-23.json`
+- `benchmarks/results/gateup-instrument-paired-load-decode-a-2026-08-23.json`
