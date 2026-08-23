@@ -125,6 +125,10 @@ enum ExpertLayout {
     RowInline2,
     RowInline4,
     RowInline8,
+    #[value(name = "transaction-144", alias = "transaction144")]
+    Transaction144,
+    #[value(name = "transaction-160", alias = "transaction160")]
+    Transaction160,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -143,6 +147,8 @@ impl From<ExpertLayout> for PackingLayout {
             ExpertLayout::RowInline2 => Self::Q4RowInlineRows2,
             ExpertLayout::RowInline4 => Self::Q4RowInlineRows4,
             ExpertLayout::RowInline8 => Self::Q4RowInlineRows8,
+            ExpertLayout::Transaction144 => Self::Q4Transaction144,
+            ExpertLayout::Transaction160 => Self::Q4Transaction160,
         }
     }
 }
@@ -298,6 +304,20 @@ fn main() -> Result<()> {
         || args.expertwise_q3)
     {
         bail!("multi-row row-inline candidates require uniform exact group-32 Q4 experts");
+    }
+    if matches!(
+        args.expert_layout,
+        ExpertLayout::Transaction144 | ExpertLayout::Transaction160
+    ) && (args.expert_format != ExpertFormat::QxQ4
+        || args.uniform_expert_bits.is_some()
+        || args.layerwise_q3
+        || args.tensorwise_q3
+        || args.expertwise_q3
+        || args.group_size != 32)
+    {
+        bail!(
+            "transaction-block candidates require uniform exact group-32 Q4 experts and --group-size 32"
+        );
     }
 
     let grouped = trace.as_ref().map(QxTrace::samples).unwrap_or_default();
@@ -771,7 +791,7 @@ fn main() -> Result<()> {
             down_layout,
         )
         .map_err(anyhow::Error::msg)?;
-        actual_weight_bytes += gate_up.bytes() + down.bytes();
+        actual_weight_bytes += gate_up.serialized_bytes() + down.serialized_bytes();
         compiled.push(CompiledTensor {
             layer,
             expert,

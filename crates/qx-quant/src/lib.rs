@@ -35,6 +35,13 @@ pub enum PackingLayout {
     Q4RowInlineRows4 = 5,
     /// Exact-Q4 row-inline packets containing eight complete rows per packet.
     Q4RowInlineRows8 = 6,
+    /// Exact-Q4 transaction blocks containing eight group-32 groups (144
+    /// useful bytes) per row block. Codes and their FP16 scale are adjacent
+    /// within each group; the block is the compiler/runtime consumption unit.
+    Q4Transaction144 = 7,
+    /// Exact-Q4 transaction blocks as above, padded to 160 bytes per block.
+    /// The sixteen-byte tail is physical alignment only and is not decoded.
+    Q4Transaction160 = 8,
 }
 
 impl PackingLayout {
@@ -47,6 +54,8 @@ impl PackingLayout {
             4 => Some(Self::Q4RowInlineRows2),
             5 => Some(Self::Q4RowInlineRows4),
             6 => Some(Self::Q4RowInlineRows8),
+            7 => Some(Self::Q4Transaction144),
+            8 => Some(Self::Q4Transaction160),
             _ => None,
         }
     }
@@ -63,6 +72,18 @@ impl PackingLayout {
 
     pub const fn is_q4_row_inline(self) -> bool {
         self.row_inline_packet_rows().is_some()
+    }
+
+    pub const fn is_q4_transaction(self) -> bool {
+        matches!(self, Self::Q4Transaction144 | Self::Q4Transaction160)
+    }
+
+    pub const fn transaction_block_bytes(self) -> Option<usize> {
+        match self {
+            Self::Q4Transaction144 => Some(144),
+            Self::Q4Transaction160 => Some(160),
+            _ => None,
+        }
     }
 }
 
@@ -256,9 +277,11 @@ impl QuantizedTensor {
             PackingLayout::Q4RowInline
             | PackingLayout::Q4RowInlineRows2
             | PackingLayout::Q4RowInlineRows4
-            | PackingLayout::Q4RowInlineRows8 => {
+            | PackingLayout::Q4RowInlineRows8
+            | PackingLayout::Q4Transaction144
+            | PackingLayout::Q4Transaction160 => {
                 if self.quant_type != QuantType::Q4 || self.group_size != 32 {
-                    return Err("Q4RowInline requires group-32 Q4".to_owned());
+                    return Err("Q4 transport requires group-32 Q4".to_owned());
                 }
                 self.layout = layout;
                 Ok(())
@@ -307,6 +330,51 @@ impl QuantizedTensor {
         }
         debug_assert_eq!(output.len(), (self.rows / packet_rows) * packet_bytes);
         Ok(output)
+    }
+
+    /// Return the exact-Q4 transaction stream used by the fused code/scale
+    /// representation. A transaction contains eight group-32 blocks, i.e.
+    /// 256 logical weights. Each group is `[16 packed codes][FP16 scale]`.
+    /// The dense form is 144 bytes; the padded form is 160 bytes with a
+    /// sixteen-byte zero tail. The tail is never part of the logical tensor.
+    pub fn transaction_block_bytes(&self, padded: bool) -> Result<Vec<u8>, String> {
+        if self.quant_type != QuantType::Q4 || self.group_size != 32 {
+            return Err("transaction transport requires group-32 Q4".to_owned());
+        }
+        let groups = self.cols.div_ceil(self.group_size);
+        if !groups.is_multiple_of(8) {
+            return Err(format!(
+                "transaction transport requires a multiple of eight group-32 blocks, got {groups}"
+            ));
+        }
+        let block_bytes = if padded { 160 } else { 144 };
+        let mut output = Vec::with_capacity(self.rows * (groups / 8) * block_bytes);
+        for row in 0..self.rows {
+            for block in 0..groups / 8 {
+                for group_in_block in 0..8 {
+                    let group = block * 8 + group_in_block;
+                    let data_offset = row * groups * 16 + group * 16;
+                    let scale_offset = row * groups + group;
+                    output.extend_from_slice(&self.data[data_offset..data_offset + 16]);
+                    output.extend_from_slice(&self.scales[scale_offset].to_bits().to_le_bytes());
+                }
+                if padded {
+                    output.resize(output.len() + 16, 0);
+                }
+            }
+        }
+        debug_assert_eq!(output.len(), self.rows * (groups / 8) * block_bytes);
+        Ok(output)
+    }
+
+    /// Number of bytes emitted by the artifact writer for this tensor.
+    pub fn serialized_bytes(&self) -> usize {
+        if let Some(block_bytes) = self.layout.transaction_block_bytes() {
+            let groups = self.cols.div_ceil(self.group_size);
+            self.rows * groups.div_ceil(8) * block_bytes
+        } else {
+            self.bytes()
+        }
     }
 
     fn group_location(&self, row: usize, group: usize) -> (usize, usize) {
@@ -375,7 +443,9 @@ impl QuantizedTensor {
             PackingLayout::Q4RowInline
             | PackingLayout::Q4RowInlineRows2
             | PackingLayout::Q4RowInlineRows4
-            | PackingLayout::Q4RowInlineRows8 => {
+            | PackingLayout::Q4RowInlineRows8
+            | PackingLayout::Q4Transaction144
+            | PackingLayout::Q4Transaction160 => {
                 // QuantizedTensor keeps the split row-major backing vectors;
                 // packetization is materialized only by the artifact writer.
                 let row_bytes = groups * group_bytes;
@@ -1084,5 +1154,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn transaction_blocks_preserve_codes_scales_and_account_for_padding() {
+        let rows = 3;
+        let cols = 512;
+        let values = (0..rows * cols)
+            .map(|index| (index as f32 - 100.0) / 17.0)
+            .collect::<Vec<_>>();
+        let split = QuantizedTensor::quantize(&values, rows, cols, QuantType::Q4, 32);
+        let dense = split.transaction_block_bytes(false).unwrap();
+        let padded = split.transaction_block_bytes(true).unwrap();
+
+        assert_eq!(dense.len(), split.bytes());
+        assert_eq!(dense.len(), rows * 2 * 144);
+        assert_eq!(padded.len(), rows * 2 * 160);
+        assert_eq!(split.serialized_bytes(), split.bytes());
+
+        for row in 0..rows {
+            for group in 0..16 {
+                let block = group / 8;
+                let in_block = group % 8;
+                let dense_start = (row * 2 * 144) + block * 144 + in_block * 18;
+                let data_start = row * 16 * 16 + group * 16;
+                assert_eq!(
+                    &dense[dense_start..dense_start + 16],
+                    &split.data[data_start..data_start + 16]
+                );
+                assert_eq!(
+                    &dense[dense_start + 16..dense_start + 18],
+                    &split.scales[row * 16 + group].to_bits().to_le_bytes()
+                );
+            }
+            for block in 0..2 {
+                let padding_start = row * 2 * 160 + block * 160 + 144;
+                assert!(
+                    padded[padding_start..padding_start + 16]
+                        .iter()
+                        .all(|byte| *byte == 0)
+                );
+            }
+        }
+
+        let mut dense_layout = split.clone();
+        dense_layout.layout = PackingLayout::Q4Transaction144;
+        assert_eq!(dense_layout.serialized_bytes(), dense.len());
+        let mut padded_layout = split;
+        padded_layout.layout = PackingLayout::Q4Transaction160;
+        assert_eq!(padded_layout.serialized_bytes(), padded.len());
     }
 }

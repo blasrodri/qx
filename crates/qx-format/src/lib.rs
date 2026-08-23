@@ -540,6 +540,44 @@ impl MappedArtifact {
                 data: split_data,
             });
         }
+        if entry.layout.is_q4_transaction() {
+            if entry.quant_type != QuantType::Q4 || entry.group_size != 32 {
+                bail!("transaction artifact tensor is not group-32 Q4");
+            }
+            let groups = (entry.cols as usize).div_ceil(entry.group_size as usize);
+            if !groups.is_multiple_of(8) {
+                bail!("transaction artifact tensor group count is not divisible by eight");
+            }
+            let block_bytes = entry.layout.transaction_block_bytes().unwrap();
+            let blocks_per_row = groups / 8;
+            let expected = entry.rows as usize * blocks_per_row * block_bytes;
+            if data.len() != expected {
+                bail!("transaction artifact tensor has invalid stream length");
+            }
+            let mut split_data = Vec::with_capacity(entry.rows as usize * groups * 16);
+            let mut split_scales = Vec::with_capacity(entry.rows as usize * groups);
+            for row in 0..entry.rows as usize {
+                for block in 0..blocks_per_row {
+                    let block_start = (row * blocks_per_row + block) * block_bytes;
+                    for group_in_block in 0..8 {
+                        let start = block_start + group_in_block * 18;
+                        split_data.extend_from_slice(&data[start..start + 16]);
+                        split_scales.push(f16::from_bits(u16::from_le_bytes(
+                            data[start + 16..start + 18].try_into().unwrap(),
+                        )));
+                    }
+                }
+            }
+            return Ok(QuantizedTensor {
+                quant_type: entry.quant_type,
+                layout: PackingLayout::RowMajor,
+                rows: entry.rows as usize,
+                cols: entry.cols as usize,
+                group_size: entry.group_size as usize,
+                scales: split_scales,
+                data: split_data,
+            });
+        }
         if scales.len() % 2 != 0 {
             bail!("QX scale section is not FP16 aligned");
         }
@@ -705,6 +743,7 @@ fn write_artifact_internal(
             tensor.layer,
             tensor.kind as u8,
             quant_code(tensor.tensor.quant_type),
+            tensor.tensor.layout as u8,
             tensor.expert,
         )
     });
@@ -717,6 +756,7 @@ fn write_artifact_internal(
             if next.layer != first.layer
                 || next.kind != first.kind
                 || quant_code(next.tensor.quant_type) != quant_code(first.tensor.quant_type)
+                || next.tensor.layout != first.tensor.layout
             {
                 break;
             }
@@ -750,6 +790,38 @@ fn write_artifact_internal(
                     scale_length: inline.len() as u64,
                     data_offset: offset,
                     data_length: inline.len() as u64,
+                });
+            }
+            group_start = group_end;
+            continue;
+        }
+        if first.tensor.layout.is_q4_transaction() {
+            for index in group {
+                let compiled = &tensors[*index];
+                let stream = compiled
+                    .tensor
+                    .transaction_block_bytes(
+                        compiled.tensor.layout == PackingLayout::Q4Transaction160,
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                let offset = data_offset + blobs.len() as u64;
+                blobs.extend_from_slice(&stream);
+                quantized_entries[*index] = Some(TensorDirectoryEntry {
+                    layer: compiled.layer,
+                    expert: compiled.expert,
+                    quant_type: compiled.tensor.quant_type,
+                    layout: compiled.tensor.layout,
+                    kind: compiled.kind,
+                    rows: compiled.tensor.rows as u32,
+                    cols: compiled.tensor.cols as u32,
+                    group_size: compiled.tensor.group_size as u16,
+                    // Transaction entries deliberately point both views at
+                    // one fused stream. The scale bytes are decoded from
+                    // their per-group position by `quantized_tensor`.
+                    scale_offset: offset,
+                    scale_length: stream.len() as u64,
+                    data_offset: offset,
+                    data_length: stream.len() as u64,
                 });
             }
             group_start = group_end;
@@ -1127,6 +1199,54 @@ mod tests {
         assert_eq!(decoded.data, tensor.data);
         assert_eq!(decoded.scales, tensor.scales);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn artifact_round_trip_decodes_transaction_streams() {
+        let values = (0..3 * 512)
+            .map(|index| (index as f32 - 12.0) / 7.0)
+            .collect::<Vec<_>>();
+        for layout in [
+            PackingLayout::Q4Transaction144,
+            PackingLayout::Q4Transaction160,
+        ] {
+            let mut tensor = QuantizedTensor::quantize(&values, 3, 512, QuantType::Q4, 32);
+            tensor.layout = layout;
+            let path = std::env::temp_dir().join(format!(
+                "qx-transaction-{}-{}.qx",
+                std::process::id(),
+                layout as u8
+            ));
+            write_artifact_with_raw(
+                &path,
+                "granite",
+                "apple-m5-pro",
+                512,
+                MemoryPlan {
+                    weights_bytes: tensor.serialized_bytes() as u64,
+                    total_bytes: tensor.serialized_bytes() as u64,
+                    ..Default::default()
+                },
+                &[CompiledTensor {
+                    layer: 0,
+                    expert: 0,
+                    kind: TensorKind::GateUp,
+                    tensor: tensor.clone(),
+                }],
+                &[],
+            )
+            .unwrap();
+            let artifact = MappedArtifact::open(&path).unwrap();
+            let decoded = artifact.quantized_tensor(0).unwrap();
+            assert_eq!(decoded.layout, PackingLayout::RowMajor);
+            assert_eq!(decoded.data, tensor.data);
+            assert_eq!(decoded.scales, tensor.scales);
+            assert_eq!(
+                artifact.info().entries[0].data_length as usize,
+                tensor.serialized_bytes()
+            );
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
