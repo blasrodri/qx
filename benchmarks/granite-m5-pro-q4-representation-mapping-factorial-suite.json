@@ -1,0 +1,74 @@
+{
+  "schema_version": 2,
+  "qx_bench": "target/release/qx-bench",
+  "fixtures": [
+    "benchmarks/fixtures/general.json",
+    "benchmarks/fixtures/instruction.json",
+    "benchmarks/fixtures/code.json",
+    "benchmarks/fixtures/reasoning.json",
+    "benchmarks/fixtures/chat.json"
+  ],
+  "rounds": 3,
+  "warmup": 2,
+  "interaction_matrix": {
+    "representations": ["row-inline", "fused-code-scale"],
+    "mappings": ["qx", "llama-like"],
+    "incompatible": []
+  },
+  "baseline_plan_id": "granite-m5-row-inline-1-control",
+  "minimum_improvement_ms_per_token": 0.10,
+  "candidates": [
+    {
+      "artifact": "external/models/granite-m5-pro-q4-factorial-row-inline-qx.qx",
+      "interaction": {
+        "representation_id": "row-inline",
+        "mapping_id": "qx"
+      },
+      "screening_tiers": [
+        {"tier": "kernel", "wall_ms_per_token": 0.25, "gpu_ms_per_token": 0.24},
+        {"tier": "producer_consumer", "wall_ms_per_token": 0.02, "gpu_ms_per_token": 0.02},
+        {"tier": "multi_layer", "wall_ms_per_token": 0.005, "gpu_ms_per_token": 0.005}
+      ],
+      "exact_equivalent_to": "external/models/granite-m5-pro-q4-rowinline-1-control.qx"
+    },
+    {
+      "artifact": "external/models/granite-m5-pro-q4-factorial-row-inline-llama-like.qx",
+      "interaction": {
+        "representation_id": "row-inline",
+        "mapping_id": "llama-like"
+      },
+      "screening_tiers": [
+        {"tier": "kernel", "wall_ms_per_token": 0.25, "gpu_ms_per_token": 0.24},
+        {"tier": "producer_consumer", "wall_ms_per_token": 0.02, "gpu_ms_per_token": 0.02},
+        {"tier": "multi_layer", "wall_ms_per_token": 0.005, "gpu_ms_per_token": 0.005}
+      ],
+      "quality_gate": "benchmarks/quality/granite-m5-pro-q4-row-inline-llama-like.json"
+    },
+    {
+      "artifact": "external/models/granite-m5-pro-q4-factorial-fused-code-scale-qx.qx",
+      "interaction": {
+        "representation_id": "fused-code-scale",
+        "mapping_id": "qx"
+      },
+      "screening_tiers": [
+        {"tier": "kernel", "wall_ms_per_token": 0.25, "gpu_ms_per_token": 0.24},
+        {"tier": "producer_consumer", "wall_ms_per_token": 0.02, "gpu_ms_per_token": 0.02},
+        {"tier": "multi_layer", "wall_ms_per_token": 0.005, "gpu_ms_per_token": 0.005}
+      ],
+      "quality_gate": "benchmarks/quality/granite-m5-pro-q4-fused-code-scale-qx.json"
+    },
+    {
+      "artifact": "external/models/granite-m5-pro-q4-factorial-fused-code-scale-llama-like.qx",
+      "interaction": {
+        "representation_id": "fused-code-scale",
+        "mapping_id": "llama-like"
+      },
+      "screening_tiers": [
+        {"tier": "kernel", "wall_ms_per_token": 0.25, "gpu_ms_per_token": 0.24},
+        {"tier": "producer_consumer", "wall_ms_per_token": 0.02, "gpu_ms_per_token": 0.02},
+        {"tier": "multi_layer", "wall_ms_per_token": 0.005, "gpu_ms_per_token": 0.005}
+      ],
+      "quality_gate": "benchmarks/quality/granite-m5-pro-q4-fused-code-scale-llama-like.json"
+    }
+  ]
+}

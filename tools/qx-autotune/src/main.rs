@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use qx_compiler::{
-    PlanCandidateEvidence, PlanSelectionConstraints, PromotionTier, QualityMeasurement,
-    ResidentMemoryMeasurement, TierMeasurement, missing_promotion_tier, select_execution_plan,
+    InteractionMatrix, PlanCandidateEvidence, PlanInteraction, PlanSelectionConstraints,
+    PlanSelectionPolicy, PromotionTier, QualityMeasurement, ResidentMemoryMeasurement,
+    TierMeasurement, missing_promotion_tier, select_execution_plan_with_policy,
+    validate_interaction_candidates,
 };
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf, process::Command};
@@ -42,6 +44,7 @@ struct Args {
 #[derive(Serialize)]
 struct SelectionReport<'a> {
     selected_plan_id: &'a str,
+    selected_interaction: Option<&'a PlanInteraction>,
     selected_complete_model_wall_ms_per_token: f64,
     selected_reason: &'static str,
     candidates: Vec<CandidateSummary>,
@@ -51,6 +54,7 @@ struct SelectionReport<'a> {
 #[derive(Serialize)]
 struct CandidateSummary {
     plan_id: String,
+    interaction: Option<PlanInteraction>,
     exact_semantics_verified: bool,
     complete_model_wall_ms_per_token: f64,
     complete_model_gpu_ms_per_token: f64,
@@ -67,6 +71,17 @@ struct CandidateSuite {
     rounds: usize,
     #[serde(default = "default_warmup")]
     warmup: usize,
+    /// Optional representation × mapping matrix. When present, candidates
+    /// must cover every compatible Cartesian pair exactly once.
+    #[serde(default)]
+    interaction_matrix: Option<InteractionMatrix>,
+    /// Complete-model baseline used by the meaningful-improvement kill gate.
+    #[serde(default)]
+    baseline_plan_id: Option<String>,
+    /// Candidates must beat the declared baseline by this amount to survive
+    /// selection. Omit the baseline to preserve legacy suite behavior.
+    #[serde(default)]
+    minimum_improvement_ms_per_token: Option<f64>,
     candidates: Vec<CandidateRun>,
 }
 
@@ -81,6 +96,8 @@ const fn default_warmup() -> usize {
 #[derive(Debug, Deserialize)]
 struct CandidateRun {
     artifact: PathBuf,
+    #[serde(default)]
+    interaction: Option<PlanInteraction>,
     /// Legacy hand-recorded screening evidence. New suites should omit this
     /// and use `tier_commands` so the runner produces the evidence itself.
     #[serde(default)]
@@ -134,11 +151,14 @@ struct BenchRecord {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let candidates = if let Some(path) = &args.evidence {
-        serde_json::from_slice::<Vec<PlanCandidateEvidence>>(
-            &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    let (candidates, selection_policy) = if let Some(path) = &args.evidence {
+        (
+            serde_json::from_slice::<Vec<PlanCandidateEvidence>>(
+                &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+            )
+            .with_context(|| format!("parse {}", path.display()))?,
+            PlanSelectionPolicy::default(),
         )
-        .with_context(|| format!("parse {}", path.display()))?
     } else if let Some(path) = &args.suite {
         let suite = serde_json::from_slice::<CandidateSuite>(
             &fs::read(path).with_context(|| format!("read {}", path.display()))?,
@@ -149,11 +169,19 @@ fn main() -> Result<()> {
             fs::write(output, serde_json::to_vec_pretty(&evidence)?)
                 .with_context(|| format!("write {}", output.display()))?;
         }
-        evidence
+        (
+            evidence,
+            PlanSelectionPolicy {
+                baseline_plan_id: suite.baseline_plan_id,
+                minimum_improvement_ms_per_token: suite
+                    .minimum_improvement_ms_per_token
+                    .unwrap_or(0.10),
+            },
+        )
     } else {
         bail!("provide either --evidence or --suite");
     };
-    let selection = select_execution_plan(
+    let selection = select_execution_plan_with_policy(
         &candidates,
         PlanSelectionConstraints {
             max_aggregate_relative_ppl_delta: args.max_relative_ppl_delta,
@@ -161,6 +189,7 @@ fn main() -> Result<()> {
             max_task_delta_points: args.max_task_delta_points,
             max_peak_physical_footprint_bytes: args.max_peak_physical_footprint_bytes,
         },
+        selection_policy,
     )?;
     fs::write(
         &args.output,
@@ -178,6 +207,7 @@ fn main() -> Result<()> {
                     .expect("complete-model tier is added by run_suite or required by evidence");
                 CandidateSummary {
                     plan_id: candidate.plan.plan_id.clone(),
+                    interaction: candidate.interaction.clone(),
                     exact_semantics_verified: candidate.exact_semantics_verified,
                     complete_model_wall_ms_per_token: complete.wall_ms_per_token,
                     complete_model_gpu_ms_per_token: complete.gpu_ms_per_token,
@@ -201,6 +231,10 @@ fn main() -> Result<()> {
             report,
             serde_json::to_vec_pretty(&SelectionReport {
                 selected_plan_id: &selection.selected.plan_id,
+                selected_interaction: candidates
+                    .iter()
+                    .find(|candidate| candidate.plan.plan_id == selection.selected.plan_id)
+                    .and_then(|candidate| candidate.interaction.as_ref()),
                 selected_complete_model_wall_ms_per_token,
                 selected_reason: "lowest measured complete-model wall latency after semantic-equivalence or quality, memory, and promotion-tier gates",
                 candidates: candidates_report,
@@ -215,11 +249,29 @@ fn main() -> Result<()> {
 }
 
 fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
-    if suite.schema_version != 1 || suite.rounds == 0 || suite.fixtures.is_empty() {
-        bail!("candidate suite requires schema 1, positive rounds, and fixtures");
+    if !matches!(suite.schema_version, 1 | 2) || suite.rounds == 0 || suite.fixtures.is_empty() {
+        bail!("candidate suite requires schema 1 or 2, positive rounds, and fixtures");
     }
     if suite.candidates.is_empty() {
         bail!("candidate suite has no artifacts");
+    }
+    if suite.interaction_matrix.is_some() && suite.schema_version < 2 {
+        bail!("interaction_matrix requires candidate suite schema 2");
+    }
+    if let Some(matrix) = &suite.interaction_matrix {
+        let interactions = suite
+            .candidates
+            .iter()
+            .map(|candidate| {
+                candidate.interaction.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "candidate {} is missing representation × mapping interaction metadata",
+                        candidate.artifact.display()
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        validate_interaction_candidates(matrix, &interactions)?;
     }
     for candidate in &suite.candidates {
         let supplied = candidate
@@ -411,6 +463,7 @@ fn run_suite(suite: &CandidateSuite) -> Result<Vec<PlanCandidateEvidence>> {
                     }),
                 },
                 exact_semantics_verified,
+                interaction: candidate.interaction.clone(),
             })
         })
         .collect()
@@ -682,10 +735,14 @@ mod tests {
             fixtures: vec![PathBuf::from("fixture.json")],
             rounds: 2,
             warmup: 0,
+            interaction_matrix: None,
+            baseline_plan_id: None,
+            minimum_improvement_ms_per_token: None,
             candidates: Vec::new(),
         };
         let candidate = CandidateRun {
             artifact: PathBuf::from("candidate.qx"),
+            interaction: None,
             screening_tiers: Vec::new(),
             tier_commands: vec![TierCommand {
                 tier: PromotionTier::Kernel,
@@ -703,5 +760,19 @@ mod tests {
         assert_eq!(evidence[0].tier, PromotionTier::Kernel);
         assert_eq!(evidence[0].wall_ms_per_token, 1.5);
         assert_eq!(evidence[0].gpu_ms_per_token, 1.25);
+    }
+
+    #[test]
+    fn factorial_metadata_requires_every_compatible_pair() {
+        let matrix = InteractionMatrix {
+            representations: vec!["row-inline".to_owned(), "fused-block".to_owned()],
+            mappings: vec!["qx".to_owned(), "llama-like".to_owned()],
+            incompatible: Vec::new(),
+        };
+        let pairs = vec![PlanInteraction {
+            representation_id: "row-inline".to_owned(),
+            mapping_id: "qx".to_owned(),
+        }];
+        assert!(validate_interaction_candidates(&matrix, &pairs).is_err());
     }
 }

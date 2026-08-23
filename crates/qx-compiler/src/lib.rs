@@ -8,7 +8,11 @@ use qx_model::{ATTENTION_HEADS, EXPERTS, HEAD_DIM, HIDDEN, KV_HEADS, LAYERS, TOP
 use qx_quant::{QuantType, QuantizedTensor};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 #[derive(Clone, Debug)]
 pub struct ExpertWeights {
@@ -556,6 +560,103 @@ pub struct PlanCandidateEvidence {
     /// exists; lossy candidates still require the full quality gate.
     #[serde(default)]
     pub exact_semantics_verified: bool,
+    /// Optional compiler-visible interaction coordinates. Keeping this
+    /// optional preserves compatibility with pre-interaction evidence files.
+    #[serde(default)]
+    pub interaction: Option<PlanInteraction>,
+}
+
+/// The two independent specialization axes that must be evaluated together.
+/// These are opaque IDs on purpose: the artifact/compiler owns their meaning,
+/// while the planner owns the interaction and evidence contract.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct PlanInteraction {
+    pub representation_id: String,
+    pub mapping_id: String,
+}
+
+/// A compiler-declared Cartesian search space. Pairs in `incompatible` are
+/// removed before candidate validation, so a 2x2 experiment can explicitly
+/// describe a smaller legal matrix without silently omitting a candidate.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InteractionMatrix {
+    pub representations: Vec<String>,
+    pub mappings: Vec<String>,
+    #[serde(default)]
+    pub incompatible: Vec<PlanInteraction>,
+}
+
+pub fn expand_interaction_matrix(matrix: &InteractionMatrix) -> Result<Vec<PlanInteraction>> {
+    validate_axis("representation", &matrix.representations)?;
+    validate_axis("mapping", &matrix.mappings)?;
+    let incompatible = matrix.incompatible.iter().cloned().collect::<BTreeSet<_>>();
+    if incompatible.len() != matrix.incompatible.len() {
+        bail!("interaction matrix contains duplicate incompatible pairs");
+    }
+    for pair in &incompatible {
+        if !matrix.representations.contains(&pair.representation_id)
+            || !matrix.mappings.contains(&pair.mapping_id)
+        {
+            bail!(
+                "incompatible interaction {} × {} is outside the declared axes",
+                pair.representation_id,
+                pair.mapping_id
+            );
+        }
+    }
+    let mut expanded = Vec::new();
+    for representation_id in &matrix.representations {
+        for mapping_id in &matrix.mappings {
+            let pair = PlanInteraction {
+                representation_id: representation_id.clone(),
+                mapping_id: mapping_id.clone(),
+            };
+            if !incompatible.contains(&pair) {
+                expanded.push(pair);
+            }
+        }
+    }
+    if expanded.is_empty() {
+        bail!("interaction matrix has no compatible candidates");
+    }
+    Ok(expanded)
+}
+
+pub fn validate_interaction_candidates(
+    matrix: &InteractionMatrix,
+    candidates: &[PlanInteraction],
+) -> Result<()> {
+    let expected = expand_interaction_matrix(matrix)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let actual = candidates.iter().cloned().collect::<BTreeSet<_>>();
+    if actual.len() != candidates.len() {
+        bail!("interaction candidate matrix contains duplicate representation × mapping pairs");
+    }
+    if actual != expected {
+        let missing = expected.difference(&actual).collect::<Vec<_>>();
+        let unexpected = actual.difference(&expected).collect::<Vec<_>>();
+        bail!(
+            "interaction candidate matrix is incomplete or incompatible (missing: {:?}; unexpected: {:?})",
+            missing,
+            unexpected
+        );
+    }
+    Ok(())
+}
+
+fn validate_axis(name: &str, values: &[String]) -> Result<()> {
+    if values.is_empty() {
+        bail!("interaction matrix has no {name} values");
+    }
+    if values.iter().any(|value| value.trim().is_empty()) {
+        bail!("interaction matrix contains an empty {name} ID");
+    }
+    let unique = values.iter().collect::<BTreeSet<_>>();
+    if unique.len() != values.len() {
+        bail!("interaction matrix contains duplicate {name} IDs");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -573,6 +674,10 @@ pub enum CandidateRejection {
     Quality,
     Memory,
     NonFiniteLatency,
+    InsufficientImprovement {
+        improvement_micros: i64,
+        threshold_micros: u64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -581,9 +686,25 @@ pub struct PlanSelection {
     pub rejected: Vec<(String, CandidateRejection)>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct PlanSelectionPolicy {
+    /// If present, non-baseline candidates must beat this plan by at least
+    /// `minimum_improvement_ms_per_token` on complete-model wall latency.
+    pub baseline_plan_id: Option<String>,
+    pub minimum_improvement_ms_per_token: f64,
+}
+
 pub fn select_execution_plan(
     candidates: &[PlanCandidateEvidence],
     constraints: PlanSelectionConstraints,
+) -> Result<PlanSelection> {
+    select_execution_plan_with_policy(candidates, constraints, PlanSelectionPolicy::default())
+}
+
+pub fn select_execution_plan_with_policy(
+    candidates: &[PlanCandidateEvidence],
+    constraints: PlanSelectionConstraints,
+    policy: PlanSelectionPolicy,
 ) -> Result<PlanSelection> {
     let mut eligible = Vec::<(&PlanCandidateEvidence, f64)>::new();
     let mut rejected = Vec::new();
@@ -657,6 +778,32 @@ pub fn select_execution_plan(
             })
             .then_with(|| left.plan.plan_id.cmp(&right.plan.plan_id))
     });
+    if let Some(baseline_id) = policy.baseline_plan_id.as_deref() {
+        let baseline_wall = eligible
+            .iter()
+            .find(|(candidate, _)| candidate.plan.plan_id == baseline_id)
+            .map(|(_, wall)| *wall)
+            .ok_or_else(|| anyhow::anyhow!("baseline plan {baseline_id} is not eligible"))?;
+        let threshold = policy.minimum_improvement_ms_per_token.max(0.0);
+        if threshold > 0.0 {
+            let mut retained = Vec::with_capacity(eligible.len());
+            for (candidate, wall) in eligible {
+                let improvement = baseline_wall - wall;
+                if candidate.plan.plan_id != baseline_id && improvement < threshold {
+                    rejected.push((
+                        candidate.plan.plan_id.clone(),
+                        CandidateRejection::InsufficientImprovement {
+                            improvement_micros: (improvement * 1_000.0).round() as i64,
+                            threshold_micros: (threshold * 1_000.0).round() as u64,
+                        },
+                    ));
+                } else {
+                    retained.push((candidate, wall));
+                }
+            }
+            eligible = retained;
+        }
+    }
     let selected = eligible
         .first()
         .map(|(candidate, _)| candidate.plan.clone())
@@ -886,6 +1033,7 @@ mod tests {
                 mapped_model_bytes: 750_000_000,
             },
             exact_semantics_verified: false,
+            interaction: None,
         }
     }
 
@@ -956,5 +1104,62 @@ mod tests {
             missing_promotion_tier(&tiers),
             Some(PromotionTier::CompleteModel)
         );
+    }
+
+    #[test]
+    fn interaction_matrix_expands_and_validates_the_full_factorial() {
+        let matrix = InteractionMatrix {
+            representations: vec!["row-inline".to_owned(), "fused-block".to_owned()],
+            mappings: vec!["qx".to_owned(), "llama-like".to_owned()],
+            incompatible: Vec::new(),
+        };
+        let expanded = expand_interaction_matrix(&matrix).unwrap();
+        assert_eq!(expanded.len(), 4);
+        validate_interaction_candidates(&matrix, &expanded).unwrap();
+    }
+
+    #[test]
+    fn interaction_matrix_rejects_missing_or_incompatible_pairs() {
+        let matrix = InteractionMatrix {
+            representations: vec!["row-inline".to_owned(), "fused-block".to_owned()],
+            mappings: vec!["qx".to_owned(), "llama-like".to_owned()],
+            incompatible: vec![PlanInteraction {
+                representation_id: "fused-block".to_owned(),
+                mapping_id: "llama-like".to_owned(),
+            }],
+        };
+        let expanded = expand_interaction_matrix(&matrix).unwrap();
+        assert_eq!(expanded.len(), 3);
+        let incomplete = expanded[..2].to_vec();
+        assert!(validate_interaction_candidates(&matrix, &incomplete).is_err());
+    }
+
+    #[test]
+    fn policy_rejects_candidates_below_meaningful_improvement_threshold() {
+        let baseline = plan_candidate("baseline", 5.0, 0.0);
+        let tiny_win = plan_candidate("tiny-win", 4.95, 0.0);
+        let meaningful_win = plan_candidate("meaningful-win", 4.80, 0.0);
+        let result = select_execution_plan_with_policy(
+            &[baseline, tiny_win, meaningful_win],
+            PlanSelectionConstraints {
+                max_aggregate_relative_ppl_delta: 0.01,
+                max_domain_relative_ppl_delta: 0.02,
+                max_task_delta_points: 2.0,
+                max_peak_physical_footprint_bytes: 0,
+            },
+            PlanSelectionPolicy {
+                baseline_plan_id: Some("baseline".to_owned()),
+                minimum_improvement_ms_per_token: 0.10,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.selected.plan_id, "meaningful-win");
+        assert!(result.rejected.contains(&(
+            "tiny-win".to_owned(),
+            CandidateRejection::InsufficientImprovement {
+                improvement_micros: 50,
+                threshold_micros: 100,
+            }
+        )));
     }
 }
