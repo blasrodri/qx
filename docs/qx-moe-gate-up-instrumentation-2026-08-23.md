@@ -7,7 +7,7 @@ Artifact hash: `e3f2940482d5999d`
 
 ## What was added
 
-The existing row-inline Q4 gate/up dispatch now has three diagnostic variants,
+The existing row-inline Q4 gate/up dispatch now has five diagnostic variants,
 selected with `QX_V2_MOE_GATE_UP_INSTRUMENT`:
 
 ```text
@@ -16,6 +16,10 @@ load-only             read packed Q4 code bytes and inline FP16 scales
 load-decode           additionally unpack nibbles and convert/scale Q4 values
 dot-no-reduction      additionally multiply by the staged activation, with no
                       final SIMD reduction
+staging-only          preserve activation staging/barrier, but do not touch
+                      expert weights
+address-only          calculate production routed row/group/byte addresses,
+                      but do not dereference expert weights
 ```
 
 The variants preserve the production path's:
@@ -31,6 +35,11 @@ The variants preserve the production path's:
 The three diagnostic paths are non-semantic: they must only be used through
 the gate/up boundary profiler because they do not produce valid gate/up
 outputs for the following SiLU/down stages.
+
+All five variants retain the same 24-layer fixed-route boundary, dispatch
+geometry, activation staging shape, and buffer bindings. The new staging and
+address controls are deliberately not alternate production kernels; they are
+cost-isolation instruments.
 
 ## Static QX work count
 
@@ -141,15 +150,41 @@ single-sample swings enough to expose a useful provisional ordering:
 
 These are still diagnostic, nonsemantic kernels and were run in separate
 processes, so they are not a promotion result. Within this instrumented
-mapping, however, the bytes themselves are not the dominant incremental cost:
-adding decode to load-only costs about 61 µs per 24 layers, adding the dot
-loop costs about another 95 µs, and adding the production SIMD reduction/output
-behavior accounts for the remaining roughly 52 µs relative to canonical.
+mapping, decode, FMA work, and final SIMD reduction are not individually large
+enough to explain the roughly 0.8 ms QX-vs-llama gate/up gap. However, the
+load-only path is not a pure raw-byte cost: it still includes the shared
+dispatch, activation staging, routed expert selection, address generation,
+packed loads, and diagnostic sink. Therefore it would be too strong to say
+that raw weight traffic is unimportant.
 
-The provisional implication is that another raw-weight-traffic experiment is
-unlikely to close the llama gap. The open exact lane is now the production
-kernel's coupled address-generation/vectorization/output dataflow, followed by
-a source-matched llama `MUL_MAT_ID` build when its checkout is available.
+## Staging/address/load split
+
+The next surgical split keeps the exact production boundary and adds controls
+for the shared pre-load work:
+
+| Variant | 24-layer gate/up GPU µs | µs / layer | Interpretation |
+|---|---:|---:|---|
+| staging-only | 843.38 | 35.14 | staging/barrier plus minimal sink |
+| address-only | 642.46 | 26.77 | staging plus routed row/group/byte address arithmetic |
+| load-only, averaged follow-up | 1,263.42 | 52.64 | real packed code/scale dereferences plus shared diagnostic work |
+| canonical, averaged follow-up | 1,471.37 | 61.31 | production decode/dot/reduction path |
+
+The measurements are separate release processes and are not additive cost
+components. The surprising ordering—address-only below staging-only—is itself
+useful: staging is not the dominant explanation, and address generation is not
+expensive enough in this control to account for the load-only/canonical gap.
+The load-only control is about 621 µs above address-only over 24 layers, while
+canonical is about 208 µs above load-only. This is evidence that actual packed
+code/scale transactions remain a major live cost, but not a clean bandwidth
+measurement because each control has different compiler-visible work and sink
+behavior.
+
+The next valid representation experiment is therefore a same-byte contiguous
+fake-stream control using the production mapping. If that is much cheaper than
+load-only, physical placement/transaction shape remains open. If it is close,
+the remaining cost is more likely coupled address/decoder/vectorization
+behavior. Neither result justifies a new format until it is confirmed in the
+complete semantic graph.
 
 Result records:
 
@@ -165,3 +200,5 @@ Result records:
 - `benchmarks/results/gateup-instrument-averaged-load-only-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-averaged-load-decode-2026-08-23.json`
 - `benchmarks/results/gateup-instrument-averaged-dot-no-reduction-2026-08-23.json`
+- `benchmarks/results/gateup-instrument-averaged-staging-only-2026-08-23.json`
+- `benchmarks/results/gateup-instrument-averaged-address-only-2026-08-23.json`

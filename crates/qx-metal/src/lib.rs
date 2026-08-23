@@ -398,6 +398,8 @@ pub mod platform {
     /// paths and must never be used for model output.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum MoeGateUpInstrumentVariant {
+        StagingOnly,
+        AddressOnly,
         LoadOnly,
         LoadDecode,
         DotNoReduction,
@@ -409,6 +411,12 @@ pub mod platform {
             .map(|value| value.to_ascii_lowercase())
             .as_deref()
         {
+            Some("staging-only") | Some("staging_only") => {
+                Some(MoeGateUpInstrumentVariant::StagingOnly)
+            }
+            Some("address-only") | Some("address_only") => {
+                Some(MoeGateUpInstrumentVariant::AddressOnly)
+            }
             Some("load-only") | Some("load_only") => Some(MoeGateUpInstrumentVariant::LoadOnly),
             Some("load-decode") | Some("load_decode") => {
                 Some(MoeGateUpInstrumentVariant::LoadDecode)
@@ -828,9 +836,13 @@ pub mod platform {
         two_row_dataflow_gate_up_pipeline: Option<Pipeline>,
         two_row_dataflow_gate_up_norm_pipeline: Option<Pipeline>,
         gate_up_instrument_load_only_pipeline: Pipeline,
+        gate_up_instrument_staging_only_pipeline: Pipeline,
+        gate_up_instrument_address_only_pipeline: Pipeline,
         gate_up_instrument_load_decode_pipeline: Pipeline,
         gate_up_instrument_dot_no_reduce_pipeline: Pipeline,
         gate_up_instrument_load_only_norm_pipeline: Pipeline,
+        gate_up_instrument_staging_only_norm_pipeline: Pipeline,
+        gate_up_instrument_address_only_norm_pipeline: Pipeline,
         gate_up_instrument_load_decode_norm_pipeline: Pipeline,
         gate_up_instrument_dot_no_reduce_norm_pipeline: Pipeline,
         q4k_mature_gate_up_pipeline: Pipeline,
@@ -2405,6 +2417,12 @@ pub mod platform {
                 return Ok(false);
             };
             let pipeline = match (variant, normalized) {
+                (MoeGateUpInstrumentVariant::StagingOnly, false) => {
+                    &prepared.gate_up_instrument_staging_only_pipeline
+                }
+                (MoeGateUpInstrumentVariant::AddressOnly, false) => {
+                    &prepared.gate_up_instrument_address_only_pipeline
+                }
                 (MoeGateUpInstrumentVariant::LoadOnly, false) => {
                     &prepared.gate_up_instrument_load_only_pipeline
                 }
@@ -2416,6 +2434,12 @@ pub mod platform {
                 }
                 (MoeGateUpInstrumentVariant::LoadOnly, true) => {
                     &prepared.gate_up_instrument_load_only_norm_pipeline
+                }
+                (MoeGateUpInstrumentVariant::StagingOnly, true) => {
+                    &prepared.gate_up_instrument_staging_only_norm_pipeline
+                }
+                (MoeGateUpInstrumentVariant::AddressOnly, true) => {
+                    &prepared.gate_up_instrument_address_only_norm_pipeline
                 }
                 (MoeGateUpInstrumentVariant::LoadDecode, true) => {
                     &prepared.gate_up_instrument_load_decode_norm_pipeline
@@ -7634,6 +7658,12 @@ pub mod platform {
                 two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
                 )?),
+                gate_up_instrument_staging_only_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_staging_only_simd",
+                )?,
+                gate_up_instrument_address_only_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_address_only_simd",
+                )?,
                 gate_up_instrument_load_only_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_only_simd",
                 )?,
@@ -7645,6 +7675,12 @@ pub mod platform {
                 )?,
                 gate_up_instrument_load_only_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_only_norm_simd",
+                )?,
+                gate_up_instrument_staging_only_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_staging_only_norm_simd",
+                )?,
+                gate_up_instrument_address_only_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_address_only_norm_simd",
                 )?,
                 gate_up_instrument_load_decode_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_decode_norm_simd",
@@ -7934,6 +7970,12 @@ pub mod platform {
                 two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
                 )?),
+                gate_up_instrument_staging_only_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_staging_only_simd",
+                )?,
+                gate_up_instrument_address_only_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_address_only_simd",
+                )?,
                 gate_up_instrument_load_only_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_only_simd",
                 )?,
@@ -7945,6 +7987,12 @@ pub mod platform {
                 )?,
                 gate_up_instrument_load_only_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_only_norm_simd",
+                )?,
+                gate_up_instrument_staging_only_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_staging_only_norm_simd",
+                )?,
+                gate_up_instrument_address_only_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_address_only_norm_simd",
                 )?,
                 gate_up_instrument_load_decode_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_decode_norm_simd",
@@ -8187,6 +8235,12 @@ pub mod platform {
                 two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
                 )?),
+                gate_up_instrument_staging_only_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_staging_only_simd",
+                )?,
+                gate_up_instrument_address_only_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_address_only_simd",
+                )?,
                 gate_up_instrument_load_only_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_only_simd",
                 )?,
@@ -8198,6 +8252,12 @@ pub mod platform {
                 )?,
                 gate_up_instrument_load_only_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_only_norm_simd",
+                )?,
+                gate_up_instrument_staging_only_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_staging_only_norm_simd",
+                )?,
+                gate_up_instrument_address_only_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_address_only_norm_simd",
                 )?,
                 gate_up_instrument_load_decode_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_decode_norm_simd",
@@ -8523,6 +8583,12 @@ pub mod platform {
                 two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
                 )?),
+                gate_up_instrument_staging_only_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_staging_only_simd",
+                )?,
+                gate_up_instrument_address_only_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_address_only_simd",
+                )?,
                 gate_up_instrument_load_only_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_only_simd",
                 )?,
@@ -8534,6 +8600,12 @@ pub mod platform {
                 )?,
                 gate_up_instrument_load_only_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_only_norm_simd",
+                )?,
+                gate_up_instrument_staging_only_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_staging_only_norm_simd",
+                )?,
+                gate_up_instrument_address_only_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_inline_address_only_norm_simd",
                 )?,
                 gate_up_instrument_load_decode_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_decode_norm_simd",
