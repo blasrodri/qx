@@ -220,6 +220,20 @@ pub mod platform {
         })
     }
 
+    /// Opt-in consumer for the exact Q4CrossExpertTile8 artifact stream. The
+    /// stream is shared by all experts and is addressed with the selected
+    /// expert slot IDs; keep this separate from the older row-inline route-set
+    /// candidate until artifact-level parity promotes it.
+    pub fn moe_cross_expert_tile8_enabled() -> bool {
+        matches!(
+            std::env::var("QX_V2_MOE_CROSS_EXPERT_TILE8")
+                .ok()
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    }
+
     /// Bounded Granite-M5 top-8 row-stream candidate for exact Q4 row-inline
     /// gate/up. One SIMD group owns one selected expert while the threadgroup
     /// advances an eight-row tile in lockstep. It is opt-in until complete
@@ -595,6 +609,8 @@ pub mod platform {
         inline_gate_up_nocache_norm_pipeline: Pipeline,
         cross_expert_gate_up_pipeline: Pipeline,
         cross_expert_gate_up_norm_pipeline: Pipeline,
+        cross_expert_tile8_gate_up_pipeline: Pipeline,
+        cross_expert_tile8_gate_up_norm_pipeline: Pipeline,
         row_stream_gate_up_pipeline: Pipeline,
         row_stream_gate_up_norm_pipeline: Pipeline,
         llama_like_gate_up_pipeline: Pipeline,
@@ -653,6 +669,7 @@ pub mod platform {
         batched_silu_pipeline: Pipeline,
         batched_down_pipeline: Pipeline,
         inline_down_pipeline: Pipeline,
+        cross_expert_tile8_down_pipeline: Pipeline,
         inline_layout: bool,
         down_inline_layout: bool,
         wide_down_pipeline: Pipeline,
@@ -1854,6 +1871,12 @@ pub mod platform {
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none();
+            let cross_expert_tile8 = moe_cross_expert_tile8_enabled()
+                && prepared.gate_up_layout == PackingLayout::Q4CrossExpertTile8
+                && q3_block_bytes.is_none();
+            let cross_expert_tile8_down = moe_cross_expert_tile8_enabled()
+                && prepared.down_layout == PackingLayout::Q4CrossExpertTile8
+                && q3_block_bytes.is_none();
 
             if let Some((norm_weights, inverse_rms)) = norm {
                 if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
@@ -1866,6 +1889,10 @@ pub mod platform {
                     }
                     .ok_or_else(|| "fused transaction-block pipeline is missing".to_owned())?;
                     self.encoder.setComputePipelineState(pipeline);
+                } else if cross_expert_tile8 {
+                    self.encoder.setComputePipelineState(
+                        &prepared.cross_expert_tile8_gate_up_norm_pipeline,
+                    );
                 } else if llama_like_mapping {
                     self.encoder
                         .setComputePipelineState(&prepared.llama_like_gate_up_norm_pipeline);
@@ -1940,6 +1967,9 @@ pub mod platform {
                     }
                     .ok_or_else(|| "fused transaction-block pipeline is missing".to_owned())?;
                     self.encoder.setComputePipelineState(pipeline);
+                } else if cross_expert_tile8 {
+                    self.encoder
+                        .setComputePipelineState(&prepared.cross_expert_tile8_gate_up_pipeline);
                 } else if llama_like_mapping {
                     self.encoder
                         .setComputePipelineState(&prepared.llama_like_gate_up_pipeline);
@@ -2037,6 +2067,8 @@ pub mod platform {
                         8 * (1024 / 8)
                     } else if llama_like_mapping {
                         8 * (1024 / 4)
+                    } else if cross_expert_tile8 {
+                        1024 / 8
                     } else if cross_expert_activation {
                         1024 / 8
                     } else if row_inline_streaming {
@@ -2094,6 +2126,9 @@ pub mod platform {
 
             if let Some(pipeline) = prepared.q3_down_pipeline.as_ref() {
                 self.encoder.setComputePipelineState(pipeline);
+            } else if cross_expert_tile8_down {
+                self.encoder
+                    .setComputePipelineState(&prepared.cross_expert_tile8_down_pipeline);
             } else if prepared.down_inline_layout {
                 self.encoder
                     .setComputePipelineState(&prepared.inline_down_pipeline);
@@ -2126,8 +2161,16 @@ pub mod platform {
                         0,
                     );
                     self.encoder.setBuffer_offset_atIndex(
-                        Some(&prepared.down_scales.buffer),
-                        prepared.down_scales.offset,
+                        Some(if cross_expert_tile8_down {
+                            &prepared.down_packed.buffer
+                        } else {
+                            &prepared.down_scales.buffer
+                        }),
+                        if cross_expert_tile8_down {
+                            prepared.down_packed.offset
+                        } else {
+                            prepared.down_scales.offset
+                        },
                         1,
                     );
                     self.encoder.setBytes_length_atIndex(
@@ -3004,11 +3047,21 @@ pub mod platform {
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none();
+            let cross_expert_tile8 = moe_cross_expert_tile8_enabled()
+                && prepared.gate_up_layout == PackingLayout::Q4CrossExpertTile8
+                && q3_block_bytes.is_none();
+            let cross_expert_tile8_down = moe_cross_expert_tile8_enabled()
+                && prepared.down_layout == PackingLayout::Q4CrossExpertTile8
+                && q3_block_bytes.is_none();
             match stage {
                 0 => {
                     if let Some((norm_weights, inverse_rms)) = norm {
                         if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
                             self.encoder.setComputePipelineState(pipeline);
+                        } else if cross_expert_tile8 {
+                            self.encoder.setComputePipelineState(
+                                &prepared.cross_expert_tile8_gate_up_norm_pipeline,
+                            );
                         } else if row_inline_streaming {
                             self.encoder.setComputePipelineState(
                                 &prepared.row_stream_gate_up_norm_pipeline,
@@ -3073,6 +3126,10 @@ pub mod platform {
                             );
                         } else if let Some(pipeline) = prepared.q3_gate_up_pipeline.as_ref() {
                             self.encoder.setComputePipelineState(pipeline);
+                        } else if cross_expert_tile8 {
+                            self.encoder.setComputePipelineState(
+                                &prepared.cross_expert_tile8_gate_up_pipeline,
+                            );
                         } else if row_inline_streaming {
                             self.encoder
                                 .setComputePipelineState(&prepared.row_stream_gate_up_pipeline);
@@ -3165,7 +3222,7 @@ pub mod platform {
                     }
                     self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: if row_inline_streaming {
+                            width: if cross_expert_tile8 || row_inline_streaming {
                                 1024 / 8
                             } else if wide_expert {
                                 8
@@ -3218,6 +3275,9 @@ pub mod platform {
                 2 => {
                     if let Some(pipeline) = prepared.q3_down_pipeline.as_ref() {
                         self.encoder.setComputePipelineState(pipeline);
+                    } else if cross_expert_tile8_down {
+                        self.encoder
+                            .setComputePipelineState(&prepared.cross_expert_tile8_down_pipeline);
                     } else if prepared.down_inline_layout {
                         self.encoder
                             .setComputePipelineState(&prepared.inline_down_pipeline);
@@ -3248,6 +3308,17 @@ pub mod platform {
                                 NonNull::from(&block_bytes).cast(),
                                 4,
                                 7,
+                            );
+                        } else if cross_expert_tile8_down {
+                            self.encoder.setBuffer_offset_atIndex(
+                                Some(&prepared.down_packed.buffer),
+                                prepared.down_packed.offset,
+                                0,
+                            );
+                            self.encoder.setBuffer_offset_atIndex(
+                                Some(&prepared.down_packed.buffer),
+                                prepared.down_packed.offset,
+                                1,
                             );
                         } else {
                             self.encoder.setBuffer_offset_atIndex(
@@ -6133,6 +6204,8 @@ pub mod platform {
             const Q4_TRANSACTION_GATE_UP_160: usize = 1024 * 4 * 160;
             const Q4_TRANSACTION_DOWN_144: usize = 1024 * 2 * 144;
             const Q4_TRANSACTION_DOWN_160: usize = 1024 * 2 * 160;
+            const Q4_CROSS_EXPERT_GATE_UP: usize = EXPERTS * 1024 * 32 * 18;
+            const Q4_CROSS_EXPERT_DOWN: usize = EXPERTS * 1024 * 16 * 18;
             let is_q4_gate = gate_up_packed.len() == EXPERTS * GATE_UP_PACKED
                 && gate_up_scales.len() == EXPERTS * GATE_UP_SCALES
                 || gate_up_packed.len() == EXPERTS * 1024 * 32 * 18
@@ -6159,8 +6232,14 @@ pub mod platform {
                             _ => 0,
                         }
                 && down_scales.len() == down_packed.len();
-            let is_q4_gate = is_q4_gate || is_q4_transaction_gate;
-            let is_q4_down = is_q4_down || is_q4_transaction_down;
+            let is_q4_cross_expert_gate = gate_up_layout == PackingLayout::Q4CrossExpertTile8
+                && gate_up_packed.len() == Q4_CROSS_EXPERT_GATE_UP
+                && gate_up_scales.len() == Q4_CROSS_EXPERT_GATE_UP;
+            let is_q4_cross_expert_down = down_layout == PackingLayout::Q4CrossExpertTile8
+                && down_packed.len() == Q4_CROSS_EXPERT_DOWN
+                && down_scales.len() == Q4_CROSS_EXPERT_DOWN;
+            let is_q4_gate = is_q4_gate || is_q4_transaction_gate || is_q4_cross_expert_gate;
+            let is_q4_down = is_q4_down || is_q4_transaction_down || is_q4_cross_expert_down;
             let is_q4 = is_q4_gate && is_q4_down;
             let is_q4k = gate_up_packed.len() == EXPERTS * Q4K_GATE_UP_PACKED
                 && gate_up_scales.len() == EXPERTS * Q4K_GATE_UP_SCALES
@@ -6169,9 +6248,23 @@ pub mod platform {
             if (!is_q4 && !is_q4k)
                 || (gate_up_layout.is_q4_transaction() && !is_q4_transaction_gate)
                 || (down_layout.is_q4_transaction() && !is_q4_transaction_down)
+                || (gate_up_layout == PackingLayout::Q4CrossExpertTile8 && !is_q4_cross_expert_gate)
+                || (down_layout == PackingLayout::Q4CrossExpertTile8 && !is_q4_cross_expert_down)
             {
                 return Err("dynamic Q4 MoE buffers have an invalid Granite shape".to_owned());
             }
+            let gate_up_runtime = self.input_runtime_buffer(gate_up_packed)?;
+            let gate_up_scales_runtime = if is_q4_cross_expert_gate {
+                gate_up_runtime.clone()
+            } else {
+                self.input_runtime_buffer(gate_up_scales)?
+            };
+            let down_runtime = self.input_runtime_buffer(down_packed)?;
+            let down_scales_runtime = if is_q4_cross_expert_down {
+                down_runtime.clone()
+            } else {
+                self.input_runtime_buffer(down_scales)?
+            };
             let gate_up_pipeline = if is_q4k {
                 "qx_dynamic_q4k_moe_gate_up_simd"
             } else {
@@ -6211,6 +6304,12 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_cross_expert_simd")?,
                 cross_expert_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_cross_expert_norm_simd",
+                )?,
+                cross_expert_tile8_gate_up_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_cross_expert_tile8_simd",
+                )?,
+                cross_expert_tile8_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_cross_expert_tile8_norm_simd",
                 )?,
                 row_stream_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_row_stream_simd")?,
@@ -6309,21 +6408,23 @@ pub mod platform {
                 batched_down_pipeline: self.dynamic_moe_named_pipeline(down_pipeline)?,
                 inline_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_inline_simd")?,
+                cross_expert_tile8_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cross_expert_tile8_simd")?,
                 inline_layout: gate_up_layout == PackingLayout::Q4RowInline,
                 down_inline_layout: down_layout.is_q4_row_inline(),
                 wide_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_wide_simd")?,
                 batched_accumulate_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_accumulate")?,
-                gate_up_packed: self.input_runtime_buffer(gate_up_packed)?,
-                gate_up_scales: self.input_runtime_buffer(gate_up_scales)?,
+                gate_up_packed: gate_up_runtime,
+                gate_up_scales: gate_up_scales_runtime,
                 split_gate_packed: None,
                 split_gate_scales: None,
                 split_up_packed: None,
                 split_up_scales: None,
                 split_gate_up: false,
-                down_packed: self.input_runtime_buffer(down_packed)?,
-                down_scales: self.input_runtime_buffer(down_scales)?,
+                down_packed: down_runtime,
+                down_scales: down_scales_runtime,
                 layout: gate_up_layout,
                 gate_up_layout,
                 down_layout,
@@ -6356,6 +6457,8 @@ pub mod platform {
             const Q4_TRANSACTION_GATE_UP_160: usize = 1024 * 4 * 160;
             const Q4_TRANSACTION_DOWN_144: usize = 1024 * 2 * 144;
             const Q4_TRANSACTION_DOWN_160: usize = 1024 * 2 * 160;
+            const Q4_CROSS_EXPERT_GATE_UP: usize = EXPERTS * 1024 * 32 * 18;
+            const Q4_CROSS_EXPERT_DOWN: usize = EXPERTS * 1024 * 16 * 18;
             const Q3_GATE_UP_12: usize = 1024 * 32 * 12;
             const Q3_GATE_UP_16: usize = 1024 * 32 * 16;
             const Q3_DOWN_12: usize = 1024 * 16 * 12;
@@ -6386,8 +6489,14 @@ pub mod platform {
                             _ => 0,
                         }
                 && down_scales.length == down_packed.length;
-            let is_q4_gate = is_q4_gate || is_q4_transaction_gate;
-            let is_q4_down = is_q4_down || is_q4_transaction_down;
+            let is_q4_cross_expert_gate = gate_up_layout == PackingLayout::Q4CrossExpertTile8
+                && gate_up_packed.length == Q4_CROSS_EXPERT_GATE_UP
+                && gate_up_scales.length == Q4_CROSS_EXPERT_GATE_UP;
+            let is_q4_cross_expert_down = down_layout == PackingLayout::Q4CrossExpertTile8
+                && down_packed.length == Q4_CROSS_EXPERT_DOWN
+                && down_scales.length == Q4_CROSS_EXPERT_DOWN;
+            let is_q4_gate = is_q4_gate || is_q4_transaction_gate || is_q4_cross_expert_gate;
+            let is_q4_down = is_q4_down || is_q4_transaction_down || is_q4_cross_expert_down;
             let is_q4 = is_q4_gate && is_q4_down;
             let is_q4k = gate_up_packed.length == EXPERTS * Q4K_GATE_UP_PACKED
                 && gate_up_scales.length == EXPERTS * Q4K_GATE_UP_SCALES
@@ -6414,6 +6523,8 @@ pub mod platform {
                 && !is_q4_gate_q3_down)
                 || (gate_up_layout.is_q4_transaction() && !is_q4_transaction_gate)
                 || (down_layout.is_q4_transaction() && !is_q4_transaction_down)
+                || (gate_up_layout == PackingLayout::Q4CrossExpertTile8 && !is_q4_cross_expert_gate)
+                || (down_layout == PackingLayout::Q4CrossExpertTile8 && !is_q4_cross_expert_down)
             {
                 return Err("dynamic Q4 MoE slab views have an invalid Granite shape".to_owned());
             }
@@ -6457,6 +6568,12 @@ pub mod platform {
                 cross_expert_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_cross_expert_norm_simd",
                 )?,
+                cross_expert_tile8_gate_up_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_cross_expert_tile8_simd",
+                )?,
+                cross_expert_tile8_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_cross_expert_tile8_norm_simd",
+                )?,
                 row_stream_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_row_stream_simd")?,
                 row_stream_gate_up_norm_pipeline: self
@@ -6554,6 +6671,8 @@ pub mod platform {
                 batched_down_pipeline: self.dynamic_moe_named_pipeline(down_pipeline)?,
                 inline_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_inline_simd")?,
+                cross_expert_tile8_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cross_expert_tile8_simd")?,
                 inline_layout: gate_up_layout == PackingLayout::Q4RowInline,
                 down_inline_layout: down_layout.is_q4_row_inline(),
                 wide_down_pipeline: self
@@ -6669,6 +6788,12 @@ pub mod platform {
                 cross_expert_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_cross_expert_norm_simd",
                 )?,
+                cross_expert_tile8_gate_up_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_cross_expert_tile8_simd",
+                )?,
+                cross_expert_tile8_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_cross_expert_tile8_norm_simd",
+                )?,
                 llama_like_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
                 llama_like_gate_up_norm_pipeline: self
@@ -6769,6 +6894,8 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_simd")?,
                 inline_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_inline_simd")?,
+                cross_expert_tile8_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cross_expert_tile8_simd")?,
                 inline_layout: false,
                 down_inline_layout: false,
                 wide_down_pipeline: self
@@ -6960,6 +7087,12 @@ pub mod platform {
                 cross_expert_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_cross_expert_norm_simd",
                 )?,
+                cross_expert_tile8_gate_up_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_cross_expert_tile8_simd",
+                )?,
+                cross_expert_tile8_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_cross_expert_tile8_norm_simd",
+                )?,
                 llama_like_gate_up_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_gate_up_llama_like_simd")?,
                 llama_like_gate_up_norm_pipeline: self
@@ -7054,6 +7187,8 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_simd")?,
                 inline_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_inline_simd")?,
+                cross_expert_tile8_down_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cross_expert_tile8_simd")?,
                 inline_layout: gate_up_layout == PackingLayout::Q4RowInline,
                 down_inline_layout: down_layout.is_q4_row_inline(),
                 wide_down_pipeline: self

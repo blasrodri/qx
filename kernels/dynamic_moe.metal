@@ -603,6 +603,105 @@ kernel void qx_dynamic_q4_moe_gate_up_cross_expert_norm_simd(
     }
 }
 
+// Exact-Q4 cross-expert tile-8 consumer. The compiler artifact stores one
+// shared stream in [tile][group][row-in-tile][expert][codes][FP16 scale]
+// order. A threadgroup owns one tile and each SIMD group owns one selected
+// expert slot, so every group/row frontier is traversed in the artifact's
+// physical order. The lane/group accumulation order remains the canonical
+// Q4 order: lane n consumes columns n, n+32, ... and reduces with simd_sum.
+inline void qx_dynamic_q4_cross_expert_tile8_gate_up_body(
+    device const uchar* stream,
+    device const uint* expert_ids,
+    device float* output,
+    threadgroup float* cached_input,
+    threadgroup uint* selected_experts,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id,
+    uint thread_index) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint tile_rows = 8;
+    constexpr uint experts = 32;
+    constexpr uint group_stride = experts * 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint tile_stride = tile_rows * row_stride;
+
+    if (thread_index < tile_rows) {
+        selected_experts[thread_index] = expert_ids[thread_index];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint expert = selected_experts[simdgroup];
+    uint first_row = threadgroup_id * tile_rows;
+    for (uint row_offset = 0; row_offset < tile_rows; ++row_offset) {
+        uint row = first_row + row_offset;
+        float sum = 0.0f;
+        if (expert < experts && row < hidden) {
+            uint tile_base = threadgroup_id * tile_stride;
+            for (uint group = 0; group < groups; ++group) {
+                uint group_base = tile_base + group * tile_stride / tile_rows
+                    + row_offset * group_stride + expert * 18;
+                ushort packed = reinterpret_cast<device const ushort*>(stream + group_base)[lane >> 2];
+                uint byte = (uint(packed) >> (((lane >> 1) & 1) * 8)) & 0xff;
+                uint code = (byte >> ((lane & 1) * 4)) & 0xf;
+                float scale = lane == 0
+                    ? qx_q4_inline_scale(stream, group_base + 16)
+                    : 0.0f;
+                scale = simd_broadcast(scale, 0);
+                sum += float(int(code) - 7)
+                    * scale
+                    * cached_input[group * 32 + lane];
+            }
+        }
+        sum = simd_sum(sum);
+        if (lane == 0 && row < hidden) {
+            output[simdgroup * hidden + row] = sum;
+        }
+    }
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_cross_expert_tile8_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    for (uint column = thread_index; column < 1024; column += 256) {
+        cached_input[column] = input[column];
+    }
+    threadgroup uint selected_experts[8];
+    qx_dynamic_q4_cross_expert_tile8_gate_up_body(
+        stream, expert_ids, output, cached_input, selected_experts,
+        lane, simdgroup, threadgroup_id, thread_index);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_cross_expert_tile8_norm_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]],
+    device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    float inverse = inverse_rms[0];
+    for (uint column = thread_index; column < 1024; column += 256) {
+        cached_input[column] = input[column] * inverse * norm_weights[column];
+    }
+    threadgroup uint selected_experts[8];
+    qx_dynamic_q4_cross_expert_tile8_gate_up_body(
+        stream, expert_ids, output, cached_input, selected_experts,
+        lane, simdgroup, threadgroup_id, thread_index);
+}
+
 // Fixed Granite-M5 top-8 row-stream candidate. A threadgroup owns one
 // eight-row tile and one SIMD group owns one selected expert. The eight
 // streams therefore advance through the same row/group frontier in lockstep
@@ -2349,6 +2448,64 @@ kernel void qx_dynamic_q4_moe_down_inline_simd(
     }
     sum = simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
+}
+
+// Down-projection consumer for the same shared cross-expert tile-8 stream.
+// The only shape change from gate/up is the 512-wide activation and sixteen
+// quantization groups per output row.
+kernel void qx_dynamic_q4_moe_down_cross_expert_tile8_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* activated [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint intermediate = 512;
+    constexpr uint groups = 16;
+    constexpr uint tile_rows = 8;
+    constexpr uint experts = 32;
+    constexpr uint group_stride = experts * 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint tile_stride = tile_rows * row_stride;
+    threadgroup uint selected_experts[8];
+    if (thread_index < tile_rows) {
+        selected_experts[thread_index] = expert_ids[thread_index];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint expert = selected_experts[simdgroup];
+    uint first_row = threadgroup_id * tile_rows;
+    for (uint row_offset = 0; row_offset < tile_rows; ++row_offset) {
+        uint row = first_row + row_offset;
+        float sum = 0.0f;
+        if (expert < experts && row < hidden) {
+            uint tile_base = threadgroup_id * tile_stride;
+            for (uint group = 0; group < groups; ++group) {
+                uint group_base = tile_base + group * tile_stride / tile_rows
+                    + row_offset * group_stride + expert * 18;
+                ushort packed = reinterpret_cast<device const ushort*>(stream + group_base)[lane >> 2];
+                uint byte = (uint(packed) >> (((lane >> 1) & 1) * 8)) & 0xff;
+                uint code = (byte >> ((lane & 1) * 4)) & 0xf;
+                float scale = lane == 0
+                    ? qx_q4_inline_scale(stream, group_base + 16)
+                    : 0.0f;
+                scale = simd_broadcast(scale, 0);
+                uint column = group * 32 + lane;
+                if (column < intermediate) {
+                    sum += float(int(code) - 7)
+                        * scale
+                        * activated[simdgroup * intermediate + column];
+                }
+            }
+        }
+        sum = simd_sum(sum);
+        if (lane == 0 && row < hidden) {
+            output[simdgroup * hidden + row] = sum;
+        }
+    }
 }
 
 // Wide-expert down projection paired with the gate/up candidate above.
