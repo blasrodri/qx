@@ -98,6 +98,25 @@ pub fn activate_artifact_execution_plan(
             return Err("single-dispatch MoE is diagnostic-only and cannot be sealed".to_owned());
         }
     }
+    let cross_expert_tile8 = match plan.expert_traversal.as_ref() {
+        Some(traversal) if traversal.kind == qx_format::ExpertTraversalKind::CrossExpertTile => {
+            if traversal.tile_rows != 8
+                || traversal.expert_count != EXPERTS as u16
+                || traversal.active_k != TOP_K as u8
+            {
+                return Err(format!(
+                    "unsupported cross-expert traversal: rows={}, experts={}, active_k={}",
+                    traversal.tile_rows, traversal.expert_count, traversal.active_k
+                ));
+            }
+            true
+        }
+        _ => false,
+    };
+    // The candidate consumes the physical shared stream selected by the
+    // artifact, while the logical top-k IDs remain in the normal TopKIds
+    // buffer. Keep this separate from the older activation-sharing topology.
+    set_plan_bool_env("QX_V2_MOE_CROSS_EXPERT_TILE8", cross_expert_tile8);
     match plan.representations.gate_up {
         qx_format::ExpertRepresentation::Group32Q4RowMajor => {
             set_plan_env("QX_V2_MOE_LAYOUT", "rowmajor")
@@ -1441,18 +1460,20 @@ impl PreparedMoeStack {
                 qx_format::MappedArtifact::open(path).map_err(|error| error.to_string())
             })
             .transpose()?;
-        let no_copy_storage = artifact.info().execution_plan.as_ref().is_some_and(|plan| {
-            matches!(
-                plan.memory.weight_storage,
-                qx_format::WeightStorage::MmapNoCopy | qx_format::WeightStorage::Hybrid
-            )
-        });
+        let no_copy_storage = artifact_uses_no_copy_experts(&artifact);
+        let cross_expert_tile8 = artifact_uses_cross_expert_tile8(&artifact);
         let identity_permutation = permutation.iter().all(|layer| {
             layer
                 .iter()
                 .enumerate()
                 .all(|(expert, logical)| *logical as usize == expert)
         });
+        if cross_expert_tile8 && (expertwise || q3_request.is_some() || split_gate_up) {
+            return Err(
+                "Q4CrossExpertTile8 requires one uniform top-8 artifact without Q3 or split overrides"
+                    .to_owned(),
+            );
+        }
         if expertwise {
             if !identity_permutation || mixed_layout || split_gate_up || q3_request.is_some() {
                 return Err(
@@ -1479,6 +1500,11 @@ impl PreparedMoeStack {
                 );
             }
             return load_no_copy_moe_stack(context, artifact, requested_layout);
+        }
+        if cross_expert_tile8 {
+            return Err(
+                "Q4CrossExpertTile8 artifacts require mmap/no-copy expert storage".to_owned(),
+            );
         }
         if requested_layout.is_some_and(qx_quant::PackingLayout::is_q4_row_inline) {
             return Err(
@@ -1953,6 +1979,9 @@ fn load_no_copy_moe_stack(
     // Arc keeps it alive until Metal releases the no-copy buffer.
     let slab =
         unsafe { context.input_buffer_no_copy(slab_pointer, slab_length, artifact.clone())? };
+    if artifact_uses_cross_expert_tile8(&artifact) {
+        return load_no_copy_moe_stack_cross_expert_tile8(context, artifact, slab);
+    }
     let mut layers = Vec::with_capacity(LAYERS);
     for layer in 0..LAYERS {
         let (gate_scales, gate_packed, gate_quant, gate_layout) =
@@ -2016,6 +2045,152 @@ fn load_no_copy_moe_stack(
         layers.push(prepared);
     }
     Ok(PreparedMoeStack { layers })
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct CrossExpertTile8Slab {
+    stream: std::ops::Range<usize>,
+    rows: usize,
+    columns: usize,
+}
+
+#[cfg(target_os = "macos")]
+fn load_no_copy_moe_stack_cross_expert_tile8(
+    context: &qx_metal::platform::MetalContext,
+    artifact: Arc<qx_format::MappedArtifact>,
+    slab: qx_metal::platform::RuntimeBuffer,
+) -> Result<PreparedMoeStack, String> {
+    let traversal = artifact_cross_expert_tile8_plan(&artifact)?
+        .ok_or_else(|| "cross-expert tile stream is missing traversal metadata".to_owned())?;
+    if traversal.tile_rows != 8
+        || traversal.expert_count != EXPERTS as u16
+        || traversal.active_k != TOP_K as u8
+    {
+        return Err("Q4CrossExpertTile8 requires an 8-row, 32-expert, top-8 plan".to_owned());
+    }
+
+    let mut layers = Vec::with_capacity(LAYERS);
+    for layer in 0..LAYERS {
+        let gate_up =
+            cross_expert_tile8_slab(&artifact, layer as u16, qx_format::TensorKind::GateUp)?;
+        let down = cross_expert_tile8_slab(&artifact, layer as u16, qx_format::TensorKind::Down)?;
+        if gate_up.rows != HIDDEN
+            || gate_up.columns != HIDDEN
+            || down.rows != HIDDEN
+            || down.columns != INTERMEDIATE
+        {
+            return Err(format!(
+                "layer {layer} cross-expert tile has invalid gate/up or down shape"
+            ));
+        }
+
+        // The directory entries for all 32 logical experts intentionally name
+        // these same two streams. RuntimeBuffer::subregion preserves the
+        // stream base in the Metal binding; no expert permutation or ID map is
+        // introduced, so GPU-selected logical IDs remain unchanged.
+        let prepared = context.prepare_dynamic_q4_moe_runtime_views(
+            slab.subregion(gate_up.stream.start, gate_up.stream.len())?,
+            slab.subregion(gate_up.stream.start, gate_up.stream.len())?,
+            slab.subregion(down.stream.start, down.stream.len())?,
+            slab.subregion(down.stream.start, down.stream.len())?,
+            qx_quant::PackingLayout::Q4CrossExpertTile8,
+            qx_quant::PackingLayout::Q4CrossExpertTile8,
+        )?;
+        layers.push(prepared);
+    }
+    artifact
+        .discard_resident_pages()
+        .map_err(|error| error.to_string())?;
+    Ok(PreparedMoeStack { layers })
+}
+
+#[cfg(target_os = "macos")]
+fn cross_expert_tile8_slab(
+    artifact: &qx_format::MappedArtifact,
+    layer: u16,
+    kind: qx_format::TensorKind,
+) -> Result<CrossExpertTile8Slab, String> {
+    let entries = artifact
+        .info()
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.layer == layer && entry.kind == kind)
+        .collect::<Vec<_>>();
+    if entries.len() != EXPERTS {
+        return Err(format!(
+            "layer {layer} {kind:?} cross-expert tile has {} entries, expected {EXPERTS}",
+            entries.len()
+        ));
+    }
+
+    let first = entries[0].1;
+    if first.quant_type != qx_quant::QuantType::Q4
+        || first.layout != qx_quant::PackingLayout::Q4CrossExpertTile8
+        || first.group_size != 32
+        || first.expert == u8::MAX
+    {
+        return Err(format!(
+            "layer {layer} {kind:?} is not group-32 Q4CrossExpertTile8"
+        ));
+    }
+    let mut seen = [false; EXPERTS];
+    for (index, entry) in entries {
+        if entry.expert as usize >= EXPERTS || seen[entry.expert as usize] {
+            return Err(format!(
+                "layer {layer} {kind:?} has duplicate or invalid logical expert"
+            ));
+        }
+        seen[entry.expert as usize] = true;
+        if entry.quant_type != first.quant_type
+            || entry.layout != first.layout
+            || entry.rows != first.rows
+            || entry.cols != first.cols
+            || entry.group_size != first.group_size
+            || entry.scale_offset != first.scale_offset
+            || entry.scale_length != first.scale_length
+            || entry.data_offset != first.data_offset
+            || entry.data_length != first.data_length
+        {
+            return Err(format!(
+                "layer {layer} {kind:?} experts do not share one physical stream"
+            ));
+        }
+        let (scales, data) = artifact
+            .tensor_slab_ranges(index)
+            .map_err(|error| error.to_string())?;
+        if scales != data {
+            return Err(format!(
+                "layer {layer} {kind:?} cross-expert scale/data views differ"
+            ));
+        }
+    }
+    if seen.iter().any(|value| !value) {
+        return Err(format!(
+            "layer {layer} {kind:?} does not cover all logical experts"
+        ));
+    }
+    let (_, stream) = artifact
+        .tensor_slab_ranges(
+            artifact
+                .info()
+                .entries
+                .iter()
+                .position(|entry| {
+                    entry.layer == layer
+                        && entry.expert == 0
+                        && entry.kind == kind
+                        && entry.layout == qx_quant::PackingLayout::Q4CrossExpertTile8
+                })
+                .ok_or_else(|| format!("layer {layer} {kind:?} expert 0 is missing"))?,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(CrossExpertTile8Slab {
+        stream,
+        rows: first.rows as usize,
+        columns: first.cols as usize,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -2164,6 +2339,39 @@ fn artifact_uses_no_copy(artifact: &qx_format::MappedArtifact) -> bool {
         .execution_plan
         .as_ref()
         .is_some_and(|plan| plan.memory.weight_storage == qx_format::WeightStorage::MmapNoCopy)
+}
+
+#[cfg(target_os = "macos")]
+fn artifact_uses_no_copy_experts(artifact: &qx_format::MappedArtifact) -> bool {
+    artifact.info().execution_plan.as_ref().is_some_and(|plan| {
+        matches!(
+            plan.memory.weight_storage,
+            qx_format::WeightStorage::MmapNoCopy | qx_format::WeightStorage::Hybrid
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn artifact_uses_cross_expert_tile8(artifact: &qx_format::MappedArtifact) -> bool {
+    artifact.info().entries.iter().any(|entry| {
+        entry.is_expert() && entry.layout == qx_quant::PackingLayout::Q4CrossExpertTile8
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn artifact_cross_expert_tile8_plan(
+    artifact: &qx_format::MappedArtifact,
+) -> Result<Option<&qx_format::ExpertTraversalPlan>, String> {
+    let Some(plan) = artifact.info().execution_plan.as_ref() else {
+        return Ok(None);
+    };
+    let Some(traversal) = plan.expert_traversal.as_ref() else {
+        return Ok(None);
+    };
+    if traversal.kind != qx_format::ExpertTraversalKind::CrossExpertTile {
+        return Err("Q4CrossExpertTile8 artifact has a non-cross traversal plan".to_owned());
+    }
+    Ok(Some(traversal))
 }
 
 #[cfg(target_os = "macos")]
