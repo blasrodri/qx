@@ -1,0 +1,12 @@
+{
+  "date": "2026-08-23",
+  "candidate": "chunk_parallel_online_softmax_gqa",
+  "context": 512,
+  "gpu_us_per_live_attention": {
+    "canonical": [68.0, 67.75, 67.79],
+    "chunked": [75.5, 75.5, 18.5]
+  },
+  "observed_checkpoint_status": "matching KV, attention, logits, cosine, and argmax values through the checkpoints emitted before the benchmark process terminated",
+  "status": "rejected",
+  "reason": "repeatable chunked samples are slower than canonical; one GPU timestamp is an outlier"
+}

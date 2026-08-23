@@ -564,6 +564,191 @@ kernel void qx_v2_attention_qk_kmajor(
     scores[tid] = score * scale;
 }
 
+// Granite decode-specialized qlen=1 streaming attention. One SIMD group owns
+// one KV head and serves both query heads that share it. K and V are loaded
+// once per lane while online softmax state and two 64-value output vectors are
+// maintained without score/probability or partial buffers.
+kernel void qx_v2_attention_stream_gqa(
+    device const float* query [[buffer(0)]],
+    device const float* key_cache [[buffer(1)]],
+    device const float* value_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant AttentionParams& params [[buffer(4)]],
+    uint tid [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint head_dim = 64;
+    constexpr uint kv_heads = 8;
+    constexpr uint q_heads = 16;
+    constexpr uint max_context = 512;
+    constexpr float scale = 0.015625f;
+    if (tid >= kv_heads * 32) return;
+
+    uint kv_head = tid / 32;
+    uint q_head0 = kv_head * 2;
+    uint q_head1 = q_head0 + 1;
+    uint dim0 = lane * 2;
+    uint dim1 = dim0 + 1;
+    uint query0 = q_head0 * head_dim;
+    uint query1 = q_head1 * head_dim;
+
+    float max0 = -INFINITY;
+    float max1 = -INFINITY;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float acc00 = 0.0f;
+    float acc01 = 0.0f;
+    float acc10 = 0.0f;
+    float acc11 = 0.0f;
+
+    for (uint position = 0; position < min(params.length, max_context); ++position) {
+        uint cache_offset = (position * kv_heads + kv_head) * head_dim;
+        float k0 = key_cache[cache_offset + dim0];
+        float k1 = key_cache[cache_offset + dim1];
+        float dot0 = simd_sum(query[query0 + dim0] * k0
+                            + query[query0 + dim1] * k1);
+        float dot1 = simd_sum(query[query1 + dim0] * k0
+                            + query[query1 + dim1] * k1);
+        dot0 = simd_broadcast(dot0 * scale, 0);
+        dot1 = simd_broadcast(dot1 * scale, 0);
+
+        float new_max0 = max(max0, dot0);
+        float new_max1 = max(max1, dot1);
+        float alpha0 = exp(max0 - new_max0);
+        float alpha1 = exp(max1 - new_max1);
+        float beta0 = exp(dot0 - new_max0);
+        float beta1 = exp(dot1 - new_max1);
+        max0 = new_max0;
+        max1 = new_max1;
+        sum0 = sum0 * alpha0 + beta0;
+        sum1 = sum1 * alpha1 + beta1;
+
+        float v0 = value_cache[cache_offset + dim0];
+        float v1 = value_cache[cache_offset + dim1];
+        acc00 = acc00 * alpha0 + beta0 * v0;
+        acc01 = acc01 * alpha0 + beta0 * v1;
+        acc10 = acc10 * alpha1 + beta1 * v0;
+        acc11 = acc11 * alpha1 + beta1 * v1;
+    }
+
+    output[query0 + dim0] = acc00 / sum0;
+    output[query0 + dim1] = acc01 / sum0;
+    output[query1 + dim0] = acc10 / sum1;
+    output[query1 + dim1] = acc11 / sum1;
+}
+
+// Chunk-parallel variant: one 256-thread workgroup owns one KV head and its
+// eight SIMD groups process independent 64-position context chunks. Each
+// group emits online-softmax statistics and unnormalized output partials.
+kernel void qx_v2_attention_chunked_gqa(
+    device const float* query [[buffer(0)]],
+    device const float* key_cache [[buffer(1)]],
+    device const float* value_cache [[buffer(2)]],
+    device float* scratch [[buffer(3)]],
+    constant AttentionParams& params [[buffer(4)]],
+    uint tid [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint head_dim = 64;
+    constexpr uint kv_heads = 8;
+    constexpr uint max_context = 512;
+    constexpr uint chunk = 64;
+    constexpr uint chunks = 8;
+    constexpr uint partial_floats = 16 * chunks * head_dim;
+    constexpr float scale = 0.015625f;
+    if (tid >= kv_heads * 256) return;
+
+    uint kv_head = tid / 256;
+    uint local = tid % 256;
+    uint chunk_id = local / 32;
+    uint q_head0 = kv_head * 2;
+    uint q_head1 = q_head0 + 1;
+    uint dim0 = lane * 2;
+    uint dim1 = dim0 + 1;
+    uint query0 = q_head0 * head_dim;
+    uint query1 = q_head1 * head_dim;
+    uint position_begin = chunk_id * chunk;
+
+    float max0 = -INFINITY;
+    float max1 = -INFINITY;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float acc00 = 0.0f;
+    float acc01 = 0.0f;
+    float acc10 = 0.0f;
+    float acc11 = 0.0f;
+    for (uint position = position_begin;
+         position < min(params.length, position_begin + chunk);
+         ++position) {
+        uint cache_offset = (position * kv_heads + kv_head) * head_dim;
+        float k0 = key_cache[cache_offset + dim0];
+        float k1 = key_cache[cache_offset + dim1];
+        float dot0 = simd_broadcast(simd_sum(
+            query[query0 + dim0] * k0 + query[query0 + dim1] * k1) * scale, 0);
+        float dot1 = simd_broadcast(simd_sum(
+            query[query1 + dim0] * k0 + query[query1 + dim1] * k1) * scale, 0);
+        float new_max0 = max(max0, dot0);
+        float new_max1 = max(max1, dot1);
+        float alpha0 = exp(max0 - new_max0);
+        float alpha1 = exp(max1 - new_max1);
+        float beta0 = exp(dot0 - new_max0);
+        float beta1 = exp(dot1 - new_max1);
+        max0 = new_max0;
+        max1 = new_max1;
+        sum0 = sum0 * alpha0 + beta0;
+        sum1 = sum1 * alpha1 + beta1;
+        float v0 = value_cache[cache_offset + dim0];
+        float v1 = value_cache[cache_offset + dim1];
+        acc00 = acc00 * alpha0 + beta0 * v0;
+        acc01 = acc01 * alpha0 + beta0 * v1;
+        acc10 = acc10 * alpha1 + beta1 * v0;
+        acc11 = acc11 * alpha1 + beta1 * v1;
+    }
+
+    uint base0 = (q_head0 * chunks + chunk_id) * head_dim;
+    uint base1 = (q_head1 * chunks + chunk_id) * head_dim;
+    scratch[base0 + dim0] = acc00;
+    scratch[base0 + dim1] = acc01;
+    scratch[base1 + dim0] = acc10;
+    scratch[base1 + dim1] = acc11;
+    if (lane == 0) {
+        uint stats = partial_floats + (q_head0 * chunks + chunk_id) * 2;
+        scratch[stats] = max0;
+        scratch[stats + 1] = sum0;
+        stats = partial_floats + (q_head1 * chunks + chunk_id) * 2;
+        scratch[stats] = max1;
+        scratch[stats + 1] = sum1;
+    }
+}
+
+// Merge the eight chunk summaries for each query head and output dimension.
+kernel void qx_v2_attention_chunked_merge(
+    device const float* scratch [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant AttentionParams& params [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]) {
+    constexpr uint head_dim = 64;
+    constexpr uint chunks = 8;
+    constexpr uint partial_floats = 16 * chunks * head_dim;
+    constexpr float neg_inf = -INFINITY;
+    if (tid >= 16 * head_dim) return;
+    uint q_head = tid / head_dim;
+    uint dimension = tid % head_dim;
+    float global_max = neg_inf;
+    for (uint c = 0; c < chunks; ++c) {
+        uint stats = partial_floats + (q_head * chunks + c) * 2;
+        global_max = max(global_max, scratch[stats]);
+    }
+    float total = 0.0f;
+    float value = 0.0f;
+    for (uint c = 0; c < chunks; ++c) {
+        uint stats = partial_floats + (q_head * chunks + c) * 2;
+        float factor = exp(scratch[stats] - global_max);
+        total += scratch[stats + 1] * factor;
+        value += scratch[(q_head * chunks + c) * head_dim + dimension] * factor;
+    }
+    output[q_head * head_dim + dimension] = value / total;
+    (void)params;
+}
+
 kernel void qx_v2_attention_softmax(
     device float* scores [[buffer(0)]],
     constant AttentionParams& params [[buffer(1)]],

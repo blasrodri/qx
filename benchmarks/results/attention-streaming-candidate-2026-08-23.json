@@ -1,0 +1,12 @@
+{
+  "date": "2026-08-23",
+  "candidate": "granite_q_len_1_streaming_gqa_online_softmax",
+  "context": 512,
+  "gpu_us_per_live_attention": {
+    "canonical": [67.75, 67.79, 47.88],
+    "stream_tg32": [363.25, 364.13, 359.25],
+    "stream_tg256": [273.87, 223.0, 225.75]
+  },
+  "status": "rejected",
+  "reason": "complete attention is materially slower despite eliminating score/probability/partial buffers"
+}

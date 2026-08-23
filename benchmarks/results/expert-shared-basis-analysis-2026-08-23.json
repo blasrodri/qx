@@ -1,0 +1,844 @@
+{
+  "model": "external/models/granite-3.0-1b-a400m-instruct",
+  "experts": 32,
+  "layers": [
+    {
+      "layer": 0,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.033940853505803684,
+      "shared_plus_rank_1": 0.06907483742373152,
+      "shared_plus_rank_2": 0.10363984880092654,
+      "shared_plus_rank_4": 0.17194046086466974,
+      "shared_plus_rank_8": 0.306495948445339,
+      "shared_plus_rank_16": 0.5637174602816902,
+      "centered_variance_fraction": 0.9660591464802354,
+      "residual_fraction_rank_4": 0.8280595391353303
+    },
+    {
+      "layer": 0,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.03135783667693805,
+      "shared_plus_rank_1": 0.06590040785197186,
+      "shared_plus_rank_2": 0.09997957959765612,
+      "shared_plus_rank_4": 0.16675018826703564,
+      "shared_plus_rank_8": 0.2961248745681666,
+      "shared_plus_rank_16": 0.5484628591130913,
+      "centered_variance_fraction": 0.968642163308614,
+      "residual_fraction_rank_4": 0.8332498117329643
+    },
+    {
+      "layer": 1,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03427719704233084,
+      "shared_plus_rank_1": 0.06948282083753232,
+      "shared_plus_rank_2": 0.1046568479068287,
+      "shared_plus_rank_4": 0.17337920259420286,
+      "shared_plus_rank_8": 0.3068215250820247,
+      "shared_plus_rank_16": 0.5588048089327308,
+      "centered_variance_fraction": 0.9657228029537896,
+      "residual_fraction_rank_4": 0.8266207974057971
+    },
+    {
+      "layer": 1,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031162480441782412,
+      "shared_plus_rank_1": 0.08919465329839624,
+      "shared_plus_rank_2": 0.14599697113758925,
+      "shared_plus_rank_4": 0.2477094320774832,
+      "shared_plus_rank_8": 0.4029953465111456,
+      "shared_plus_rank_16": 0.6372344012805434,
+      "centered_variance_fraction": 0.9688375195483678,
+      "residual_fraction_rank_4": 0.7522905679225168
+    },
+    {
+      "layer": 2,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.035511333575619315,
+      "shared_plus_rank_1": 0.06896506619795227,
+      "shared_plus_rank_2": 0.10189668414161533,
+      "shared_plus_rank_4": 0.1673707420517676,
+      "shared_plus_rank_8": 0.29640227391694157,
+      "shared_plus_rank_16": 0.5474891178734673,
+      "centered_variance_fraction": 0.9644886664149992,
+      "residual_fraction_rank_4": 0.8326292579482324
+    },
+    {
+      "layer": 2,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031265947072538894,
+      "shared_plus_rank_1": 0.07985300311775897,
+      "shared_plus_rank_2": 0.12714276266969976,
+      "shared_plus_rank_4": 0.20736856200286,
+      "shared_plus_rank_8": 0.34474721365100414,
+      "shared_plus_rank_16": 0.583102929047029,
+      "centered_variance_fraction": 0.9687340529205039,
+      "residual_fraction_rank_4": 0.79263143799714
+    },
+    {
+      "layer": 3,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03550316384515119,
+      "shared_plus_rank_1": 0.07000733116272134,
+      "shared_plus_rank_2": 0.10349407469865221,
+      "shared_plus_rank_4": 0.16994236001398166,
+      "shared_plus_rank_8": 0.30055027024762265,
+      "shared_plus_rank_16": 0.5529380865276049,
+      "centered_variance_fraction": 0.9644968361431399,
+      "residual_fraction_rank_4": 0.8300576399860183
+    },
+    {
+      "layer": 3,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031248992223427766,
+      "shared_plus_rank_1": 0.0732047344474349,
+      "shared_plus_rank_2": 0.1116670607367042,
+      "shared_plus_rank_4": 0.1859245237140575,
+      "shared_plus_rank_8": 0.3188940735852664,
+      "shared_plus_rank_16": 0.5630568042803696,
+      "centered_variance_fraction": 0.9687510077604865,
+      "residual_fraction_rank_4": 0.8140754762859426
+    },
+    {
+      "layer": 4,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.036323102776064355,
+      "shared_plus_rank_1": 0.07052482345475641,
+      "shared_plus_rank_2": 0.10389330323619451,
+      "shared_plus_rank_4": 0.16993091538408964,
+      "shared_plus_rank_8": 0.30084536326730404,
+      "shared_plus_rank_16": 0.5546192259270573,
+      "centered_variance_fraction": 0.9636768972133716,
+      "residual_fraction_rank_4": 0.8300690846159103
+    },
+    {
+      "layer": 4,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.03114914285805421,
+      "shared_plus_rank_1": 0.06693212778239391,
+      "shared_plus_rank_2": 0.1019120717250108,
+      "shared_plus_rank_4": 0.16881897613572264,
+      "shared_plus_rank_8": 0.2983961546234391,
+      "shared_plus_rank_16": 0.5508191072596692,
+      "centered_variance_fraction": 0.968850857136781,
+      "residual_fraction_rank_4": 0.8311810238642774
+    },
+    {
+      "layer": 5,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03335437770145621,
+      "shared_plus_rank_1": 0.06665888974564284,
+      "shared_plus_rank_2": 0.09947800904322529,
+      "shared_plus_rank_4": 0.16476742713309547,
+      "shared_plus_rank_8": 0.29302578772831694,
+      "shared_plus_rank_16": 0.545662860284631,
+      "centered_variance_fraction": 0.9666456222824248,
+      "residual_fraction_rank_4": 0.8352325728669046
+    },
+    {
+      "layer": 5,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.03136742874916802,
+      "shared_plus_rank_1": 0.0645273256307699,
+      "shared_plus_rank_2": 0.0975296435225207,
+      "shared_plus_rank_4": 0.1624414087201585,
+      "shared_plus_rank_8": 0.2912515624785653,
+      "shared_plus_rank_16": 0.5442052523300628,
+      "centered_variance_fraction": 0.968632571236715,
+      "residual_fraction_rank_4": 0.8375585912798416
+    },
+    {
+      "layer": 6,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.034831530376971606,
+      "shared_plus_rank_1": 0.06843968140168842,
+      "shared_plus_rank_2": 0.1018194388561606,
+      "shared_plus_rank_4": 0.1679697059233206,
+      "shared_plus_rank_8": 0.29838359949504795,
+      "shared_plus_rank_16": 0.5537943486428443,
+      "centered_variance_fraction": 0.9651684696125411,
+      "residual_fraction_rank_4": 0.8320302940766794
+    },
+    {
+      "layer": 6,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031175892966467222,
+      "shared_plus_rank_1": 0.06481730556270318,
+      "shared_plus_rank_2": 0.09778405217122284,
+      "shared_plus_rank_4": 0.16328326591588926,
+      "shared_plus_rank_8": 0.29265380851432554,
+      "shared_plus_rank_16": 0.5465613355517392,
+      "centered_variance_fraction": 0.9688241070276369,
+      "residual_fraction_rank_4": 0.8367167340841107
+    },
+    {
+      "layer": 7,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.0381955948131669,
+      "shared_plus_rank_1": 0.07350195016903806,
+      "shared_plus_rank_2": 0.1079206032835553,
+      "shared_plus_rank_4": 0.1753119249981688,
+      "shared_plus_rank_8": 0.3043711254836992,
+      "shared_plus_rank_16": 0.5555812266411706,
+      "centered_variance_fraction": 0.9618044051772267,
+      "residual_fraction_rank_4": 0.8246880750018312
+    },
+    {
+      "layer": 7,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.03133200423100261,
+      "shared_plus_rank_1": 0.06468519552004816,
+      "shared_plus_rank_2": 0.09755844238435697,
+      "shared_plus_rank_4": 0.16282854398646313,
+      "shared_plus_rank_8": 0.2918595926646359,
+      "shared_plus_rank_16": 0.5438365419772753,
+      "centered_variance_fraction": 0.9686679957613724,
+      "residual_fraction_rank_4": 0.8371714560135368
+    },
+    {
+      "layer": 8,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.038633030779568554,
+      "shared_plus_rank_1": 0.0729658985488862,
+      "shared_plus_rank_2": 0.1065942811737858,
+      "shared_plus_rank_4": 0.17163538332407846,
+      "shared_plus_rank_8": 0.3005030016009762,
+      "shared_plus_rank_16": 0.5511011470205072,
+      "centered_variance_fraction": 0.9613669692106555,
+      "residual_fraction_rank_4": 0.8283646166759215
+    },
+    {
+      "layer": 8,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031221252249226165,
+      "shared_plus_rank_1": 0.06422510239399017,
+      "shared_plus_rank_2": 0.09702857826309357,
+      "shared_plus_rank_4": 0.16192069674639628,
+      "shared_plus_rank_8": 0.2900971141469299,
+      "shared_plus_rank_16": 0.5416184670338762,
+      "centered_variance_fraction": 0.9687787477326929,
+      "residual_fraction_rank_4": 0.8380793032536037
+    },
+    {
+      "layer": 9,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03496488658425636,
+      "shared_plus_rank_1": 0.06882016448853918,
+      "shared_plus_rank_2": 0.10212961375512417,
+      "shared_plus_rank_4": 0.16801628540389704,
+      "shared_plus_rank_8": 0.29826754545384154,
+      "shared_plus_rank_16": 0.5532591252474639,
+      "centered_variance_fraction": 0.9650351133981191,
+      "residual_fraction_rank_4": 0.831983714596103
+    },
+    {
+      "layer": 9,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.03129644336009729,
+      "shared_plus_rank_1": 0.06410231892925956,
+      "shared_plus_rank_2": 0.09684735943554731,
+      "shared_plus_rank_4": 0.16205498145257255,
+      "shared_plus_rank_8": 0.29157338245609615,
+      "shared_plus_rank_16": 0.5460455939277445,
+      "centered_variance_fraction": 0.9687035566295544,
+      "residual_fraction_rank_4": 0.8379450185474274
+    },
+    {
+      "layer": 10,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03428836765372937,
+      "shared_plus_rank_1": 0.06885549253360773,
+      "shared_plus_rank_2": 0.10312791942475218,
+      "shared_plus_rank_4": 0.16938841845151573,
+      "shared_plus_rank_8": 0.29871434247210094,
+      "shared_plus_rank_16": 0.550588145257168,
+      "centered_variance_fraction": 0.9657116323330501,
+      "residual_fraction_rank_4": 0.8306115815484842
+    },
+    {
+      "layer": 10,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.03141170754372497,
+      "shared_plus_rank_1": 0.06559204725195653,
+      "shared_plus_rank_2": 0.09935685341918092,
+      "shared_plus_rank_4": 0.16599753855407484,
+      "shared_plus_rank_8": 0.29655306490505834,
+      "shared_plus_rank_16": 0.5491481325484618,
+      "centered_variance_fraction": 0.9685882924402524,
+      "residual_fraction_rank_4": 0.8340024614459252
+    },
+    {
+      "layer": 11,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03368620214427096,
+      "shared_plus_rank_1": 0.06764635557838547,
+      "shared_plus_rank_2": 0.10148473772715426,
+      "shared_plus_rank_4": 0.16873075890935335,
+      "shared_plus_rank_8": 0.29968746881707725,
+      "shared_plus_rank_16": 0.5523157925697755,
+      "centered_variance_fraction": 0.9663137978431982,
+      "residual_fraction_rank_4": 0.8312692410906466
+    },
+    {
+      "layer": 11,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031188018537856153,
+      "shared_plus_rank_1": 0.06420117586185588,
+      "shared_plus_rank_2": 0.09696154948931493,
+      "shared_plus_rank_4": 0.16232320398833355,
+      "shared_plus_rank_8": 0.2917258090206777,
+      "shared_plus_rank_16": 0.546268251013809,
+      "centered_variance_fraction": 0.9688119814525812,
+      "residual_fraction_rank_4": 0.8376767960116664
+    },
+    {
+      "layer": 12,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03325960006726245,
+      "shared_plus_rank_1": 0.06945352743446563,
+      "shared_plus_rank_2": 0.10452282224556021,
+      "shared_plus_rank_4": 0.1735043127711947,
+      "shared_plus_rank_8": 0.307202436023252,
+      "shared_plus_rank_16": 0.5626516820330335,
+      "centered_variance_fraction": 0.9667403999215505,
+      "residual_fraction_rank_4": 0.8264956872288053
+    },
+    {
+      "layer": 12,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031270405086729236,
+      "shared_plus_rank_1": 0.06608226686083381,
+      "shared_plus_rank_2": 0.10004019203506637,
+      "shared_plus_rank_4": 0.1672148726272413,
+      "shared_plus_rank_8": 0.2984925538017777,
+      "shared_plus_rank_16": 0.5542309215632388,
+      "centered_variance_fraction": 0.9687295949014546,
+      "residual_fraction_rank_4": 0.8327851273727587
+    },
+    {
+      "layer": 13,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03400643639468184,
+      "shared_plus_rank_1": 0.07118361033046396,
+      "shared_plus_rank_2": 0.10691151983684073,
+      "shared_plus_rank_4": 0.17672322315655206,
+      "shared_plus_rank_8": 0.30990698267489064,
+      "shared_plus_rank_16": 0.5616748533243812,
+      "centered_variance_fraction": 0.965993563597401,
+      "residual_fraction_rank_4": 0.8232767768434479
+    },
+    {
+      "layer": 13,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031240923000506206,
+      "shared_plus_rank_1": 0.06706555322575107,
+      "shared_plus_rank_2": 0.10263796061816836,
+      "shared_plus_rank_4": 0.17079938751129847,
+      "shared_plus_rank_8": 0.3005978573868738,
+      "shared_plus_rank_16": 0.5521006752134074,
+      "centered_variance_fraction": 0.9687590769828582,
+      "residual_fraction_rank_4": 0.8292006124887015
+    },
+    {
+      "layer": 14,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.033995361673694616,
+      "shared_plus_rank_1": 0.07063124039702162,
+      "shared_plus_rank_2": 0.10592474978841412,
+      "shared_plus_rank_4": 0.17477940672479655,
+      "shared_plus_rank_8": 0.30898946863563964,
+      "shared_plus_rank_16": 0.5619428282327447,
+      "centered_variance_fraction": 0.9660046383166289,
+      "residual_fraction_rank_4": 0.8252205932752035
+    },
+    {
+      "layer": 14,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031097695554219946,
+      "shared_plus_rank_1": 0.06563099596245604,
+      "shared_plus_rank_2": 0.09991707002479701,
+      "shared_plus_rank_4": 0.1680094280608308,
+      "shared_plus_rank_8": 0.3000146226397933,
+      "shared_plus_rank_16": 0.5530148128280183,
+      "centered_variance_fraction": 0.9689023044278574,
+      "residual_fraction_rank_4": 0.8319905719391691
+    },
+    {
+      "layer": 15,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03275519766480448,
+      "shared_plus_rank_1": 0.07003032848801707,
+      "shared_plus_rank_2": 0.10662133608925049,
+      "shared_plus_rank_4": 0.17813499619657763,
+      "shared_plus_rank_8": 0.3138937121394454,
+      "shared_plus_rank_16": 0.5661564083637718,
+      "centered_variance_fraction": 0.9672448023249363,
+      "residual_fraction_rank_4": 0.8218650038034223
+    },
+    {
+      "layer": 15,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031212584277668008,
+      "shared_plus_rank_1": 0.06732196638257662,
+      "shared_plus_rank_2": 0.10270187016920629,
+      "shared_plus_rank_4": 0.17229407092703147,
+      "shared_plus_rank_8": 0.30486004323719085,
+      "shared_plus_rank_16": 0.5571361770026225,
+      "centered_variance_fraction": 0.9687874157059068,
+      "residual_fraction_rank_4": 0.8277059290729685
+    },
+    {
+      "layer": 16,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03349833059462317,
+      "shared_plus_rank_1": 0.06999627686600982,
+      "shared_plus_rank_2": 0.10592338363645042,
+      "shared_plus_rank_4": 0.1771397994684398,
+      "shared_plus_rank_8": 0.31636631245282687,
+      "shared_plus_rank_16": 0.5720608858891052,
+      "centered_variance_fraction": 0.9665016693944278,
+      "residual_fraction_rank_4": 0.8228602005315602
+    },
+    {
+      "layer": 16,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.03125952846974246,
+      "shared_plus_rank_1": 0.06591045099947052,
+      "shared_plus_rank_2": 0.09979442518595202,
+      "shared_plus_rank_4": 0.16708729999432342,
+      "shared_plus_rank_8": 0.2990339570252981,
+      "shared_plus_rank_16": 0.5541975889800822,
+      "centered_variance_fraction": 0.9687404715140314,
+      "residual_fraction_rank_4": 0.8329127000056766
+    },
+    {
+      "layer": 17,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03427863436081957,
+      "shared_plus_rank_1": 0.07022367163310662,
+      "shared_plus_rank_2": 0.1056705786321418,
+      "shared_plus_rank_4": 0.17335138240903197,
+      "shared_plus_rank_8": 0.3057793463629798,
+      "shared_plus_rank_16": 0.5627612308030877,
+      "centered_variance_fraction": 0.9657213656262825,
+      "residual_fraction_rank_4": 0.826648617590968
+    },
+    {
+      "layer": 17,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031184404144509917,
+      "shared_plus_rank_1": 0.06627954712443523,
+      "shared_plus_rank_2": 0.10026535508813046,
+      "shared_plus_rank_4": 0.16719201376358553,
+      "shared_plus_rank_8": 0.29768846927901266,
+      "shared_plus_rank_16": 0.5522794814111269,
+      "centered_variance_fraction": 0.9688155958360919,
+      "residual_fraction_rank_4": 0.8328079862364145
+    },
+    {
+      "layer": 18,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03469679106152143,
+      "shared_plus_rank_1": 0.06984973998539509,
+      "shared_plus_rank_2": 0.1042901771276427,
+      "shared_plus_rank_4": 0.1725564185347415,
+      "shared_plus_rank_8": 0.3067168826030833,
+      "shared_plus_rank_16": 0.5622712212625423,
+      "centered_variance_fraction": 0.9653032089205634,
+      "residual_fraction_rank_4": 0.8274435814652585
+    },
+    {
+      "layer": 18,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031308542475053436,
+      "shared_plus_rank_1": 0.06897674498775741,
+      "shared_plus_rank_2": 0.10308617570041077,
+      "shared_plus_rank_4": 0.17032088076196752,
+      "shared_plus_rank_8": 0.3025291057170274,
+      "shared_plus_rank_16": 0.5568222365082329,
+      "centered_variance_fraction": 0.9686914575077229,
+      "residual_fraction_rank_4": 0.8296791192380325
+    },
+    {
+      "layer": 19,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03461705534020893,
+      "shared_plus_rank_1": 0.07030112327193756,
+      "shared_plus_rank_2": 0.10551031687751809,
+      "shared_plus_rank_4": 0.17432332614607088,
+      "shared_plus_rank_8": 0.3067161067686117,
+      "shared_plus_rank_16": 0.5599109298864601,
+      "centered_variance_fraction": 0.9653829446508325,
+      "residual_fraction_rank_4": 0.8256766738539292
+    },
+    {
+      "layer": 19,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.03121156770036968,
+      "shared_plus_rank_1": 0.06772629816469736,
+      "shared_plus_rank_2": 0.10327671768346049,
+      "shared_plus_rank_4": 0.1723775711272566,
+      "shared_plus_rank_8": 0.305132383351122,
+      "shared_plus_rank_16": 0.5583616866362365,
+      "centered_variance_fraction": 0.9687884322843839,
+      "residual_fraction_rank_4": 0.8276224288727434
+    },
+    {
+      "layer": 20,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03573408668249883,
+      "shared_plus_rank_1": 0.07078656711415993,
+      "shared_plus_rank_2": 0.10530448292593092,
+      "shared_plus_rank_4": 0.17268877571735744,
+      "shared_plus_rank_8": 0.30484381741273775,
+      "shared_plus_rank_16": 0.5601529363826968,
+      "centered_variance_fraction": 0.9642659133015379,
+      "residual_fraction_rank_4": 0.8273112242826426
+    },
+    {
+      "layer": 20,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031174221277801673,
+      "shared_plus_rank_1": 0.06672052308095673,
+      "shared_plus_rank_2": 0.10047610344621695,
+      "shared_plus_rank_4": 0.16721683955922545,
+      "shared_plus_rank_8": 0.29825943053969356,
+      "shared_plus_rank_16": 0.5528204305800776,
+      "centered_variance_fraction": 0.9688257787032604,
+      "residual_fraction_rank_4": 0.8327831604407745
+    },
+    {
+      "layer": 21,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03704881467693395,
+      "shared_plus_rank_1": 0.07186001837850892,
+      "shared_plus_rank_2": 0.10629401061114709,
+      "shared_plus_rank_4": 0.17435071329041257,
+      "shared_plus_rank_8": 0.30716331243403605,
+      "shared_plus_rank_16": 0.5624249839265758,
+      "centered_variance_fraction": 0.9629511853115977,
+      "residual_fraction_rank_4": 0.8256492867095875
+    },
+    {
+      "layer": 21,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031272451497234746,
+      "shared_plus_rank_1": 0.06728926131360125,
+      "shared_plus_rank_2": 0.10094609523290007,
+      "shared_plus_rank_4": 0.1674025639406454,
+      "shared_plus_rank_8": 0.29696925748344505,
+      "shared_plus_rank_16": 0.5499415457449346,
+      "centered_variance_fraction": 0.968727548487139,
+      "residual_fraction_rank_4": 0.8325974360593547
+    },
+    {
+      "layer": 22,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03486617920035391,
+      "shared_plus_rank_1": 0.06979514896398926,
+      "shared_plus_rank_2": 0.10428316408942799,
+      "shared_plus_rank_4": 0.17266738670932769,
+      "shared_plus_rank_8": 0.30738819682510427,
+      "shared_plus_rank_16": 0.5671835747139325,
+      "centered_variance_fraction": 0.9651338207839778,
+      "residual_fraction_rank_4": 0.8273326132906723
+    },
+    {
+      "layer": 22,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031219573213741057,
+      "shared_plus_rank_1": 0.06594509187756033,
+      "shared_plus_rank_2": 0.10021906887666113,
+      "shared_plus_rank_4": 0.1670512672403197,
+      "shared_plus_rank_8": 0.2987242346015142,
+      "shared_plus_rank_16": 0.5550400022995634,
+      "centered_variance_fraction": 0.9687804267687274,
+      "residual_fraction_rank_4": 0.8329487327596803
+    },
+    {
+      "layer": 23,
+      "tensor": "gate_up",
+      "shape": [
+        32,
+        1024,
+        1024
+      ],
+      "shared": 0.03344364954897875,
+      "shared_plus_rank_1": 0.08589560688286976,
+      "shared_plus_rank_2": 0.12258776879410947,
+      "shared_plus_rank_4": 0.19455642594304912,
+      "shared_plus_rank_8": 0.3321024694489326,
+      "shared_plus_rank_16": 0.5953301648492872,
+      "centered_variance_fraction": 0.9665563504247272,
+      "residual_fraction_rank_4": 0.8054435740569509
+    },
+    {
+      "layer": 23,
+      "tensor": "down",
+      "shape": [
+        32,
+        1024,
+        512
+      ],
+      "shared": 0.031313192863507026,
+      "shared_plus_rank_1": 0.06968112444494277,
+      "shared_plus_rank_2": 0.10738258102237568,
+      "shared_plus_rank_4": 0.1793571957638165,
+      "shared_plus_rank_8": 0.31605358051722526,
+      "shared_plus_rank_16": 0.575815578224211,
+      "centered_variance_fraction": 0.9686868071382563,
+      "residual_fraction_rank_4": 0.8206428042361835
+    }
+  ],
+  "method": "cross-expert covariance eigenvalues on centered BF16 weights",
+  "quality_status": "candidate generation only; no teacher-forced validation",
+  "aggregate": {
+    "gate_up": {
+      "shared": 0.0348212407526988,
+      "shared_plus_rank_1": 0.07062292380368446,
+      "shared_plus_rank_2": 0.10516581969593371,
+      "shared_plus_rank_4": 0.1730483230049872,
+      "shared_plus_rank_8": 0.3054640539913263,
+      "shared_plus_rank_16": 0.5597663768697387,
+      "residual_fraction_rank_4": 0.8269516769950128
+    },
+    "down": {
+      "shared": 0.03124759318630697,
+      "shared_plus_rank_1": 0.06799438425306577,
+      "shared_plus_rank_2": 0.10377118915146848,
+      "shared_plus_rank_4": 0.17307269636827458,
+      "shared_plus_rank_8": 0.30521781219605354,
+      "shared_plus_rank_16": 0.5571717005148092,
+      "residual_fraction_rank_4": 0.8269273036317255
+    }
+  }
+}

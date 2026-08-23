@@ -140,6 +140,48 @@ pub mod platform {
         })
     }
 
+    /// Experimental qlen=1 FlashAttention-style streaming path. Disabled by
+    /// default until its long sequential parity gate passes.
+    pub fn attention_stream_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("QX_V2_ATTENTION_STREAM")
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    /// Streaming attention geometry: 32 gives one SIMD group per workgroup;
+    /// 256 puts all eight KV-head groups in one workgroup.
+    pub fn attention_stream_threadgroup_size() -> usize {
+        if std::env::var("QX_V2_ATTENTION_STREAM_TG").ok().as_deref() == Some("32") {
+            32
+        } else {
+            256
+        }
+    }
+
+    /// Experimental chunk-parallel online-softmax attention. Disabled by
+    /// default; this preserves context parallelism while avoiding score data.
+    pub fn attention_chunked_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("QX_V2_ATTENTION_CHUNKED")
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
     /// Experimental topology B: compute only inverse RMS before QKV, then
     /// let the SIMD QKV consumer apply the norm weights while reading input.
     pub fn rms_scalar_qkv_enabled() -> bool {
@@ -883,6 +925,9 @@ pub mod platform {
         AttentionSoftmaxSimd,
         TopKMask,
         AttentionQkKMajor,
+        AttentionStreamGqa,
+        AttentionChunkedGqa,
+        AttentionChunkedMerge,
     }
 
     fn bytes_of<T>(value: &T) -> &[u8] {
@@ -1075,7 +1120,7 @@ pub mod platform {
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
-        v2_pipelines: Mutex<[Option<Pipeline>; 28]>,
+        v2_pipelines: Mutex<[Option<Pipeline>; 31]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
         stage_counters: Mutex<bool>,
@@ -4920,6 +4965,33 @@ pub mod platform {
             output: &RuntimeBuffer,
             length: usize,
         ) -> Result<(), String> {
+            if attention_chunked_enabled()
+                && !kv_key_fp16_enabled()
+                && !kv_value_fp16_enabled()
+            {
+                return self.encode_attention_chunked_gqa(
+                    context,
+                    query,
+                    key_cache,
+                    value_cache,
+                    scores,
+                    output,
+                    length,
+                );
+            }
+            if attention_stream_enabled()
+                && !kv_key_fp16_enabled()
+                && !kv_value_fp16_enabled()
+            {
+                return self.encode_attention_stream_gqa(
+                    context,
+                    query,
+                    key_cache,
+                    value_cache,
+                    output,
+                    length,
+                );
+            }
             self.encode_attention_qk(context, query, key_cache, scores, length)?;
             self.encode_attention_softmax(context, scores, length)?;
             self.encode_attention_v(context, scores, value_cache, output, length)
@@ -4937,9 +5009,123 @@ pub mod platform {
             layer: usize,
             length: usize,
         ) -> Result<(), String> {
+            if attention_chunked_enabled()
+                && !kv_key_fp16_for_layer(layer)
+                && !kv_value_fp16_for_layer(layer)
+            {
+                return self.encode_attention_chunked_gqa(
+                    context,
+                    query,
+                    key_cache,
+                    value_cache,
+                    scores,
+                    output,
+                    length,
+                );
+            }
+            if attention_stream_enabled()
+                && !kv_key_fp16_for_layer(layer)
+                && !kv_value_fp16_for_layer(layer)
+            {
+                return self.encode_attention_stream_gqa(
+                    context,
+                    query,
+                    key_cache,
+                    value_cache,
+                    output,
+                    length,
+                );
+            }
             self.encode_attention_qk_for_layer(context, query, key_cache, scores, layer, length)?;
             self.encode_attention_softmax(context, scores, length)?;
             self.encode_attention_v_for_layer(context, scores, value_cache, output, layer, length)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_attention_stream_gqa(
+            &mut self,
+            context: &MetalContext,
+            query: &RuntimeBuffer,
+            key_cache: &RuntimeBuffer,
+            value_cache: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            length: usize,
+        ) -> Result<(), String> {
+            #[repr(C)]
+            struct Params {
+                length: u32,
+            }
+            let params = Params {
+                length: length as u32,
+            };
+            self.encode_decode_kernel(
+                context,
+                DecodeKernel::AttentionStreamGqa,
+                &[query, key_cache, value_cache, output],
+                bytes_of(&params),
+                MTLSize {
+                    width: 8 * 32,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: attention_stream_threadgroup_size(),
+                    height: 1,
+                    depth: 1,
+                },
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_attention_chunked_gqa(
+            &mut self,
+            context: &MetalContext,
+            query: &RuntimeBuffer,
+            key_cache: &RuntimeBuffer,
+            value_cache: &RuntimeBuffer,
+            scratch: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            length: usize,
+        ) -> Result<(), String> {
+            #[repr(C)]
+            struct Params {
+                length: u32,
+            }
+            let params = Params {
+                length: length as u32,
+            };
+            self.encode_decode_kernel(
+                context,
+                DecodeKernel::AttentionChunkedGqa,
+                &[query, key_cache, value_cache, scratch],
+                bytes_of(&params),
+                MTLSize {
+                    width: 8 * 256,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            )?;
+            self.encode_decode_kernel(
+                context,
+                DecodeKernel::AttentionChunkedMerge,
+                &[scratch, output],
+                bytes_of(&params),
+                MTLSize {
+                    width: 16 * 64,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            )
         }
 
         pub fn encode_attention_qk(
@@ -5568,7 +5754,7 @@ pub mod platform {
                 v2_pipelines: Mutex::new([
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
-                    None, None,
+                    None, None, None, None, None,
                 ]),
                 scratch: Mutex::new(MetalScratch {
                     input_f32: None,
@@ -6504,6 +6690,9 @@ pub mod platform {
                 DecodeKernel::RopeKvSimd => 25,
                 DecodeKernel::TopKMask => 26,
                 DecodeKernel::AttentionQkKMajor => 27,
+                DecodeKernel::AttentionStreamGqa => 28,
+                DecodeKernel::AttentionChunkedGqa => 29,
+                DecodeKernel::AttentionChunkedMerge => 30,
             };
             let mut pipelines = self
                 .v2_pipelines
@@ -6546,6 +6735,9 @@ pub mod platform {
                 DecodeKernel::RopeKvSimd => "qx_v2_rope_kv_simd",
                 DecodeKernel::TopKMask => "qx_v2_topk_mask",
                 DecodeKernel::AttentionQkKMajor => "qx_v2_attention_qk_kmajor",
+                DecodeKernel::AttentionStreamGqa => "qx_v2_attention_stream_gqa",
+                DecodeKernel::AttentionChunkedGqa => "qx_v2_attention_chunked_gqa",
+                DecodeKernel::AttentionChunkedMerge => "qx_v2_attention_chunked_merge",
             });
             let function = library
                 .newFunctionWithName(&name)
