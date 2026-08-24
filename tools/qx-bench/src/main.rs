@@ -2285,14 +2285,18 @@ fn benchmark_v2_gpu_verifier(
         .map_err(anyhow::Error::msg)?;
     println!("QX V2 persistent GPU verifier benchmark");
     println!("artifact: {}", artifact_path.display());
-    println!("iterations: {iterations} (K=1/2/4, synthetic expected stream)");
+    println!("iterations: {iterations} (K=1/2/4, teacher-forced target stream)");
     println!("width  GPU us  wall us  GPU/proposed  accepted  position");
     for width in [1_usize, 2, 4] {
-        let inputs = vec![1_u32; width];
+        let mut inputs = Vec::with_capacity(width);
         let mut expected = Vec::with_capacity(width);
         generator.reset();
-        for &input in &inputs {
-            expected.push(generator.step(input).map_err(anyhow::Error::msg)?);
+        let mut input = 1_u32;
+        for _ in 0..width {
+            inputs.push(input);
+            let next = generator.step(input).map_err(anyhow::Error::msg)?;
+            expected.push(next);
+            input = next;
         }
         for _ in 0..3 {
             generator.reset();
