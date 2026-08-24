@@ -894,6 +894,8 @@ pub mod platform {
         inline_gate_up_nocache_pipeline: Pipeline,
         inline_gate_up_nocache_norm_pipeline: Pipeline,
         unique_packet_gate_up_pipeline: Pipeline,
+        verifier_gate_up_pipeline: Pipeline,
+        verifier_gate_up_expert_major_pipeline: Pipeline,
         unique_packet_gate_up_norm_pipeline: Pipeline,
         unique_packet_down_pipeline: Pipeline,
         cluster_down16_pipeline: Pipeline,
@@ -2666,6 +2668,178 @@ pub mod platform {
             };
             self.encoder.setComputePipelineState(pipeline);
             Ok(true)
+        }
+
+        /// Encode the first expert-major stage of a K-wide verifier.
+        ///
+        /// `route_experts[p]` and `route_tokens[p]` describe one selected
+        /// `(expert, token)` pair. The output is pair-major with 1024
+        /// gate/up values per pair. This deliberately exposes only the
+        /// exact row-inline Q4 gate/up stage; SiLU, down, and weighted
+        /// accumulation remain separate verifier stages.
+        pub fn encode_verifier_q4_gate_up_batch(
+            &mut self,
+            prepared: &PreparedDynamicQ4Moe,
+            input: &RuntimeBuffer,
+            route_experts: &RuntimeBuffer,
+            route_tokens: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            pair_count: usize,
+        ) -> Result<(), String> {
+            if prepared.gate_up_layout != PackingLayout::Q4RowInline {
+                return Err(
+                    "K-wide verifier gate/up requires the exact Q4 row-inline layout".to_owned(),
+                );
+            }
+            if pair_count == 0 {
+                return Ok(());
+            }
+            if pair_count > u32::MAX as usize {
+                return Err("K-wide verifier route count exceeds u32".to_owned());
+            }
+            if input.length < 1024 * std::mem::size_of::<f32>()
+                || route_experts.length < pair_count * std::mem::size_of::<u32>()
+                || route_tokens.length < pair_count * std::mem::size_of::<u32>()
+                || output.length < pair_count * 1024 * std::mem::size_of::<f32>()
+            {
+                return Err("K-wide verifier gate/up buffers are too small".to_owned());
+            }
+            let pair_count = pair_count as u32;
+            self.encoder
+                .setComputePipelineState(&prepared.verifier_gate_up_pipeline);
+            unsafe {
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.gate_up_packed.buffer),
+                    prepared.gate_up_packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&route_experts.buffer),
+                    route_experts.offset,
+                    1,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&route_tokens.buffer),
+                    route_tokens.offset,
+                    2,
+                );
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 3);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&output.buffer), output.offset, 4);
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&pair_count).cast(),
+                    std::mem::size_of_val(&pair_count),
+                    5,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: (pair_count as usize) * (1024 / 8),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        /// Encode the weight-amortizing expert-major verifier stage. Each
+        /// bucket is one expert and `bucket_pairs[offset..next]` identifies
+        /// up to four route pairs for that expert. The kernel consumes each
+        /// row-inline Q4 weight packet once while updating all token outputs
+        /// in the bucket.
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_verifier_q4_gate_up_expert_major(
+            &mut self,
+            prepared: &PreparedDynamicQ4Moe,
+            input: &RuntimeBuffer,
+            bucket_experts: &RuntimeBuffer,
+            bucket_offsets: &RuntimeBuffer,
+            bucket_pairs: &RuntimeBuffer,
+            route_tokens: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            bucket_count: usize,
+        ) -> Result<(), String> {
+            if prepared.gate_up_layout != PackingLayout::Q4RowInline {
+                return Err(
+                    "K-wide expert-major gate/up requires the exact Q4 row-inline layout"
+                        .to_owned(),
+                );
+            }
+            if bucket_count == 0 {
+                return Ok(());
+            }
+            if bucket_count > 32 {
+                return Err("K-wide expert-major bucket count exceeds 32".to_owned());
+            }
+            if input.length < 1024 * std::mem::size_of::<f32>()
+                || bucket_experts.length < bucket_count * std::mem::size_of::<u32>()
+                || bucket_offsets.length < (bucket_count + 1) * std::mem::size_of::<u32>()
+                || bucket_pairs.length < std::mem::size_of::<u32>()
+                || route_tokens.length < std::mem::size_of::<u32>()
+                || output.length < 1024 * std::mem::size_of::<f32>()
+            {
+                return Err("K-wide expert-major gate/up buffers are too small".to_owned());
+            }
+            let bucket_count = bucket_count as u32;
+            self.encoder
+                .setComputePipelineState(&prepared.verifier_gate_up_expert_major_pipeline);
+            unsafe {
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.gate_up_packed.buffer),
+                    prepared.gate_up_packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&bucket_experts.buffer),
+                    bucket_experts.offset,
+                    1,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&bucket_offsets.buffer),
+                    bucket_offsets.offset,
+                    2,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&bucket_pairs.buffer),
+                    bucket_pairs.offset,
+                    3,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&route_tokens.buffer),
+                    route_tokens.offset,
+                    4,
+                );
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 5);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&output.buffer), output.offset, 6);
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&bucket_count).cast(),
+                    std::mem::size_of_val(&bucket_count),
+                    7,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: (bucket_count as usize) * (1024 / 8),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
         }
 
         /// GPU-resident batched SIMD MoE. The eight selected experts remain
@@ -8126,6 +8300,10 @@ pub mod platform {
                 unique_packet_gate_up_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_unique_packet_simd",
                 )?,
+                verifier_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_batch")?,
+                verifier_gate_up_expert_major_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_expert_major")?,
                 unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd",
                 )?,
@@ -8471,6 +8649,10 @@ pub mod platform {
                 unique_packet_gate_up_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_unique_packet_simd",
                 )?,
+                verifier_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_batch")?,
+                verifier_gate_up_expert_major_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_expert_major")?,
                 unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd",
                 )?,
@@ -8772,6 +8954,10 @@ pub mod platform {
                 unique_packet_gate_up_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_unique_packet_simd",
                 )?,
+                verifier_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_batch")?,
+                verifier_gate_up_expert_major_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_expert_major")?,
                 unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd",
                 )?,
@@ -9153,6 +9339,10 @@ pub mod platform {
                 unique_packet_gate_up_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_unique_packet_simd",
                 )?,
+                verifier_gate_up_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_batch")?,
+                verifier_gate_up_expert_major_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_expert_major")?,
                 unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd",
                 )?,
@@ -10750,6 +10940,96 @@ mod tests {
                 .iter()
                 .all(|value| *value == 0.0)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verifier_gate_up_batch_matches_exact_row_inline_reference() {
+        const EXPERTS: usize = 32;
+        const HIDDEN: usize = 1024;
+        const GROUPS: usize = 32;
+        const GROUP_BYTES: usize = 18;
+        const PAIRS: usize = 2;
+        let context = platform::MetalContext::system_default().expect("Metal device");
+        let mut gate_up = vec![0_u8; EXPERTS * HIDDEN * GROUPS * GROUP_BYTES];
+        for expert in 0..EXPERTS {
+            for row in 0..HIDDEN {
+                for group in 0..GROUPS {
+                    let offset = (expert * HIDDEN * GROUPS + row * GROUPS + group) * GROUP_BYTES;
+                    gate_up[offset..offset + 16].fill(0x88);
+                    gate_up[offset + 16..offset + 18].copy_from_slice(&[0x00, 0x3c]);
+                }
+            }
+        }
+        let down = vec![0_u8; EXPERTS * HIDDEN * 16 * GROUP_BYTES];
+        let prepared = context
+            .prepare_dynamic_q4_moe_with_layouts(
+                &gate_up,
+                &gate_up,
+                &down,
+                &down,
+                PackingLayout::Q4RowInline,
+                PackingLayout::Q4RowInline,
+            )
+            .unwrap();
+        let input = context
+            .allocate_runtime_buffer(PAIRS * HIDDEN * std::mem::size_of::<f32>())
+            .unwrap();
+        let route_experts = context
+            .allocate_runtime_buffer(PAIRS * std::mem::size_of::<u32>())
+            .unwrap();
+        let route_tokens = context
+            .allocate_runtime_buffer(PAIRS * std::mem::size_of::<u32>())
+            .unwrap();
+        let output = context
+            .allocate_runtime_buffer(PAIRS * HIDDEN * std::mem::size_of::<f32>())
+            .unwrap();
+        let input_values = [vec![1.0_f32; HIDDEN], vec![2.0_f32; HIDDEN]].concat();
+        let experts = [0_u32, 1_u32];
+        let tokens = [0_u32, 1_u32];
+        for (buffer, bytes) in [
+            (&input, unsafe {
+                std::slice::from_raw_parts(
+                    input_values.as_ptr() as *const u8,
+                    std::mem::size_of_val(input_values.as_slice()),
+                )
+            }),
+            (&route_experts, unsafe {
+                std::slice::from_raw_parts(
+                    experts.as_ptr() as *const u8,
+                    std::mem::size_of_val(&experts),
+                )
+            }),
+            (&route_tokens, unsafe {
+                std::slice::from_raw_parts(
+                    tokens.as_ptr() as *const u8,
+                    std::mem::size_of_val(&tokens),
+                )
+            }),
+        ] {
+            context.write_runtime_buffer(buffer, bytes).unwrap();
+        }
+        let mut graph = context.begin_decode().unwrap();
+        graph
+            .encode_verifier_q4_gate_up_batch(
+                &prepared,
+                &input,
+                &route_experts,
+                &route_tokens,
+                &output,
+                PAIRS,
+            )
+            .unwrap();
+        graph.finish(&context).unwrap();
+        let observed = context.read_runtime_f32(&output, PAIRS * HIDDEN).unwrap();
+        for (pair, expected) in [1024.0_f32, 2048.0].into_iter().enumerate() {
+            let start = pair * HIDDEN;
+            let max_error = observed[start..start + HIDDEN]
+                .iter()
+                .map(|value| (value - expected).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(max_error < 1.0e-3, "pair {pair} gate/up error: {max_error}");
+        }
     }
 
     #[cfg(target_os = "macos")]
