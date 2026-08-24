@@ -1207,15 +1207,25 @@ impl GraniteV2Generator {
             } else {
                 (&verifier.hidden_b, &verifier.hidden_a)
             };
-            for token in 0..width {
-                graph.encode_rmsnorm(
+            if verifier_batch_stage_enabled("rms") {
+                graph.encode_rmsnorm_batch_scalar(
                     self.context.as_ref(),
-                    &input.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                    input,
                     &weights.input_norm,
-                    &verifier
-                        .normalized
-                        .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                    &verifier.normalized,
+                    width,
                 )?;
+            } else {
+                for token in 0..width {
+                    graph.encode_rmsnorm(
+                        self.context.as_ref(),
+                        &input.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                        &weights.input_norm,
+                        &verifier
+                            .normalized
+                            .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                    )?;
+                }
             }
             graph.encode_prepared_q4_qkv_simd_batch(
                 &weights.q_proj,
@@ -1255,24 +1265,47 @@ impl GraniteV2Generator {
                 &verifier.moe_output,
                 width,
             )?;
-            for token in 0..width {
-                graph.encode_residual(
+            if verifier_batch_stage_enabled("residual") {
+                graph.encode_residual_batch(
                     self.context.as_ref(),
-                    &input.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
-                    &verifier
-                        .moe_output
-                        .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
-                    &output.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                    input,
+                    &verifier.moe_output,
+                    output,
+                    width,
                     qx_model::RESIDUAL_MULTIPLIER,
                 )?;
-                graph.encode_rmsnorm(
+            } else {
+                for token in 0..width {
+                    graph.encode_residual(
+                        self.context.as_ref(),
+                        &input.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                        &verifier
+                            .moe_output
+                            .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                        &output.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                        qx_model::RESIDUAL_MULTIPLIER,
+                    )?;
+                }
+            }
+            if verifier_batch_stage_enabled("rms") {
+                graph.encode_rmsnorm_batch_scalar(
                     self.context.as_ref(),
-                    &output.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                    output,
                     &weights.post_attention_norm,
-                    &verifier
-                        .normalized
-                        .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                    &verifier.normalized,
+                    width,
                 )?;
+            } else {
+                for token in 0..width {
+                    graph.encode_rmsnorm(
+                        self.context.as_ref(),
+                        &output.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                        &weights.post_attention_norm,
+                        &verifier
+                            .normalized
+                            .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                    )?;
+                }
             }
             graph.encode_prepared_q4_dense_simd_batch(
                 &weights.router,
@@ -1280,20 +1313,30 @@ impl GraniteV2Generator {
                 &verifier.router_scores,
                 width,
             )?;
-            for token in 0..width {
-                graph.encode_topk(
+            if verifier_batch_stage_enabled("topk") {
+                graph.encode_topk_batch(
                     self.context.as_ref(),
-                    &verifier
-                        .router_scores
-                        .subregion(token * EXPERTS * f32_bytes, EXPERTS * f32_bytes)?,
-                    &verifier.topk_ids.subregion(
-                        token * TOP_K * std::mem::size_of::<u32>(),
-                        TOP_K * std::mem::size_of::<u32>(),
-                    )?,
-                    &verifier
-                        .topk_weights
-                        .subregion(token * TOP_K * f32_bytes, TOP_K * f32_bytes)?,
+                    &verifier.router_scores,
+                    &verifier.topk_ids,
+                    &verifier.topk_weights,
+                    width,
                 )?;
+            } else {
+                for token in 0..width {
+                    graph.encode_topk(
+                        self.context.as_ref(),
+                        &verifier
+                            .router_scores
+                            .subregion(token * EXPERTS * f32_bytes, EXPERTS * f32_bytes)?,
+                        &verifier.topk_ids.subregion(
+                            token * TOP_K * std::mem::size_of::<u32>(),
+                            TOP_K * std::mem::size_of::<u32>(),
+                        )?,
+                        &verifier
+                            .topk_weights
+                            .subregion(token * TOP_K * f32_bytes, TOP_K * f32_bytes)?,
+                    )?;
+                }
             }
             self.moe.encode_verifier_compact_packet_moe(
                 &mut graph,
@@ -1311,16 +1354,27 @@ impl GraniteV2Generator {
                 verifier.pair_count,
                 width,
             )?;
-            for token in 0..width {
-                graph.encode_residual(
+            if verifier_batch_stage_enabled("residual") {
+                graph.encode_residual_batch(
                     self.context.as_ref(),
-                    &output.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
-                    &verifier
-                        .moe_output
-                        .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
-                    &output.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                    output,
+                    &verifier.moe_output,
+                    output,
+                    width,
                     qx_model::RESIDUAL_MULTIPLIER,
                 )?;
+            } else {
+                for token in 0..width {
+                    graph.encode_residual(
+                        self.context.as_ref(),
+                        &output.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                        &verifier
+                            .moe_output
+                            .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                        &output.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                        qx_model::RESIDUAL_MULTIPLIER,
+                    )?;
+                }
             }
         }
         let final_hidden = if LAYERS.is_multiple_of(2) {
@@ -1328,15 +1382,25 @@ impl GraniteV2Generator {
         } else {
             &verifier.hidden_b
         };
-        for token in 0..width {
-            graph.encode_rmsnorm(
+        if verifier_batch_stage_enabled("rms") {
+            graph.encode_rmsnorm_batch_scalar(
                 self.context.as_ref(),
-                &final_hidden.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                final_hidden,
                 &self.stack.final_norm,
-                &verifier
-                    .normalized
-                    .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                &verifier.normalized,
+                width,
             )?;
+        } else {
+            for token in 0..width {
+                graph.encode_rmsnorm(
+                    self.context.as_ref(),
+                    &final_hidden.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                    &self.stack.final_norm,
+                    &verifier
+                        .normalized
+                        .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                )?;
+            }
         }
         let f32_bytes = std::mem::size_of::<f32>();
         for token in 0..width {
@@ -3027,6 +3091,24 @@ fn command_buffers_per_token() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&count| (1..=LAYERS).contains(&count))
         .unwrap_or(1)
+}
+
+#[cfg(target_os = "macos")]
+fn verifier_batch_stage_enabled(stage: &str) -> bool {
+    let variable = match stage {
+        "rms" => "QX_V2_VERIFIER_BATCH_RMS",
+        "residual" => "QX_V2_VERIFIER_BATCH_RESIDUAL",
+        "topk" => "QX_V2_VERIFIER_BATCH_TOPK",
+        _ => return false,
+    };
+    match std::env::var(variable) {
+        Ok(value) => matches!(value.as_str(), "1" | "true" | "yes"),
+        // The scalar-semantics RMS path is now the canonical K>1 verifier
+        // stage. An explicit zero keeps the old per-token dispatches
+        // available for A/B attribution; the other experimental stages stay
+        // opt-in until they demonstrate a complete-verifier win.
+        Err(_) => stage == "rms",
+    }
 }
 
 /// Diagnostic schedule selector. Values are deliberately not part of the

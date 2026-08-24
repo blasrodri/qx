@@ -140,6 +140,26 @@ kernel void qx_v2_rmsnorm_batch(
     }
 }
 
+// Dispatch-batched scalar RMSNorm. Each threadgroup owns one token but keeps
+// the exact serial accumulation order of qx_v2_rmsnorm. Changing the
+// reduction tree can change router logits and therefore the selected experts.
+kernel void qx_v2_rmsnorm_batch_scalar(
+    device const float* input [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant NormParams& params [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint token [[threadgroup_position_in_grid]]) {
+    if (tid != 0) return;
+    uint base = token * params.n;
+    float sum = 0.0f;
+    for (uint i = 0; i < params.n; ++i) sum += input[base + i] * input[base + i];
+    float inverse = rsqrt(sum / float(params.n) + params.epsilon);
+    for (uint i = 0; i < params.n; ++i) {
+        output[base + i] = input[base + i] * inverse * weights[i];
+    }
+}
+
 kernel void qx_v2_f32_to_f16(
     device const float* input [[buffer(0)]],
     device half* output [[buffer(1)]],

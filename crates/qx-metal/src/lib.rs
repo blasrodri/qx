@@ -1088,6 +1088,7 @@ pub mod platform {
         RmsNormBatch,
         ResidualBatch,
         TopKBatch,
+        RmsNormBatchScalar,
     }
 
     fn bytes_of<T>(value: &T) -> &[u8] {
@@ -1284,7 +1285,7 @@ pub mod platform {
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
-        v2_pipelines: Mutex<[Option<Pipeline>; 38]>,
+        v2_pipelines: Mutex<[Option<Pipeline>; 39]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
         stage_counters: Mutex<bool>,
@@ -5956,6 +5957,42 @@ pub mod platform {
             )
         }
 
+        /// Encode one serial, scalar-semantics RMSNorm per token in a single
+        /// dispatch. This is a dispatch-batching control, not a SIMD
+        /// reduction: preserving the canonical accumulation order is
+        /// necessary because RMSNorm feeds routing decisions.
+        pub fn encode_rmsnorm_batch_scalar(
+            &mut self,
+            context: &MetalContext,
+            input: &RuntimeBuffer,
+            weights: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            tokens: usize,
+        ) -> Result<(), String> {
+            if tokens == 0 {
+                return Err(
+                    "scalar-semantics batched RMSNorm requires at least one token".to_owned(),
+                );
+            }
+            let params = [1024u32.to_ne_bytes(), 1e-5f32.to_ne_bytes()].concat();
+            self.encode_decode_kernel(
+                context,
+                DecodeKernel::RmsNormBatchScalar,
+                &[input, weights, output],
+                &params,
+                MTLSize {
+                    width: tokens,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+        }
+
         pub fn encode_f32_to_f16(
             &mut self,
             context: &MetalContext,
@@ -7214,6 +7251,7 @@ pub mod platform {
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None,
+                    None,
                 ]),
                 scratch: Mutex::new(MetalScratch {
                     input_f32: None,
@@ -8251,6 +8289,7 @@ pub mod platform {
                 DecodeKernel::RmsNormBatch => 35,
                 DecodeKernel::ResidualBatch => 36,
                 DecodeKernel::TopKBatch => 37,
+                DecodeKernel::RmsNormBatchScalar => 38,
             };
             let mut pipelines = self
                 .v2_pipelines
@@ -8303,6 +8342,7 @@ pub mod platform {
                 DecodeKernel::RmsNormBatch => "qx_v2_rmsnorm_batch",
                 DecodeKernel::ResidualBatch => "qx_v2_residual_batch",
                 DecodeKernel::TopKBatch => "qx_v2_topk_batch",
+                DecodeKernel::RmsNormBatchScalar => "qx_v2_rmsnorm_batch_scalar",
             });
             let function = library
                 .newFunctionWithName(&name)
