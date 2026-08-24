@@ -2790,6 +2790,80 @@ pub struct ExecutionPlan {
     pub encoders_per_token: usize,
 }
 
+/// Fixed speculative-verifier widths supported by the planner. The GPU
+/// implementation is intentionally separate from the one-token ExecutionPlan:
+/// a verifier needs K-wide activation, projection, route, logits, and causal
+/// KV regions rather than four aliases of the scalar decode buffers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerifierWidth {
+    K1,
+    K2,
+    K4,
+}
+
+impl VerifierWidth {
+    pub const fn tokens(self) -> usize {
+        match self {
+            Self::K1 => 1,
+            Self::K2 => 2,
+            Self::K4 => 4,
+        }
+    }
+
+    pub const fn from_tokens(tokens: usize) -> Option<Self> {
+        match tokens {
+            1 => Some(Self::K1),
+            2 => Some(Self::K2),
+            4 => Some(Self::K4),
+            _ => None,
+        }
+    }
+}
+
+/// Shape/accounting contract for the future multi-position Metal verifier.
+/// This is deliberately not executable by the scalar decode graph. Keeping
+/// the contract explicit prevents a serial fallback from being reported as a
+/// batched verifier benchmark.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifierExecutionPlan {
+    pub width: VerifierWidth,
+    pub hidden_bytes: usize,
+    pub query_bytes: usize,
+    pub key_bytes: usize,
+    pub value_bytes: usize,
+    pub route_id_bytes: usize,
+    pub route_weight_bytes: usize,
+    pub logits_bytes: usize,
+    pub kv_candidate_bytes: usize,
+    pub gpu_batch_kernels_required: bool,
+}
+
+impl ExecutionPlan {
+    pub fn verifier(&self, width: VerifierWidth) -> VerifierExecutionPlan {
+        let k = width.tokens();
+        let hidden_bytes = k * HIDDEN * std::mem::size_of::<f32>();
+        let query_bytes = k * ATTENTION_HEADS * HEAD_DIM * std::mem::size_of::<f32>();
+        let key_bytes = k * KV_HEADS * HEAD_DIM * std::mem::size_of::<f32>();
+        let value_bytes = key_bytes;
+        let route_id_bytes = k * TOP_K * std::mem::size_of::<u32>();
+        let route_weight_bytes = k * TOP_K * std::mem::size_of::<f32>();
+        let logits_bytes = k * VOCAB * std::mem::size_of::<f32>();
+        let kv_candidate_bytes = LAYERS * (key_bytes + value_bytes);
+        VerifierExecutionPlan {
+            width,
+            hidden_bytes,
+            query_bytes,
+            key_bytes,
+            value_bytes,
+            route_id_bytes,
+            route_weight_bytes,
+            logits_bytes,
+            kv_candidate_bytes,
+            gpu_batch_kernels_required: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryAudit {
     pub expert_artifact_bytes: usize,
@@ -3205,6 +3279,21 @@ mod tests {
         assert_eq!(plan.layers[0].input, BufferId::HiddenA);
         assert_eq!(plan.layers[1].input, BufferId::HiddenB);
         assert_eq!(plan.expected_dispatches_per_token(), 461);
+    }
+
+    #[test]
+    fn verifier_plan_scales_all_candidate_dimensions() {
+        let plan = ExecutionPlan::granite(512).unwrap();
+        let k1 = plan.verifier(VerifierWidth::K1);
+        let k4 = plan.verifier(VerifierWidth::K4);
+        assert_eq!(VerifierWidth::from_tokens(4), Some(VerifierWidth::K4));
+        assert_eq!(VerifierWidth::from_tokens(3), None);
+        assert_eq!(k4.hidden_bytes, 4 * k1.hidden_bytes);
+        assert_eq!(k4.query_bytes, 4 * k1.query_bytes);
+        assert_eq!(k4.route_id_bytes, 4 * k1.route_id_bytes);
+        assert_eq!(k4.logits_bytes, 4 * k1.logits_bytes);
+        assert_eq!(k4.kv_candidate_bytes, 4 * k1.kv_candidate_bytes);
+        assert!(k4.gpu_batch_kernels_required);
     }
 
     #[test]

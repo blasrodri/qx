@@ -45,6 +45,13 @@ become a true multi-position graph that consumes `[K, hidden]` activations and
 commits only the accepted prefix. Repeated calls to `step()` are retained only
 as a reference oracle.
 
+The planner now has an explicit `VerifierWidth` / `VerifierExecutionPlan`
+contract for K=1, K=2, and K=4. It accounts for the K-scaled hidden, Q/K/V,
+route, logits, and candidate-KV regions and marks the plan as requiring batch
+kernels. The scalar decode graph cannot instantiate this plan; this guard is
+intentional so a serial implementation cannot be misreported as a verifier
+speedup.
+
 The verifier must keep target weights and intermediate state GPU-resident,
 handle causal attention for K candidate positions, and commit only the
 accepted prefix. Rejected suffix state must not contaminate the next decode.
