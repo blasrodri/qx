@@ -200,6 +200,50 @@ pub mod platform {
         })
     }
 
+    /// Opt-in K-wide QKV consumer that loads each packed Q4 weight packet once
+    /// per output row and applies it to all resident verifier tokens.
+    pub fn qkv_weight_stationary_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("QX_V2_QKV_WEIGHT_STATIONARY")
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn o_projection_weight_stationary_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("QX_V2_O_WEIGHT_STATIONARY")
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn rms_parallel_writeback_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("QX_V2_RMS_PARALLEL_WRITEBACK")
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
     /// Experimental topology B: compute only inverse RMS before QKV, then
     /// let the SIMD QKV consumer apply the norm weights while reading input.
     pub fn rms_scalar_qkv_enabled() -> bool {
@@ -858,6 +902,7 @@ pub mod platform {
         sweep_pipeline: Pipeline,
         simd_norm_pipeline: Pipeline,
         batch_simd_pipeline: Pipeline,
+        weight_stationary_batch_pipeline: Pipeline,
         packed: RuntimeBuffer,
         scales: RuntimeBuffer,
         rows: usize,
@@ -1120,6 +1165,7 @@ pub mod platform {
         ResidualBatch,
         TopKBatch,
         RmsNormBatchScalar,
+        RmsNormBatchParallelWriteback,
     }
 
     fn bytes_of<T>(value: &T) -> &[u8] {
@@ -1296,6 +1342,7 @@ pub mod platform {
         q4_dense_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_batch_simd_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_weight_stationary_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_sweep_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_norm_pipeline: Mutex<Option<Pipeline>>,
@@ -1316,7 +1363,7 @@ pub mod platform {
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
-        v2_pipelines: Mutex<[Option<Pipeline>; 40]>,
+        v2_pipelines: Mutex<[Option<Pipeline>; 41]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
         stage_counters: Mutex<bool>,
@@ -1618,6 +1665,81 @@ pub mod platform {
             Ok(())
         }
 
+        pub fn encode_prepared_q4_dense_weight_stationary_batch(
+            &mut self,
+            prepared: &PreparedQuantizedDense,
+            input: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            tokens: usize,
+        ) -> Result<(), String> {
+            if tokens == 0 || tokens > 4 {
+                return Err("weight-stationary Q4 verifier supports K=1..4".to_owned());
+            }
+            if input.length < tokens * prepared.columns * std::mem::size_of::<f32>()
+                || output.length < tokens * prepared.rows * std::mem::size_of::<f32>()
+            {
+                return Err(
+                    "weight-stationary Q4 buffers are smaller than their fixed shape".to_owned(),
+                );
+            }
+            self.encoder
+                .setComputePipelineState(&prepared.weight_stationary_batch_pipeline);
+            let columns = prepared.columns as u32;
+            let rows = prepared.rows as u32;
+            let token_count = tokens as u32;
+            let multiplier = 1.0_f32;
+            unsafe {
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.packed.buffer),
+                    prepared.packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.scales.buffer),
+                    prepared.scales.offset,
+                    1,
+                );
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 2);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&output.buffer), output.offset, 3);
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&columns).cast(),
+                    std::mem::size_of_val(&columns),
+                    4,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&multiplier).cast(),
+                    std::mem::size_of_val(&multiplier),
+                    5,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&rows).cast(),
+                    std::mem::size_of_val(&rows),
+                    6,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&token_count).cast(),
+                    std::mem::size_of_val(&token_count),
+                    7,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: prepared.rows.div_ceil(8),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
         /// Encode Q, K, and V for K verifier positions using the validated
         /// token-major dense primitive. This is intentionally three
         /// K-wide dispatches rather than K scalar QKV calls; the next
@@ -1634,6 +1756,13 @@ pub mod platform {
             value: &RuntimeBuffer,
             tokens: usize,
         ) -> Result<(), String> {
+            if qkv_weight_stationary_enabled() && tokens > 1 {
+                self.encode_prepared_q4_dense_weight_stationary_batch(q, input, query, tokens)?;
+                self.encode_prepared_q4_dense_weight_stationary_batch(k, input, key, tokens)?;
+                return self.encode_prepared_q4_dense_weight_stationary_batch(
+                    v, input, value, tokens,
+                );
+            }
             self.encode_prepared_q4_dense_simd_batch(q, input, query, tokens)?;
             self.encode_prepared_q4_dense_simd_batch(k, input, key, tokens)?;
             self.encode_prepared_q4_dense_simd_batch(v, input, value, tokens)
@@ -6059,21 +6188,44 @@ pub mod platform {
                 );
             }
             let params = [1024u32.to_ne_bytes(), 1e-5f32.to_ne_bytes()].concat();
-            self.encode_decode_kernel(
-                context,
-                DecodeKernel::RmsNormBatchScalar,
-                &[input, weights, output],
-                &params,
+            let kernel = if rms_parallel_writeback_enabled() {
+                DecodeKernel::RmsNormBatchParallelWriteback
+            } else {
+                DecodeKernel::RmsNormBatchScalar
+            };
+            let threads = if rms_parallel_writeback_enabled() {
+                MTLSize {
+                    width: 256,
+                    height: tokens,
+                    depth: 1,
+                }
+            } else {
                 MTLSize {
                     width: tokens,
                     height: 1,
                     depth: 1,
-                },
+                }
+            };
+            let group = if rms_parallel_writeback_enabled() {
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                }
+            } else {
                 MTLSize {
                     width: 1,
                     height: 1,
                     depth: 1,
-                },
+                }
+            };
+            self.encode_decode_kernel(
+                context,
+                kernel,
+                &[input, weights, output],
+                &params,
+                threads,
+                group,
             )
         }
 
@@ -7377,6 +7529,7 @@ pub mod platform {
                 q4_dense_pipeline: Mutex::new(None),
                 q4_dense_simd_pipeline: Mutex::new(None),
                 q4_dense_batch_simd_pipeline: Mutex::new(None),
+                q4_dense_weight_stationary_pipeline: Mutex::new(None),
                 q4_dense_sweep_pipeline: Mutex::new(None),
                 q4_dense_argmax_pipeline: Mutex::new(None),
                 q4_dense_argmax_norm_pipeline: Mutex::new(None),
@@ -7401,6 +7554,7 @@ pub mod platform {
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
+                    None,
                     None,
                 ]),
                 scratch: Mutex::new(MetalScratch {
@@ -8010,6 +8164,27 @@ pub mod platform {
             Ok(value)
         }
 
+        fn q4_dense_weight_stationary_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_weight_stationary_pipeline
+                .lock()
+                .map_err(|_| "Metal weight-stationary Q4 pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_weight_stationary_gemm_k");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal weight-stationary Q4 function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal weight-stationary Q4 pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
         fn q4_dense_sweep_pipeline(&self) -> Result<Pipeline, String> {
             let mut pipeline = self
                 .q4_dense_sweep_pipeline
@@ -8441,6 +8616,7 @@ pub mod platform {
                 DecodeKernel::TopKBatch => 37,
                 DecodeKernel::RmsNormBatchScalar => 38,
                 DecodeKernel::AttentionBatchSimd => 39,
+                DecodeKernel::RmsNormBatchParallelWriteback => 40,
             };
             let mut pipelines = self
                 .v2_pipelines
@@ -8495,6 +8671,9 @@ pub mod platform {
                 DecodeKernel::TopKBatch => "qx_v2_topk_batch",
                 DecodeKernel::RmsNormBatchScalar => "qx_v2_rmsnorm_batch_scalar",
                 DecodeKernel::AttentionBatchSimd => "qx_v2_attention_batch_simd",
+                DecodeKernel::RmsNormBatchParallelWriteback => {
+                    "qx_v2_rmsnorm_batch_parallel_writeback"
+                }
             });
             let function = library
                 .newFunctionWithName(&name)
@@ -8651,6 +8830,7 @@ pub mod platform {
                 pipeline: self.q4_dense_pipeline()?,
                 simd_pipeline: self.q4_dense_simd_pipeline()?,
                 batch_simd_pipeline: self.q4_dense_batch_simd_pipeline()?,
+                weight_stationary_batch_pipeline: self.q4_dense_weight_stationary_pipeline()?,
                 sweep_pipeline: self.q4_dense_sweep_pipeline()?,
                 simd_norm_pipeline: self.q4_simd_norm_gemv_pipeline()?,
                 packed,
@@ -8684,6 +8864,7 @@ pub mod platform {
                 pipeline: self.q4_dense_pipeline()?,
                 simd_pipeline: self.q4_dense_simd_pipeline()?,
                 batch_simd_pipeline: self.q4_dense_batch_simd_pipeline()?,
+                weight_stationary_batch_pipeline: self.q4_dense_weight_stationary_pipeline()?,
                 sweep_pipeline: self.q4_dense_sweep_pipeline()?,
                 simd_norm_pipeline: self.q4_simd_norm_gemv_pipeline()?,
                 packed,

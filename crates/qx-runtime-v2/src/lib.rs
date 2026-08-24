@@ -1513,12 +1513,21 @@ impl GraniteV2Generator {
             if profile_stages {
                 graph.stage_boundary(self.context.as_ref())?;
             }
-            graph.encode_prepared_q4_dense_simd_batch(
-                &weights.o_proj,
-                &verifier.attention,
-                &verifier.moe_output,
-                width,
-            )?;
+            if qx_metal::platform::o_projection_weight_stationary_enabled() && width > 1 {
+                graph.encode_prepared_q4_dense_weight_stationary_batch(
+                    &weights.o_proj,
+                    &verifier.attention,
+                    &verifier.moe_output,
+                    width,
+                )?;
+            } else {
+                graph.encode_prepared_q4_dense_simd_batch(
+                    &weights.o_proj,
+                    &verifier.attention,
+                    &verifier.moe_output,
+                    width,
+                )?;
+            }
             if verifier_batch_stage_enabled("residual") {
                 graph.encode_residual_batch(
                     self.context.as_ref(),

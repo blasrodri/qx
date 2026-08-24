@@ -107,6 +107,55 @@ kernel void qx_q4_dense_simd_gemm_k(
     }
 }
 
+// Weight-stationary K-wide Q4 projection. A threadgroup owns eight output
+// rows and each SIMD group owns one row. Each packed byte and scale is loaded
+// once for that row, then applied to all resident token activations before
+// being discarded. This is used only by the verifier's QKV candidate.
+kernel void qx_q4_dense_weight_stationary_gemm_k(
+    device const uchar* packed [[buffer(0)]],
+    device const half* scales [[buffer(1)]],
+    device const float* input [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& columns [[buffer(4)]],
+    constant float& multiplier [[buffer(5)]],
+    constant uint& rows [[buffer(6)]],
+    constant uint& tokens [[buffer(7)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    constexpr uint group_size = 32;
+    constexpr uint bytes_per_group = 16;
+    constexpr int qmax = 7;
+    constexpr uint rows_per_threadgroup = 8;
+    uint row = threadgroup_id * rows_per_threadgroup + simdgroup;
+    if (row >= rows || tokens == 0) return;
+
+    uint groups = (columns + group_size - 1) / group_size;
+    uint row_base = row * groups * bytes_per_group;
+    float accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint group = 0; group < groups; ++group) {
+        float selected_scale = simd_broadcast(
+            lane == 0 ? float(scales[row * groups + group]) : 0.0f, 0);
+        uint byte_index = lane >> 1u;
+        uchar packed_byte = packed[row_base + group * bytes_per_group + byte_index];
+        uint code = (packed_byte >> ((lane & 1u) * 4u)) & 0xfu;
+        float weight = float(int(code) - qmax) * selected_scale;
+        uint input_base = group * group_size + lane;
+        for (uint token = 0; token < 4; ++token) {
+            if (token >= tokens) break;
+            uint token_base = token * columns;
+            if (input_base < columns) {
+                accum[token] += weight * input[token_base + input_base];
+            }
+        }
+    }
+    for (uint token = 0; token < 4; ++token) {
+        if (token >= tokens) break;
+        float sum = simd_sum(accum[token]) * multiplier;
+        if (lane == 0) output[token * rows + row] = sum;
+    }
+}
+
 // Exact greedy-decode vocabulary projection. Each SIMD group computes one
 // vocabulary row, and the threadgroup emits only its best (value, token)
 // pair. This avoids materializing and rereading the full logits vector when

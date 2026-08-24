@@ -160,6 +160,32 @@ kernel void qx_v2_rmsnorm_batch_scalar(
     }
 }
 
+// Exact-reduction RMSNorm candidate. Lane zero keeps the scalar accumulation
+// and rsqrt order, while the writeback is distributed across the 256 threads
+// in the token's threadgroup.
+kernel void qx_v2_rmsnorm_batch_parallel_writeback(
+    device const float* input [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant NormParams& params [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint token [[threadgroup_position_in_grid]]) {
+    threadgroup float shared_inverse[1];
+    uint base = token * params.n;
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (uint i = 0; i < params.n; ++i) {
+            float value = input[base + i];
+            sum += value * value;
+        }
+        shared_inverse[0] = rsqrt(sum / float(params.n) + params.epsilon);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < params.n; i += 256) {
+        output[base + i] = input[base + i] * shared_inverse[0] * weights[i];
+    }
+}
+
 kernel void qx_v2_f32_to_f16(
     device const float* input [[buffer(0)]],
     device half* output [[buffer(1)]],
