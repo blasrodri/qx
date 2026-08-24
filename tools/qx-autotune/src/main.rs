@@ -715,6 +715,7 @@ fn verify_exact_semantics(candidate_path: &PathBuf, reference_path: &PathBuf) ->
                         | qx_format::ExpertRepresentation::Group32Q4RowInlineRows2
                         | qx_format::ExpertRepresentation::Group32Q4RowInlineRows4
                         | qx_format::ExpertRepresentation::Group32Q4RowInlineRows8
+                        | qx_format::ExpertRepresentation::Group32Q4Superblock144
                         | qx_format::ExpertRepresentation::Group32Q4Transaction144
                         | qx_format::ExpertRepresentation::Group32Q4Transaction160
                 )
@@ -729,6 +730,12 @@ fn verify_exact_semantics(candidate_path: &PathBuf, reference_path: &PathBuf) ->
                     ) | (
                         qx_format::ExpertRepresentation::Group32Q4RowMajor,
                         qx_format::ExpertRepresentation::Group32Q4RowInline
+                    ) | (
+                        qx_format::ExpertRepresentation::Group32Q4Superblock144,
+                        qx_format::ExpertRepresentation::Group32Q4RowMajor
+                    ) | (
+                        qx_format::ExpertRepresentation::Group32Q4RowMajor,
+                        qx_format::ExpertRepresentation::Group32Q4Superblock144
                     )
                 )
         };
@@ -754,7 +761,10 @@ fn verify_exact_semantics(candidate_path: &PathBuf, reference_path: &PathBuf) ->
     }
     // Likewise, memory ownership/budget is an evaluated plan dimension, not
     // a reason to reject an otherwise exact transport/dataflow candidate.
-    if candidate_plan.representations.dense != reference_plan.representations.dense {
+    if !compatible_expert_layout(
+        candidate_plan.representations.dense,
+        reference_plan.representations.dense,
+    ) {
         plan_mismatches.push("dense_representation");
     }
     if !compatible_expert_layout(

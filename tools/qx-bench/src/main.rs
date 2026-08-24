@@ -3390,6 +3390,7 @@ fn encode_interference_variant(
                 &weights.input_norm,
                 &weights.qkv,
                 &weights.o_proj,
+                false,
                 position,
             )
             .map_err(anyhow::Error::msg)?;
@@ -4265,6 +4266,7 @@ fn capture_route_trace(
                     &layer_weights.input_norm,
                     &layer_weights.qkv,
                     &layer_weights.o_proj,
+                    false,
                     position,
                 )
                 .map_err(anyhow::Error::msg)?;
@@ -5383,6 +5385,7 @@ fn encode_canonical_pre_moe(
                 &weights.input_norm,
                 &weights.qkv,
                 &weights.o_proj,
+                false,
                 position,
             )
             .map_err(anyhow::Error::msg)?;

@@ -907,6 +907,7 @@ pub mod platform {
         scales: RuntimeBuffer,
         rows: usize,
         columns: usize,
+        layout: PackingLayout,
     }
 
     /// Dense row-major Q4 weights prepared for the SIMD-cooperative control
@@ -955,6 +956,7 @@ pub mod platform {
         v_packed: RuntimeBuffer,
         v_scales: RuntimeBuffer,
         columns: usize,
+        layout: PackingLayout,
     }
 
     pub struct PreparedDynamicQ4Moe {
@@ -1339,18 +1341,26 @@ pub mod platform {
         dense_pipeline: Mutex<Option<Pipeline>>,
         f16_dense_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_library: Mutex<Option<Retained<ProtocolObject<dyn MTLLibrary>>>>,
+        residual_rms_pipeline: Mutex<Option<Pipeline>>,
+        attention_softmax_onepass_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_simd_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_superblock_simd_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_superblock_norm_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_batch_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_weight_stationary_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_sweep_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_norm_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_argmax_superblock_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_argmax_superblock_norm_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_unique_packet_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_unique_packet_norm_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_simd_norm_pipeline: Mutex<Option<Pipeline>>,
+        q4_qkv_superblock_simd_pipeline: Mutex<Option<Pipeline>>,
+        q4_qkv_superblock_norm_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_sweep_pipeline: Mutex<Option<Pipeline>>,
         q4_gemv_pipeline: Mutex<Option<Pipeline>>,
         q4_simd_gemv_pipeline: Mutex<Option<Pipeline>>,
@@ -1360,6 +1370,8 @@ pub mod platform {
         dynamic_moe_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_embedding_pipeline: Mutex<Option<Pipeline>>,
         q4_embedding_batch_pipeline: Mutex<Option<Pipeline>>,
+        q4_embedding_superblock_pipeline: Mutex<Option<Pipeline>>,
+        q4_embedding_superblock_batch_pipeline: Mutex<Option<Pipeline>>,
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
@@ -1447,6 +1459,9 @@ pub mod platform {
             output: &RuntimeBuffer,
             multiplier: f32,
         ) -> Result<(), String> {
+            if prepared.layout != PackingLayout::RowMajor {
+                return Err("scalar Q4 dense only supports row-major weights".to_owned());
+            }
             if input.length < prepared.columns * std::mem::size_of::<f32>()
                 || output.length < prepared.rows * std::mem::size_of::<f32>()
             {
@@ -1517,7 +1532,7 @@ pub mod platform {
             {
                 return Err("V2 SIMD Q4 dense buffer is smaller than its fixed shape".to_owned());
             }
-            if prepared.rows >= 16_384 {
+            if prepared.layout == PackingLayout::RowMajor && prepared.rows >= 16_384 {
                 if let Some((rows_per_simd, simd_groups, cache_input)) = final_head_sweep_geometry()
                 {
                     return self.encode_prepared_q4_dense_sweep_scaled(
@@ -1568,7 +1583,13 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: prepared.rows.div_ceil(8),
+                    width: prepared.rows.div_ceil(
+                        if prepared.layout == PackingLayout::Q4Superblock144 {
+                            16
+                        } else {
+                            8
+                        },
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -1593,6 +1614,9 @@ pub mod platform {
             output: &RuntimeBuffer,
             tokens: usize,
         ) -> Result<(), String> {
+            if prepared.layout != PackingLayout::RowMajor {
+                return Err("batched Q4 dense only supports row-major weights".to_owned());
+            }
             if tokens == 0 {
                 return Err("batched Q4 dense requires at least one token".to_owned());
             }
@@ -1672,6 +1696,11 @@ pub mod platform {
             output: &RuntimeBuffer,
             tokens: usize,
         ) -> Result<(), String> {
+            if prepared.layout != PackingLayout::RowMajor {
+                return Err(
+                    "weight-stationary Q4 verifier only supports row-major weights".to_owned(),
+                );
+            }
             if tokens == 0 || tokens > 4 {
                 return Err("weight-stationary Q4 verifier supports K=1..4".to_owned());
             }
@@ -1759,9 +1788,8 @@ pub mod platform {
             if qkv_weight_stationary_enabled() && tokens > 1 {
                 self.encode_prepared_q4_dense_weight_stationary_batch(q, input, query, tokens)?;
                 self.encode_prepared_q4_dense_weight_stationary_batch(k, input, key, tokens)?;
-                return self.encode_prepared_q4_dense_weight_stationary_batch(
-                    v, input, value, tokens,
-                );
+                return self
+                    .encode_prepared_q4_dense_weight_stationary_batch(v, input, value, tokens);
             }
             self.encode_prepared_q4_dense_simd_batch(q, input, query, tokens)?;
             self.encode_prepared_q4_dense_simd_batch(k, input, key, tokens)?;
@@ -1832,7 +1860,12 @@ pub mod platform {
             {
                 return Err("V2 fused final head buffer is smaller than its fixed shape".to_owned());
             }
-            let partial_count = prepared.rows.div_ceil(8);
+            let rows_per_threadgroup = if prepared.layout == PackingLayout::Q4Superblock144 {
+                32
+            } else {
+                8
+            };
+            let partial_count = prepared.rows.div_ceil(rows_per_threadgroup);
             let partial_bytes = partial_count * 2 * std::mem::size_of::<u32>();
             if partials.length < partial_bytes {
                 return Err(
@@ -1842,7 +1875,13 @@ pub mod platform {
             let columns = prepared.columns as u32;
             let rows = prepared.rows as u32;
             let partial_count_u32 = partial_count as u32;
-            let pipeline = if final_argmax_unique_packet_enabled() {
+            let pipeline = if prepared.layout == PackingLayout::Q4Superblock144 {
+                if norm_weights.is_some() {
+                    context.q4_dense_argmax_superblock_norm_pipeline()?
+                } else {
+                    context.q4_dense_argmax_superblock_pipeline()?
+                }
+            } else if final_argmax_unique_packet_enabled() {
                 if norm_weights.is_some() {
                     context.q4_dense_argmax_unique_packet_norm_pipeline()?
                 } else {
@@ -2109,7 +2148,13 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: prepared.rows.div_ceil(8),
+                    width: prepared.rows.div_ceil(
+                        if prepared.layout == PackingLayout::Q4Superblock144 {
+                            16
+                        } else {
+                            8
+                        },
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -2131,6 +2176,9 @@ pub mod platform {
             key: &RuntimeBuffer,
             value: &RuntimeBuffer,
         ) -> Result<(), String> {
+            if prepared.layout != PackingLayout::RowMajor {
+                return Err("scalar fused QKV only supports row-major weights".to_owned());
+            }
             if input.length < prepared.columns * std::mem::size_of::<f32>()
                 || query.length < 1024 * std::mem::size_of::<f32>()
                 || key.length < 512 * std::mem::size_of::<f32>()
@@ -2215,7 +2263,7 @@ pub mod platform {
             key: &RuntimeBuffer,
             value: &RuntimeBuffer,
         ) -> Result<(), String> {
-            if qkv_split_enabled() {
+            if prepared.layout == PackingLayout::RowMajor && qkv_split_enabled() {
                 return self.encode_prepared_q4_qkv_split(prepared, input, query, key, value);
             }
             if input.length < prepared.columns * std::mem::size_of::<f32>()
@@ -2267,7 +2315,12 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: 2048 / 8,
+                    width: 2048
+                        / if prepared.layout == PackingLayout::Q4Superblock144 {
+                            16
+                        } else {
+                            8
+                        },
                     height: 1,
                     depth: 1,
                 },
@@ -2362,7 +2415,7 @@ pub mod platform {
             key: &RuntimeBuffer,
             value: &RuntimeBuffer,
         ) -> Result<(), String> {
-            if qkv_split_enabled() {
+            if prepared.layout == PackingLayout::RowMajor && qkv_split_enabled() {
                 return self.encode_prepared_q4_qkv_split_normalized(
                     prepared,
                     input,
@@ -2373,7 +2426,7 @@ pub mod platform {
                     value,
                 );
             }
-            if qkv_geometry_enabled() {
+            if prepared.layout == PackingLayout::RowMajor && qkv_geometry_enabled() {
                 return self.encode_prepared_q4_qkv_geometry_normalized(
                     prepared,
                     input,
@@ -2446,7 +2499,12 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: 2048 / 8,
+                    width: 2048
+                        / if prepared.layout == PackingLayout::Q4Superblock144 {
+                            16
+                        } else {
+                            8
+                        },
                     height: 1,
                     depth: 1,
                 },
@@ -2640,8 +2698,7 @@ pub mod platform {
             expert_weights: &RuntimeBuffer,
             output: &RuntimeBuffer,
         ) -> Result<(), String> {
-            if prepared.gate_up_layout.is_q4_superblock()
-                || prepared.down_layout.is_q4_superblock()
+            if prepared.gate_up_layout.is_q4_superblock() || prepared.down_layout.is_q4_superblock()
             {
                 return Err(
                     "Q4 superblocks require the four-stage batched SIMD MoE path".to_owned(),
@@ -2699,7 +2756,7 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: 1,
+                    width: 256,
                     height: 1,
                     depth: 1,
                 },
@@ -2721,8 +2778,7 @@ pub mod platform {
             expert_weights: &RuntimeBuffer,
             output: &RuntimeBuffer,
         ) -> Result<(), String> {
-            if prepared.gate_up_layout.is_q4_superblock()
-                || prepared.down_layout.is_q4_superblock()
+            if prepared.gate_up_layout.is_q4_superblock() || prepared.down_layout.is_q4_superblock()
             {
                 return Err(
                     "Q4 superblocks require the four-stage batched SIMD MoE path".to_owned(),
@@ -2781,7 +2837,7 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: 1,
+                    width: 256,
                     height: 1,
                     depth: 1,
                 },
@@ -3992,7 +4048,7 @@ pub mod platform {
                 self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
                         width: if superblock_gate_up {
-                            8 * (1024 / 16)
+                            8 * (1024 / 32)
                         } else if q4k_mature_gate_up {
                             8 * (1024 / 8)
                         } else if fused_block_active && fused_block_mapping == Some(true) {
@@ -4188,7 +4244,7 @@ pub mod platform {
                 self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
                         width: if superblock_down {
-                            8 * (1024 / 16)
+                            8 * (1024 / 32)
                         } else if q4k_mature_down {
                             8 * (1024 / 8)
                         } else if decode_direct {
@@ -5338,7 +5394,7 @@ pub mod platform {
                     self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
                             width: if superblock_gate_up {
-                                8 * (1024 / 16)
+                                8 * (1024 / 32)
                             } else if q4k_mature_gate_up {
                                 8 * (1024 / 8)
                             } else if two_row_dataflow {
@@ -5517,7 +5573,7 @@ pub mod platform {
                     self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
                             width: if superblock_down {
-                                8 * (1024 / 16)
+                                8 * (1024 / 32)
                             } else if q4k_mature_down {
                                 8 * (1024 / 8)
                             } else if decode_direct {
@@ -5857,7 +5913,7 @@ pub mod platform {
                     depth: 1,
                 },
                 MTLSize {
-                    width: 1,
+                    width: 256,
                     height: 1,
                     depth: 1,
                 },
@@ -6931,7 +6987,35 @@ pub mod platform {
             length: usize,
         ) -> Result<(), String> {
             if attention_softmax_simd_enabled() {
-                return self.encode_attention_softmax_simd(context, scores, length);
+                if length == 0 || length > 512 {
+                    return Err("one-pass attention softmax length is outside 1..=512".to_owned());
+                }
+                let pipeline = context.attention_softmax_onepass_pipeline()?;
+                let length = length as u32;
+                self.encoder.setComputePipelineState(&pipeline);
+                unsafe {
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(&scores.buffer), scores.offset, 0);
+                    self.encoder.setBytes_length_atIndex(
+                        NonNull::from(&length).cast(),
+                        std::mem::size_of_val(&length),
+                        1,
+                    );
+                }
+                self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: 16,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                self.dispatches += 1;
+                return Ok(());
             }
             #[repr(C)]
             struct Params {
@@ -6958,6 +7042,7 @@ pub mod platform {
             )
         }
 
+        #[allow(dead_code)]
         fn encode_attention_softmax_simd(
             &mut self,
             context: &MetalContext,
@@ -7179,6 +7264,56 @@ pub mod platform {
                     depth: 1,
                 },
             )
+        }
+
+        pub fn encode_residual_rms_scalar(
+            &mut self,
+            context: &MetalContext,
+            left: &RuntimeBuffer,
+            right: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            inverse_rms: &RuntimeBuffer,
+            scale: f32,
+        ) -> Result<(), String> {
+            if left.length < 1024 * std::mem::size_of::<f32>()
+                || right.length < 1024 * std::mem::size_of::<f32>()
+                || output.length < 1024 * std::mem::size_of::<f32>()
+                || inverse_rms.length < std::mem::size_of::<f32>()
+            {
+                return Err("residual/RMS buffers are smaller than the fixed shape".to_owned());
+            }
+            let pipeline = context.residual_rms_pipeline()?;
+            self.encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                for (buffer, offset, index) in [
+                    (&left.buffer, left.offset, 0),
+                    (&right.buffer, right.offset, 1),
+                    (&output.buffer, output.offset, 2),
+                    (&inverse_rms.buffer, inverse_rms.offset, 3),
+                ] {
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(buffer), offset, index);
+                }
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&scale).cast(),
+                    std::mem::size_of_val(&scale),
+                    4,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
         }
 
         pub fn encode_residual_batch(
@@ -7571,18 +7706,26 @@ pub mod platform {
                 dense_pipeline: Mutex::new(None),
                 f16_dense_pipeline: Mutex::new(None),
                 q4_dense_library: Mutex::new(None),
+                residual_rms_pipeline: Mutex::new(None),
+                attention_softmax_onepass_pipeline: Mutex::new(None),
                 q4_dense_pipeline: Mutex::new(None),
                 q4_dense_simd_pipeline: Mutex::new(None),
+                q4_dense_superblock_simd_pipeline: Mutex::new(None),
+                q4_dense_superblock_norm_pipeline: Mutex::new(None),
                 q4_dense_batch_simd_pipeline: Mutex::new(None),
                 q4_dense_weight_stationary_pipeline: Mutex::new(None),
                 q4_dense_sweep_pipeline: Mutex::new(None),
                 q4_dense_argmax_pipeline: Mutex::new(None),
                 q4_dense_argmax_norm_pipeline: Mutex::new(None),
+                q4_dense_argmax_superblock_pipeline: Mutex::new(None),
+                q4_dense_argmax_superblock_norm_pipeline: Mutex::new(None),
                 q4_dense_argmax_unique_packet_pipeline: Mutex::new(None),
                 q4_dense_argmax_unique_packet_norm_pipeline: Mutex::new(None),
                 q4_qkv_pipeline: Mutex::new(None),
                 q4_qkv_simd_pipeline: Mutex::new(None),
                 q4_qkv_simd_norm_pipeline: Mutex::new(None),
+                q4_qkv_superblock_simd_pipeline: Mutex::new(None),
+                q4_qkv_superblock_norm_pipeline: Mutex::new(None),
                 q4_qkv_sweep_pipeline: Mutex::new(None),
                 q4_gemv_pipeline: Mutex::new(None),
                 q4_simd_gemv_pipeline: Mutex::new(None),
@@ -7592,6 +7735,8 @@ pub mod platform {
                 dynamic_moe_simd_pipeline: Mutex::new(None),
                 q4_embedding_pipeline: Mutex::new(None),
                 q4_embedding_batch_pipeline: Mutex::new(None),
+                q4_embedding_superblock_pipeline: Mutex::new(None),
+                q4_embedding_superblock_batch_pipeline: Mutex::new(None),
                 argmax_partial_pipeline: Mutex::new(None),
                 argmax_reduce_pipeline: Mutex::new(None),
                 argmax_reduce_partials_pipeline: Mutex::new(None),
@@ -7599,8 +7744,7 @@ pub mod platform {
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
-                    None,
-                    None,
+                    None, None,
                 ]),
                 scratch: Mutex::new(MetalScratch {
                     input_f32: None,
@@ -8146,6 +8290,50 @@ pub mod platform {
             Ok(value)
         }
 
+        fn residual_rms_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .residual_rms_pipeline
+                .lock()
+                .map_err(|_| "Metal residual/RMS pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_residual_rms_scalar");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal residual/RMS function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal residual/RMS pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn attention_softmax_onepass_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .attention_softmax_onepass_pipeline
+                .lock()
+                .map_err(|_| "Metal one-pass attention softmax cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_attention_softmax_onepass_simd");
+            let function = library.newFunctionWithName(&name).ok_or_else(|| {
+                "Metal one-pass attention softmax function was not found".to_owned()
+            })?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| {
+                    "Metal one-pass attention softmax pipeline creation failed".to_owned()
+                })?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
         fn q4_dense_pipeline(&self) -> Result<Pipeline, String> {
             let mut pipeline = self
                 .q4_dense_pipeline
@@ -8184,6 +8372,50 @@ pub mod platform {
                 .device
                 .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|_| "Metal SIMD Q4 dense pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_dense_superblock_simd_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_superblock_simd_pipeline
+                .lock()
+                .map_err(|_| "Metal superblock Q4 dense pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_superblock144_simd_gemv");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal superblock Q4 dense function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal superblock Q4 dense pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_dense_superblock_norm_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_superblock_norm_pipeline
+                .lock()
+                .map_err(|_| "Metal normalized superblock Q4 dense cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_superblock144_norm_simd_gemv");
+            let function = library.newFunctionWithName(&name).ok_or_else(|| {
+                "Metal normalized superblock Q4 dense function was not found".to_owned()
+            })?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| {
+                    "Metal normalized superblock Q4 dense pipeline creation failed".to_owned()
+                })?;
             *pipeline = Some(value.clone());
             Ok(value)
         }
@@ -8356,6 +8588,50 @@ pub mod platform {
             Ok(value)
         }
 
+        fn q4_qkv_superblock_simd_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_qkv_superblock_simd_pipeline
+                .lock()
+                .map_err(|_| "Metal superblock QKV pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_qkv_superblock144_simd_gemv");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal superblock QKV function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal superblock QKV pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_qkv_superblock_norm_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_qkv_superblock_norm_pipeline
+                .lock()
+                .map_err(|_| "Metal normalized superblock QKV cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_qkv_superblock144_norm_simd_gemv");
+            let function = library.newFunctionWithName(&name).ok_or_else(|| {
+                "Metal normalized superblock QKV function was not found".to_owned()
+            })?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| {
+                    "Metal normalized superblock QKV pipeline creation failed".to_owned()
+                })?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
         fn q4_qkv_sweep_pipeline(&self) -> Result<Pipeline, String> {
             let mut pipeline = self
                 .q4_qkv_sweep_pipeline
@@ -8496,6 +8772,60 @@ pub mod platform {
             Ok(value)
         }
 
+        fn q4_embedding_superblock_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_embedding_superblock_pipeline
+                .lock()
+                .map_err(|_| "Metal superblock embedding cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let source = NSString::from_str(Q4_EMBEDDING_KERNEL_SOURCE);
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&source, None)
+                .map_err(|_| "Metal superblock embedding library compilation failed".to_owned())?;
+            let name = NSString::from_str("qx_q4_embedding_superblock144_lookup");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal superblock embedding function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal superblock embedding pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_embedding_superblock_batch_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_embedding_superblock_batch_pipeline
+                .lock()
+                .map_err(|_| "Metal batch superblock embedding cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let source = NSString::from_str(Q4_EMBEDDING_KERNEL_SOURCE);
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&source, None)
+                .map_err(|_| {
+                    "Metal batch superblock embedding library compilation failed".to_owned()
+                })?;
+            let name = NSString::from_str("qx_q4_embedding_superblock144_lookup_batch");
+            let function = library.newFunctionWithName(&name).ok_or_else(|| {
+                "Metal batch superblock embedding function was not found".to_owned()
+            })?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| {
+                    "Metal batch superblock embedding pipeline creation failed".to_owned()
+                })?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
         fn argmax_partial_pipeline(&self) -> Result<Pipeline, String> {
             let mut pipeline = self
                 .argmax_partial_pipeline
@@ -8590,6 +8920,52 @@ pub mod platform {
                 .device
                 .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|_| "Metal normalized Q4 argmax pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_dense_argmax_superblock_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_argmax_superblock_pipeline
+                .lock()
+                .map_err(|_| "Metal superblock Q4 argmax cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_argmax_superblock144_partial");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal superblock Q4 argmax function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal superblock Q4 argmax pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_dense_argmax_superblock_norm_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_argmax_superblock_norm_pipeline
+                .lock()
+                .map_err(|_| {
+                    "Metal normalized superblock Q4 argmax cache is poisoned".to_owned()
+                })?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_argmax_superblock144_norm_partial");
+            let function = library.newFunctionWithName(&name).ok_or_else(|| {
+                "Metal normalized superblock Q4 argmax function was not found".to_owned()
+            })?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| {
+                    "Metal normalized superblock Q4 argmax pipeline creation failed".to_owned()
+                })?;
             *pipeline = Some(value.clone());
             Ok(value)
         }
@@ -8882,23 +9258,44 @@ pub mod platform {
                 scales,
                 rows: weights.rows,
                 columns: weights.cols,
+                layout: PackingLayout::RowMajor,
             })
         }
 
-        /// Prepare a row-major group-32 Q4 dense matrix from views into a
-        /// static artifact slab without reconstructing a QuantizedTensor.
+        /// Prepare a group-32 Q4 dense matrix from views into a static
+        /// artifact slab without reconstructing a QuantizedTensor.
         pub fn prepare_q4_dense_runtime_views(
             &self,
             packed: RuntimeBuffer,
             scales: RuntimeBuffer,
             rows: usize,
             columns: usize,
+            layout: PackingLayout,
         ) -> Result<PreparedQuantizedDense, String> {
             if rows == 0 || columns == 0 || columns % 32 != 0 {
                 return Err("no-copy Q4 dense has an invalid shape".to_owned());
             }
-            let expected_packed = rows * columns / 2;
-            let expected_scales = rows * (columns / 32) * 2;
+            if !matches!(
+                layout,
+                PackingLayout::RowMajor | PackingLayout::Q4Superblock144
+            ) {
+                return Err("no-copy Q4 dense has an unsupported layout".to_owned());
+            }
+            if layout == PackingLayout::Q4Superblock144 && columns % 256 != 0 {
+                return Err(
+                    "no-copy superblock Q4 dense columns must be divisible by 256".to_owned(),
+                );
+            }
+            let expected_packed = if layout == PackingLayout::Q4Superblock144 {
+                rows * (columns / 256) * 144
+            } else {
+                rows * columns / 2
+            };
+            let expected_scales = if layout == PackingLayout::Q4Superblock144 {
+                expected_packed
+            } else {
+                rows * (columns / 32) * 2
+            };
             if packed.length != expected_packed || scales.length != expected_scales {
                 return Err(format!(
                     "no-copy Q4 dense byte lengths are {}/{}, expected {expected_packed}/{expected_scales}",
@@ -8907,15 +9304,24 @@ pub mod platform {
             }
             Ok(PreparedQuantizedDense {
                 pipeline: self.q4_dense_pipeline()?,
-                simd_pipeline: self.q4_dense_simd_pipeline()?,
+                simd_pipeline: if layout == PackingLayout::Q4Superblock144 {
+                    self.q4_dense_superblock_simd_pipeline()?
+                } else {
+                    self.q4_dense_simd_pipeline()?
+                },
                 batch_simd_pipeline: self.q4_dense_batch_simd_pipeline()?,
                 weight_stationary_batch_pipeline: self.q4_dense_weight_stationary_pipeline()?,
                 sweep_pipeline: self.q4_dense_sweep_pipeline()?,
-                simd_norm_pipeline: self.q4_simd_norm_gemv_pipeline()?,
+                simd_norm_pipeline: if layout == PackingLayout::Q4Superblock144 {
+                    self.q4_dense_superblock_norm_pipeline()?
+                } else {
+                    self.q4_simd_norm_gemv_pipeline()?
+                },
                 packed,
                 scales,
                 rows,
                 columns,
+                layout,
             })
         }
 
@@ -9292,13 +9698,23 @@ pub mod platform {
                 || query.columns != 1024
                 || key.columns != 1024
                 || value.columns != 1024
+                || query.layout != key.layout
+                || query.layout != value.layout
             {
                 return Err("fused QKV requires Granite 1024x1024/512 projections".to_owned());
             }
             Ok(PreparedQuantizedQkv {
                 pipeline: self.q4_qkv_pipeline()?,
-                simd_pipeline: self.q4_qkv_simd_pipeline()?,
-                simd_norm_pipeline: self.q4_qkv_simd_norm_pipeline()?,
+                simd_pipeline: if query.layout == PackingLayout::Q4Superblock144 {
+                    self.q4_qkv_superblock_simd_pipeline()?
+                } else {
+                    self.q4_qkv_simd_pipeline()?
+                },
+                simd_norm_pipeline: if query.layout == PackingLayout::Q4Superblock144 {
+                    self.q4_qkv_superblock_norm_pipeline()?
+                } else {
+                    self.q4_qkv_simd_norm_pipeline()?
+                },
                 split_simd_pipeline: self.q4_dense_simd_pipeline()?,
                 split_simd_norm_pipeline: self.q4_simd_norm_gemv_pipeline()?,
                 sweep_pipeline: self.q4_qkv_sweep_pipeline()?,
@@ -9309,6 +9725,7 @@ pub mod platform {
                 v_packed: value.packed.clone(),
                 v_scales: value.scales.clone(),
                 columns: query.columns,
+                layout: query.layout,
             })
         }
 
@@ -10861,8 +11278,16 @@ pub mod platform {
             weights: &PreparedQuantizedDense,
         ) -> Result<PreparedQ4Embedding, String> {
             Ok(PreparedQ4Embedding {
-                pipeline: self.q4_embedding_pipeline()?,
-                batch_pipeline: self.q4_embedding_batch_pipeline()?,
+                pipeline: if weights.layout == PackingLayout::Q4Superblock144 {
+                    self.q4_embedding_superblock_pipeline()?
+                } else {
+                    self.q4_embedding_pipeline()?
+                },
+                batch_pipeline: if weights.layout == PackingLayout::Q4Superblock144 {
+                    self.q4_embedding_superblock_batch_pipeline()?
+                } else {
+                    self.q4_embedding_batch_pipeline()?
+                },
                 packed: weights.packed.clone(),
                 scales: weights.scales.clone(),
                 rows: weights.rows,

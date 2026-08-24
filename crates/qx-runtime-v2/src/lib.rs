@@ -484,6 +484,7 @@ impl PreparedAttentionStack {
                 &weights.input_norm,
                 &weights.qkv,
                 &weights.o_proj,
+                false,
                 position,
             )?;
         }
@@ -557,6 +558,7 @@ impl PreparedAttentionStack {
                 &weights.input_norm,
                 &weights.qkv,
                 &weights.o_proj,
+                layer > 0,
                 position,
             )?;
             let context = buffers.context().as_ref();
@@ -564,12 +566,6 @@ impl PreparedAttentionStack {
                 let inverse_rms = buffers
                     .buffer(BufferId::MoeScratch)
                     .subregion(81_916, std::mem::size_of::<f32>())?;
-                graph.encode_rmsnorm_scalar(
-                    context,
-                    buffers.buffer(output),
-                    &weights.post_attention_norm,
-                    &inverse_rms,
-                )?;
                 graph.encode_prepared_q4_dense_simd_normalized(
                     &weights.router,
                     buffers.buffer(output),
@@ -631,11 +627,12 @@ impl PreparedAttentionStack {
                     buffers.buffer(BufferId::MoeOutput),
                 )?;
             }
-            graph.encode_residual(
+            graph.encode_residual_rms_scalar(
                 context,
                 buffers.buffer(output),
                 buffers.buffer(BufferId::MoeOutput),
                 buffers.buffer(output),
+                buffers.buffer(BufferId::MoeScratch),
                 qx_model::RESIDUAL_MULTIPLIER,
             )?;
             if isolate_moe && layer + 1 < LAYERS && moe_boundary_enabled("cb-exit") {
@@ -682,13 +679,7 @@ impl PreparedAttentionStack {
         if qx_metal::platform::final_argmax_normalized_enabled() {
             let inverse_rms = buffers
                 .buffer(BufferId::MoeScratch)
-                .subregion(81_916, std::mem::size_of::<f32>())?;
-            graph.encode_rmsnorm_scalar(
-                context,
-                buffers.buffer(final_hidden),
-                &self.final_norm,
-                &inverse_rms,
-            )?;
+                .subregion(0, std::mem::size_of::<f32>())?;
             graph.encode_prepared_q4_dense_argmax_normalized(
                 context,
                 &self.embedding,
@@ -3563,12 +3554,15 @@ fn prepare_matrix(
             .ok_or_else(|| format!("dense Q4 artifact is missing {kind:?} for layer {layer}"))?;
         let entry = &artifact.info().entries[index];
         if entry.quant_type != qx_quant::QuantType::Q4
-            || entry.layout != qx_quant::PackingLayout::RowMajor
+            || !matches!(
+                entry.layout,
+                qx_quant::PackingLayout::RowMajor | qx_quant::PackingLayout::Q4Superblock144
+            )
             || entry.rows as usize != rows
             || entry.cols as usize != columns
         {
             return Err(format!(
-                "artifact tensor {kind:?} layer {layer} is not row-major Q4 [{rows}, {columns}]"
+                "artifact tensor {kind:?} layer {layer} is not supported Q4 [{rows}, {columns}]"
             ));
         }
         if let Some(slab) = artifact_slab {
@@ -3580,6 +3574,7 @@ fn prepare_matrix(
                 slab.subregion(scales.start, scales.len())?,
                 rows,
                 columns,
+                entry.layout,
             );
         }
         let quantized = artifact
@@ -4182,6 +4177,7 @@ impl GpuRuntimeBuffers {
         input_norm: &qx_metal::platform::RuntimeBuffer,
         qkv: &qx_metal::platform::PreparedQuantizedQkv,
         o_proj: &qx_metal::platform::PreparedQuantizedDense,
+        inverse_rms_ready: bool,
         position: usize,
     ) -> Result<(), String> {
         if layer >= LAYERS {
@@ -4199,7 +4195,14 @@ impl GpuRuntimeBuffers {
 
         if qx_metal::platform::rms_scalar_qkv_enabled() {
             let inverse_rms = self.buffer(BufferId::MoeScratch);
-            graph.encode_rmsnorm_scalar(context, self.buffer(input), input_norm, inverse_rms)?;
+            if !inverse_rms_ready {
+                graph.encode_rmsnorm_scalar(
+                    context,
+                    self.buffer(input),
+                    input_norm,
+                    inverse_rms,
+                )?;
+            }
             graph.encode_prepared_q4_qkv_simd_normalized(
                 qkv,
                 self.buffer(input),
@@ -4246,11 +4249,15 @@ impl GpuRuntimeBuffers {
             )?;
         }
         graph.encode_prepared_q4_dense_simd(o_proj, attention, projection)?;
-        graph.encode_residual(
+        let router_inverse = self
+            .buffer(BufferId::MoeScratch)
+            .subregion(81_916, std::mem::size_of::<f32>())?;
+        graph.encode_residual_rms_scalar(
             context,
             self.buffer(input),
             projection,
             self.buffer(output),
+            &router_inverse,
             qx_model::RESIDUAL_MULTIPLIER,
         )?;
         Ok(())
@@ -4496,6 +4503,7 @@ mod tests {
                 &norm,
                 &qkv,
                 &o_proj,
+                false,
                 0,
             )
             .unwrap();
@@ -4503,6 +4511,6 @@ mod tests {
         let after = context.metrics().unwrap();
         assert_eq!(after.command_buffers - before.command_buffers, 1);
         assert_eq!(after.encoders - before.encoders, 1);
-        assert_eq!(after.dispatches - before.dispatches, 11);
+        assert_eq!(after.dispatches - before.dispatches, 10);
     }
 }

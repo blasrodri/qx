@@ -66,6 +66,10 @@ struct Args {
     /// row-major the Granite/M5 control even though Tile32 wins in isolation.
     #[arg(long, value_enum, default_value_t = ExpertLayout::RowMajor)]
     expert_layout: ExpertLayout,
+    /// Physical layout for attention, router, and tied embedding/LM-head Q4
+    /// projections.
+    #[arg(long, value_enum, default_value_t = DenseLayout::RowMajor)]
+    dense_layout: DenseLayout,
     /// Four-stage MoE execution candidate. `wide-expert` changes only the
     /// threadgroup mapping; it is never selected without complete-model
     /// evidence by qx-autotune.
@@ -148,6 +152,22 @@ enum ExpertLayout {
     Superblock144,
     #[value(name = "cross-expert-tile8", alias = "cross-expert")]
     CrossExpertTile8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DenseLayout {
+    RowMajor,
+    #[value(name = "superblock-144", alias = "superblock144")]
+    Superblock144,
+}
+
+impl From<DenseLayout> for PackingLayout {
+    fn from(value: DenseLayout) -> Self {
+        match value {
+            DenseLayout::RowMajor => Self::RowMajor,
+            DenseLayout::Superblock144 => Self::Q4Superblock144,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -920,13 +940,15 @@ fn main() -> Result<()> {
                 if shape != [rows, columns] {
                     bail!("tensor {name} has shape {shape:?}, expected [{rows}, {columns}]");
                 }
-                let tensor = QuantizedTensor::quantize(
+                let tensor = QuantizedTensor::quantize_for_layout(
                     &values,
                     rows,
                     columns,
                     QuantType::Q4,
                     args.group_size,
-                );
+                    args.dense_layout.into(),
+                )
+                .map_err(anyhow::Error::msg)?;
                 actual_weight_bytes += tensor.bytes();
                 compiled.push(CompiledTensor {
                     layer: layer as u16,
@@ -946,13 +968,15 @@ fn main() -> Result<()> {
                 qx_model::HIDDEN
             );
         }
-        let tensor = QuantizedTensor::quantize(
+        let tensor = QuantizedTensor::quantize_for_layout(
             &values,
             qx_model::VOCAB,
             qx_model::HIDDEN,
             QuantType::Q4,
             args.group_size,
-        );
+            args.dense_layout.into(),
+        )
+        .map_err(anyhow::Error::msg)?;
         actual_weight_bytes += tensor.bytes();
         compiled.push(CompiledTensor {
             layer: u16::MAX,
@@ -1001,6 +1025,7 @@ fn main() -> Result<()> {
     execution_plan.memory.weight_storage = args.weight_storage.into();
     execution_plan.schedule.command_buffers_per_token = args.command_buffers_per_token;
     execution_plan.schedule.encoders_per_token = args.command_buffers_per_token;
+    execution_plan.schedule.expected_dispatches_per_token = 390;
     let last_dispatch = execution_plan
         .schedule
         .expected_dispatches_per_token
@@ -1071,7 +1096,10 @@ fn main() -> Result<()> {
     execution_plan.representations.dense = if args.experts_only {
         ExpertRepresentation::MixedQ2Q3Q4
     } else {
-        ExpertRepresentation::Group32Q4RowMajor
+        match args.dense_layout {
+            DenseLayout::RowMajor => ExpertRepresentation::Group32Q4RowMajor,
+            DenseLayout::Superblock144 => ExpertRepresentation::Group32Q4Superblock144,
+        }
     };
     execution_plan.topology.moe = match args.moe_variant {
         MoeVariant::FourStage => qx_format::MoeTopology::FourStage,
