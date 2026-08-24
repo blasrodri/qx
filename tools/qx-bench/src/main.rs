@@ -2441,6 +2441,12 @@ fn benchmark_v2_gpu_verifier(
                 .filter(|value| matches!(value.as_str(), "1" | "true" | "yes"))
                 .map(|_| "whole".to_owned())
         });
+    let qkv_probe = std::env::var("QX_V2_VERIFIER_QKV_PROBE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    if moe_probe.is_some() && qkv_probe {
+        bail!("QKV and MoE probes are mutually exclusive");
+    }
     generator
         .set_stage_counters(stage_profile)
         .map_err(anyhow::Error::msg)?;
@@ -2462,6 +2468,7 @@ fn benchmark_v2_gpu_verifier(
         for _ in 0..3 {
             generator.reset();
             generator.clear_moe_probe();
+            generator.clear_qkv_probe();
             let result = generator
                 .verify_tokens_gpu(&inputs, &expected)
                 .map_err(anyhow::Error::msg)?;
@@ -2473,6 +2480,18 @@ fn benchmark_v2_gpu_verifier(
                     expected[width - 1]
                 );
             }
+        }
+        if qkv_probe {
+            generator.reset();
+            generator.set_qkv_capture(true);
+            let result = generator
+                .verify_tokens_gpu(&inputs, &expected)
+                .map_err(anyhow::Error::msg)?;
+            if result.accepted_prefix != width || result.next_token != expected[width - 1] {
+                bail!("K={width} QKV capture baseline failed exact verification");
+            }
+            generator.clear_qkv_probe();
+            generator.set_qkv_replay(true);
         }
         if let Some(probe) = moe_probe.as_deref() {
             generator.reset();

@@ -761,6 +761,7 @@ struct KWideVerifierBuffers {
     expert_output: qx_metal::platform::RuntimeBuffer,
     moe_output: qx_metal::platform::RuntimeBuffer,
     moe_capture: Vec<qx_metal::platform::RuntimeBuffer>,
+    qkv_capture: Vec<qx_metal::platform::RuntimeBuffer>,
     logits_scratch: qx_metal::platform::RuntimeBuffer,
     token_output: qx_metal::platform::RuntimeBuffer,
 }
@@ -794,10 +795,14 @@ impl KWideVerifierBuffers {
         let expert_output = alloc(pair_count * HIDDEN * f32_bytes)?;
         let moe_output = alloc(width * HIDDEN * f32_bytes)?;
         let mut moe_capture = Vec::with_capacity(LAYERS);
+        let mut qkv_capture = Vec::with_capacity(LAYERS);
         for _ in 0..LAYERS {
             // Whole-MoE replay stores one vector per token; gate/up and down
             // probes store one vector per routed expert-token pair.
             moe_capture.push(alloc(width * TOP_K * HIDDEN * f32_bytes)?);
+            qkv_capture.push(alloc(
+                width * (HIDDEN + 2 * KV_HEADS * HEAD_DIM) * f32_bytes,
+            )?);
         }
         // The fused final head uses this only as a partial-max workspace. A
         // full logits matrix is intentionally not allocated for verification.
@@ -836,6 +841,7 @@ impl KWideVerifierBuffers {
             expert_output,
             moe_output,
             moe_capture,
+            qkv_capture,
             logits_scratch,
             token_output,
         })
@@ -991,6 +997,8 @@ pub struct GraniteV2Generator {
     position: usize,
     verifier_moe_capture: bool,
     verifier_moe_replay: bool,
+    verifier_qkv_capture: bool,
+    verifier_qkv_replay: bool,
     verifier_gate_up_capture: bool,
     verifier_gate_up_replay: bool,
     verifier_down_capture: bool,
@@ -1048,6 +1056,8 @@ impl GraniteV2Generator {
             position: 0,
             verifier_moe_capture: false,
             verifier_moe_replay: false,
+            verifier_qkv_capture: false,
+            verifier_qkv_replay: false,
             verifier_gate_up_capture: false,
             verifier_gate_up_replay: false,
             verifier_down_capture: false,
@@ -1136,6 +1146,25 @@ impl GraniteV2Generator {
         self.verifier_gate_up_replay = false;
         self.verifier_down_capture = false;
         self.verifier_down_replay = false;
+    }
+
+    pub fn set_qkv_capture(&mut self, enabled: bool) {
+        self.verifier_qkv_capture = enabled;
+        if enabled {
+            self.verifier_qkv_replay = false;
+        }
+    }
+
+    pub fn set_qkv_replay(&mut self, enabled: bool) {
+        self.verifier_qkv_replay = enabled;
+        if enabled {
+            self.verifier_qkv_capture = false;
+        }
+    }
+
+    pub fn clear_qkv_probe(&mut self) {
+        self.verifier_qkv_capture = false;
+        self.verifier_qkv_replay = false;
     }
 
     pub fn checkpoint_kv(&self) -> KvCheckpoint {
@@ -1354,16 +1383,61 @@ impl GraniteV2Generator {
                     )?;
                 }
             }
-            graph.encode_prepared_q4_qkv_simd_batch(
-                &weights.q_proj,
-                &weights.k_proj,
-                &weights.v_proj,
-                &verifier.normalized,
-                &verifier.query,
-                &verifier.key,
-                &verifier.value,
-                width,
-            )?;
+            let q_bytes = width * HIDDEN * f32_bytes;
+            let kv_bytes = width * KV_HEADS * HEAD_DIM * f32_bytes;
+            if self.verifier_qkv_replay {
+                let capture = &verifier.qkv_capture[layer];
+                graph.encode_copy_f32(
+                    self.context.as_ref(),
+                    &capture.subregion(0, q_bytes)?,
+                    &verifier.query,
+                    width * HIDDEN,
+                )?;
+                graph.encode_copy_f32(
+                    self.context.as_ref(),
+                    &capture.subregion(q_bytes, kv_bytes)?,
+                    &verifier.key,
+                    width * KV_HEADS * HEAD_DIM,
+                )?;
+                graph.encode_copy_f32(
+                    self.context.as_ref(),
+                    &capture.subregion(q_bytes + kv_bytes, kv_bytes)?,
+                    &verifier.value,
+                    width * KV_HEADS * HEAD_DIM,
+                )?;
+            } else {
+                graph.encode_prepared_q4_qkv_simd_batch(
+                    &weights.q_proj,
+                    &weights.k_proj,
+                    &weights.v_proj,
+                    &verifier.normalized,
+                    &verifier.query,
+                    &verifier.key,
+                    &verifier.value,
+                    width,
+                )?;
+                if self.verifier_qkv_capture {
+                    let capture = &verifier.qkv_capture[layer];
+                    graph.encode_copy_f32(
+                        self.context.as_ref(),
+                        &verifier.query,
+                        &capture.subregion(0, q_bytes)?,
+                        width * HIDDEN,
+                    )?;
+                    graph.encode_copy_f32(
+                        self.context.as_ref(),
+                        &verifier.key,
+                        &capture.subregion(q_bytes, kv_bytes)?,
+                        width * KV_HEADS * HEAD_DIM,
+                    )?;
+                    graph.encode_copy_f32(
+                        self.context.as_ref(),
+                        &verifier.value,
+                        &capture.subregion(q_bytes + kv_bytes, kv_bytes)?,
+                        width * KV_HEADS * HEAD_DIM,
+                    )?;
+                }
+            }
             if profile_stages {
                 graph.stage_boundary(self.context.as_ref())?;
             }
