@@ -54,6 +54,38 @@ building a full artifact family. If it does, the next implementation should
 add explicit cluster slabs and bounded Gate/Up/Down consumers, with planner
 selection only after complete-model evidence.
 
+## Down-side execution-only pre-screen
+
+Before adding Gate/Up clusters, the existing row-inline artifact was reused
+with two opt-in Down consumers. They changed only the accumulation loop; no
+cluster packing, interleaving, or new artifact section was introduced:
+
+| Variant | Wall ms/token | GPU ms/token | Equivalent tok/s |
+|---|---:|---:|---:|
+| Canonical control | 4.478 | 4.012 | 223.33 |
+| C=16 Down | 4.413 | 3.932 | 226.59 |
+| C=32 Down | 4.408 | 3.906 | 226.87 |
+
+These are single complete-token fixture runs, so they are not promotion
+evidence. Both candidates passed the full sequential parity gate:
+
+```text
+positions:       0, 1, 7, 31, 63, 127, 255, 511
+max KV key:      0.009853
+max KV value:    0.001048
+max attention:   0.000127
+max logits:      0.009898
+min cosine:      1.000000
+argmax:          8/8
+```
+
+The apparent 0.06–0.07 ms/token improvement is below the 0.15 ms/token
+cluster promotion bar and the short differential runs did not establish the
+required roughly 6.25 us/layer saving. Decision: **retain as an opt-in
+diagnostic, do not emit a clustered artifact, and do not implement Gate/Up
+cluster packing yet**. A future attempt must improve the Down partial-output
+topology, not merely change the loop order.
+
 ## Product lane kept separate
 
 Speculative decoding remains a separate product-throughput lane. It may turn

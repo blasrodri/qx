@@ -195,6 +195,41 @@ pub enum MoeExecutionUnit {
     MoeNeuronCluster { width: u16 },
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantizedConsumer {
+    Canonical,
+    UniquePacket,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoeClusterStorage {
+    MatrixOriented,
+    ClusterSlab,
+    GateUpDownInterleaved,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoeClusterSchedule {
+    SeparateStages,
+    ProducerConsumer,
+}
+
+/// Semantic cluster execution is intentionally independent from physical
+/// storage, packet consumer, and dispatch schedule. This keeps the planner
+/// capable of testing a clustered execution unit with matrix-oriented
+/// storage before committing to an interleaved artifact format.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MoeNeuronClusterPlan {
+    pub width: u16,
+    pub gate_up_consumer: QuantizedConsumer,
+    pub down_consumer: QuantizedConsumer,
+    pub storage: MoeClusterStorage,
+    pub schedule: MoeClusterSchedule,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExpertTraversalPlan {
     pub kind: ExpertTraversalKind,
@@ -278,6 +313,10 @@ pub struct ExecutionPlanManifest {
     /// artifact and Metal consumer are available.
     #[serde(default)]
     pub moe_execution_unit: Option<MoeExecutionUnit>,
+    /// Optional clustered-execution details. This remains absent on all
+    /// executable artifacts until a backend proves the complete path.
+    #[serde(default)]
+    pub moe_neuron_cluster: Option<MoeNeuronClusterPlan>,
     /// Optional physical expert traversal metadata. It is absent on legacy
     /// artifacts and present only when a structural cross-expert stream is
     /// selected by the compiler.
@@ -342,6 +381,7 @@ impl ExecutionPlanManifest {
             moe_consumer: None,
             moe_down_consumer: None,
             moe_execution_unit: None,
+            moe_neuron_cluster: None,
             expert_traversal: None,
             schedule: DispatchSchedule {
                 command_buffers_per_token: 1,

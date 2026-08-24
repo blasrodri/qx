@@ -3362,6 +3362,79 @@ kernel void qx_dynamic_q4_moe_down_inline_unique_packet_simd(
         stream, activated, expert_ids, output, lane, simdgroup, threadgroup_id);
 }
 
+// Down-side neuron-cluster pre-screen. This keeps the existing row-inline
+// storage and output ownership, but changes the accumulation order to consume
+// the activated vector in C-wide intermediate-neuron clusters. It is a
+// deliberately conservative first test: no new artifact packing or fused
+// Gate/Up path is implied. The two widths are compile-time variants so the
+// benchmark can reject the Down-side idea before a cluster format is built.
+inline void qx_dynamic_q4_down_cluster_body(
+    device const uchar* stream,
+    device const float* activated,
+    device const uint* expert_ids,
+    device float* output,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id,
+    uint cluster_width) {
+    constexpr uint hidden = 1024;
+    constexpr uint intermediate = 512;
+    constexpr uint groups = 16;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint row = (threadgroup_id % threadgroups_per_expert) * rows_per_threadgroup + simdgroup;
+    uint expert = expert_ids[slot];
+    float sum = 0.0f;
+    if (expert < 32 && row < hidden) {
+        uint row_base = expert * expert_stride + row * row_stride;
+        for (uint cluster = 0; cluster < intermediate; cluster += cluster_width) {
+            uint cluster_end = min(cluster + cluster_width, intermediate);
+            for (uint column = cluster + lane; column < cluster_end; column += 32) {
+                uint group = column / 32;
+                uint local = column % 32;
+                uint group_base = row_base + group * group_stride;
+                uint code = (uint(stream[group_base + local / 2])
+                    >> ((local % 2) * 4)) & 0xf;
+                sum += float(int(code) - 7)
+                    * qx_q4_inline_scale(stream, group_base + 16)
+                    * activated[slot * intermediate + column];
+            }
+        }
+    }
+    sum = simd_sum(sum);
+    if (lane == 0 && expert < 32 && row < hidden) {
+        output[slot * hidden + row] = sum;
+    }
+}
+
+kernel void qx_dynamic_q4_moe_down_cluster16_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* activated [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    qx_dynamic_q4_down_cluster_body(
+        stream, activated, expert_ids, output, lane, simdgroup, threadgroup_id, 16);
+}
+
+kernel void qx_dynamic_q4_moe_down_cluster32_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* activated [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    qx_dynamic_q4_down_cluster_body(
+        stream, activated, expert_ids, output, lane, simdgroup, threadgroup_id, 32);
+}
+
 // Decode-direct exact-Q4 down projection. It mirrors the gate/up geometry:
 // two SIMD groups per 64-thread threadgroup and one row per group.
 // Activated values and row-inline QX packets are consumed directly; no

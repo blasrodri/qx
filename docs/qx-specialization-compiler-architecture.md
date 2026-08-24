@@ -51,6 +51,11 @@ only a planning surface for now. Cluster candidates must not be emitted as
 executable artifacts until their packed representation, exact consumer, and
 full sequential parity gate exist.
 
+`MoeNeuronClusterPlan` keeps the semantic cluster width independent from its
+`QuantizedConsumer`, `MoeClusterStorage`, and `MoeClusterSchedule`. In
+particular, a clustered execution unit may continue to use matrix-oriented
+storage while the Down-side pre-screen is running.
+
 ## What is deliberately deferred
 
 The following are valuable but should follow statistical sealing of Result #2:

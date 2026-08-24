@@ -390,6 +390,20 @@ pub mod platform {
         })
     }
 
+    /// Experimental Down-side neuron-cluster pre-screen. Accepted values are
+    /// `16` and `32`; the switch is intentionally independent from the sealed
+    /// artifact plan until a complete clustered path exists.
+    pub fn moe_cluster_down_width() -> Option<u32> {
+        static WIDTH: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        *WIDTH.get_or_init(
+            || match std::env::var("QX_V2_MOE_CLUSTER_DOWN").ok()?.as_str() {
+                "16" => Some(16),
+                "32" => Some(32),
+                _ => None,
+            },
+        )
+    }
+
     /// Experimental decode-specific Q4 row-inline mapping candidate. It uses
     /// two SIMD groups per 64-thread threadgroup and computes two output rows
     /// per SIMD group, matching the batch-1 work shape used by the llama audit.
@@ -881,6 +895,8 @@ pub mod platform {
         unique_packet_gate_up_pipeline: Pipeline,
         unique_packet_gate_up_norm_pipeline: Pipeline,
         unique_packet_down_pipeline: Pipeline,
+        cluster_down16_pipeline: Pipeline,
+        cluster_down32_pipeline: Pipeline,
         cross_expert_gate_up_pipeline: Pipeline,
         cross_expert_gate_up_norm_pipeline: Pipeline,
         cross_expert_tile8_gate_up_pipeline: Pipeline,
@@ -4012,6 +4028,14 @@ pub mod platform {
                 && prepared.down_inline_layout
                 && prepared.down_layout == PackingLayout::Q4RowInline
                 && prepared.q3_down_block_bytes.is_none();
+            let cluster_down_width = if prepared.down_inline_layout
+                && prepared.down_layout == PackingLayout::Q4RowInline
+                && prepared.q3_down_block_bytes.is_none()
+            {
+                moe_cluster_down_width()
+            } else {
+                None
+            };
             if input.length < 1024 * 4
                 || expert_ids.length < 8 * 4
                 || expert_weights.length < 8 * 4
@@ -4346,6 +4370,12 @@ pub mod platform {
                     } else if q4k_mature_down {
                         self.encoder
                             .setComputePipelineState(&prepared.q4k_mature_down_pipeline);
+                    } else if let Some(width) = cluster_down_width {
+                        self.encoder.setComputePipelineState(match width {
+                            16 => &prepared.cluster_down16_pipeline,
+                            32 => &prepared.cluster_down32_pipeline,
+                            _ => unreachable!(),
+                        });
                     } else if unique_packet_down {
                         self.encoder
                             .setComputePipelineState(&prepared.unique_packet_down_pipeline);
@@ -7795,6 +7825,10 @@ pub mod platform {
                 unique_packet_down_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_down_inline_unique_packet_simd",
                 )?,
+                cluster_down16_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cluster16_simd")?,
+                cluster_down32_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cluster32_simd")?,
                 gate_up_instrument_load_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_simd",
                 )?,
@@ -8136,6 +8170,10 @@ pub mod platform {
                 unique_packet_down_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_down_inline_unique_packet_simd",
                 )?,
+                cluster_down16_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cluster16_simd")?,
+                cluster_down32_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cluster32_simd")?,
                 gate_up_instrument_load_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_simd",
                 )?,
@@ -8433,6 +8471,10 @@ pub mod platform {
                 unique_packet_down_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_down_inline_unique_packet_simd",
                 )?,
+                cluster_down16_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cluster16_simd")?,
+                cluster_down32_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cluster32_simd")?,
                 gate_up_instrument_load_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_load_unique_packet_simd",
                 )?,
@@ -8810,6 +8852,10 @@ pub mod platform {
                 unique_packet_down_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_down_inline_unique_packet_simd",
                 )?,
+                cluster_down16_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cluster16_simd")?,
+                cluster_down32_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_dynamic_q4_moe_down_cluster32_simd")?,
                 gate_up_instrument_contiguous_load_only_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_contiguous_load_only_simd",
                 )?,
