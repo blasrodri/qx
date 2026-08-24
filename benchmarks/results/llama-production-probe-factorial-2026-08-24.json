@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "status": "instrumentation_invalid_for_shapley",
+  "engine": "llama.cpp",
+  "llama_commit": "1719747",
+  "model": "granite-3.0-1b-a400m-instruct-q4_k_m.gguf",
+  "fixture": {
+    "prefill": 384,
+    "decode_tokens": 128,
+    "batch": 512,
+    "ubatch": 512,
+    "gpu_layers": 99,
+    "flash_attention": true
+  },
+  "capture": "/tmp/qx-granite-probe.bin",
+  "gpu_ledger_us_median": {
+    "T00_real_attention_real_moe": 2530.92,
+    "T10_captured_attention_real_moe": 2355.75,
+    "T01_real_attention_captured_moe": 2654.83,
+    "T11_captured_attention_captured_moe": 1139.90
+  },
+  "graph_nodes_observed": {
+    "T00": [1471],
+    "T10": [1471],
+    "T01": [1495],
+    "T11": [805, 690]
+  },
+  "command_buffers_observed": 2,
+  "interaction": null,
+  "rejection_reason": "T11 changes graph pruning/scheduler partitioning and alternates graph shape; raw T11 timing is not a production-preserving replacement measurement.",
+  "next_fix": "Use a production-preserving GPU boundary instrument or a replacement scaffold whose scheduled graph and command-buffer partition remain identical in all four cells."
+}
