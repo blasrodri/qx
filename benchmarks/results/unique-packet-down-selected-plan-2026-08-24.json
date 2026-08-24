@@ -1,0 +1,172 @@
+{
+  "schema_version": 1,
+  "plan_id": "granite-m5-top8-rowinline-unique-packet",
+  "model_id": "ibm-granite-3.0-1b-a400m-instruct",
+  "target": {
+    "target_id": "apple-m5-pro",
+    "gpu_family": "apple-m5-pro",
+    "os_version": "",
+    "physical_memory_bytes": 0,
+    "max_threads_per_threadgroup": 1024
+  },
+  "workload": {
+    "batch": 1,
+    "context_limit": 512,
+    "generation": 128,
+    "sampling": "greedy"
+  },
+  "quality_budget": {
+    "max_relative_ppl_delta": 0.01,
+    "max_domain_relative_ppl_delta": 0.02
+  },
+  "memory": {
+    "budget_bytes": 838860800,
+    "predicted_peak_bytes": 801639360,
+    "weight_storage": "mmap_no_copy",
+    "page_alignment": 16384
+  },
+  "representations": {
+    "gate_up": "group32_q4_row_inline",
+    "down": "group32_q4_row_inline",
+    "dense": "group32_q4_row_major"
+  },
+  "topology": {
+    "qkv": "fused",
+    "input_rms": "scalar_consumer",
+    "post_attention_rms": "scalar_consumer",
+    "rope_kv": "split_direct",
+    "attention": "hierarchical_gqa",
+    "moe": "four_stage",
+    "kv_precision": "fp32"
+  },
+  "moe_mapping": "qx",
+  "moe_consumer": "unique-packet",
+  "expert_traversal": null,
+  "schedule": {
+    "command_buffers_per_token": 1,
+    "encoders_per_token": 1,
+    "expected_dispatches_per_token": 461,
+    "internal_cpu_waits": 0
+  },
+  "arena": {
+    "arena_bytes": 406784,
+    "kv_bytes": 50331648,
+    "no_decode_allocations": true,
+    "regions": [
+      {
+        "name": "HiddenA",
+        "offset": 0,
+        "length": 4096,
+        "live_from_dispatch": 0,
+        "live_through_dispatch": 460
+      },
+      {
+        "name": "HiddenB",
+        "offset": 4096,
+        "length": 4096,
+        "live_from_dispatch": 0,
+        "live_through_dispatch": 460
+      },
+      {
+        "name": "Query",
+        "offset": 8192,
+        "length": 4096,
+        "live_from_dispatch": 1,
+        "live_through_dispatch": 457
+      },
+      {
+        "name": "Key",
+        "offset": 12288,
+        "length": 2048,
+        "live_from_dispatch": 1,
+        "live_through_dispatch": 457
+      },
+      {
+        "name": "Value",
+        "offset": 14336,
+        "length": 2048,
+        "live_from_dispatch": 1,
+        "live_through_dispatch": 457
+      },
+      {
+        "name": "Attention",
+        "offset": 16384,
+        "length": 4096,
+        "live_from_dispatch": 1,
+        "live_through_dispatch": 457
+      },
+      {
+        "name": "AttentionScratch",
+        "offset": 20480,
+        "length": 32768,
+        "live_from_dispatch": 1,
+        "live_through_dispatch": 457
+      },
+      {
+        "name": "MoeInput",
+        "offset": 53248,
+        "length": 4096,
+        "live_from_dispatch": 1,
+        "live_through_dispatch": 457
+      },
+      {
+        "name": "RouterScores",
+        "offset": 57344,
+        "length": 128,
+        "live_from_dispatch": 1,
+        "live_through_dispatch": 457
+      },
+      {
+        "name": "TopKIds",
+        "offset": 57600,
+        "length": 32,
+        "live_from_dispatch": 1,
+        "live_through_dispatch": 457
+      },
+      {
+        "name": "TopKWeights",
+        "offset": 57856,
+        "length": 32,
+        "live_from_dispatch": 1,
+        "live_through_dispatch": 457
+      },
+      {
+        "name": "MoeScratch",
+        "offset": 58112,
+        "length": 147456,
+        "live_from_dispatch": 1,
+        "live_through_dispatch": 457
+      },
+      {
+        "name": "MoeOutput",
+        "offset": 205568,
+        "length": 4096,
+        "live_from_dispatch": 1,
+        "live_through_dispatch": 457
+      },
+      {
+        "name": "Logits",
+        "offset": 209664,
+        "length": 196620,
+        "live_from_dispatch": 458,
+        "live_through_dispatch": 460
+      },
+      {
+        "name": "TokenOutput",
+        "offset": 406528,
+        "length": 4,
+        "live_from_dispatch": 0,
+        "live_through_dispatch": 460
+      }
+    ]
+  },
+  "sparse_experts": {
+    "kind": "top8"
+  },
+  "provenance": {
+    "compiler_revision": "9fec9f8df0d4a3b3c37282e882d339719cb3d86b+dirty",
+    "calibration_hash": "",
+    "evaluation_hash": "",
+    "benchmark_contract_hash": ""
+  }
+}

@@ -58,6 +58,36 @@ five context-512 fixtures. Promotion requires a repeatable complete-token
 win and the same 0–511 parity gate; fixed-route or single-run speedups are
 diagnostic only.
 
+## 20-round paired result (2026-08-24)
+
+The full five-fixture suite was run for 20 randomized pairs on battery power.
+The machine stayed within the normal performance regime, but this remains a
+power-source-qualified result rather than an AC reference benchmark.
+
+```text
+selected plan:        granite-m5-top8-rowinline-unique-packet
+control median wall:  4.467985 ms/token
+candidate median:     4.473212 ms/token
+control median GPU:   3.998893 ms/token
+candidate median GPU: 4.005573 ms/token
+```
+
+The candidate was exact-equivalent, but did not win consistently:
+
+| Fixture | Pairs | Median candidate-control wall delta | Bootstrap 95% CI | Candidate win rate |
+|---|---:|---:|---:|---:|
+| General | 20 | -0.0018 ms | [-0.0679, 0.0238] | 50% |
+| Instruction | 20 | +0.0107 ms | [-0.0153, 0.0598] | 40% |
+| Code | 20 | +0.0070 ms | [-0.0142, 0.0586] | 35% |
+| Reasoning | 20 | +0.0044 ms | [-0.0373, 0.0359] | 40% |
+| Chat | 20 | -0.0066 ms | [-0.0407, 0.0182] | 65% |
+
+Decision: **reject for promotion and retain the gate/up-only unique-packet
+plan**. The down consumer is not materially harmful, but its complete-model
+effect is statistically indistinguishable from noise and does not clear the
+0.10 ms promotion threshold. Its exact implementation remains useful as a
+negative compiler record.
+
 The generated down-consumer artifact is intentionally not checked into Git;
 the reproducible compiler command is:
 
@@ -72,4 +102,3 @@ target/release/qx-compile \
   --plan-id granite-m5-top8-rowinline-unique-packet-down \
   --output external/models/granite-m5-pro-q4-rowinline-unique-packet-down.qx
 ```
-
