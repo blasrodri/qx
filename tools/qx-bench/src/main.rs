@@ -90,6 +90,9 @@ struct Args {
     /// Benchmark representative artifact Q4 GEMV stages on Metal.
     #[arg(long)]
     v2_kernel_bench: bool,
+    /// Benchmark the real K-wide Q4 projection primitive used by the verifier.
+    #[arg(long)]
+    v2_batch_kernel_bench: bool,
     /// Profile each major fixed-shape V2 GPU kernel independently.
     #[arg(long)]
     v2_kernel_profile: bool,
@@ -353,6 +356,13 @@ fn main() -> Result<()> {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--v2-kernel-bench requires an artifact path"))?;
         return benchmark_v2_kernel(artifact, args.iterations);
+    }
+    if args.v2_batch_kernel_bench {
+        let artifact = args
+            .artifact
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--v2-batch-kernel-bench requires an artifact path"))?;
+        return benchmark_v2_batch_kernel(artifact, args.iterations);
     }
     if args.v2_kernel_profile {
         let artifact = args
@@ -706,6 +716,150 @@ fn main() -> Result<()> {
     #[cfg(target_os = "macos")]
     benchmark_gpu_expert(&expert, args.iterations, info)?;
     println!("note:           CPU reference and, on macOS, real Metal dispatch");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn benchmark_v2_batch_kernel(artifact_path: &std::path::Path, iterations: usize) -> Result<()> {
+    use std::rc::Rc;
+
+    if iterations == 0 {
+        bail!("batch kernel benchmark iterations must be positive");
+    }
+    let artifact = MappedArtifact::open(artifact_path)?;
+    let context = Rc::new(
+        qx_metal::platform::MetalContext::system_default()
+            .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
+    );
+    let q_index = artifact
+        .info()
+        .entries
+        .iter()
+        .position(|entry| {
+            entry.layer == 0 && entry.expert == u8::MAX && entry.kind == TensorKind::QProj
+        })
+        .ok_or_else(|| anyhow::anyhow!("artifact Q projection not found"))?;
+    let q_tensor = artifact.quantized_tensor(q_index)?;
+    if q_tensor.rows != HIDDEN || q_tensor.cols != HIDDEN {
+        bail!("artifact Q projection is not the expected {HIDDEN}x{HIDDEN} shape");
+    }
+    let prepared = context
+        .prepare_q4_dense(&q_tensor)
+        .map_err(anyhow::Error::msg)?;
+    let input_one = context
+        .allocate_runtime_buffer(HIDDEN * std::mem::size_of::<f32>())
+        .map_err(anyhow::Error::msg)?;
+    let scalar_output = context
+        .allocate_runtime_buffer(HIDDEN * std::mem::size_of::<f32>())
+        .map_err(anyhow::Error::msg)?;
+    let batch_output = context
+        .allocate_runtime_buffer(HIDDEN * std::mem::size_of::<f32>())
+        .map_err(anyhow::Error::msg)?;
+    let ones = vec![1.0_f32; HIDDEN];
+    let ones_bytes = unsafe {
+        std::slice::from_raw_parts(
+            ones.as_ptr() as *const u8,
+            std::mem::size_of_val(ones.as_slice()),
+        )
+    };
+    context
+        .write_runtime_buffer(&input_one, ones_bytes)
+        .map_err(anyhow::Error::msg)?;
+    let mut scalar_graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+    scalar_graph
+        .encode_prepared_q4_dense_simd(&prepared, &input_one, &scalar_output)
+        .map_err(anyhow::Error::msg)?;
+    scalar_graph
+        .finish(context.as_ref())
+        .map_err(anyhow::Error::msg)?;
+    let mut batch_graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+    batch_graph
+        .encode_prepared_q4_dense_simd_batch(&prepared, &input_one, &batch_output, 1)
+        .map_err(anyhow::Error::msg)?;
+    batch_graph
+        .finish(context.as_ref())
+        .map_err(anyhow::Error::msg)?;
+    let scalar_values = context
+        .read_runtime_f32(&scalar_output, HIDDEN)
+        .map_err(anyhow::Error::msg)?;
+    let batch_values = context
+        .read_runtime_f32(&batch_output, HIDDEN)
+        .map_err(anyhow::Error::msg)?;
+    let max_abs = scalar_values
+        .iter()
+        .zip(batch_values.iter())
+        .map(|(scalar, batch)| (scalar - batch).abs())
+        .fold(0.0_f32, f32::max);
+    println!("K=1 numerical max_abs_error: {max_abs:.8}");
+    println!("QX V2 K-wide Q4 projection benchmark");
+    println!("artifact: {}", artifact_path.display());
+    println!("iterations: {iterations} (warmup 3)");
+    println!("width  GPU us  wall us  GPU/proposed  dispatches  input/output");
+
+    for tokens in [1_usize, 2, 4] {
+        let input_values = vec![1.0_f32; tokens * HIDDEN];
+        let input = context
+            .allocate_runtime_buffer(std::mem::size_of_val(input_values.as_slice()))
+            .map_err(anyhow::Error::msg)?;
+        let output = context
+            .allocate_runtime_buffer(tokens * HIDDEN * std::mem::size_of::<f32>())
+            .map_err(anyhow::Error::msg)?;
+        let input_bytes = unsafe {
+            std::slice::from_raw_parts(
+                input_values.as_ptr() as *const u8,
+                std::mem::size_of_val(input_values.as_slice()),
+            )
+        };
+        context
+            .write_runtime_buffer(&input, input_bytes)
+            .map_err(anyhow::Error::msg)?;
+        for _ in 0..3 {
+            let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+            graph
+                .encode_prepared_q4_dense_simd_batch(&prepared, &input, &output, tokens)
+                .map_err(anyhow::Error::msg)?;
+            graph.finish(context.as_ref()).map_err(anyhow::Error::msg)?;
+        }
+        let batch_values = context
+            .read_runtime_f32(&output, tokens * HIDDEN)
+            .map_err(anyhow::Error::msg)?;
+        let max_abs = batch_values
+            .chunks_exact(HIDDEN)
+            .flat_map(|values| values.iter().zip(scalar_values.iter()))
+            .map(|(batch, scalar)| (batch - scalar).abs())
+            .fold(0.0_f32, f32::max);
+        println!("K={tokens} numerical max_abs_error: {max_abs:.8}");
+        if max_abs > 1.0e-5 {
+            bail!(
+                "K={tokens} batched projection is not numerically equivalent to scalar projection"
+            );
+        }
+        let mut gpu_samples = Vec::with_capacity(iterations);
+        let mut wall_samples = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let before = context.metrics().map_err(anyhow::Error::msg)?;
+            let start = Instant::now();
+            let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+            graph
+                .encode_prepared_q4_dense_simd_batch(&prepared, &input, &output, tokens)
+                .map_err(anyhow::Error::msg)?;
+            graph.finish(context.as_ref()).map_err(anyhow::Error::msg)?;
+            let after = context.metrics().map_err(anyhow::Error::msg)?;
+            gpu_samples
+                .push((after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1_000_000.0);
+            wall_samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+        }
+        let stats = summarize_kernel_samples(&mut gpu_samples, &mut wall_samples);
+        println!(
+            "{tokens:>5} {:>8.2} {:>8.2} {:>12.2} {:>11} {:>7}x{}",
+            stats.gpu_median_us,
+            stats.wall_median_us,
+            stats.gpu_median_us / tokens as f64,
+            1,
+            tokens,
+            HIDDEN,
+        );
+    }
     Ok(())
 }
 

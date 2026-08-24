@@ -64,6 +64,49 @@ kernel void qx_q4_dense_simd_gemv(
     }
 }
 
+// K-wide verifier projection. Inputs and outputs are token-major:
+// input[token * columns + column] and output[token * rows + row]. A
+// threadgroup owns eight output rows for one candidate token, so the packed
+// weight stream is reused across K threadgroups without calling the scalar
+// decode graph K times.
+kernel void qx_q4_dense_simd_gemm_k(
+    device const uchar* packed [[buffer(0)]],
+    device const half* scales [[buffer(1)]],
+    device const float* input [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& columns [[buffer(4)]],
+    constant float& multiplier [[buffer(5)]],
+    constant uint& rows [[buffer(6)]],
+    constant uint& tokens [[buffer(7)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint3 threadgroup_id [[threadgroup_position_in_grid]]) {
+    constexpr uint group_size = 32;
+    constexpr uint bytes_per_group = 16;
+    constexpr int qmax = 7;
+    constexpr uint rows_per_threadgroup = 8;
+    uint token = threadgroup_id.y;
+    uint row = threadgroup_id.x * rows_per_threadgroup + simdgroup;
+    if (token >= tokens || row >= rows) return;
+
+    uint groups = (columns + group_size - 1) / group_size;
+    uint packed_row_base = row * groups * bytes_per_group;
+    uint input_base = token * columns;
+    float sum = 0.0f;
+    for (uint column = lane; column < columns; column += 32) {
+        uint group = column / group_size;
+        uint local = column % group_size;
+        uchar byte = packed[packed_row_base + group * bytes_per_group + local / 2];
+        uint code = (byte >> ((local % 2) * 4)) & 0xf;
+        float weight = float(int(code) - qmax) * float(scales[row * groups + group]);
+        sum += weight * input[input_base + column];
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) {
+        output[token * rows + row] = sum * multiplier;
+    }
+}
+
 // Exact greedy-decode vocabulary projection. Each SIMD group computes one
 // vocabulary row, and the threadgroup emits only its best (value, token)
 // pair. This avoids materializing and rereading the full logits vector when

@@ -2887,9 +2887,7 @@ pub fn compact_verifier_routes(
             if expert as usize >= EXPERTS {
                 return Err(format!(
                     "verifier route expert {} at token {} is outside 0..{}",
-                    expert,
-                    token_index,
-                    EXPERTS
+                    expert, token_index, EXPERTS
                 ));
             }
             buckets[expert as usize].pairs.push(VerifierRoutePair {
@@ -3366,10 +3364,8 @@ mod tests {
     #[test]
     fn verifier_routes_are_compacted_expert_major_without_reordering_tokens() {
         let ids = vec![
-            3, 5, 3, 7, 5, 9, 12, 3,
-            5, 7, 12, 15, 3, 5, 7, 12,
-            3, 5, 7, 12, 3, 5, 7, 12,
-            3, 5, 7, 12, 3, 5, 7, 12,
+            3, 5, 3, 7, 5, 9, 12, 3, 5, 7, 12, 15, 3, 5, 7, 12, 3, 5, 7, 12, 3, 5, 7, 12, 3, 5, 7,
+            12, 3, 5, 7, 12,
         ];
         let weights = (0..ids.len()).map(|index| index as f32).collect::<Vec<_>>();
         let buckets = compact_verifier_routes(VerifierWidth::K4, &ids, &weights).unwrap();
@@ -3377,13 +3373,19 @@ mod tests {
         assert_eq!(buckets.last().map(|bucket| bucket.expert), Some(15));
         let expert_three = buckets.iter().find(|bucket| bucket.expert == 3).unwrap();
         assert_eq!(
-            expert_three.pairs.iter().map(|pair| pair.token_index).collect::<Vec<_>>(),
+            expert_three
+                .pairs
+                .iter()
+                .map(|pair| pair.token_index)
+                .collect::<Vec<_>>(),
             vec![0, 0, 0, 1, 2, 2, 3, 3]
         );
-        assert!(buckets
-            .iter()
-            .flat_map(|bucket| bucket.pairs.iter())
-            .all(|pair| pair.expert < EXPERTS as u16));
+        assert!(
+            buckets
+                .iter()
+                .flat_map(|bucket| bucket.pairs.iter())
+                .all(|pair| pair.expert < EXPERTS as u16)
+        );
     }
 
     #[test]

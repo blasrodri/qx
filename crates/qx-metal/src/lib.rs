@@ -827,6 +827,7 @@ pub mod platform {
         simd_pipeline: Pipeline,
         sweep_pipeline: Pipeline,
         simd_norm_pipeline: Pipeline,
+        batch_simd_pipeline: Pipeline,
         packed: RuntimeBuffer,
         scales: RuntimeBuffer,
         rows: usize,
@@ -1246,6 +1247,7 @@ pub mod platform {
         q4_dense_library: Mutex<Option<Retained<ProtocolObject<dyn MTLLibrary>>>>,
         q4_dense_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_simd_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_batch_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_sweep_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_norm_pipeline: Mutex<Option<Pipeline>>,
@@ -1472,6 +1474,89 @@ pub mod platform {
                 MTLSize {
                     width: prepared.rows.div_ceil(8),
                     height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        /// Encode a real K-position Q4 projection. Inputs and outputs are
+        /// token-major `[tokens, columns]` and `[tokens, rows]`; this is the
+        /// first verifier primitive and is intentionally not implemented as
+        /// K calls to the scalar decode path.
+        pub fn encode_prepared_q4_dense_simd_batch(
+            &mut self,
+            prepared: &PreparedQuantizedDense,
+            input: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            tokens: usize,
+        ) -> Result<(), String> {
+            if tokens == 0 {
+                return Err("batched Q4 dense requires at least one token".to_owned());
+            }
+            if input.length < tokens * prepared.columns * std::mem::size_of::<f32>()
+                || output.length < tokens * prepared.rows * std::mem::size_of::<f32>()
+            {
+                return Err(
+                    "batched Q4 dense buffers are smaller than their fixed shape".to_owned(),
+                );
+            }
+            self.encoder
+                .setComputePipelineState(&prepared.batch_simd_pipeline);
+            let columns = prepared.columns as u32;
+            let rows = prepared.rows as u32;
+            let token_count = tokens as u32;
+            let multiplier = 1.0_f32;
+            unsafe {
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.packed.buffer),
+                    prepared.packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.scales.buffer),
+                    prepared.scales.offset,
+                    1,
+                );
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 2);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&output.buffer), output.offset, 3);
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&columns).cast(),
+                    std::mem::size_of_val(&columns),
+                    4,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&multiplier).cast(),
+                    std::mem::size_of_val(&multiplier),
+                    5,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&rows).cast(),
+                    std::mem::size_of_val(&rows),
+                    6,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&token_count).cast(),
+                    std::mem::size_of_val(&token_count),
+                    7,
+                );
+            }
+            // The kernel assigns one threadgroup to eight output rows.  Use
+            // an explicit threadgroup grid, matching the scalar GEMV path,
+            // rather than dispatchThreads' partial-group semantics.  This
+            // also makes the token dimension an exact workgroup coordinate.
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: prepared.rows.div_ceil(8),
+                    height: tokens,
                     depth: 1,
                 },
                 MTLSize {
@@ -6092,6 +6177,7 @@ pub mod platform {
                 q4_dense_library: Mutex::new(None),
                 q4_dense_pipeline: Mutex::new(None),
                 q4_dense_simd_pipeline: Mutex::new(None),
+                q4_dense_batch_simd_pipeline: Mutex::new(None),
                 q4_dense_sweep_pipeline: Mutex::new(None),
                 q4_dense_argmax_pipeline: Mutex::new(None),
                 q4_dense_argmax_norm_pipeline: Mutex::new(None),
@@ -6702,6 +6788,27 @@ pub mod platform {
             Ok(value)
         }
 
+        fn q4_dense_batch_simd_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_batch_simd_pipeline
+                .lock()
+                .map_err(|_| "Metal batched Q4 dense pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_simd_gemm_k");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal batched Q4 dense function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal batched Q4 dense pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
         fn q4_dense_sweep_pipeline(&self) -> Result<Pipeline, String> {
             let mut pipeline = self
                 .q4_dense_sweep_pipeline
@@ -7301,6 +7408,7 @@ pub mod platform {
             Ok(PreparedQuantizedDense {
                 pipeline: self.q4_dense_pipeline()?,
                 simd_pipeline: self.q4_dense_simd_pipeline()?,
+                batch_simd_pipeline: self.q4_dense_batch_simd_pipeline()?,
                 sweep_pipeline: self.q4_dense_sweep_pipeline()?,
                 simd_norm_pipeline: self.q4_simd_norm_gemv_pipeline()?,
                 packed,
@@ -7333,6 +7441,7 @@ pub mod platform {
             Ok(PreparedQuantizedDense {
                 pipeline: self.q4_dense_pipeline()?,
                 simd_pipeline: self.q4_dense_simd_pipeline()?,
+                batch_simd_pipeline: self.q4_dense_batch_simd_pipeline()?,
                 sweep_pipeline: self.q4_dense_sweep_pipeline()?,
                 simd_norm_pipeline: self.q4_simd_norm_gemv_pipeline()?,
                 packed,
