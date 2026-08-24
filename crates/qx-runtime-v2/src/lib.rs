@@ -739,7 +739,6 @@ pub struct PreparedMoeStack {
 
 #[cfg(target_os = "macos")]
 struct KWideVerifierBuffers {
-    pair_count: usize,
     tokens: qx_metal::platform::RuntimeBuffer,
     hidden_a: qx_metal::platform::RuntimeBuffer,
     hidden_b: qx_metal::platform::RuntimeBuffer,
@@ -815,7 +814,6 @@ impl KWideVerifierBuffers {
         };
         context.write_runtime_buffer(&route_tokens, route_bytes)?;
         Ok(Self {
-            pair_count,
             tokens,
             hidden_a,
             hidden_b,
@@ -1303,6 +1301,10 @@ impl GraniteV2Generator {
                 self.context_length()
             ));
         }
+        // Buffers are allocated for the maximum verifier width, but the
+        // route schedule must describe only the active width. Reusing the
+        // capacity-sized pair count would make K=2 consume stale K=4 routes.
+        let pair_count = width * TOP_K;
         let verifier = &self.verifier_buffers;
         let token_bytes = unsafe {
             std::slice::from_raw_parts(inputs.as_ptr() as *const u8, std::mem::size_of_val(inputs))
@@ -1488,7 +1490,7 @@ impl GraniteV2Generator {
                     &verifier.topk_ids,
                     &verifier.bucket_counts,
                     &verifier.bucket_pairs,
-                    verifier.pair_count,
+                    pair_count,
                     &verifier.active_experts,
                     &verifier.gate_up_dispatch_args,
                 )?;
@@ -1508,7 +1510,7 @@ impl GraniteV2Generator {
                     &verifier.topk_ids,
                     &verifier.bucket_counts,
                     &verifier.bucket_pairs,
-                    verifier.pair_count,
+                    pair_count,
                     &verifier.active_experts,
                     &verifier.gate_up_dispatch_args,
                 )?;
@@ -1517,7 +1519,7 @@ impl GraniteV2Generator {
                         self.context.as_ref(),
                         &verifier.moe_capture[layer],
                         &verifier.gate_up,
-                        verifier.pair_count * 1024,
+                        pair_count * 1024,
                     )?;
                 } else {
                     graph.encode_verifier_q4_gate_up_compact_unique_packet(
@@ -1527,7 +1529,7 @@ impl GraniteV2Generator {
                         &verifier.bucket_pairs,
                         &verifier.route_tokens,
                         &verifier.gate_up,
-                        verifier.pair_count,
+                        pair_count,
                         &verifier.active_experts,
                         &verifier.gate_up_dispatch_args,
                     )?;
@@ -1537,21 +1539,21 @@ impl GraniteV2Generator {
                         self.context.as_ref(),
                         &verifier.gate_up,
                         &verifier.moe_capture[layer],
-                        verifier.pair_count * 1024,
+                        pair_count * 1024,
                     )?;
                 }
                 graph.encode_verifier_q4_silu_batch(
                     prepared,
                     &verifier.gate_up,
                     &verifier.activated,
-                    verifier.pair_count,
+                    pair_count,
                 )?;
                 if self.verifier_down_replay {
                     graph.encode_copy_f32(
                         self.context.as_ref(),
                         &verifier.moe_capture[layer],
                         &verifier.expert_output,
-                        verifier.pair_count * 1024,
+                        pair_count * 1024,
                     )?;
                 } else {
                     graph.encode_verifier_q4_down_batch(
@@ -1559,7 +1561,7 @@ impl GraniteV2Generator {
                         &verifier.topk_ids,
                         &verifier.activated,
                         &verifier.expert_output,
-                        verifier.pair_count,
+                        pair_count,
                     )?;
                 }
                 if self.verifier_down_capture {
@@ -1567,7 +1569,7 @@ impl GraniteV2Generator {
                         self.context.as_ref(),
                         &verifier.expert_output,
                         &verifier.moe_capture[layer],
-                        verifier.pair_count * 1024,
+                        pair_count * 1024,
                     )?;
                 }
                 graph.encode_verifier_q4_accumulate_batch(
@@ -1576,7 +1578,7 @@ impl GraniteV2Generator {
                     &verifier.route_tokens,
                     &verifier.topk_weights,
                     &verifier.moe_output,
-                    verifier.pair_count,
+                    pair_count,
                     width,
                 )?;
             }
