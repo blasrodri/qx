@@ -1,5 +1,10 @@
 # GPU-resident greedy rollout
 
+> Historical discovery report. The instrumented multi-context sweep in
+> `qx-canonical-gpu-rollout-2026-08-24.md` supersedes the depth-4 selection:
+> canonical M5 Pro greedy rollout is depth 2, and EOS now synchronizes at chunk
+> boundaries.
+
 ## Result
 
 QX can now enqueue multiple exact greedy-decode token graphs without waiting

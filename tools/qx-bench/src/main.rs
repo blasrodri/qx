@@ -173,8 +173,8 @@ struct Args {
     v2_token: bool,
     /// Keep this many complete token graphs in flight. Values greater than one
     /// use GPU-resident argmax-to-embedding rollout without a per-token wait.
-    #[arg(long, default_value_t = 1)]
-    v2_rollout_window: usize,
+    #[arg(long)]
+    v2_rollout_window: Option<usize>,
     /// Hash the final GPU KV arena after timing to verify rollout equivalence.
     #[arg(long, requires = "v2_token")]
     v2_rollout_verify: bool,
@@ -211,6 +211,10 @@ struct Args {
     /// Run a real llama.cpp draft against the QX K-wide verifier.
     #[arg(long)]
     v2_speculative: bool,
+    /// Measure llama.cpp token-at-a-time greedy decode over the exact raw-token
+    /// fixture used by QX. This includes synchronization and CPU argmax.
+    #[arg(long, requires = "draft_gguf")]
+    llama_greedy: bool,
     /// Compatible draft GGUF consumed by the llama.cpp draft backend.
     #[arg(long)]
     draft_gguf: Option<PathBuf>,
@@ -388,6 +392,20 @@ fn main() -> Result<()> {
     }
     if args.v2_metal_kernel_inventory {
         return print_v2_metal_kernel_inventory();
+    }
+    if args.llama_greedy {
+        let fixture = args.fixture.as_deref().map(load_fixture).transpose()?;
+        return benchmark_llama_greedy(
+            args.draft_gguf
+                .as_deref()
+                .expect("clap draft GGUF requirement"),
+            args.context,
+            args.iterations,
+            args.draft_gpu_layers,
+            args.draft_threads,
+            fixture.as_ref(),
+            args.result_json.as_deref(),
+        );
     }
     if args.v2_quality_trace {
         let artifact = args
@@ -2878,6 +2896,129 @@ fn benchmark_v2_gpu_verifier(
         println!("result JSON:            {}", path.display());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn benchmark_llama_greedy(
+    model_path: &std::path::Path,
+    context_length: usize,
+    iterations: usize,
+    gpu_layers: i32,
+    threads: i32,
+    fixture: Option<&BenchmarkFixture>,
+    result_json: Option<&std::path::Path>,
+) -> Result<()> {
+    let default_tokens = [0_u32];
+    let prompt = fixture
+        .map(|fixture| fixture.tokens.as_slice())
+        .unwrap_or(default_tokens.as_slice());
+    if prompt.is_empty() {
+        bail!("llama greedy benchmark requires at least one prompt token");
+    }
+    if prompt.len().saturating_add(iterations) > context_length {
+        bail!("prompt plus measured llama decode exceeds context");
+    }
+    if let Some(fixture_context) = fixture.and_then(|fixture| fixture.context)
+        && fixture_context != context_length
+    {
+        bail!(
+            "fixture context {fixture_context} does not match requested llama context {context_length}"
+        );
+    }
+
+    let mut llama = llama_draft::Draft::open(model_path, context_length, gpu_layers, threads)
+        .map_err(anyhow::Error::msg)?;
+    let mut next = 0_u32;
+    for &token in prompt {
+        next = llama.step(token).map_err(anyhow::Error::msg)?;
+    }
+    let mut generated = Vec::with_capacity(iterations);
+    let start = Instant::now();
+    for _ in 0..iterations {
+        next = llama.step(next).map_err(anyhow::Error::msg)?;
+        generated.push(next);
+    }
+    let wall = start.elapsed();
+    let count = iterations as f64;
+    let (model_bytes, model_hash) = artifact_fingerprint(model_path)?;
+    let (current_physical_footprint_bytes, peak_physical_footprint_bytes) = physical_footprint();
+    let generated_bytes = generated
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .collect::<Vec<_>>();
+    #[derive(Serialize)]
+    struct LlamaGreedyRecord {
+        schema_version: u32,
+        implementation: &'static str,
+        model: String,
+        model_bytes: u64,
+        model_hash: String,
+        fixture_name: String,
+        fixture_token_hash: String,
+        context: usize,
+        prefill_tokens: usize,
+        measured_tokens: usize,
+        wall_ms_per_token: f64,
+        tokens_per_second: f64,
+        token_history_hash: String,
+        last_token_id: u32,
+        current_rss_bytes: u64,
+        peak_rss_bytes: u64,
+        current_physical_footprint_bytes: u64,
+        peak_physical_footprint_bytes: u64,
+        gpu_layers: i32,
+        threads: i32,
+    }
+    let record = LlamaGreedyRecord {
+        schema_version: 1,
+        implementation: "llama.cpp-greedy",
+        model: model_path.display().to_string(),
+        model_bytes,
+        model_hash: format!("{model_hash:016x}"),
+        fixture_name: fixture
+            .map(|fixture| fixture.name.clone())
+            .unwrap_or_else(unnamed_fixture),
+        fixture_token_hash: format!("{:016x}", token_fixture_hash(prompt)),
+        context: context_length,
+        prefill_tokens: prompt.len(),
+        measured_tokens: iterations,
+        wall_ms_per_token: 1_000.0 * wall.as_secs_f64() / count,
+        tokens_per_second: count / wall.as_secs_f64(),
+        token_history_hash: format!("{:016x}", fnv1a64_bytes(&generated_bytes)),
+        last_token_id: next,
+        current_rss_bytes: current_rss_bytes(),
+        peak_rss_bytes: peak_rss_bytes(),
+        current_physical_footprint_bytes,
+        peak_physical_footprint_bytes,
+        gpu_layers,
+        threads,
+    };
+    println!("llama.cpp exact-fixture greedy benchmark");
+    println!("model:                  {}", model_path.display());
+    println!("context:                {context_length}");
+    println!("prefill tokens:         {}", prompt.len());
+    println!("measured tokens:        {iterations}");
+    println!("wall ms/token:          {:.3}", record.wall_ms_per_token);
+    println!("greedy tok/s:           {:.2}", record.tokens_per_second);
+    println!("token history hash:     {}", record.token_history_hash);
+    if let Some(path) = result_json {
+        std::fs::write(path, serde_json::to_vec_pretty(&record)?)?;
+        println!("result JSON:            {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn benchmark_llama_greedy(
+    _model_path: &std::path::Path,
+    _context_length: usize,
+    _iterations: usize,
+    _gpu_layers: i32,
+    _threads: i32,
+    _fixture: Option<&BenchmarkFixture>,
+    _result_json: Option<&std::path::Path>,
+) -> Result<()> {
+    bail!("--llama-greedy requires macOS and llama.cpp")
 }
 
 #[cfg(target_os = "macos")]
@@ -9633,6 +9774,10 @@ struct V2TokenBenchmarkRecord {
     token_history_hash: Option<String>,
     wall_ms_per_token: f64,
     gpu_ms_per_token: f64,
+    cpu_encode_ms_per_token: f64,
+    cpu_wait_ms_per_token: f64,
+    command_buffer_gap_ms_per_token: f64,
+    wall_idle_ms_per_token: f64,
     tokens_per_second: f64,
     command_buffers_per_token: f64,
     encoders_per_token: f64,
@@ -9943,7 +10088,7 @@ fn benchmark_v2_token(
     context_length: usize,
     warmup: usize,
     iterations: usize,
-    rollout_window: usize,
+    rollout_window_override: Option<usize>,
     rollout_verify: bool,
     fixture: Option<&BenchmarkFixture>,
     result_json: Option<&std::path::Path>,
@@ -9968,9 +10113,6 @@ fn benchmark_v2_token(
     if prefill_tokens.saturating_add(iterations) > context_length {
         bail!("prefill plus measured positions must fit within the V2 context");
     }
-    if rollout_window == 0 {
-        bail!("--v2-rollout-window must be at least one");
-    }
     let initial_token = tokens[0];
     let sealed_plan = qx_runtime_v2::activate_artifact_execution_plan(artifact_path)
         .map_err(anyhow::Error::msg)?;
@@ -9981,6 +10123,16 @@ fn benchmark_v2_token(
                 plan.workload.context_limit
             );
         }
+    }
+    let rollout_window = rollout_window_override
+        .or_else(|| {
+            sealed_plan
+                .as_ref()
+                .map(|plan| plan.schedule.rollout.inflight_depth as usize)
+        })
+        .unwrap_or(1);
+    if rollout_window == 0 {
+        bail!("--v2-rollout-window must be at least one");
     }
     let metal = Rc::new(
         qx_metal::platform::MetalContext::system_default()
@@ -10048,6 +10200,7 @@ fn benchmark_v2_token(
     metal
         .write_runtime_buffer(&rollout_history, &rollout_seed.to_le_bytes())
         .map_err(anyhow::Error::msg)?;
+    metal.begin_metrics_interval().map_err(anyhow::Error::msg)?;
     let before = metal.metrics().map_err(anyhow::Error::msg)?;
     let start = Instant::now();
     let measured_position_start = prefill_tokens;
@@ -10123,6 +10276,10 @@ fn benchmark_v2_token(
     let after = metal.metrics().map_err(anyhow::Error::msg)?;
     let count = iterations.max(1) as f64;
     let gpu_seconds = after.gpu_time_seconds - before.gpu_time_seconds;
+    let cpu_encode_seconds = (after.cpu_encode_seconds - before.cpu_encode_seconds).max(0.0);
+    let cpu_wait_seconds = (after.cpu_wait_seconds - before.cpu_wait_seconds).max(0.0);
+    let command_buffer_gap_seconds =
+        (after.gpu_queue_gap_seconds - before.gpu_queue_gap_seconds).max(0.0);
     let token_history = metal
         .read_runtime_u32s(&rollout_history, iterations + 1)
         .map_err(anyhow::Error::msg)?;
@@ -10149,6 +10306,10 @@ fn benchmark_v2_token(
     let target_id = mapped_artifact.info().header.target_id.clone();
     let wall_ms_per_token = 1000.0 * wall.as_secs_f64() / count;
     let gpu_ms_per_token = 1000.0 * gpu_seconds / count;
+    let cpu_encode_ms_per_token = 1000.0 * cpu_encode_seconds / count;
+    let cpu_wait_ms_per_token = 1000.0 * cpu_wait_seconds / count;
+    let command_buffer_gap_ms_per_token = 1000.0 * command_buffer_gap_seconds / count;
+    let wall_idle_ms_per_token = (wall_ms_per_token - gpu_ms_per_token).max(0.0);
     let command_buffers_per_token = (after.command_buffers - before.command_buffers) as f64 / count;
     let encoders_per_token = (after.encoders - before.encoders) as f64 / count;
     let dispatches_per_token = (after.dispatches - before.dispatches) as f64 / count;
@@ -10181,6 +10342,10 @@ fn benchmark_v2_token(
         token_history_hash: token_history_hash.clone(),
         wall_ms_per_token,
         gpu_ms_per_token,
+        cpu_encode_ms_per_token,
+        cpu_wait_ms_per_token,
+        command_buffer_gap_ms_per_token,
+        wall_idle_ms_per_token,
         tokens_per_second: count / wall.as_secs_f64(),
         command_buffers_per_token,
         encoders_per_token,
@@ -10229,6 +10394,13 @@ fn benchmark_v2_token(
     );
     println!("wall ms/token:          {:.3}", wall_ms_per_token);
     println!("GPU ms/token:           {:.3}", gpu_ms_per_token);
+    println!("CPU encode ms/token:    {:.3}", cpu_encode_ms_per_token);
+    println!("CPU wait ms/token:      {:.3}", cpu_wait_ms_per_token);
+    println!(
+        "CB gap ms/token:        {:.3}",
+        command_buffer_gap_ms_per_token
+    );
+    println!("wall idle ms/token:     {:.3}", wall_idle_ms_per_token);
     println!("command buffers/token:  {:.2}", command_buffers_per_token);
     println!("encoders/token:         {:.2}", encoders_per_token);
     println!("dispatches/token:       {:.2}", dispatches_per_token);
@@ -10316,7 +10488,7 @@ fn benchmark_v2_generate(
     prompt: &str,
     max_new_tokens: usize,
     context_length: usize,
-    rollout_window: usize,
+    rollout_window_override: Option<usize>,
 ) -> Result<()> {
     use std::rc::Rc;
     let tokenizer = qx_tokenizer::Tokenizer::from_dir(model_path)?;
@@ -10330,18 +10502,25 @@ fn benchmark_v2_generate(
     if prompt_tokens.len().saturating_add(max_new_tokens) > context_length {
         bail!("prompt plus requested generation exceeds the V2 context");
     }
-    if rollout_window == 0 {
-        bail!("--v2-rollout-window must be at least one");
-    }
     let sealed_plan = qx_runtime_v2::activate_artifact_execution_plan(artifact_path)
         .map_err(anyhow::Error::msg)?;
-    if let Some(plan) = sealed_plan {
+    if let Some(plan) = &sealed_plan {
         if plan.workload.context_limit as usize != context_length {
             bail!(
                 "requested context {context_length} does not match sealed plan context {}",
                 plan.workload.context_limit
             );
         }
+    }
+    let rollout_window = rollout_window_override
+        .or_else(|| {
+            sealed_plan
+                .as_ref()
+                .map(|plan| plan.schedule.rollout.inflight_depth as usize)
+        })
+        .unwrap_or(1);
+    if rollout_window == 0 {
+        bail!("--v2-rollout-window must be at least one");
     }
     let metal = Rc::new(
         qx_metal::platform::MetalContext::system_default()
@@ -10847,7 +11026,7 @@ fn benchmark_v2_generate(
     _prompt: &str,
     _max_new_tokens: usize,
     _context_length: usize,
-    _rollout_window: usize,
+    _rollout_window: Option<usize>,
 ) -> Result<()> {
     bail!("--v2-generate requires macOS Metal")
 }
@@ -10858,7 +11037,7 @@ fn benchmark_v2_token(
     _context_length: usize,
     _warmup: usize,
     _iterations: usize,
-    _rollout_window: usize,
+    _rollout_window: Option<usize>,
     _rollout_verify: bool,
     _fixture: Option<&BenchmarkFixture>,
     _result_json: Option<&std::path::Path>,

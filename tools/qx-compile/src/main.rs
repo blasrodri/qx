@@ -144,6 +144,10 @@ struct Args {
     /// is permitted; layer boundaries are divided evenly between buffers.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=24))]
     command_buffers_per_token: u16,
+    /// Compiler-selected number of queue-ordered greedy token graphs kept in
+    /// flight before a host synchronization boundary.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=64))]
+    rollout_depth: u16,
     /// QXTRACE produced by the llama.cpp calibration bridge. Without this,
     /// compilation is conservative and emits uniform Q4 experts.
     #[arg(long)]
@@ -1064,6 +1068,15 @@ fn main() -> Result<()> {
     execution_plan.schedule.command_buffers_per_token = args.command_buffers_per_token;
     execution_plan.schedule.encoders_per_token = args.command_buffers_per_token;
     execution_plan.schedule.expected_dispatches_per_token = 390;
+    execution_plan.schedule.rollout = if args.rollout_depth == 1 {
+        qx_format::RolloutPlan::default()
+    } else {
+        qx_format::RolloutPlan {
+            dependency: qx_format::RolloutDependency::GpuTokenChain,
+            inflight_depth: args.rollout_depth,
+            host_sync: qx_format::RolloutHostSync::ChunkBoundary,
+        }
+    };
     let last_dispatch = execution_plan
         .schedule
         .expected_dispatches_per_token

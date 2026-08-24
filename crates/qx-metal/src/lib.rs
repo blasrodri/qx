@@ -1250,6 +1250,9 @@ pub mod platform {
         pub encoders: u64,
         pub dispatches: u64,
         pub gpu_time_seconds: f64,
+        /// Idle time between consecutive GPU command-buffer timestamp ranges
+        /// inside the current measurement interval.
+        pub gpu_queue_gap_seconds: f64,
         pub cpu_encode_seconds: f64,
         pub cpu_wait_seconds: f64,
     }
@@ -1404,6 +1407,8 @@ pub mod platform {
         encoders: u64,
         dispatches: u64,
         gpu_time_seconds: f64,
+        gpu_queue_gap_seconds: f64,
+        last_gpu_end_seconds: Option<f64>,
         cpu_encode_seconds: f64,
         cpu_wait_seconds: f64,
     }
@@ -8115,6 +8120,20 @@ pub mod platform {
                     (command_buffer.GPUEndTime() - command_buffer.GPUStartTime()).max(0.0)
                 })
                 .sum::<f64>();
+            for (command_buffer, _, _) in &self.committed {
+                let gpu_start = command_buffer.GPUStartTime();
+                let gpu_end = command_buffer.GPUEndTime();
+                if gpu_start > 0.0 && gpu_end >= gpu_start {
+                    if let Some(previous_end) = metrics.last_gpu_end_seconds {
+                        metrics.gpu_queue_gap_seconds += (gpu_start - previous_end).max(0.0);
+                    }
+                    metrics.last_gpu_end_seconds = Some(
+                        metrics
+                            .last_gpu_end_seconds
+                            .map_or(gpu_end, |previous_end| previous_end.max(gpu_end)),
+                    );
+                }
+            }
             metrics.cpu_encode_seconds += self
                 .submitted_at
                 .duration_since(self.encode_started_at)
@@ -8202,9 +8221,23 @@ pub mod platform {
                 encoders: metrics.encoders,
                 dispatches: metrics.dispatches,
                 gpu_time_seconds: metrics.gpu_time_seconds,
+                gpu_queue_gap_seconds: metrics.gpu_queue_gap_seconds,
                 cpu_encode_seconds: metrics.cpu_encode_seconds,
                 cpu_wait_seconds: metrics.cpu_wait_seconds,
             })
+        }
+
+        /// Start a new GPU queue-gap interval without discarding cumulative
+        /// work counters. The next completed command buffer becomes the
+        /// timestamp anchor, so setup/prefill time is not charged as decode
+        /// idle time.
+        pub fn begin_metrics_interval(&self) -> Result<(), String> {
+            let mut metrics = self
+                .metrics
+                .lock()
+                .map_err(|_| "Metal metrics cache is poisoned".to_owned())?;
+            metrics.last_gpu_end_seconds = None;
+            Ok(())
         }
 
         /// Enable dispatch-boundary timestamps for subsequently created
@@ -8497,6 +8530,16 @@ pub mod platform {
             metrics.encoders += 1;
             metrics.dispatches += dispatches;
             metrics.gpu_time_seconds += (gpu_end - gpu_start).max(0.0);
+            if gpu_start > 0.0 && gpu_end >= gpu_start {
+                if let Some(previous_end) = metrics.last_gpu_end_seconds {
+                    metrics.gpu_queue_gap_seconds += (gpu_start - previous_end).max(0.0);
+                }
+                metrics.last_gpu_end_seconds = Some(
+                    metrics
+                        .last_gpu_end_seconds
+                        .map_or(gpu_end, |previous_end| previous_end.max(gpu_end)),
+                );
+            }
             metrics.cpu_encode_seconds += wait_start.duration_since(encode_start).as_secs_f64();
             metrics.cpu_wait_seconds += wait_start.elapsed().as_secs_f64();
             Ok(())

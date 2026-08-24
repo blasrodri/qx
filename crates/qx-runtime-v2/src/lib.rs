@@ -13,6 +13,7 @@ use qx_model::{ATTENTION_HEADS, EXPERTS, HIDDEN, KV_HEADS, LAYERS, TOP_K, VOCAB}
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedExecutionPlan {
     pub command_buffers_per_token: usize,
+    pub rollout: qx_format::RolloutPlan,
     pub qkv: qx_format::QkvTopology,
     pub scalar_rms_qkv: bool,
     pub scalar_rms_router: bool,
@@ -43,6 +44,7 @@ impl Default for ResolvedExecutionPlan {
     fn default() -> Self {
         Self {
             command_buffers_per_token: 1,
+            rollout: qx_format::RolloutPlan::default(),
             qkv: qx_format::QkvTopology::Fused,
             scalar_rms_qkv: true,
             scalar_rms_router: true,
@@ -88,6 +90,47 @@ impl ResolvedExecutionPlan {
             return Err(format!(
                 "compiled plan requests {command_buffers_per_token} command buffers/token; supported range is 1..={LAYERS}"
             ));
+        }
+        let mut rollout = manifest.schedule.rollout;
+        if let Some(depth) = std::env::var("QX_V2_ROLLOUT_DEPTH_OVERRIDE")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|&depth| (1..=64).contains(&depth))
+        {
+            rollout = if depth == 1 {
+                qx_format::RolloutPlan::default()
+            } else {
+                qx_format::RolloutPlan {
+                    dependency: qx_format::RolloutDependency::GpuTokenChain,
+                    inflight_depth: depth,
+                    host_sync: qx_format::RolloutHostSync::ChunkBoundary,
+                }
+            };
+        }
+        if rollout.inflight_depth == 0 || rollout.inflight_depth > 64 {
+            return Err(format!(
+                "compiled plan requests rollout depth {}; supported range is 1..=64",
+                rollout.inflight_depth
+            ));
+        }
+        match (
+            rollout.dependency,
+            rollout.host_sync,
+            rollout.inflight_depth,
+        ) {
+            (
+                qx_format::RolloutDependency::HostTokenBoundary,
+                qx_format::RolloutHostSync::TokenBoundary,
+                1,
+            )
+            | (
+                qx_format::RolloutDependency::GpuTokenChain,
+                qx_format::RolloutHostSync::ChunkBoundary,
+                2..=64,
+            ) => {}
+            _ => {
+                return Err("unsupported rollout dependency/synchronization combination".to_owned());
+            }
         }
 
         let active_k_by_layer = match &manifest.sparse_experts {
@@ -185,6 +228,7 @@ impl ResolvedExecutionPlan {
 
         Ok(Self {
             command_buffers_per_token,
+            rollout,
             qkv: manifest.topology.qkv,
             scalar_rms_qkv: manifest.topology.input_rms == qx_format::RmsTopology::ScalarConsumer,
             scalar_rms_router: manifest.topology.post_attention_rms
@@ -1671,6 +1715,14 @@ impl GraniteV2Generator {
         self.context.metrics()
     }
 
+    pub fn begin_metrics_interval(&self) -> Result<(), String> {
+        self.context.begin_metrics_interval()
+    }
+
+    pub fn rollout_plan(&self) -> qx_format::RolloutPlan {
+        self.resolved_plan.rollout
+    }
+
     /// Enable dispatch-boundary timestamps for the diagnostic K-wide
     /// verifier timeline. This changes only instrumentation, never the
     /// execution plan, and is intentionally not enabled by default.
@@ -2459,6 +2511,24 @@ impl GraniteV2Generator {
         max_new_tokens: usize,
         eos_token: Option<u32>,
     ) -> Result<Vec<u32>, String> {
+        if self.resolved_plan.rollout.dependency == qx_format::RolloutDependency::GpuTokenChain {
+            return self.generate_tokens_gpu_resident_eos(
+                prompt_tokens,
+                max_new_tokens,
+                eos_token,
+                self.resolved_plan.rollout.inflight_depth as usize,
+            );
+        }
+        self.generate_tokens_host_synchronized(prompt_tokens, max_new_tokens, eos_token)
+    }
+
+    /// Token-boundary reference path retained for differential measurement.
+    pub fn generate_tokens_host_synchronized(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        eos_token: Option<u32>,
+    ) -> Result<Vec<u32>, String> {
         if prompt_tokens.is_empty() {
             return Err("prompt produced no tokens".to_owned());
         }
@@ -2487,11 +2557,101 @@ impl GraniteV2Generator {
         Ok(generated)
     }
 
+    /// Greedy rollout synchronized only at chunk boundaries. The GPU follows
+    /// its own argmax token chain inside each chunk. If EOS appears, later
+    /// evaluations in that final chunk are discarded by rewinding the logical
+    /// KV cursor; their slots are overwritten before any future attention can
+    /// observe them.
+    pub fn generate_tokens_gpu_resident_eos(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        eos_token: Option<u32>,
+        chunk_depth: usize,
+    ) -> Result<Vec<u32>, String> {
+        if prompt_tokens.is_empty() {
+            return Err("prompt produced no tokens".to_owned());
+        }
+        if max_new_tokens == 0 {
+            return Err("max_new_tokens must be positive".to_owned());
+        }
+        if chunk_depth < 2 {
+            return Err("GPU-resident rollout chunk must be at least two".to_owned());
+        }
+        if prompt_tokens.len().saturating_add(max_new_tokens) > self.context_length() {
+            return Err(format!(
+                "prompt plus generation exceeds context {}",
+                self.context_length()
+            ));
+        }
+
+        self.reset();
+        let mut first_generated = 0_u32;
+        for &token in prompt_tokens {
+            first_generated = self.step(token)?;
+        }
+        let mut generated = Vec::with_capacity(max_new_tokens);
+        generated.push(first_generated);
+        if Some(first_generated) == eos_token || max_new_tokens == 1 {
+            return Ok(generated);
+        }
+
+        let history = self
+            .context
+            .allocate_runtime_buffer(max_new_tokens * std::mem::size_of::<u32>())?;
+        self.context
+            .write_runtime_buffer(&history, &first_generated.to_le_bytes())?;
+        let mut evaluated = 0_usize;
+        while evaluated < max_new_tokens - 1 {
+            let evaluations = chunk_depth.min(max_new_tokens - 1 - evaluated);
+            let chunk_position = self.position;
+            let mut submitted = Vec::with_capacity(evaluations);
+            for offset in 0..evaluations {
+                let index = evaluated + offset;
+                let token_input = history.subregion(
+                    index * std::mem::size_of::<u32>(),
+                    std::mem::size_of::<u32>(),
+                )?;
+                let token_output = history.subregion(
+                    (index + 1) * std::mem::size_of::<u32>(),
+                    std::mem::size_of::<u32>(),
+                )?;
+                let mut graph = self.buffers.begin_token()?;
+                self.stack.encode_token_from_to_with_plan(
+                    &mut graph,
+                    &self.buffers,
+                    &self.moe,
+                    &token_input,
+                    &token_output,
+                    chunk_position + offset,
+                    Some(&self.resolved_plan),
+                )?;
+                submitted.push(self.buffers.submit_token(graph));
+            }
+            for token in submitted {
+                self.buffers.wait_token(token)?;
+            }
+            self.position += evaluations;
+            let chunk_tokens = self
+                .context
+                .read_runtime_u32s(&history, evaluated + evaluations + 1)?;
+            let produced = &chunk_tokens[evaluated + 1..];
+            if let Some(eos_offset) = produced.iter().position(|&token| Some(token) == eos_token) {
+                generated.extend_from_slice(&produced[..=eos_offset]);
+                self.position -= evaluations - (eos_offset + 1);
+                return Ok(generated);
+            }
+            generated.extend_from_slice(produced);
+            evaluated += evaluations;
+        }
+        Ok(generated)
+    }
+
     /// Fixed-length greedy generation with several complete token graphs kept
     /// in flight. This preserves exact queue-ordered model semantics and
     /// returns every generated token from a GPU-resident history buffer. It is
-    /// intentionally separate from EOS-aware generation, which requires a
-    /// synchronization decision after each sampled token.
+    /// The EOS-aware canonical path uses chunk-boundary synchronization via
+    /// `generate_tokens_gpu_resident_eos`.
     pub fn generate_tokens_gpu_resident(
         &mut self,
         prompt_tokens: &[u32],
@@ -5099,6 +5259,26 @@ mod tests {
         manifest.verifier_attention = Some(qx_format::VerifierAttentionTopology::ScoreReuse);
         let error = ResolvedExecutionPlan::from_manifest(&manifest).unwrap_err();
         assert!(error.contains("score-reuse verifier attention"));
+    }
+
+    #[test]
+    fn rollout_plan_is_resolved_and_inconsistent_combinations_are_rejected() {
+        let mut manifest = qx_format::ExecutionPlanManifest::granite_m5_canonical(
+            "model",
+            "target",
+            512,
+            qx_format::MemoryPlan::default(),
+        );
+        let plan = ResolvedExecutionPlan::from_manifest(&manifest).unwrap();
+        assert_eq!(plan.rollout.inflight_depth, 2);
+        assert_eq!(
+            plan.rollout.dependency,
+            qx_format::RolloutDependency::GpuTokenChain
+        );
+
+        manifest.schedule.rollout.inflight_depth = 1;
+        let error = ResolvedExecutionPlan::from_manifest(&manifest).unwrap_err();
+        assert!(error.contains("unsupported rollout dependency"));
     }
 
     #[test]

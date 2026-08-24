@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-24",
+  "device": "Apple M5 Pro",
+  "model": "ibm-granite-3.0-1b-a400m-instruct",
+  "artifact_plan": "granite-m5-top8-superblock144-cb2-rollout2",
+  "sweep_contract": {
+    "depths": [1, 2, 3, 4, 6, 8],
+    "contexts": [64, 128, 256, 384, 512],
+    "repetitions": 3,
+    "measured_tokens_per_run": {"64":64,"128":64,"256":64,"384":64,"512":128},
+    "prefill_tokens_by_context": {"64": 0, "128": 64, "256": 192, "384": 320, "512": 384},
+    "command_buffers_per_token": 2,
+    "dispatches_per_token": 390,
+    "sampling": "greedy",
+    "all_values_below_are_three_run_means": true
+  },
+  "columns": ["context", "depth", "tok_s", "wall_ms_token", "gpu_busy_ms_token", "cpu_encode_ms_token", "cpu_wait_ms_token", "command_buffer_gap_ms_token", "wall_idle_ms_token", "peak_physical_footprint_bytes"],
+  "sweep": [
+    [64,1,391.901828,2.552199,2.286936,0.157194,2.384964,0.256654,0.265262,72325093],
+    [64,2,430.204746,2.326828,2.321582,0.138816,2.179550,0.001110,0.005247,72996789],
+    [64,3,432.249777,2.314689,2.308092,0.148045,2.154795,0.000933,0.006597,73734085],
+    [64,4,426.302726,2.346584,2.336473,0.157505,2.175171,0.001053,0.010110,74460451],
+    [64,6,429.541286,2.329004,2.323047,0.153012,2.162625,0.001137,0.005957,76186208],
+    [64,8,433.455873,2.309432,2.302878,0.164131,2.128853,0.001090,0.006554,77857368],
+    [128,1,373.943573,2.674695,2.407202,0.164253,2.499491,0.264134,0.267492,78578328],
+    [128,2,411.083245,2.432778,2.428015,0.189517,2.226998,0.001093,0.004763,79184504],
+    [128,3,420.747560,2.377802,2.372906,0.149509,2.217799,0.001304,0.004896,80047395],
+    [128,4,426.042803,2.347911,2.343267,0.145473,2.192069,0.001266,0.004643,80904840],
+    [128,6,415.498177,2.407587,2.402055,0.185607,2.204258,0.001134,0.005532,82849091],
+    [128,8,414.861921,2.411038,2.406257,0.182638,2.211473,0.001385,0.004781,84323651],
+    [256,1,374.604608,2.669482,2.400277,0.161046,2.497230,0.264951,0.269205,91330525],
+    [256,2,409.995913,2.439688,2.434798,0.190268,2.233079,0.001290,0.004890,91953077],
+    [256,3,410.893355,2.434523,2.429335,0.163128,2.258525,0.001697,0.005188,92837813],
+    [256,4,408.632498,2.447393,2.442070,0.161182,2.273443,0.001493,0.005324,93515051],
+    [256,6,408.777597,2.446793,2.442313,0.173277,2.256333,0.001221,0.004480,95251755],
+    [256,8,406.385402,2.460981,2.455907,0.173916,2.270198,0.001541,0.005074,97015789],
+    [384,1,370.521085,2.699449,2.443046,0.159144,2.530302,0.252697,0.256402,103946173],
+    [384,2,412.911923,2.422627,2.417832,0.168873,2.241550,0.001365,0.004796,104596088],
+    [384,3,396.802471,2.520798,2.515590,0.170185,2.336592,0.001277,0.005208,105311547],
+    [384,4,404.079017,2.476164,2.471461,0.173526,2.288719,0.001168,0.004703,106245411],
+    [384,6,412.024161,2.427410,2.422912,0.168957,2.241334,0.001006,0.004497,107856520],
+    [384,8,404.802234,2.471774,2.466436,0.167896,2.288048,0.001266,0.005339,109473083],
+    [512,1,356.433284,2.805613,2.565768,0.138270,2.659914,0.238158,0.239845,116441728],
+    [512,2,390.559297,2.560450,2.557239,0.146248,2.403140,0.001211,0.003211,117184477],
+    [512,3,390.814961,2.558770,2.555746,0.144795,2.403165,0.001243,0.003024,117916272],
+    [512,4,390.355052,2.561778,2.558672,0.146358,2.404154,0.001183,0.003106,118779187],
+    [512,6,390.755382,2.559186,2.555877,0.145524,2.401385,0.001249,0.003308,120499523],
+    [512,8,390.237324,2.562549,2.559304,0.146095,2.403509,0.001387,0.003245,122197965]
+  ],
+  "mean_across_contexts": [
+    {"depth":1,"tok_s":373.480876,"wall_ms_token":2.680287,"gpu_busy_ms_token":2.420646,"command_buffer_gap_ms_token":0.255319,"wall_idle_ms_token":0.259641,"peak_physical_footprint_bytes":92524370},
+    {"depth":2,"tok_s":410.951025,"wall_ms_token":2.436474,"gpu_busy_ms_token":2.431893,"command_buffer_gap_ms_token":0.001214,"wall_idle_ms_token":0.004581,"peak_physical_footprint_bytes":93182987},
+    {"depth":3,"tok_s":410.301625,"wall_ms_token":2.441316,"gpu_busy_ms_token":2.436334,"command_buffer_gap_ms_token":0.001291,"wall_idle_ms_token":0.004983,"peak_physical_footprint_bytes":93969422},
+    {"depth":4,"tok_s":411.082419,"wall_ms_token":2.435966,"gpu_busy_ms_token":2.430389,"command_buffer_gap_ms_token":0.001233,"wall_idle_ms_token":0.005577,"peak_physical_footprint_bytes":94780988},
+    {"depth":6,"tok_s":411.319321,"wall_ms_token":2.433996,"gpu_busy_ms_token":2.429241,"command_buffer_gap_ms_token":0.001149,"wall_idle_ms_token":0.004755,"peak_physical_footprint_bytes":96528619},
+    {"depth":8,"tok_s":409.948551,"wall_ms_token":2.443155,"gpu_busy_ms_token":2.438157,"command_buffer_gap_ms_token":0.001334,"wall_idle_ms_token":0.004998,"peak_physical_footprint_bytes":98173571}
+  ],
+  "same_session_context_512_prefill_384_decode_128": {
+    "qx_synchronous_tok_s": [379.617694, 357.246731, 369.885359],
+    "qx_synchronous_mean_tok_s": 368.916595,
+    "qx_canonical_depth_2_tok_s": [413.299583, 414.192567, 412.474230],
+    "qx_canonical_depth_2_mean_tok_s": 413.322127,
+    "llama_bench_q4_k_m_tok_s": [334.884828, 333.682948, 314.984399],
+    "llama_bench_q4_k_m_mean_tok_s": 327.850725,
+    "llama_exact_fixture_greedy_tok_s": [314.298076, 313.519263, 312.334212],
+    "llama_exact_fixture_greedy_mean_tok_s": 313.383850,
+    "qx_vs_llama_bench_percent": 26.07,
+    "qx_vs_llama_exact_fixture_percent": 31.89
+  },
+  "correctness": {
+    "qx_sync_and_depth_2_token_history_hash": "19b4967c2513510e",
+    "qx_sync_and_depth_2_kv_hash": "5f18e9cd28097e0b",
+    "last_token_id": 34
+  },
+  "kernel_screen": {
+    "candidate": "superblock_64_rows_per_threadgroup",
+    "status": "rejected_and_reverted",
+    "canonical_tok_s": 413.322127,
+    "candidate_tok_s": 350.88,
+    "candidate_token_history_hash": "19b4967c2513510e",
+    "candidate_kv_hash": "5f18e9cd28097e0b",
+    "diagnosis": "extra live row accumulators reduce occupancy more than halved input staging helps"
+  },
+  "selection": {
+    "dependency": "gpu_token_chain",
+    "inflight_depth": 2,
+    "host_sync": "chunk_boundary",
+    "reason": "depth 2 removes 99.5% of the depth-1 GPU queue gap; deeper windows add memory without a repeatable throughput or idle-time gain"
+  }
+}

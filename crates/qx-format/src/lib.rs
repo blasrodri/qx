@@ -279,6 +279,41 @@ pub struct DispatchSchedule {
     pub encoders_per_token: u16,
     pub expected_dispatches_per_token: u32,
     pub internal_cpu_waits: u16,
+    /// Cross-token dependency and synchronization policy selected for greedy
+    /// decode. Older artifacts deserialize to token-at-a-time host sync.
+    #[serde(default)]
+    pub rollout: RolloutPlan,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutDependency {
+    HostTokenBoundary,
+    GpuTokenChain,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutHostSync {
+    TokenBoundary,
+    ChunkBoundary,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RolloutPlan {
+    pub dependency: RolloutDependency,
+    pub inflight_depth: u16,
+    pub host_sync: RolloutHostSync,
+}
+
+impl Default for RolloutPlan {
+    fn default() -> Self {
+        Self {
+            dependency: RolloutDependency::HostTokenBoundary,
+            inflight_depth: 1,
+            host_sync: RolloutHostSync::TokenBoundary,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -456,6 +491,11 @@ impl ExecutionPlanManifest {
                 encoders_per_token: 1,
                 expected_dispatches_per_token: 461,
                 internal_cpu_waits: 0,
+                rollout: RolloutPlan {
+                    dependency: RolloutDependency::GpuTokenChain,
+                    inflight_depth: 2,
+                    host_sync: RolloutHostSync::ChunkBoundary,
+                },
             },
             arena: ArenaPlan::default(),
             sparse_experts: SparseExpertPolicy::Top8,
@@ -1813,5 +1853,31 @@ mod tests {
         let encoded = serde_json::to_vec(&manifest).unwrap();
         let decoded: ExecutionPlanManifest = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn rollout_plan_is_canonical_but_legacy_manifests_remain_synchronous() {
+        let manifest = ExecutionPlanManifest::granite_m5_canonical(
+            "granite",
+            "apple-m5-pro",
+            512,
+            MemoryPlan::default(),
+        );
+        assert_eq!(
+            manifest.schedule.rollout,
+            RolloutPlan {
+                dependency: RolloutDependency::GpuTokenChain,
+                inflight_depth: 2,
+                host_sync: RolloutHostSync::ChunkBoundary,
+            }
+        );
+
+        let mut legacy = serde_json::to_value(&manifest).unwrap();
+        legacy["schedule"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rollout");
+        let decoded: ExecutionPlanManifest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.schedule.rollout, RolloutPlan::default());
     }
 }
