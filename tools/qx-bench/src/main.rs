@@ -96,6 +96,9 @@ struct Args {
     /// Benchmark K-wide Q/K/V projections as one verifier stage.
     #[arg(long)]
     v2_batch_qkv_bench: bool,
+    /// Execute the persistent GPU K=1/2/4 transactional verifier path.
+    #[arg(long)]
+    v2_gpu_verifier: bool,
     /// Benchmark the expert-major K-wide row-inline Q4 gate/up verifier stage.
     #[arg(long)]
     v2_batch_moe_gateup_bench: bool,
@@ -379,6 +382,13 @@ fn main() -> Result<()> {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--v2-batch-qkv-bench requires an artifact path"))?;
         return benchmark_v2_batch_qkv(artifact, args.iterations);
+    }
+    if args.v2_gpu_verifier {
+        let artifact = args
+            .artifact
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--v2-gpu-verifier requires an artifact path"))?;
+        return benchmark_v2_gpu_verifier(artifact, args.context, args.iterations);
     }
     if args.v2_batch_moe_gateup_bench {
         let artifact = args.artifact.as_deref().ok_or_else(|| {
@@ -1029,6 +1039,12 @@ fn benchmark_v2_batch_moe_gateup(artifact_path: &std::path::Path, iterations: us
         let bucket_pairs = context
             .allocate_runtime_buffer(std::mem::size_of_val(bucket_pairs_values.as_slice()))
             .map_err(anyhow::Error::msg)?;
+        let bucket_counts = context
+            .allocate_runtime_buffer(32 * std::mem::size_of::<u32>())
+            .map_err(anyhow::Error::msg)?;
+        let compact_bucket_pairs = context
+            .allocate_runtime_buffer(32 * pair_count * std::mem::size_of::<u32>())
+            .map_err(anyhow::Error::msg)?;
         let output = context
             .allocate_runtime_buffer(pair_count * HIDDEN * 4)
             .map_err(anyhow::Error::msg)?;
@@ -1448,41 +1464,24 @@ fn benchmark_v2_batch_moe_gateup(artifact_path: &std::path::Path, iterations: us
 
         for _ in 0..3 {
             let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
-            graph
-                .encode_verifier_q4_gate_up_expert_major_unique_packet(
-                    prepared,
-                    &input,
-                    &bucket_experts,
-                    &bucket_offsets,
-                    &bucket_pairs,
-                    &route_tokens,
-                    &output,
-                    TOP_K,
-                )
-                .map_err(anyhow::Error::msg)?;
-            graph
-                .encode_verifier_q4_silu_batch(prepared, &output, &activated, pair_count)
-                .map_err(anyhow::Error::msg)?;
-            graph
-                .encode_verifier_q4_down_batch(
-                    prepared,
-                    &route_experts,
-                    &activated,
-                    &expert_output,
-                    pair_count,
-                )
-                .map_err(anyhow::Error::msg)?;
-            graph
-                .encode_verifier_q4_accumulate_batch(
-                    prepared,
-                    &expert_output,
-                    &route_tokens,
-                    &route_weights,
-                    &token_output,
-                    pair_count,
-                    tokens,
-                )
-                .map_err(anyhow::Error::msg)?;
+            moe.encode_verifier_packet_moe(
+                &mut graph,
+                0,
+                &input,
+                &route_experts,
+                &route_tokens,
+                &route_weights,
+                &bucket_experts,
+                &bucket_offsets,
+                &bucket_pairs,
+                &output,
+                &activated,
+                &expert_output,
+                &token_output,
+                pair_count,
+                tokens,
+            )
+            .map_err(anyhow::Error::msg)?;
             graph.finish(context.as_ref()).map_err(anyhow::Error::msg)?;
         }
         let packet_full_values = context
@@ -1506,41 +1505,24 @@ fn benchmark_v2_batch_moe_gateup(artifact_path: &std::path::Path, iterations: us
             let before = context.metrics().map_err(anyhow::Error::msg)?;
             let start = Instant::now();
             let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
-            graph
-                .encode_verifier_q4_gate_up_expert_major_unique_packet(
-                    prepared,
-                    &input,
-                    &bucket_experts,
-                    &bucket_offsets,
-                    &bucket_pairs,
-                    &route_tokens,
-                    &output,
-                    TOP_K,
-                )
-                .map_err(anyhow::Error::msg)?;
-            graph
-                .encode_verifier_q4_silu_batch(prepared, &output, &activated, pair_count)
-                .map_err(anyhow::Error::msg)?;
-            graph
-                .encode_verifier_q4_down_batch(
-                    prepared,
-                    &route_experts,
-                    &activated,
-                    &expert_output,
-                    pair_count,
-                )
-                .map_err(anyhow::Error::msg)?;
-            graph
-                .encode_verifier_q4_accumulate_batch(
-                    prepared,
-                    &expert_output,
-                    &route_tokens,
-                    &route_weights,
-                    &token_output,
-                    pair_count,
-                    tokens,
-                )
-                .map_err(anyhow::Error::msg)?;
+            moe.encode_verifier_packet_moe(
+                &mut graph,
+                0,
+                &input,
+                &route_experts,
+                &route_tokens,
+                &route_weights,
+                &bucket_experts,
+                &bucket_offsets,
+                &bucket_pairs,
+                &output,
+                &activated,
+                &expert_output,
+                &token_output,
+                pair_count,
+                tokens,
+            )
+            .map_err(anyhow::Error::msg)?;
             graph.finish(context.as_ref()).map_err(anyhow::Error::msg)?;
             let after = context.metrics().map_err(anyhow::Error::msg)?;
             packet_full_gpu_samples
@@ -1556,6 +1538,82 @@ fn benchmark_v2_batch_moe_gateup(artifact_path: &std::path::Path, iterations: us
             packet_full_stats.gpu_median_us / tokens as f64,
             4,
             packet_full_max_abs,
+        );
+
+        for _ in 0..3 {
+            let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+            moe.encode_verifier_compact_packet_moe(
+                &mut graph,
+                0,
+                &input,
+                &route_experts,
+                &route_tokens,
+                &route_weights,
+                &bucket_counts,
+                &compact_bucket_pairs,
+                &output,
+                &activated,
+                &expert_output,
+                &token_output,
+                pair_count,
+                tokens,
+            )
+            .map_err(anyhow::Error::msg)?;
+            graph.finish(context.as_ref()).map_err(anyhow::Error::msg)?;
+        }
+        let compact_full_values = context
+            .read_runtime_f32(&token_output, tokens * HIDDEN)
+            .map_err(anyhow::Error::msg)?;
+        let compact_full_max_abs = if tokens == 1 {
+            compact_full_values
+                .iter()
+                .zip(&scalar_full)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0_f32, f32::max)
+        } else {
+            0.0
+        };
+        if tokens == 1 && compact_full_max_abs > 1.0e-3 {
+            bail!("K=1 compact packet MoE mismatch: {compact_full_max_abs:.8}");
+        }
+        let mut compact_gpu_samples = Vec::with_capacity(iterations);
+        let mut compact_wall_samples = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let before = context.metrics().map_err(anyhow::Error::msg)?;
+            let start = Instant::now();
+            let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+            moe.encode_verifier_compact_packet_moe(
+                &mut graph,
+                0,
+                &input,
+                &route_experts,
+                &route_tokens,
+                &route_weights,
+                &bucket_counts,
+                &compact_bucket_pairs,
+                &output,
+                &activated,
+                &expert_output,
+                &token_output,
+                pair_count,
+                tokens,
+            )
+            .map_err(anyhow::Error::msg)?;
+            graph.finish(context.as_ref()).map_err(anyhow::Error::msg)?;
+            let after = context.metrics().map_err(anyhow::Error::msg)?;
+            compact_gpu_samples
+                .push((after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1e6);
+            compact_wall_samples.push(start.elapsed().as_secs_f64() * 1e6);
+        }
+        let compact_stats =
+            summarize_kernel_samples(&mut compact_gpu_samples, &mut compact_wall_samples);
+        println!(
+            "compact-moe {tokens:>5} {pair_count:>5} {:>8.2} {:>8.2} {:>8.2} {:>11} {:>12.8}",
+            compact_stats.gpu_median_us,
+            compact_stats.wall_median_us,
+            compact_stats.gpu_median_us / tokens as f64,
+            5,
+            compact_full_max_abs,
         );
     }
     Ok(())
@@ -2209,6 +2267,80 @@ fn benchmark_v2_batch_qkv(artifact_path: &std::path::Path, iterations: usize) ->
             packet_front_stats.gpu_median_us,
             packet_front_stats.gpu_median_us / tokens as f64,
             10,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn benchmark_v2_gpu_verifier(
+    artifact_path: &std::path::Path,
+    context_length: usize,
+    iterations: usize,
+) -> Result<()> {
+    if iterations == 0 {
+        bail!("GPU verifier benchmark iterations must be positive");
+    }
+    let mut generator = qx_runtime_v2::GraniteV2Generator::load(artifact_path, context_length)
+        .map_err(anyhow::Error::msg)?;
+    println!("QX V2 persistent GPU verifier benchmark");
+    println!("artifact: {}", artifact_path.display());
+    println!("iterations: {iterations} (K=1/2/4, synthetic expected stream)");
+    println!("width  GPU us  wall us  GPU/proposed  accepted  position");
+    for width in [1_usize, 2, 4] {
+        let inputs = vec![1_u32; width];
+        let mut expected = Vec::with_capacity(width);
+        generator.reset();
+        for &input in &inputs {
+            expected.push(generator.step(input).map_err(anyhow::Error::msg)?);
+        }
+        for _ in 0..3 {
+            generator.reset();
+            let result = generator
+                .verify_tokens_gpu(&inputs, &expected)
+                .map_err(anyhow::Error::msg)?;
+            if result.accepted_prefix != width || result.next_token != expected[width - 1] {
+                bail!(
+                    "K={width} GPU verifier mismatch during warmup: accepted={}, next={}, expected={}",
+                    result.accepted_prefix,
+                    result.next_token,
+                    expected[width - 1]
+                );
+            }
+        }
+        let mut gpu_samples = Vec::with_capacity(iterations);
+        let mut wall_samples = Vec::with_capacity(iterations);
+        let mut accepted = 0_usize;
+        let mut position = 0_usize;
+        for _ in 0..iterations {
+            generator.reset();
+            let before = generator.metrics().map_err(anyhow::Error::msg)?;
+            let start = Instant::now();
+            let result = generator
+                .verify_tokens_gpu(&inputs, &expected)
+                .map_err(anyhow::Error::msg)?;
+            if result.accepted_prefix != width || result.next_token != expected[width - 1] {
+                bail!(
+                    "K={width} GPU verifier mismatch: accepted={}, next={}, expected={}",
+                    result.accepted_prefix,
+                    result.next_token,
+                    expected[width - 1]
+                );
+            }
+            let after = generator.metrics().map_err(anyhow::Error::msg)?;
+            accepted = result.accepted_prefix;
+            position = generator.position();
+            gpu_samples.push((after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1e6);
+            wall_samples.push(start.elapsed().as_secs_f64() * 1e6);
+        }
+        let stats = summarize_kernel_samples(&mut gpu_samples, &mut wall_samples);
+        println!(
+            "{width:>5} {:>8.2} {:>8.2} {:>12.2} {:>9} {:>8}",
+            stats.gpu_median_us,
+            stats.wall_median_us,
+            stats.gpu_median_us / width as f64,
+            accepted,
+            position,
         );
     }
     Ok(())
@@ -6880,6 +7012,15 @@ fn benchmark_v2_verifier_route_stats(
     _requested_positions: usize,
 ) -> Result<()> {
     bail!("--v2-verifier-route-stats requires macOS Metal")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn benchmark_v2_gpu_verifier(
+    _artifact_path: &std::path::Path,
+    _context_length: usize,
+    _iterations: usize,
+) -> Result<()> {
+    bail!("--v2-gpu-verifier requires macOS Metal")
 }
 
 #[cfg(not(target_os = "macos"))]

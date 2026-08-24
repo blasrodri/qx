@@ -737,6 +737,235 @@ pub struct PreparedMoeStack {
     pub layers: Vec<qx_metal::platform::PreparedDynamicQ4Moe>,
 }
 
+#[cfg(target_os = "macos")]
+struct KWideVerifierBuffers {
+    pair_count: usize,
+    tokens: qx_metal::platform::RuntimeBuffer,
+    hidden_a: qx_metal::platform::RuntimeBuffer,
+    hidden_b: qx_metal::platform::RuntimeBuffer,
+    normalized: qx_metal::platform::RuntimeBuffer,
+    query: qx_metal::platform::RuntimeBuffer,
+    key: qx_metal::platform::RuntimeBuffer,
+    value: qx_metal::platform::RuntimeBuffer,
+    query_rotated: qx_metal::platform::RuntimeBuffer,
+    attention: qx_metal::platform::RuntimeBuffer,
+    router_scores: qx_metal::platform::RuntimeBuffer,
+    topk_ids: qx_metal::platform::RuntimeBuffer,
+    topk_weights: qx_metal::platform::RuntimeBuffer,
+    route_tokens: qx_metal::platform::RuntimeBuffer,
+    bucket_counts: qx_metal::platform::RuntimeBuffer,
+    bucket_pairs: qx_metal::platform::RuntimeBuffer,
+    gate_up: qx_metal::platform::RuntimeBuffer,
+    activated: qx_metal::platform::RuntimeBuffer,
+    expert_output: qx_metal::platform::RuntimeBuffer,
+    moe_output: qx_metal::platform::RuntimeBuffer,
+    logits_scratch: qx_metal::platform::RuntimeBuffer,
+    token_output: qx_metal::platform::RuntimeBuffer,
+}
+
+#[cfg(target_os = "macos")]
+impl KWideVerifierBuffers {
+    fn new(context: &qx_metal::platform::MetalContext, width: usize) -> Result<Self, String> {
+        let pair_count = width * TOP_K;
+        let f32_bytes = std::mem::size_of::<f32>();
+        let u32_bytes = std::mem::size_of::<u32>();
+        let alloc = |bytes: usize| context.allocate_runtime_buffer(bytes.max(1));
+        let tokens = alloc(width * u32_bytes)?;
+        let hidden_a = alloc(width * HIDDEN * f32_bytes)?;
+        let hidden_b = alloc(width * HIDDEN * f32_bytes)?;
+        let normalized = alloc(width * HIDDEN * f32_bytes)?;
+        let query = alloc(width * HIDDEN * f32_bytes)?;
+        let key = alloc(width * KV_HEADS * HEAD_DIM * f32_bytes)?;
+        let value = alloc(width * KV_HEADS * HEAD_DIM * f32_bytes)?;
+        let query_rotated = alloc(width * HIDDEN * f32_bytes)?;
+        let attention = alloc(width * HIDDEN * f32_bytes)?;
+        let router_scores = alloc(width * EXPERTS * f32_bytes)?;
+        let topk_ids = alloc(pair_count * u32_bytes)?;
+        let topk_weights = alloc(pair_count * f32_bytes)?;
+        let route_tokens = alloc(pair_count * u32_bytes)?;
+        let bucket_counts = alloc(EXPERTS * u32_bytes)?;
+        let bucket_pairs = alloc(EXPERTS * pair_count * u32_bytes)?;
+        let gate_up = alloc(pair_count * HIDDEN * f32_bytes)?;
+        let activated = alloc(pair_count * INTERMEDIATE * f32_bytes)?;
+        let expert_output = alloc(pair_count * HIDDEN * f32_bytes)?;
+        let moe_output = alloc(width * HIDDEN * f32_bytes)?;
+        // The fused final head uses this only as a partial-max workspace. A
+        // full logits matrix is intentionally not allocated for verification.
+        let logits_scratch = alloc(EXPERTS * HIDDEN * f32_bytes)?;
+        let token_output = alloc(width * u32_bytes)?;
+
+        let route_tokens_values: Vec<u32> =
+            (0..pair_count).map(|pair| (pair / TOP_K) as u32).collect();
+        let route_bytes = unsafe {
+            std::slice::from_raw_parts(
+                route_tokens_values.as_ptr() as *const u8,
+                std::mem::size_of_val(route_tokens_values.as_slice()),
+            )
+        };
+        context.write_runtime_buffer(&route_tokens, route_bytes)?;
+        Ok(Self {
+            pair_count,
+            tokens,
+            hidden_a,
+            hidden_b,
+            normalized,
+            query,
+            key,
+            value,
+            query_rotated,
+            attention,
+            router_scores,
+            topk_ids,
+            topk_weights,
+            route_tokens,
+            bucket_counts,
+            bucket_pairs,
+            gate_up,
+            activated,
+            expert_output,
+            moe_output,
+            logits_scratch,
+            token_output,
+        })
+    }
+
+    fn token_slice(
+        buffer: &qx_metal::platform::RuntimeBuffer,
+        token: usize,
+        width: usize,
+    ) -> Result<qx_metal::platform::RuntimeBuffer, String> {
+        buffer.subregion(token * width, width)
+    }
+}
+
+/// K-wide MoE consumer selected by the verifier plan. The packet consumer is
+/// exact-Q4 and keeps the expert-major route schedule while assigning packed
+/// code/scale ownership cooperatively across SIMD lanes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerifierMoeConsumer {
+    Pair,
+    UniquePacket,
+}
+
+#[cfg(target_os = "macos")]
+impl PreparedMoeStack {
+    /// Encode the K-wide packet MoE using GPU route compaction. This is the
+    /// runtime form used by the transactional verifier; the route IDs and
+    /// weights remain GPU-resident from router/top-k through accumulation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_verifier_compact_packet_moe(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        layer: usize,
+        input: &qx_metal::platform::RuntimeBuffer,
+        route_experts: &qx_metal::platform::RuntimeBuffer,
+        route_tokens: &qx_metal::platform::RuntimeBuffer,
+        route_weights: &qx_metal::platform::RuntimeBuffer,
+        bucket_counts: &qx_metal::platform::RuntimeBuffer,
+        bucket_pairs: &qx_metal::platform::RuntimeBuffer,
+        gate_up: &qx_metal::platform::RuntimeBuffer,
+        activated: &qx_metal::platform::RuntimeBuffer,
+        expert_output: &qx_metal::platform::RuntimeBuffer,
+        output: &qx_metal::platform::RuntimeBuffer,
+        pair_count: usize,
+        token_count: usize,
+    ) -> Result<(), String> {
+        let prepared = self
+            .layers
+            .get(layer)
+            .ok_or_else(|| format!("verifier MoE layer {layer} is outside the stack"))?;
+        graph.encode_verifier_compact_routes_fixed(
+            prepared,
+            route_experts,
+            bucket_counts,
+            bucket_pairs,
+            pair_count,
+        )?;
+        graph.encode_verifier_q4_gate_up_compact_unique_packet(
+            prepared,
+            input,
+            bucket_counts,
+            bucket_pairs,
+            route_tokens,
+            gate_up,
+            pair_count,
+        )?;
+        graph.encode_verifier_q4_silu_batch(prepared, gate_up, activated, pair_count)?;
+        graph.encode_verifier_q4_down_batch(
+            prepared,
+            route_experts,
+            activated,
+            expert_output,
+            pair_count,
+        )?;
+        graph.encode_verifier_q4_accumulate_batch(
+            prepared,
+            expert_output,
+            route_tokens,
+            route_weights,
+            output,
+            pair_count,
+            token_count,
+        )
+    }
+
+    /// Encode the exact K-wide MoE transaction using the planner-selected
+    /// packet consumer. Route buffers are GPU-resident and already compacted
+    /// into expert buckets; no CPU readback or route-dependent allocation is
+    /// introduced by this helper.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_verifier_packet_moe(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        layer: usize,
+        input: &qx_metal::platform::RuntimeBuffer,
+        route_experts: &qx_metal::platform::RuntimeBuffer,
+        route_tokens: &qx_metal::platform::RuntimeBuffer,
+        route_weights: &qx_metal::platform::RuntimeBuffer,
+        bucket_experts: &qx_metal::platform::RuntimeBuffer,
+        bucket_offsets: &qx_metal::platform::RuntimeBuffer,
+        bucket_pairs: &qx_metal::platform::RuntimeBuffer,
+        gate_up: &qx_metal::platform::RuntimeBuffer,
+        activated: &qx_metal::platform::RuntimeBuffer,
+        expert_output: &qx_metal::platform::RuntimeBuffer,
+        output: &qx_metal::platform::RuntimeBuffer,
+        pair_count: usize,
+        token_count: usize,
+    ) -> Result<(), String> {
+        let prepared = self
+            .layers
+            .get(layer)
+            .ok_or_else(|| format!("verifier MoE layer {layer} is outside the stack"))?;
+        graph.encode_verifier_q4_gate_up_expert_major_unique_packet(
+            prepared,
+            input,
+            bucket_experts,
+            bucket_offsets,
+            bucket_pairs,
+            route_tokens,
+            gate_up,
+            8,
+        )?;
+        graph.encode_verifier_q4_silu_batch(prepared, gate_up, activated, pair_count)?;
+        graph.encode_verifier_q4_down_batch(
+            prepared,
+            route_experts,
+            activated,
+            expert_output,
+            pair_count,
+        )?;
+        graph.encode_verifier_q4_accumulate_batch(
+            prepared,
+            expert_output,
+            route_tokens,
+            route_weights,
+            output,
+            pair_count,
+            token_count,
+        )
+    }
+}
+
 /// Canonical artifact-only Runtime V2 generator.
 ///
 /// The tokenizer deliberately remains outside this type: callers provide
@@ -746,6 +975,7 @@ pub struct PreparedMoeStack {
 pub struct GraniteV2Generator {
     context: Rc<qx_metal::platform::MetalContext>,
     buffers: GpuRuntimeBuffers,
+    verifier_buffers: KWideVerifierBuffers,
     stack: PreparedAttentionStack,
     moe: PreparedMoeStack,
     position: usize,
@@ -792,9 +1022,11 @@ impl GraniteV2Generator {
         );
         let stack = PreparedAttentionStack::load_from_mapped_artifact(&context, artifact.clone())?;
         let moe = PreparedMoeStack::load_from_mapped_artifact(&context, artifact)?;
+        let verifier_buffers = KWideVerifierBuffers::new(context.as_ref(), 4)?;
         Ok(Self {
             context,
             buffers,
+            verifier_buffers,
             stack,
             moe,
             position: 0,
@@ -912,6 +1144,252 @@ impl GraniteV2Generator {
         Ok(ReferenceVerification {
             accepted_prefix: inputs.len(),
             next_token,
+        })
+    }
+
+    /// Execute a real GPU K-wide verification transaction. The expensive
+    /// dense projections and causal attention are batched; routing remains
+    /// GPU-resident through top-k, fixed-stride route compaction, and the
+    /// packet-stationary MoE consumer. KV writes land in the speculative
+    /// suffix and the logical cursor advances only after the graph finishes.
+    ///
+    /// This is intentionally greedy and accepts a target token stream for the
+    /// first integration milestone. A draft model can call this API without
+    /// changing the transaction or GPU scheduling contract.
+    pub fn verify_tokens_gpu(
+        &mut self,
+        inputs: &[u32],
+        expected_next: &[u32],
+    ) -> Result<ReferenceVerification, String> {
+        let width = inputs.len();
+        if !matches!(width, 1 | 2 | 4) || expected_next.len() != width {
+            return Err("GPU verification supports equal K=1,2,4 token slices".to_owned());
+        }
+        if inputs.iter().any(|&token| token as usize >= VOCAB) {
+            return Err("GPU verification input contains an out-of-range token".to_owned());
+        }
+        if self.position + width > self.context_length() {
+            return Err(format!(
+                "GPU verification range {}..{} exceeds context {}",
+                self.position,
+                self.position + width,
+                self.context_length()
+            ));
+        }
+        let verifier = &self.verifier_buffers;
+        let token_bytes = unsafe {
+            std::slice::from_raw_parts(inputs.as_ptr() as *const u8, std::mem::size_of_val(inputs))
+        };
+        self.context
+            .write_runtime_buffer(&verifier.tokens, token_bytes)?;
+        let mut graph = self.context.begin_decode()?;
+        let f32_bytes = std::mem::size_of::<f32>();
+        for token in 0..width {
+            let token_buffer = KWideVerifierBuffers::token_slice(
+                &verifier.tokens,
+                token,
+                std::mem::size_of::<u32>(),
+            )?;
+            let hidden_buffer =
+                KWideVerifierBuffers::token_slice(&verifier.hidden_a, token, HIDDEN * f32_bytes)?;
+            graph.encode_q4_embedding_lookup(
+                &self.stack.embedding_lookup,
+                &token_buffer,
+                &hidden_buffer,
+                qx_model::EMBEDDING_MULTIPLIER,
+            )?;
+        }
+
+        for (layer, weights) in self.stack.layers.iter().enumerate() {
+            let (input, output) = if layer.is_multiple_of(2) {
+                (&verifier.hidden_a, &verifier.hidden_b)
+            } else {
+                (&verifier.hidden_b, &verifier.hidden_a)
+            };
+            for token in 0..width {
+                let input_token =
+                    KWideVerifierBuffers::token_slice(input, token, HIDDEN * f32_bytes)?;
+                let normalized_token = KWideVerifierBuffers::token_slice(
+                    &verifier.normalized,
+                    token,
+                    HIDDEN * f32_bytes,
+                )?;
+                graph.encode_rmsnorm(
+                    self.context.as_ref(),
+                    &input_token,
+                    &weights.input_norm,
+                    &normalized_token,
+                )?;
+            }
+            graph.encode_prepared_q4_qkv_simd_batch(
+                &weights.q_proj,
+                &weights.k_proj,
+                &weights.v_proj,
+                &verifier.normalized,
+                &verifier.query,
+                &verifier.key,
+                &verifier.value,
+                width,
+            )?;
+            let key_cache = self.buffers.kv_key_buffer(layer)?;
+            let value_cache = self.buffers.kv_value_buffer(layer)?;
+            graph.encode_rope_kv_batch(
+                self.context.as_ref(),
+                &verifier.query,
+                &verifier.key,
+                &verifier.value,
+                &verifier.query_rotated,
+                &key_cache,
+                &value_cache,
+                self.position,
+                width,
+            )?;
+            graph.encode_attention_batch(
+                self.context.as_ref(),
+                &verifier.query_rotated,
+                &key_cache,
+                &value_cache,
+                &verifier.attention,
+                self.position,
+                width,
+            )?;
+            graph.encode_prepared_q4_dense_simd_batch(
+                &weights.o_proj,
+                &verifier.attention,
+                &verifier.moe_output,
+                width,
+            )?;
+            for token in 0..width {
+                let input_token =
+                    KWideVerifierBuffers::token_slice(input, token, HIDDEN * f32_bytes)?;
+                let output_token =
+                    KWideVerifierBuffers::token_slice(output, token, HIDDEN * f32_bytes)?;
+                let projection_token = KWideVerifierBuffers::token_slice(
+                    &verifier.moe_output,
+                    token,
+                    HIDDEN * f32_bytes,
+                )?;
+                graph.encode_residual(
+                    self.context.as_ref(),
+                    &input_token,
+                    &projection_token,
+                    &output_token,
+                    qx_model::RESIDUAL_MULTIPLIER,
+                )?;
+                graph.encode_rmsnorm(
+                    self.context.as_ref(),
+                    &output_token,
+                    &weights.post_attention_norm,
+                    &KWideVerifierBuffers::token_slice(
+                        &verifier.normalized,
+                        token,
+                        HIDDEN * f32_bytes,
+                    )?,
+                )?;
+            }
+            graph.encode_prepared_q4_dense_simd_batch(
+                &weights.router,
+                &verifier.normalized,
+                &verifier.router_scores,
+                width,
+            )?;
+            for token in 0..width {
+                graph.encode_topk(
+                    self.context.as_ref(),
+                    &KWideVerifierBuffers::token_slice(
+                        &verifier.router_scores,
+                        token,
+                        EXPERTS * f32_bytes,
+                    )?,
+                    &KWideVerifierBuffers::token_slice(
+                        &verifier.topk_ids,
+                        token,
+                        TOP_K * std::mem::size_of::<u32>(),
+                    )?,
+                    &KWideVerifierBuffers::token_slice(
+                        &verifier.topk_weights,
+                        token,
+                        TOP_K * f32_bytes,
+                    )?,
+                )?;
+            }
+            self.moe.encode_verifier_compact_packet_moe(
+                &mut graph,
+                layer,
+                &verifier.normalized,
+                &verifier.topk_ids,
+                &verifier.route_tokens,
+                &verifier.topk_weights,
+                &verifier.bucket_counts,
+                &verifier.bucket_pairs,
+                &verifier.gate_up,
+                &verifier.activated,
+                &verifier.expert_output,
+                &verifier.moe_output,
+                verifier.pair_count,
+                width,
+            )?;
+            for token in 0..width {
+                let output_token =
+                    KWideVerifierBuffers::token_slice(output, token, HIDDEN * f32_bytes)?;
+                let moe_token = KWideVerifierBuffers::token_slice(
+                    &verifier.moe_output,
+                    token,
+                    HIDDEN * f32_bytes,
+                )?;
+                graph.encode_residual(
+                    self.context.as_ref(),
+                    &output_token,
+                    &moe_token,
+                    &output_token,
+                    qx_model::RESIDUAL_MULTIPLIER,
+                )?;
+            }
+        }
+        let final_hidden = if LAYERS.is_multiple_of(2) {
+            &verifier.hidden_a
+        } else {
+            &verifier.hidden_b
+        };
+        for token in 0..width {
+            let hidden_token =
+                KWideVerifierBuffers::token_slice(final_hidden, token, HIDDEN * f32_bytes)?;
+            let normalized_token =
+                KWideVerifierBuffers::token_slice(&verifier.normalized, token, HIDDEN * f32_bytes)?;
+            graph.encode_rmsnorm(
+                self.context.as_ref(),
+                &hidden_token,
+                &self.stack.final_norm,
+                &normalized_token,
+            )?;
+            graph.encode_prepared_q4_dense_argmax(
+                self.context.as_ref(),
+                &self.stack.embedding,
+                &normalized_token,
+                &verifier.logits_scratch,
+                &KWideVerifierBuffers::token_slice(
+                    &verifier.token_output,
+                    token,
+                    std::mem::size_of::<u32>(),
+                )?,
+                1.0 / qx_model::LOGITS_SCALING,
+            )?;
+        }
+        graph.finish(self.context.as_ref())?;
+        let predictions = self
+            .context
+            .read_runtime_u32s(&verifier.token_output, width)?;
+        let checkpoint = self.checkpoint_kv();
+        self.position += width;
+        let accepted_prefix = predictions
+            .iter()
+            .zip(expected_next)
+            .position(|(predicted, expected)| predicted != expected)
+            .unwrap_or(width);
+        self.commit_kv(checkpoint, accepted_prefix)?;
+        Ok(ReferenceVerification {
+            accepted_prefix,
+            next_token: predictions[accepted_prefix.min(width - 1)],
         })
     }
 
@@ -2827,6 +3305,7 @@ impl VerifierWidth {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VerifierExecutionPlan {
     pub width: VerifierWidth,
+    pub moe_consumer: VerifierMoeConsumer,
     pub hidden_bytes: usize,
     pub query_bytes: usize,
     pub key_bytes: usize,
@@ -2916,6 +3395,7 @@ impl ExecutionPlan {
         let kv_candidate_bytes = LAYERS * (key_bytes + value_bytes);
         VerifierExecutionPlan {
             width,
+            moe_consumer: VerifierMoeConsumer::UniquePacket,
             hidden_bytes,
             query_bytes,
             key_bytes,

@@ -898,6 +898,8 @@ pub mod platform {
         verifier_gate_up_expert_major_pipeline: Pipeline,
         verifier_gate_up_expert_major_direct_pipeline: Pipeline,
         verifier_gate_up_expert_major_unique_packet_pipeline: Pipeline,
+        verifier_compact_routes_pipeline: Pipeline,
+        verifier_gate_up_compact_unique_packet_pipeline: Pipeline,
         verifier_silu_pipeline: Pipeline,
         verifier_down_pipeline: Pipeline,
         verifier_accumulate_pipeline: Pipeline,
@@ -2936,6 +2938,67 @@ pub mod platform {
             Ok(())
         }
 
+        /// Compact token-major top-k IDs into fixed-stride GPU-resident expert
+        /// buckets. Each expert owns one thread; no CPU route readback or
+        /// atomic prefix sum is required.
+        pub fn encode_verifier_compact_routes_fixed(
+            &mut self,
+            prepared: &PreparedDynamicQ4Moe,
+            route_experts: &RuntimeBuffer,
+            bucket_counts: &RuntimeBuffer,
+            bucket_pairs: &RuntimeBuffer,
+            pair_count: usize,
+        ) -> Result<(), String> {
+            if pair_count == 0 || pair_count > 32 {
+                return Err("K-wide route compaction supports pair counts 1..=32".to_owned());
+            }
+            if route_experts.length < pair_count * std::mem::size_of::<u32>()
+                || bucket_counts.length < 32 * std::mem::size_of::<u32>()
+                || bucket_pairs.length < 32 * pair_count * std::mem::size_of::<u32>()
+            {
+                return Err("K-wide route-compaction buffers are too small".to_owned());
+            }
+            let pair_count = pair_count as u32;
+            self.encoder
+                .setComputePipelineState(&prepared.verifier_compact_routes_pipeline);
+            unsafe {
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&route_experts.buffer),
+                    route_experts.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&bucket_counts.buffer),
+                    bucket_counts.offset,
+                    1,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&bucket_pairs.buffer),
+                    bucket_pairs.offset,
+                    2,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&pair_count).cast(),
+                    std::mem::size_of_val(&pair_count),
+                    3,
+                );
+            }
+            self.encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
         /// Encode the packet-stationary expert-major candidate. It has the
         /// same route/bucket ABI as the cached expert-major control, but the
         /// Metal kernel assigns one packed code byte and scale to each lane
@@ -3016,6 +3079,83 @@ pub mod platform {
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
                     width: (bucket_count as usize) * (1024 / 8),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        /// Encode packet-stationary gate/up from the fixed-stride GPU route
+        /// buckets produced by `encode_verifier_compact_routes_fixed`.
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_verifier_q4_gate_up_compact_unique_packet(
+            &mut self,
+            prepared: &PreparedDynamicQ4Moe,
+            input: &RuntimeBuffer,
+            bucket_counts: &RuntimeBuffer,
+            bucket_pairs: &RuntimeBuffer,
+            route_tokens: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            pair_count: usize,
+        ) -> Result<(), String> {
+            if prepared.gate_up_layout != PackingLayout::Q4RowInline {
+                return Err("K-wide compact gate/up requires Q4 row-inline".to_owned());
+            }
+            if pair_count == 0 || pair_count > 32 {
+                return Err("K-wide compact gate/up supports pair counts 1..=32".to_owned());
+            }
+            if input.length < 1024 * std::mem::size_of::<f32>()
+                || bucket_counts.length < 32 * std::mem::size_of::<u32>()
+                || bucket_pairs.length < 32 * pair_count * std::mem::size_of::<u32>()
+                || route_tokens.length < pair_count * std::mem::size_of::<u32>()
+                || output.length < pair_count * 1024 * std::mem::size_of::<f32>()
+            {
+                return Err("K-wide compact gate/up buffers are too small".to_owned());
+            }
+            let pair_count = pair_count as u32;
+            self.encoder
+                .setComputePipelineState(&prepared.verifier_gate_up_compact_unique_packet_pipeline);
+            unsafe {
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.gate_up_packed.buffer),
+                    prepared.gate_up_packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&bucket_counts.buffer),
+                    bucket_counts.offset,
+                    1,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&bucket_pairs.buffer),
+                    bucket_pairs.offset,
+                    2,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&route_tokens.buffer),
+                    route_tokens.offset,
+                    3,
+                );
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 4);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&output.buffer), output.offset, 5);
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&pair_count).cast(),
+                    std::mem::size_of_val(&pair_count),
+                    6,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: 32 * (1024 / 8),
                     height: 1,
                     depth: 1,
                 },
@@ -8674,6 +8814,11 @@ pub mod platform {
                     .dynamic_moe_named_pipeline(
                         "qx_verifier_q4_moe_gate_up_expert_major_unique_packet",
                     )?,
+                verifier_compact_routes_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_compact_routes_fixed")?,
+                verifier_gate_up_compact_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_verifier_q4_moe_gate_up_compact_unique_packet",
+                )?,
                 verifier_silu_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_silu_batch")?,
                 verifier_down_pipeline: self
@@ -9035,6 +9180,11 @@ pub mod platform {
                     .dynamic_moe_named_pipeline(
                         "qx_verifier_q4_moe_gate_up_expert_major_unique_packet",
                     )?,
+                verifier_compact_routes_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_compact_routes_fixed")?,
+                verifier_gate_up_compact_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_verifier_q4_moe_gate_up_compact_unique_packet",
+                )?,
                 verifier_silu_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_silu_batch")?,
                 verifier_down_pipeline: self
@@ -9352,6 +9502,11 @@ pub mod platform {
                     .dynamic_moe_named_pipeline(
                         "qx_verifier_q4_moe_gate_up_expert_major_unique_packet",
                     )?,
+                verifier_compact_routes_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_compact_routes_fixed")?,
+                verifier_gate_up_compact_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_verifier_q4_moe_gate_up_compact_unique_packet",
+                )?,
                 verifier_silu_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_silu_batch")?,
                 verifier_down_pipeline: self
@@ -9749,6 +9904,11 @@ pub mod platform {
                     .dynamic_moe_named_pipeline(
                         "qx_verifier_q4_moe_gate_up_expert_major_unique_packet",
                     )?,
+                verifier_compact_routes_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_compact_routes_fixed")?,
+                verifier_gate_up_compact_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
+                    "qx_verifier_q4_moe_gate_up_compact_unique_packet",
+                )?,
                 verifier_silu_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_silu_batch")?,
                 verifier_down_pipeline: self
