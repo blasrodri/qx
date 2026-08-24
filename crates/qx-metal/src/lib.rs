@@ -2640,6 +2640,13 @@ pub mod platform {
             expert_weights: &RuntimeBuffer,
             output: &RuntimeBuffer,
         ) -> Result<(), String> {
+            if prepared.gate_up_layout.is_q4_superblock()
+                || prepared.down_layout.is_q4_superblock()
+            {
+                return Err(
+                    "Q4 superblocks require the four-stage batched SIMD MoE path".to_owned(),
+                );
+            }
             if input.length < 1024 * std::mem::size_of::<f32>()
                 || expert_ids.length < 8 * std::mem::size_of::<u32>()
                 || expert_weights.length < 8 * std::mem::size_of::<f32>()
@@ -2714,6 +2721,13 @@ pub mod platform {
             expert_weights: &RuntimeBuffer,
             output: &RuntimeBuffer,
         ) -> Result<(), String> {
+            if prepared.gate_up_layout.is_q4_superblock()
+                || prepared.down_layout.is_q4_superblock()
+            {
+                return Err(
+                    "Q4 superblocks require the four-stage batched SIMD MoE path".to_owned(),
+                );
+            }
             if input.length < 1024 * std::mem::size_of::<f32>()
                 || expert_ids.length < 8 * std::mem::size_of::<u32>()
                 || expert_weights.length < 8 * std::mem::size_of::<f32>()
@@ -3674,12 +3688,15 @@ pub mod platform {
                 && prepared.down_scales.length == 32 * 1024 * 2 * 2 * 2;
             let q4k_mature_gate_up = is_q4k && moe_q4k_mature_gate_up_enabled();
             let q4k_mature_down = is_q4k && moe_q4k_mature_down_enabled();
+            let superblock_gate_up = prepared.gate_up_layout.is_q4_superblock();
+            let superblock_down = prepared.down_layout.is_q4_superblock();
             let expert_wave_width = moe_expert_wave_width();
             let wide_expert =
                 moe_wide_expert_enabled() && prepared.wide_supported && q3_block_bytes.is_none();
             let inline_input_cache = moe_inline_input_cache_enabled();
             let fused_block_mapping = moe_fused_transaction_block_mapping();
-            let transaction_gate_up = prepared.gate_up_layout.is_q4_transaction();
+            let transaction_gate_up =
+                prepared.gate_up_layout.is_q4_transaction() || superblock_gate_up;
             let fused_block_active = q3_block_bytes.is_none()
                 && (transaction_gate_up
                     || (fused_block_mapping.is_some()
@@ -3746,7 +3763,7 @@ pub mod platform {
                     self.encoder
                         .setComputePipelineState(&prepared.decode_direct_gate_up_norm_pipeline);
                 } else if fused_block_active {
-                    let pipeline = if fused_block_mapping == Some(true) {
+                    let pipeline = if fused_block_mapping == Some(true) && !superblock_gate_up {
                         prepared.fused_block_llama_gate_up_norm_pipeline.as_ref()
                     } else {
                         prepared.fused_block_qx_gate_up_norm_pipeline.as_ref()
@@ -3843,7 +3860,7 @@ pub mod platform {
                     self.encoder
                         .setComputePipelineState(&prepared.decode_direct_gate_up_pipeline);
                 } else if fused_block_active {
-                    let pipeline = if fused_block_mapping == Some(true) {
+                    let pipeline = if fused_block_mapping == Some(true) && !superblock_gate_up {
                         prepared.fused_block_llama_gate_up_pipeline.as_ref()
                     } else {
                         prepared.fused_block_qx_gate_up_pipeline.as_ref()
@@ -3974,7 +3991,9 @@ pub mod platform {
             } else {
                 self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: if q4k_mature_gate_up {
+                        width: if superblock_gate_up {
+                            8 * (1024 / 16)
+                        } else if q4k_mature_gate_up {
                             8 * (1024 / 8)
                         } else if fused_block_active && fused_block_mapping == Some(true) {
                             8 * (1024 / 4)
@@ -4006,7 +4025,9 @@ pub mod platform {
                         depth: 1,
                     },
                     MTLSize {
-                        width: if q4k_mature_gate_up {
+                        width: if superblock_gate_up {
+                            256
+                        } else if q4k_mature_gate_up {
                             128
                         } else if fused_block_active && fused_block_mapping == Some(true) {
                             64
@@ -4166,7 +4187,9 @@ pub mod platform {
             } else {
                 self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: if q4k_mature_down {
+                        width: if superblock_down {
+                            8 * (1024 / 16)
+                        } else if q4k_mature_down {
                             8 * (1024 / 8)
                         } else if decode_direct {
                             8 * (1024 / 2)
@@ -4179,7 +4202,9 @@ pub mod platform {
                         depth: 1,
                     },
                     MTLSize {
-                        width: if q4k_mature_down {
+                        width: if superblock_down {
+                            256
+                        } else if q4k_mature_down {
                             256
                         } else if decode_direct {
                             64
@@ -5062,6 +5087,8 @@ pub mod platform {
                 && prepared.down_scales.length == 32 * 1024 * 2 * 2 * 2;
             let q4k_mature_gate_up = is_q4k && moe_q4k_mature_gate_up_enabled();
             let q4k_mature_down = is_q4k && moe_q4k_mature_down_enabled();
+            let superblock_gate_up = prepared.gate_up_layout.is_q4_superblock();
+            let superblock_down = prepared.down_layout.is_q4_superblock();
             let wide_expert =
                 moe_wide_expert_enabled() && prepared.wide_supported && q3_block_bytes.is_none();
             let row_inline_streaming = moe_row_inline_streaming_enabled()
@@ -5094,6 +5121,15 @@ pub mod platform {
                         } else if gate_up_instrument
                             && self.select_gate_up_instrument_pipeline(prepared, true)?
                         {
+                        } else if superblock_gate_up {
+                            self.encoder.setComputePipelineState(
+                                prepared
+                                    .fused_block_qx_gate_up_norm_pipeline
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        "superblock gate/up pipeline is missing".to_owned()
+                                    })?,
+                            );
                         } else if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
                             self.encoder.setComputePipelineState(pipeline);
                         } else if q4k_mature_gate_up {
@@ -5176,7 +5212,8 @@ pub mod platform {
                         } else if gate_up_instrument
                             && self.select_gate_up_instrument_pipeline(prepared, false)?
                         {
-                        } else if prepared.gate_up_layout.is_q4_transaction() {
+                        } else if prepared.gate_up_layout.is_q4_transaction() || superblock_gate_up
+                        {
                             self.encoder.setComputePipelineState(
                                 prepared
                                     .fused_block_qx_gate_up_pipeline
@@ -5300,7 +5337,9 @@ pub mod platform {
                     }
                     self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: if q4k_mature_gate_up {
+                            width: if superblock_gate_up {
+                                8 * (1024 / 16)
+                            } else if q4k_mature_gate_up {
                                 8 * (1024 / 8)
                             } else if two_row_dataflow {
                                 8 * (1024 / 4)
@@ -5322,7 +5361,9 @@ pub mod platform {
                             depth: 1,
                         },
                         MTLSize {
-                            width: if q4k_mature_gate_up {
+                            width: if superblock_gate_up {
+                                256
+                            } else if q4k_mature_gate_up {
                                 128
                             } else if two_row_dataflow {
                                 64
@@ -5475,7 +5516,9 @@ pub mod platform {
                     }
                     self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: if q4k_mature_down {
+                            width: if superblock_down {
+                                8 * (1024 / 16)
+                            } else if q4k_mature_down {
                                 8 * (1024 / 8)
                             } else if decode_direct {
                                 8 * (1024 / 2)
@@ -5488,7 +5531,9 @@ pub mod platform {
                             depth: 1,
                         },
                         MTLSize {
-                            width: if q4k_mature_down {
+                            width: if superblock_down {
+                                256
+                            } else if q4k_mature_down {
                                 256
                             } else if decode_direct {
                                 64
@@ -9335,14 +9380,26 @@ pub mod platform {
                             _ => 0,
                         }
                 && down_scales.len() == down_packed.len();
+            let is_q4_superblock_gate = gate_up_layout.is_q4_superblock()
+                && gate_up_packed.len() == EXPERTS * Q4_TRANSACTION_GATE_UP_144
+                && gate_up_scales.len() == gate_up_packed.len();
+            let is_q4_superblock_down = down_layout.is_q4_superblock()
+                && down_packed.len() == EXPERTS * Q4_TRANSACTION_DOWN_144
+                && down_scales.len() == down_packed.len();
             let is_q4_cross_expert_gate = gate_up_layout == PackingLayout::Q4CrossExpertTile8
                 && gate_up_packed.len() == Q4_CROSS_EXPERT_GATE_UP
                 && gate_up_scales.len() == Q4_CROSS_EXPERT_GATE_UP;
             let is_q4_cross_expert_down = down_layout == PackingLayout::Q4CrossExpertTile8
                 && down_packed.len() == Q4_CROSS_EXPERT_DOWN
                 && down_scales.len() == Q4_CROSS_EXPERT_DOWN;
-            let is_q4_gate = is_q4_gate || is_q4_transaction_gate || is_q4_cross_expert_gate;
-            let is_q4_down = is_q4_down || is_q4_transaction_down || is_q4_cross_expert_down;
+            let is_q4_gate = is_q4_gate
+                || is_q4_transaction_gate
+                || is_q4_superblock_gate
+                || is_q4_cross_expert_gate;
+            let is_q4_down = is_q4_down
+                || is_q4_transaction_down
+                || is_q4_superblock_down
+                || is_q4_cross_expert_down;
             let is_q4 = is_q4_gate && is_q4_down;
             let is_q4k = gate_up_packed.len() == EXPERTS * Q4K_GATE_UP_PACKED
                 && gate_up_scales.len() == EXPERTS * Q4K_GATE_UP_SCALES
@@ -9351,6 +9408,8 @@ pub mod platform {
             if (!is_q4 && !is_q4k)
                 || (gate_up_layout.is_q4_transaction() && !is_q4_transaction_gate)
                 || (down_layout.is_q4_transaction() && !is_q4_transaction_down)
+                || (gate_up_layout.is_q4_superblock() && !is_q4_superblock_gate)
+                || (down_layout.is_q4_superblock() && !is_q4_superblock_down)
                 || (gate_up_layout == PackingLayout::Q4CrossExpertTile8 && !is_q4_cross_expert_gate)
                 || (down_layout == PackingLayout::Q4CrossExpertTile8 && !is_q4_cross_expert_down)
             {
@@ -9368,20 +9427,36 @@ pub mod platform {
             } else {
                 self.input_runtime_buffer(down_scales)?
             };
-            let gate_up_pipeline = if is_q4k {
+            let gate_up_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_simd"
+            } else if is_q4k {
                 "qx_dynamic_q4k_moe_gate_up_simd"
             } else {
                 "qx_dynamic_q4_moe_gate_up_simd"
             };
-            let gate_up_norm_pipeline = if is_q4k {
+            let gate_up_norm_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_norm_simd"
+            } else if is_q4k {
                 "qx_dynamic_q4k_moe_gate_up_norm_simd"
             } else {
                 "qx_dynamic_q4_moe_gate_up_norm_simd"
             };
-            let down_pipeline = if is_q4k {
+            let down_pipeline = if down_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_down_superblock144_simd"
+            } else if is_q4k {
                 "qx_dynamic_q4k_moe_down_simd"
             } else {
                 "qx_dynamic_q4_moe_down_simd"
+            };
+            let fused_block_qx_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_simd"
+            } else {
+                "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd"
+            };
+            let fused_block_qx_norm_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_norm_simd"
+            } else {
+                "qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd"
             };
             Ok(PreparedDynamicQ4Moe {
                 unique_packet_gate_up_pipeline: self.dynamic_moe_named_pipeline(
@@ -9522,13 +9597,11 @@ pub mod platform {
                 q4k_mature_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_norm_simd")?,
                 fused_block_qx_gate_up_pipeline: Some(
-                    self.dynamic_moe_named_pipeline(
-                        "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
-                    )?,
+                    self.dynamic_moe_named_pipeline(fused_block_qx_pipeline)?,
                 ),
-                fused_block_qx_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
-                    "qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd",
-                )?),
+                fused_block_qx_gate_up_norm_pipeline: Some(
+                    self.dynamic_moe_named_pipeline(fused_block_qx_norm_pipeline)?,
+                ),
                 fused_block_llama_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_fused_block_llama_simd",
                 )?),
@@ -9695,14 +9768,26 @@ pub mod platform {
                             _ => 0,
                         }
                 && down_scales.length == down_packed.length;
+            let is_q4_superblock_gate = gate_up_layout.is_q4_superblock()
+                && gate_up_packed.length == EXPERTS * Q4_TRANSACTION_GATE_UP_144
+                && gate_up_scales.length == gate_up_packed.length;
+            let is_q4_superblock_down = down_layout.is_q4_superblock()
+                && down_packed.length == EXPERTS * Q4_TRANSACTION_DOWN_144
+                && down_scales.length == down_packed.length;
             let is_q4_cross_expert_gate = gate_up_layout == PackingLayout::Q4CrossExpertTile8
                 && gate_up_packed.length == Q4_CROSS_EXPERT_GATE_UP
                 && gate_up_scales.length == Q4_CROSS_EXPERT_GATE_UP;
             let is_q4_cross_expert_down = down_layout == PackingLayout::Q4CrossExpertTile8
                 && down_packed.length == Q4_CROSS_EXPERT_DOWN
                 && down_scales.length == Q4_CROSS_EXPERT_DOWN;
-            let is_q4_gate = is_q4_gate || is_q4_transaction_gate || is_q4_cross_expert_gate;
-            let is_q4_down = is_q4_down || is_q4_transaction_down || is_q4_cross_expert_down;
+            let is_q4_gate = is_q4_gate
+                || is_q4_transaction_gate
+                || is_q4_superblock_gate
+                || is_q4_cross_expert_gate;
+            let is_q4_down = is_q4_down
+                || is_q4_transaction_down
+                || is_q4_superblock_down
+                || is_q4_cross_expert_down;
             let is_q4 = is_q4_gate && is_q4_down;
             let is_q4k = gate_up_packed.length == EXPERTS * Q4K_GATE_UP_PACKED
                 && gate_up_scales.length == EXPERTS * Q4K_GATE_UP_SCALES
@@ -9729,25 +9814,43 @@ pub mod platform {
                 && !is_q4_gate_q3_down)
                 || (gate_up_layout.is_q4_transaction() && !is_q4_transaction_gate)
                 || (down_layout.is_q4_transaction() && !is_q4_transaction_down)
+                || (gate_up_layout.is_q4_superblock() && !is_q4_superblock_gate)
+                || (down_layout.is_q4_superblock() && !is_q4_superblock_down)
                 || (gate_up_layout == PackingLayout::Q4CrossExpertTile8 && !is_q4_cross_expert_gate)
                 || (down_layout == PackingLayout::Q4CrossExpertTile8 && !is_q4_cross_expert_down)
             {
                 return Err("dynamic Q4 MoE slab views have an invalid Granite shape".to_owned());
             }
-            let gate_up_pipeline = if is_q4k {
+            let gate_up_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_simd"
+            } else if is_q4k {
                 "qx_dynamic_q4k_moe_gate_up_simd"
             } else {
                 "qx_dynamic_q4_moe_gate_up_simd"
             };
-            let gate_up_norm_pipeline = if is_q4k {
+            let gate_up_norm_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_norm_simd"
+            } else if is_q4k {
                 "qx_dynamic_q4k_moe_gate_up_norm_simd"
             } else {
                 "qx_dynamic_q4_moe_gate_up_norm_simd"
             };
-            let down_pipeline = if is_q4k {
+            let down_pipeline = if down_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_down_superblock144_simd"
+            } else if is_q4k {
                 "qx_dynamic_q4k_moe_down_simd"
             } else {
                 "qx_dynamic_q4_moe_down_simd"
+            };
+            let fused_block_qx_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_simd"
+            } else {
+                "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd"
+            };
+            let fused_block_qx_norm_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_norm_simd"
+            } else {
+                "qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd"
             };
             let mut prepared = PreparedDynamicQ4Moe {
                 unique_packet_gate_up_pipeline: self.dynamic_moe_named_pipeline(
@@ -9888,13 +9991,11 @@ pub mod platform {
                 q4k_mature_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_norm_simd")?,
                 fused_block_qx_gate_up_pipeline: Some(
-                    self.dynamic_moe_named_pipeline(
-                        "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
-                    )?,
+                    self.dynamic_moe_named_pipeline(fused_block_qx_pipeline)?,
                 ),
-                fused_block_qx_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
-                    "qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd",
-                )?),
+                fused_block_qx_gate_up_norm_pipeline: Some(
+                    self.dynamic_moe_named_pipeline(fused_block_qx_norm_pipeline)?,
+                ),
                 fused_block_llama_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_fused_block_llama_simd",
                 )?),
@@ -11744,6 +11845,16 @@ mod tests {
         }
         assert!(DYNAMIC_MOE_KERNEL_SOURCE.contains("layout == 7 || layout == 8"));
         assert!(DYNAMIC_MOE_KERNEL_SOURCE.contains("layout == 8 ? 160 : 144"));
+        for name in [
+            "qx_dynamic_q4_moe_gate_up_superblock144_simd",
+            "qx_dynamic_q4_moe_gate_up_superblock144_norm_simd",
+            "qx_dynamic_q4_moe_down_superblock144_simd",
+        ] {
+            assert!(
+                DYNAMIC_MOE_KERNEL_SOURCE.contains(name),
+                "missing Metal entry point: {name}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -12616,7 +12727,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn transaction_144_and_160_dispatches_have_identical_projection_results() {
+    fn block_layout_dispatches_have_identical_projection_results() {
         use half::f16;
 
         fn transaction_stream(
@@ -12645,13 +12756,41 @@ mod tests {
             stream
         }
 
+        fn superblock_stream(experts: usize, rows: usize, groups: usize) -> Vec<u8> {
+            let blocks = groups / 8;
+            let expert_bytes = rows * blocks * 144;
+            let mut stream = vec![0_u8; experts * expert_bytes];
+            for expert in 0..experts {
+                for row in 0..rows {
+                    for block in 0..blocks {
+                        let block_start = expert * expert_bytes + (row * blocks + block) * 144;
+                        stream[block_start..block_start + 128].fill(0x88);
+                        for group in 0..8 {
+                            let scale_start = block_start + 128 + group * 2;
+                            stream[scale_start..scale_start + 2]
+                                .copy_from_slice(&f16::from_f32(1.0).to_bits().to_le_bytes());
+                        }
+                    }
+                }
+            }
+            stream
+        }
+
         let context = platform::MetalContext::system_default().expect("Metal device");
         let input_values = [1.0_f32; 1024];
         let ids_values = [0_u32, 1, 2, 3, 4, 5, 6, 7];
         let weights_values = [0.125_f32; 8];
         let run = |layout, block_bytes| {
-            let gate_up = transaction_stream(32, 1024, 32, block_bytes);
-            let down = transaction_stream(32, 1024, 16, block_bytes);
+            let gate_up = if layout == PackingLayout::Q4Superblock144 {
+                superblock_stream(32, 1024, 32)
+            } else {
+                transaction_stream(32, 1024, 32, block_bytes)
+            };
+            let down = if layout == PackingLayout::Q4Superblock144 {
+                superblock_stream(32, 1024, 16)
+            } else {
+                transaction_stream(32, 1024, 16, block_bytes)
+            };
             let prepared = context
                 .prepare_dynamic_q4_moe_with_layouts(
                     &gate_up, &gate_up, &down, &down, layout, layout,
@@ -12714,7 +12853,9 @@ mod tests {
                 .unwrap();
             let mut graph = context.begin_decode().unwrap();
             graph
-                .encode_dynamic_q4_moe(&prepared, &input, &ids, &weights, &output)
+                .encode_dynamic_q4_moe_batched_simd(
+                    &prepared, &input, &ids, &weights, &scratch, &output,
+                )
                 .unwrap();
             graph.finish(&context).unwrap();
             (
@@ -12726,6 +12867,8 @@ mod tests {
 
         let (dense_stage, dense_down, dense) = run(PackingLayout::Q4Transaction144, 144);
         let (padded_stage, padded_down, padded) = run(PackingLayout::Q4Transaction160, 160);
+        let (superblock_stage, superblock_down, superblock) =
+            run(PackingLayout::Q4Superblock144, 144);
         let stage_error = dense_stage
             .iter()
             .zip(&padded_stage)
@@ -12741,6 +12884,21 @@ mod tests {
             .zip(&padded_down)
             .map(|(left, right)| (left - right).abs())
             .fold(0.0_f32, f32::max);
+        let superblock_stage_error = dense_stage
+            .iter()
+            .zip(&superblock_stage)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        let superblock_down_error = dense_down
+            .iter()
+            .zip(&superblock_down)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        let superblock_error = dense
+            .iter()
+            .zip(&superblock)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
         assert!(dense.iter().all(|value| value.is_finite() && *value > 0.0));
         assert!(
             max_error < 1.0e-2,
@@ -12751,6 +12909,12 @@ mod tests {
             padded_down[0],
             dense_stage[0],
             padded_stage[0]
+        );
+        assert!(
+            superblock_error < 1.0e-2
+                && superblock_stage_error < 1.0e-2
+                && superblock_down_error < 1.0e-2,
+            "superblock error: output={superblock_error}, stage={superblock_stage_error}, down={superblock_down_error}"
         );
     }
 

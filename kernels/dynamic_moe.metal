@@ -1603,6 +1603,184 @@ kernel void qx_dynamic_q4_moe_gate_up_fused_block_llama_norm_simd(
         threadgroup_id, 2, 2, layout);
 }
 
+// Payload-contiguous exact-Q4 superblock consumer. Each 144-byte block is
+// [128 code bytes][8 FP16 scales] for 256 weights. A SIMD lane owns eight
+// adjacent weights (one uint payload load), four neighboring lanes share one
+// group scale, and each SIMD group accumulates two rows while reusing the same
+// activation registers. Four SIMD groups therefore produce eight rows from a
+// 256-thread threadgroup.
+inline float qx_dynamic_q4_superblock_dot8(
+    uint packed, float4 x0, float4 x1, float scale, float sum) {
+    uint q0 = packed & 0xffu;
+    uint q1 = (packed >> 8u) & 0xffu;
+    uint q2 = (packed >> 16u) & 0xffu;
+    uint q3 = (packed >> 24u) & 0xffu;
+    sum = fma(float(int(q0 & 0xfu) - 7) * scale, x0.x, sum);
+    sum = fma(float(int(q0 >> 4u) - 7) * scale, x0.y, sum);
+    sum = fma(float(int(q1 & 0xfu) - 7) * scale, x0.z, sum);
+    sum = fma(float(int(q1 >> 4u) - 7) * scale, x0.w, sum);
+    sum = fma(float(int(q2 & 0xfu) - 7) * scale, x1.x, sum);
+    sum = fma(float(int(q2 >> 4u) - 7) * scale, x1.y, sum);
+    sum = fma(float(int(q3 & 0xfu) - 7) * scale, x1.z, sum);
+    return fma(float(int(q3 >> 4u) - 7) * scale, x1.w, sum);
+}
+
+inline void qx_dynamic_q4_superblock_gate_up_body(
+    device const uchar* stream,
+    device const uint* expert_ids,
+    device float* output,
+    threadgroup const float* cached_input,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id) {
+    constexpr uint hidden = 1024;
+    constexpr uint blocks = 4;
+    constexpr uint block_bytes = 144;
+    constexpr uint row_bytes = blocks * block_bytes;
+    constexpr uint expert_bytes = hidden * row_bytes;
+    constexpr uint rows_per_threadgroup = 16;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint first_row = (threadgroup_id % threadgroups_per_expert) * rows_per_threadgroup
+        + simdgroup * 2u;
+    uint expert = expert_ids[slot];
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    if (expert < 32u) {
+        uint expert_base = expert * expert_bytes;
+        #pragma unroll
+        for (uint block = 0; block < blocks; ++block) {
+            uint column = block * 256u + lane * 8u;
+            threadgroup const float4* values =
+                reinterpret_cast<threadgroup const float4*>(cached_input + column);
+            float4 x0 = values[0];
+            float4 x1 = values[1];
+            uint base0 = expert_base + first_row * row_bytes + block * block_bytes;
+            uint base1 = base0 + row_bytes;
+            uint packed0 = reinterpret_cast<device const uint*>(stream + base0)[lane];
+            uint packed1 = reinterpret_cast<device const uint*>(stream + base1)[lane];
+            float owned_scale0 = lane < 8u
+                ? float(reinterpret_cast<device const half*>(stream + base0 + 128u)[lane])
+                : 0.0f;
+            float owned_scale1 = lane < 8u
+                ? float(reinterpret_cast<device const half*>(stream + base1 + 128u)[lane])
+                : 0.0f;
+            ushort scale_lane = ushort(lane >> 2u);
+            float scale0 = simd_shuffle(owned_scale0, scale_lane);
+            float scale1 = simd_shuffle(owned_scale1, scale_lane);
+            sum0 = qx_dynamic_q4_superblock_dot8(packed0, x0, x1, scale0, sum0);
+            sum1 = qx_dynamic_q4_superblock_dot8(packed1, x0, x1, scale1, sum1);
+        }
+    }
+    sum0 = simd_sum(sum0);
+    sum1 = simd_sum(sum1);
+    if (lane == 0u && expert < 32u) {
+        output[slot * hidden + first_row] = sum0;
+        output[slot * hidden + first_row + 1u] = sum1;
+    }
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_superblock144_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    for (uint column = thread_index; column < 1024u; column += 256u) {
+        cached_input[column] = input[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_superblock_gate_up_body(
+        stream, expert_ids, output, cached_input, lane, simdgroup, threadgroup_id);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_superblock144_norm_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]],
+    device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    float inverse = inverse_rms[0];
+    for (uint column = thread_index; column < 1024u; column += 256u) {
+        cached_input[column] = input[column] * inverse * norm_weights[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_superblock_gate_up_body(
+        stream, expert_ids, output, cached_input, lane, simdgroup, threadgroup_id);
+}
+
+kernel void qx_dynamic_q4_moe_down_superblock144_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* activated [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint intermediate = 512;
+    constexpr uint blocks = 2;
+    constexpr uint block_bytes = 144;
+    constexpr uint row_bytes = blocks * block_bytes;
+    constexpr uint expert_bytes = hidden * row_bytes;
+    constexpr uint rows_per_threadgroup = 16;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint first_row = (threadgroup_id % threadgroups_per_expert) * rows_per_threadgroup
+        + simdgroup * 2u;
+    uint expert = expert_ids[slot];
+    threadgroup float cached_input[intermediate];
+    for (uint column = thread_index; column < intermediate; column += 256u) {
+        cached_input[column] = activated[slot * intermediate + column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    if (expert < 32u) {
+        uint expert_base = expert * expert_bytes;
+        #pragma unroll
+        for (uint block = 0; block < blocks; ++block) {
+            uint column = block * 256u + lane * 8u;
+            threadgroup const float4* values =
+                reinterpret_cast<threadgroup const float4*>(cached_input + column);
+            float4 x0 = values[0];
+            float4 x1 = values[1];
+            uint base0 = expert_base + first_row * row_bytes + block * block_bytes;
+            uint base1 = base0 + row_bytes;
+            uint packed0 = reinterpret_cast<device const uint*>(stream + base0)[lane];
+            uint packed1 = reinterpret_cast<device const uint*>(stream + base1)[lane];
+            float owned_scale0 = lane < 8u
+                ? float(reinterpret_cast<device const half*>(stream + base0 + 128u)[lane])
+                : 0.0f;
+            float owned_scale1 = lane < 8u
+                ? float(reinterpret_cast<device const half*>(stream + base1 + 128u)[lane])
+                : 0.0f;
+            ushort scale_lane = ushort(lane >> 2u);
+            float scale0 = simd_shuffle(owned_scale0, scale_lane);
+            float scale1 = simd_shuffle(owned_scale1, scale_lane);
+            sum0 = qx_dynamic_q4_superblock_dot8(packed0, x0, x1, scale0, sum0);
+            sum1 = qx_dynamic_q4_superblock_dot8(packed1, x0, x1, scale1, sum1);
+        }
+    }
+    sum0 = simd_sum(sum0);
+    sum1 = simd_sum(sum1);
+    if (lane == 0u && expert < 32u) {
+        output[slot * hidden + first_row] = sum0;
+        output[slot * hidden + first_row + 1u] = sum1;
+    }
+}
+
 // Cross-expert activation-chunk candidate. A threadgroup owns one eight-row
 // tile and walks all eight selected experts, so the 4 KiB normalized/input
 // vector is staged once for the complete route set instead of once per

@@ -9,6 +9,10 @@ Artifact: `granite-m5-pro-q4-rowinline-unique-packet.qx`
 Artifact hash: `e0891fd697f49774`  
 Machine: Apple M5 Pro, 16 GPU cores, 24 GB unified memory
 
+Implementation follow-up: the P1 superblock proposal below is now implemented
+and measured at 289.6 tok/s, a 27.8% throughput improvement over the promoted
+control. See `qx-superblock144-implementation-2026-08-24.md`.
+
 ## Executive conclusion
 
 QX is not primarily losing to llama.cpp because it launches too many kernels,

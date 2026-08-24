@@ -169,6 +169,9 @@ pub fn activate_artifact_execution_plan(
         qx_format::ExpertRepresentation::Group32Q4Transaction160 => {
             set_plan_env("QX_V2_MOE_LAYOUT", "transaction-160")
         }
+        qx_format::ExpertRepresentation::Group32Q4Superblock144 => {
+            set_plan_env("QX_V2_MOE_LAYOUT", "superblock-144")
+        }
         qx_format::ExpertRepresentation::MixedQ2Q3Q4 => set_plan_env("QX_V2_MOE_LAYOUT", "mixed"),
         qx_format::ExpertRepresentation::Q4K => set_plan_env("QX_V2_MOE_LAYOUT", "rowmajor"),
         qx_format::ExpertRepresentation::DenseQ3 | qx_format::ExpertRepresentation::PaddedQ3 => {
@@ -1903,6 +1906,10 @@ fn moe_requested_layout() -> Option<qx_quant::PackingLayout> {
         | Some("transaction160")
         | Some("q4-transaction-160")
         | Some("q4-transaction160") => Some(qx_quant::PackingLayout::Q4Transaction160),
+        Some("superblock-144")
+        | Some("superblock144")
+        | Some("q4-superblock-144")
+        | Some("q4-superblock144") => Some(qx_quant::PackingLayout::Q4Superblock144),
         Some("tile") | Some("tile32") | Some("lane") | Some("lane-native") => {
             Some(qx_quant::PackingLayout::MetalTile32)
         }
@@ -2036,6 +2043,10 @@ fn quantized_bytes_for_layout(
         let stream = tensor.transaction_block_bytes(block_bytes == 160)?;
         return Ok((stream.clone(), stream));
     }
+    if layout.is_q4_superblock() {
+        let stream = tensor.superblock_bytes()?;
+        return Ok((stream.clone(), stream));
+    }
     tensor.repack(layout)?;
     let scales = unsafe {
         std::slice::from_raw_parts(
@@ -2060,6 +2071,10 @@ fn quantized_row_range_bytes_for_layout(
         .row_range(start, count)?;
     if let Some(block_bytes) = layout.transaction_block_bytes() {
         let stream = tensor.transaction_block_bytes(block_bytes == 160)?;
+        return Ok((stream.clone(), stream));
+    }
+    if layout.is_q4_superblock() {
+        let stream = tensor.superblock_bytes()?;
         return Ok((stream.clone(), stream));
     }
     tensor.repack(layout)?;

@@ -144,6 +144,8 @@ enum ExpertLayout {
     Transaction144,
     #[value(name = "transaction-160", alias = "transaction160")]
     Transaction160,
+    #[value(name = "superblock-144", alias = "superblock144")]
+    Superblock144,
     #[value(name = "cross-expert-tile8", alias = "cross-expert")]
     CrossExpertTile8,
 }
@@ -181,6 +183,7 @@ impl From<ExpertLayout> for PackingLayout {
             ExpertLayout::Transaction144 => Self::Q4Transaction144,
             ExpertLayout::Transaction160 => Self::Q4Transaction160,
             ExpertLayout::CrossExpertTile8 => Self::Q4CrossExpertTile8,
+            ExpertLayout::Superblock144 => Self::Q4Superblock144,
         }
     }
 }
@@ -339,7 +342,7 @@ fn main() -> Result<()> {
     }
     if matches!(
         args.expert_layout,
-        ExpertLayout::Transaction144 | ExpertLayout::Transaction160
+        ExpertLayout::Transaction144 | ExpertLayout::Transaction160 | ExpertLayout::Superblock144
     ) && (args.expert_format != ExpertFormat::QxQ4
         || args.uniform_expert_bits.is_some()
         || args.layerwise_q3
@@ -348,7 +351,7 @@ fn main() -> Result<()> {
         || args.group_size != 32)
     {
         bail!(
-            "transaction-block candidates require uniform exact group-32 Q4 experts and --group-size 32"
+            "block-layout candidates require uniform exact group-32 Q4 experts and --group-size 32"
         );
     }
     if matches!(args.expert_layout, ExpertLayout::CrossExpertTile8)
@@ -1201,6 +1204,11 @@ fn representation_for(tensors: &[CompiledTensor], kind: TensorKind) -> ExpertRep
             && tensor.tensor.layout == PackingLayout::Q4Transaction160
     }) {
         ExpertRepresentation::Group32Q4Transaction160
+    } else if matching.iter().all(|tensor| {
+        tensor.tensor.quant_type == QuantType::Q4
+            && tensor.tensor.layout == PackingLayout::Q4Superblock144
+    }) {
+        ExpertRepresentation::Group32Q4Superblock144
     } else if matching.iter().all(|tensor| {
         tensor.tensor.quant_type == QuantType::Q4
             && tensor.tensor.layout == PackingLayout::Q4CrossExpertTile8

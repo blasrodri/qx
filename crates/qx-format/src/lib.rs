@@ -49,6 +49,9 @@ pub enum ExpertRepresentation {
     Group32Q4Transaction144,
     /// Exact-Q4 code/scale transaction blocks padded to 160 bytes per packet.
     Group32Q4Transaction160,
+    /// Exact-Q4 256-weight blocks with contiguous code payload followed by
+    /// eight FP16 group scales.
+    Group32Q4Superblock144,
     Q4K,
 }
 
@@ -729,6 +732,43 @@ impl MappedArtifact {
                 data: split_data,
             });
         }
+        if entry.layout.is_q4_superblock() {
+            if entry.quant_type != QuantType::Q4 || entry.group_size != 32 {
+                bail!("superblock artifact tensor is not group-32 Q4");
+            }
+            let groups = (entry.cols as usize).div_ceil(entry.group_size as usize);
+            if !groups.is_multiple_of(8) {
+                bail!("superblock artifact tensor group count is not divisible by eight");
+            }
+            let blocks_per_row = groups / 8;
+            let expected = entry.rows as usize * blocks_per_row * 144;
+            if data.len() != expected {
+                bail!("superblock artifact tensor has invalid stream length");
+            }
+            let mut split_data = Vec::with_capacity(entry.rows as usize * groups * 16);
+            let mut split_scales = Vec::with_capacity(entry.rows as usize * groups);
+            for row in 0..entry.rows as usize {
+                for block in 0..blocks_per_row {
+                    let block_start = (row * blocks_per_row + block) * 144;
+                    split_data.extend_from_slice(&data[block_start..block_start + 128]);
+                    for group_in_block in 0..8 {
+                        let start = block_start + 128 + group_in_block * 2;
+                        split_scales.push(f16::from_bits(u16::from_le_bytes(
+                            data[start..start + 2].try_into().unwrap(),
+                        )));
+                    }
+                }
+            }
+            return Ok(QuantizedTensor {
+                quant_type: entry.quant_type,
+                layout: PackingLayout::RowMajor,
+                rows: entry.rows as usize,
+                cols: entry.cols as usize,
+                group_size: entry.group_size as usize,
+                scales: split_scales,
+                data: split_data,
+            });
+        }
         if scales.len() % 2 != 0 {
             bail!("QX scale section is not FP16 aligned");
         }
@@ -969,6 +1009,33 @@ fn write_artifact_internal(
                     // Transaction entries deliberately point both views at
                     // one fused stream. The scale bytes are decoded from
                     // their per-group position by `quantized_tensor`.
+                    scale_offset: offset,
+                    scale_length: stream.len() as u64,
+                    data_offset: offset,
+                    data_length: stream.len() as u64,
+                });
+            }
+            group_start = group_end;
+            continue;
+        }
+        if first.tensor.layout.is_q4_superblock() {
+            for index in group {
+                let compiled = &tensors[*index];
+                let stream = compiled
+                    .tensor
+                    .superblock_bytes()
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                let offset = data_offset + blobs.len() as u64;
+                blobs.extend_from_slice(&stream);
+                quantized_entries[*index] = Some(TensorDirectoryEntry {
+                    layer: compiled.layer,
+                    expert: compiled.expert,
+                    quant_type: compiled.tensor.quant_type,
+                    layout: compiled.tensor.layout,
+                    kind: compiled.kind,
+                    rows: compiled.tensor.rows as u32,
+                    cols: compiled.tensor.cols as u32,
+                    group_size: compiled.tensor.group_size as u16,
                     scale_offset: offset,
                     scale_length: stream.len() as u64,
                     data_offset: offset,
@@ -1433,6 +1500,45 @@ mod tests {
             );
             std::fs::remove_file(path).unwrap();
         }
+    }
+
+    #[test]
+    fn artifact_round_trip_decodes_payload_contiguous_superblocks() {
+        let values = (0..3 * 512)
+            .map(|index| (index as f32 - 12.0) / 7.0)
+            .collect::<Vec<_>>();
+        let mut tensor = QuantizedTensor::quantize(&values, 3, 512, QuantType::Q4, 32);
+        tensor.layout = PackingLayout::Q4Superblock144;
+        let path = std::env::temp_dir().join(format!(
+            "qx-superblock-{}-{}.qx",
+            std::process::id(),
+            tensor.layout as u8
+        ));
+        write_artifact_with_raw(
+            &path,
+            "granite",
+            "apple-m5-pro",
+            512,
+            MemoryPlan {
+                weights_bytes: tensor.serialized_bytes() as u64,
+                total_bytes: tensor.serialized_bytes() as u64,
+                ..Default::default()
+            },
+            &[CompiledTensor {
+                layer: 0,
+                expert: 0,
+                kind: TensorKind::GateUp,
+                tensor: tensor.clone(),
+            }],
+            &[],
+        )
+        .unwrap();
+        let artifact = MappedArtifact::open(&path).unwrap();
+        let decoded = artifact.quantized_tensor(0).unwrap();
+        assert_eq!(decoded.layout, PackingLayout::RowMajor);
+        assert_eq!(decoded.data, tensor.data);
+        assert_eq!(decoded.scales, tensor.scales);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
