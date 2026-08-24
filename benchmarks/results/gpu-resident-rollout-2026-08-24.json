@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-24",
+  "target": "apple-m5-pro",
+  "artifact_hash": "8011bf406bff98f3",
+  "fixture": "general-systems",
+  "context": 512,
+  "prefill_tokens": 384,
+  "measured_tokens": 128,
+  "promotion_pair": {
+    "synchronous": {
+      "rollout_window": 1,
+      "tokens_per_second": [349.3579694386834, 350.3556931431559, 348.3370766234292],
+      "mean_tokens_per_second": 349.35024640175624,
+      "mean_wall_ms_per_token": 2.8624727630208326,
+      "mean_gpu_ms_per_token": 2.574407550127944,
+      "mean_physical_footprint_bytes": 116032104
+    },
+    "gpu_resident": {
+      "rollout_window": 4,
+      "tokens_per_second": [390.9855424115244, 386.5251685395437, 389.2153392003167],
+      "mean_tokens_per_second": 388.908683383795,
+      "mean_wall_ms_per_token": 2.5713549296875002,
+      "mean_gpu_ms_per_token": 2.5678148864850905,
+      "mean_physical_footprint_bytes": 118380493.33333333
+    },
+    "throughput_improvement_percent": 11.323,
+    "wall_time_reduction_percent": 10.169
+  },
+  "higher_performance_state": {
+    "synchronous_mean_tokens_per_second": 367.50812349762236,
+    "window_4_mean_tokens_per_second": 414.2413573180879,
+    "window_4_range_tokens_per_second": [413.5919898863834, 414.62911951643883],
+    "throughput_improvement_percent": 12.716
+  },
+  "window_sweep": [
+    {"window": 1, "mean_tokens_per_second": 367.50812349762236},
+    {"window": 2, "mean_tokens_per_second": 408.4321490633213},
+    {"window": 4, "mean_tokens_per_second": 414.2413573180879},
+    {"window": 8, "mean_tokens_per_second": 414.2578693393564},
+    {"window": 16, "mean_tokens_per_second": 410.95971893091564}
+  ],
+  "context_checks": [
+    {"context": 128, "synchronous_tokens_per_second": 379.00, "window_4_tokens_per_second": 437.42},
+    {"context": 256, "synchronous_tokens_per_second": 380.13, "window_4_tokens_per_second": 430.65}
+  ],
+  "equivalence": {
+    "positions": 128,
+    "synchronous_last_token": 34,
+    "gpu_resident_last_token": 34,
+    "token_history_hash": "19b4967c2513510e",
+    "kv_arena_hash": "5f18e9cd28097e0b",
+    "decoded_text_match": true
+  },
+  "graph": {
+    "command_buffers_per_token": 2,
+    "encoders_per_token": 2,
+    "dispatches_per_token": 390
+  },
+  "limitations": [
+    "GPU-resident rollout is fixed-length greedy generation.",
+    "EOS-aware generation retains the synchronous path because stopping requires a token-dependent host decision.",
+    "Window 4 is promoted as the smallest stable queue depth; larger windows add footprint without material throughput."
+  ]
+}

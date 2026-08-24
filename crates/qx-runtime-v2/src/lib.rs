@@ -932,10 +932,54 @@ impl PreparedAttentionStack {
         position: usize,
         resolved_plan: Option<&ResolvedExecutionPlan>,
     ) -> Result<(), String> {
+        self.encode_token_from_to_with_plan(
+            graph,
+            buffers,
+            moe,
+            buffers.buffer(BufferId::TokenOutput),
+            buffers.buffer(BufferId::TokenOutput),
+            position,
+            resolved_plan,
+        )
+    }
+
+    /// Encode one token with explicit GPU-resident input/output token slots.
+    /// Distinct slots let several greedy steps be queued while retaining the
+    /// complete generated token history without an intervening CPU readback.
+    pub fn encode_token_from_to(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        buffers: &GpuRuntimeBuffers,
+        moe: &PreparedMoeStack,
+        token_input: &qx_metal::platform::RuntimeBuffer,
+        token_output: &qx_metal::platform::RuntimeBuffer,
+        position: usize,
+    ) -> Result<(), String> {
+        self.encode_token_from_to_with_plan(
+            graph,
+            buffers,
+            moe,
+            token_input,
+            token_output,
+            position,
+            None,
+        )
+    }
+
+    pub fn encode_token_from_to_with_plan(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        buffers: &GpuRuntimeBuffers,
+        moe: &PreparedMoeStack,
+        token_input: &qx_metal::platform::RuntimeBuffer,
+        token_output: &qx_metal::platform::RuntimeBuffer,
+        position: usize,
+        resolved_plan: Option<&ResolvedExecutionPlan>,
+    ) -> Result<(), String> {
         let context = buffers.context().as_ref();
         graph.encode_q4_embedding_lookup(
             &self.embedding_lookup,
-            buffers.buffer(BufferId::TokenOutput),
+            token_input,
             buffers.buffer(BufferId::HiddenA),
             qx_model::EMBEDDING_MULTIPLIER,
         )?;
@@ -974,7 +1018,7 @@ impl PreparedAttentionStack {
                 &self.final_norm,
                 &inverse_rms,
                 buffers.buffer(BufferId::MoeScratch),
-                buffers.buffer(BufferId::TokenOutput),
+                token_output,
                 1.0 / qx_model::LOGITS_SCALING,
             )?;
         } else {
@@ -990,7 +1034,7 @@ impl PreparedAttentionStack {
                     &self.embedding,
                     buffers.buffer(BufferId::MoeInput),
                     buffers.buffer(BufferId::MoeScratch),
-                    buffers.buffer(BufferId::TokenOutput),
+                    token_output,
                     1.0 / qx_model::LOGITS_SCALING,
                 )?;
             } else {
@@ -1004,7 +1048,7 @@ impl PreparedAttentionStack {
                     context,
                     buffers.buffer(BufferId::Logits),
                     buffers.buffer(BufferId::MoeScratch),
-                    buffers.buffer(BufferId::TokenOutput),
+                    token_output,
                     VOCAB,
                 )?;
             }
@@ -2441,6 +2485,76 @@ impl GraniteV2Generator {
             next = self.step(next)?;
         }
         Ok(generated)
+    }
+
+    /// Fixed-length greedy generation with several complete token graphs kept
+    /// in flight. This preserves exact queue-ordered model semantics and
+    /// returns every generated token from a GPU-resident history buffer. It is
+    /// intentionally separate from EOS-aware generation, which requires a
+    /// synchronization decision after each sampled token.
+    pub fn generate_tokens_gpu_resident(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        rollout_window: usize,
+    ) -> Result<Vec<u32>, String> {
+        if prompt_tokens.is_empty() {
+            return Err("prompt produced no tokens".to_owned());
+        }
+        if max_new_tokens == 0 {
+            return Err("max_new_tokens must be positive".to_owned());
+        }
+        if rollout_window < 2 {
+            return Err("GPU-resident rollout window must be at least two".to_owned());
+        }
+        if prompt_tokens.len().saturating_add(max_new_tokens) > self.context_length() {
+            return Err(format!(
+                "prompt plus generation exceeds context {}",
+                self.context_length()
+            ));
+        }
+
+        self.reset();
+        let mut first_generated = 0_u32;
+        for &token in prompt_tokens {
+            first_generated = self.step(token)?;
+        }
+        let history = self
+            .context
+            .allocate_runtime_buffer(max_new_tokens * std::mem::size_of::<u32>())?;
+        self.context
+            .write_runtime_buffer(&history, &first_generated.to_le_bytes())?;
+        let mut in_flight = std::collections::VecDeque::with_capacity(rollout_window);
+        for index in 0..max_new_tokens.saturating_sub(1) {
+            let token_input = history.subregion(
+                index * std::mem::size_of::<u32>(),
+                std::mem::size_of::<u32>(),
+            )?;
+            let token_output = history.subregion(
+                (index + 1) * std::mem::size_of::<u32>(),
+                std::mem::size_of::<u32>(),
+            )?;
+            let mut graph = self.buffers.begin_token()?;
+            self.stack.encode_token_from_to_with_plan(
+                &mut graph,
+                &self.buffers,
+                &self.moe,
+                &token_input,
+                &token_output,
+                self.position + index,
+                Some(&self.resolved_plan),
+            )?;
+            in_flight.push_back(self.buffers.submit_token(graph));
+            if in_flight.len() >= rollout_window {
+                self.buffers
+                    .wait_token(in_flight.pop_front().expect("non-empty GPU rollout window"))?;
+            }
+        }
+        while let Some(submitted) = in_flight.pop_front() {
+            self.buffers.wait_token(submitted)?;
+        }
+        self.position += max_new_tokens.saturating_sub(1);
+        self.context.read_runtime_u32s(&history, max_new_tokens)
     }
 }
 
@@ -4949,6 +5063,20 @@ impl GpuRuntimeBuffers {
 
     pub fn finish_token(&self, graph: qx_metal::platform::DecodeGraph) -> Result<(), String> {
         graph.finish(&self.context)
+    }
+
+    /// Commit a complete token graph without waiting for it. Subsequent token
+    /// graphs on the same Metal queue consume the preceding GPU-resident
+    /// argmax output in submission order.
+    pub fn submit_token(
+        &self,
+        graph: qx_metal::platform::DecodeGraph,
+    ) -> qx_metal::platform::SubmittedDecode {
+        graph.submit()
+    }
+
+    pub fn wait_token(&self, submitted: qx_metal::platform::SubmittedDecode) -> Result<(), String> {
+        submitted.wait(&self.context)
     }
 }
 
