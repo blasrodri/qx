@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "engine": "llama.cpp",
+  "commit": "1719747",
+  "model": "external/models/granite-3.0-1b-a400m-instruct-q4_k_m.gguf",
+  "gpu": "Apple M5 Pro",
+  "backend": "MTL,BLAS",
+  "contract": {
+    "prefill_tokens": 384,
+    "decode_tokens": 128,
+    "batch_size": 512,
+    "ubatch_size": 512,
+    "gpu_layers": 99,
+    "flash_attention": true,
+    "kv_k": "f16",
+    "kv_v": "f16"
+  },
+  "production": {
+    "gpu_us_per_token_median": 2518.58,
+    "sample_indices_used": [2, 3, 4, 5, 6, 7, 8, 9, 10],
+    "sample_gpu_us": [2542.42, 2522.79, 2508.12, 2520.46, 2516.83, 2550.71, 2518.58, 2507.75, 2505.46],
+    "command_buffers": 2,
+    "graph_nodes": 1471,
+    "measurement": "real production decode command-buffer GPU intervals; first decode sample excluded as warm-up"
+  },
+  "diagnostic_replay": {
+    "gate_up_gpu_us_per_token": 642.17,
+    "down_gpu_us_per_token": 397.04,
+    "whole_moe_gpu_us_per_token": 1489.13,
+    "boundary_input_qkv_us_per_layer": 15.90,
+    "boundary_rope_kv_us_per_layer": 9.93,
+    "boundary_attention_us_per_layer": 10.43,
+    "boundary_o_residual_us_per_layer": 8.13,
+    "boundary_router_us_per_layer": 16.97,
+    "boundary_moe_us_per_layer": 62.52,
+    "boundary_moe_residual_us_per_layer": 12.31,
+    "boundary_final_us": 168.67,
+    "measurement": "GPU replay command buffers; explanatory only and not additive to production time"
+  },
+  "source_command": "GGML_METAL_PROFILE_LIVE=1 GGML_METAL_PROFILE_LEDGER=10 GGML_METAL_PROFILE_BOUNDARIES=1 GGML_METAL_PROFILE_MOE_BLOCKS=1 llama-bench -p 384 -n 128 -b 512 -ub 512 -ngl 99 -fa 1 -r 1"
+}
