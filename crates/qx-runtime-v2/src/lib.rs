@@ -1124,7 +1124,11 @@ impl GraniteV2Generator {
             next_token = predicted;
             if predicted != expected {
                 self.rollback_kv(checkpoint)?;
-                for &accepted_input in &inputs[..index] {
+                // The mismatching prediction rejects the output, not the
+                // input that produced it. Keep that input in the committed
+                // context so the returned correction token is the next input
+                // at the following position.
+                for &accepted_input in &inputs[..=index] {
                     self.step(accepted_input)?;
                 }
                 return Ok(ReferenceVerification {
@@ -1159,6 +1163,19 @@ impl GraniteV2Generator {
         }
         if inputs.iter().any(|&token| token as usize >= VOCAB) {
             return Err("GPU verification input contains an out-of-range token".to_owned());
+        }
+        // K=1 is the scalar control, not a request to run every generic
+        // K-wide kernel with a degenerate width. The latter pays verifier-only
+        // route compaction, packet staging, and batch-kernel overhead while
+        // also bypassing the canonical scalar RMS/QKV, RoPE/KV, MoE, and final
+        // head paths. Keep the baseline apples-to-apples; K=2/4 are the real
+        // multi-position product paths.
+        if width == 1 {
+            let predicted = self.step(inputs[0])?;
+            return Ok(ReferenceVerification {
+                accepted_prefix: usize::from(predicted == expected_next[0]),
+                next_token: predicted,
+            });
         }
         if self.position + width > self.context_length() {
             return Err(format!(
@@ -1349,7 +1366,15 @@ impl GraniteV2Generator {
             .zip(expected_next)
             .position(|(predicted, expected)| predicted != expected)
             .unwrap_or(width);
-        self.commit_kv(checkpoint, accepted_prefix)?;
+        // On a mismatch, `accepted_prefix` counts matching outputs. The
+        // input at that index is nevertheless valid context and must remain
+        // in KV. This is the cursor contract needed by speculative decode.
+        let committed_inputs = if accepted_prefix < width {
+            accepted_prefix + 1
+        } else {
+            width
+        };
+        self.commit_kv(checkpoint, committed_inputs)?;
         Ok(ReferenceVerification {
             accepted_prefix,
             next_token: predictions[accepted_prefix.min(width - 1)],

@@ -13,6 +13,99 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+mod llama_draft {
+    use std::ffi::{CStr, CString};
+    use std::os::raw::{c_char, c_int, c_void};
+    use std::path::Path;
+
+    unsafe extern "C" {
+        fn qx_llama_draft_open(
+            path: *const c_char,
+            context_length: u32,
+            gpu_layers: c_int,
+            threads: c_int,
+        ) -> *mut c_void;
+        fn qx_llama_draft_close(draft: *mut c_void);
+        fn qx_llama_draft_vocab(draft: *const c_void) -> c_int;
+        fn qx_llama_draft_position(draft: *const c_void) -> u32;
+        fn qx_llama_draft_error(draft: *const c_void) -> *const c_char;
+        fn qx_llama_draft_step(
+            draft: *mut c_void,
+            input: c_int,
+            output: *mut c_int,
+        ) -> c_int;
+        fn qx_llama_draft_rewind(draft: *mut c_void, position: u32) -> c_int;
+    }
+
+    pub struct Draft {
+        raw: *mut c_void,
+    }
+
+    impl Draft {
+        pub fn open(
+            path: &Path,
+            context_length: usize,
+            gpu_layers: i32,
+            threads: i32,
+        ) -> Result<Self, String> {
+            let path = CString::new(path.to_string_lossy().as_bytes())
+                .map_err(|_| "draft path contains an interior NUL".to_owned())?;
+            let raw = unsafe {
+                qx_llama_draft_open(path.as_ptr(), context_length as u32, gpu_layers, threads)
+            };
+            if raw.is_null() {
+                return Err("llama draft backend returned a null context".to_owned());
+            }
+            Ok(Self { raw })
+        }
+
+        pub fn vocab(&self) -> usize {
+            unsafe { qx_llama_draft_vocab(self.raw) as usize }
+        }
+
+        pub fn position(&self) -> usize {
+            unsafe { qx_llama_draft_position(self.raw) as usize }
+        }
+
+        pub fn step(&mut self, input: u32) -> Result<u32, String> {
+            let mut output = 0_i32;
+            let status = unsafe {
+                qx_llama_draft_step(self.raw, input as c_int, &mut output)
+            };
+            if status != 0 {
+                return Err(self.error());
+            }
+            Ok(output as u32)
+        }
+
+        pub fn rewind(&mut self, position: usize) -> Result<(), String> {
+            let status = unsafe { qx_llama_draft_rewind(self.raw, position as u32) };
+            if status != 0 {
+                return Err(self.error());
+            }
+            Ok(())
+        }
+
+        fn error(&self) -> String {
+            unsafe {
+                let error = qx_llama_draft_error(self.raw);
+                if error.is_null() {
+                    "llama draft backend error".to_owned()
+                } else {
+                    CStr::from_ptr(error).to_string_lossy().into_owned()
+                }
+            }
+        }
+    }
+
+    impl Drop for Draft {
+        fn drop(&mut self) {
+            unsafe { qx_llama_draft_close(self.raw) };
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "qx-bench",
@@ -99,6 +192,24 @@ struct Args {
     /// Execute the persistent GPU K=1/2/4 transactional verifier path.
     #[arg(long)]
     v2_gpu_verifier: bool,
+    /// Run a real llama.cpp draft against the QX K-wide verifier.
+    #[arg(long)]
+    v2_speculative: bool,
+    /// Compatible draft GGUF consumed by the llama.cpp draft backend.
+    #[arg(long)]
+    draft_gguf: Option<PathBuf>,
+    /// Number of proposed tokens per speculative verification transaction.
+    #[arg(long, default_value_t = 4)]
+    speculative_width: usize,
+    /// Number of speculative transactions to measure.
+    #[arg(long, default_value_t = 16)]
+    speculative_rounds: usize,
+    /// GPU layers for the llama.cpp draft model (-1 means all).
+    #[arg(long, default_value_t = -1)]
+    draft_gpu_layers: i32,
+    /// llama.cpp single-token and batch thread count for the draft model.
+    #[arg(long, default_value_t = 4)]
+    draft_threads: i32,
     /// Benchmark the expert-major K-wide row-inline Q4 gate/up verifier stage.
     #[arg(long)]
     v2_batch_moe_gateup_bench: bool,
@@ -389,6 +500,37 @@ fn main() -> Result<()> {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--v2-gpu-verifier requires an artifact path"))?;
         return benchmark_v2_gpu_verifier(artifact, args.context, args.iterations);
+    }
+    if args.v2_speculative {
+        let artifact = args
+            .artifact
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--v2-speculative requires an artifact path"))?;
+        let draft = args
+            .draft_gguf
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--v2-speculative requires --draft-gguf"))?;
+        if !matches!(args.speculative_width, 2 | 4) {
+            bail!("--speculative-width must be 2 or 4");
+        }
+        if args.speculative_rounds == 0 {
+            bail!("--speculative-rounds must be positive");
+        }
+        let fixture = args.fixture.as_deref().map(load_fixture).transpose()?;
+        let context = fixture
+            .as_ref()
+            .and_then(|fixture| fixture.context)
+            .unwrap_or(args.context);
+        return benchmark_v2_speculative(
+            artifact,
+            draft,
+            context,
+            fixture.as_ref(),
+            args.speculative_width,
+            args.speculative_rounds,
+            args.draft_gpu_layers,
+            args.draft_threads,
+        );
     }
     if args.v2_batch_moe_gateup_bench {
         let artifact = args.artifact.as_deref().ok_or_else(|| {
@@ -2347,6 +2489,157 @@ fn benchmark_v2_gpu_verifier(
             position,
         );
     }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn benchmark_v2_speculative(
+    artifact_path: &std::path::Path,
+    draft_path: &std::path::Path,
+    context_length: usize,
+    fixture: Option<&BenchmarkFixture>,
+    width: usize,
+    rounds: usize,
+    draft_gpu_layers: i32,
+    draft_threads: i32,
+) -> Result<()> {
+    if !matches!(width, 2 | 4) {
+        bail!("speculative verifier supports K=2 or K=4");
+    }
+    let prompt = fixture
+        .map(|fixture| fixture.tokens.as_slice())
+        .filter(|tokens| !tokens.is_empty())
+        .unwrap_or(&[1_u32]);
+    if prompt.len() + rounds.saturating_mul(width + 1) >= context_length {
+        bail!("prompt plus speculative benchmark exceeds context length");
+    }
+
+    let mut target = qx_runtime_v2::GraniteV2Generator::load(artifact_path, context_length)
+        .map_err(anyhow::Error::msg)?;
+    let mut draft = llama_draft::Draft::open(
+        draft_path,
+        context_length,
+        draft_gpu_layers,
+        draft_threads,
+    )
+    .map_err(anyhow::Error::msg)?;
+    if draft.vocab() < VOCAB {
+        bail!(
+            "draft vocabulary {} is smaller than QX vocabulary {}",
+            draft.vocab(),
+            VOCAB
+        );
+    }
+
+    // Both engines consume the same raw token IDs.  The final output of the
+    // prefill is a pending next token; it is not consumed twice at the start
+    // of the first speculative transaction.
+    let mut target_pending = 0_u32;
+    let mut draft_pending = 0_u32;
+    for &token in prompt {
+        target_pending = target.step(token).map_err(anyhow::Error::msg)?;
+        draft_pending = draft.step(token).map_err(anyhow::Error::msg)?;
+    }
+
+    let mut total_wall = 0.0_f64;
+    let mut total_verify_gpu = 0.0_f64;
+    let mut total_draft_wall = 0.0_f64;
+    let mut proposed = 0_usize;
+    let mut accepted = 0_usize;
+    let mut delivered = 0_usize;
+    let mut mismatches = 0_usize;
+
+    for round in 0..rounds {
+        let target_checkpoint = target.position();
+        let draft_checkpoint = draft.position();
+        let round_start = Instant::now();
+        let draft_start = Instant::now();
+        let mut proposals = Vec::with_capacity(width + 1);
+        proposals.push(draft_pending);
+        for index in 0..width {
+            let next = draft
+                .step(proposals[index])
+                .map_err(anyhow::Error::msg)?;
+            proposals.push(next);
+        }
+        total_draft_wall += draft_start.elapsed().as_secs_f64() * 1_000_000.0;
+        proposed += width;
+
+        // p0 is already available from the target state produced by prefill
+        // or the preceding transaction.  If it disagrees, no speculative
+        // input may be committed; emit the target correction and realign both
+        // contexts by consuming it once.
+        if proposals[0] != target_pending {
+            mismatches += 1;
+            draft.rewind(draft_checkpoint).map_err(anyhow::Error::msg)?;
+            let correction = target_pending;
+            target_pending = target.step(correction).map_err(anyhow::Error::msg)?;
+            draft_pending = draft.step(correction).map_err(anyhow::Error::msg)?;
+            delivered += 1;
+            total_wall += round_start.elapsed().as_secs_f64() * 1_000_000.0;
+            continue;
+        }
+
+        let verify_start = Instant::now();
+        let before = target.metrics().map_err(anyhow::Error::msg)?;
+        let result = target
+            .verify_tokens_gpu(&proposals[..width], &proposals[1..=width])
+            .map_err(anyhow::Error::msg)?;
+        let after = target.metrics().map_err(anyhow::Error::msg)?;
+        let verify_wall = verify_start.elapsed().as_secs_f64() * 1_000_000.0;
+        let verify_gpu = (after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1_000_000.0;
+        total_verify_gpu += verify_gpu;
+
+        if result.accepted_prefix == width {
+            // All K proposed tokens were accepted.  The target's final
+            // prediction is the bonus/pending token for the next round.
+            accepted += width;
+            delivered += width + 1;
+            target_pending = result.next_token;
+            draft_pending = proposals[width];
+        } else {
+            let accepted_here = result.accepted_prefix + 1;
+            accepted += accepted_here;
+            mismatches += 1;
+            delivered += accepted_here + 1;
+            draft.rewind(target.position()).map_err(anyhow::Error::msg)?;
+            let correction = result.next_token;
+            target_pending = target.step(correction).map_err(anyhow::Error::msg)?;
+            draft_pending = draft.step(correction).map_err(anyhow::Error::msg)?;
+        }
+        if target.position() != draft.position() {
+            bail!(
+                "draft/target position diverged after round {round}: target={}, draft={}, checkpoint target={}, draft={}",
+                target.position(),
+                draft.position(),
+                target_checkpoint,
+                draft_checkpoint
+            );
+        }
+        let _ = verify_wall;
+        total_wall += round_start.elapsed().as_secs_f64() * 1_000_000.0;
+    }
+
+    let rounds_f = rounds as f64;
+    let proposed_f = proposed as f64;
+    let delivered_f = delivered as f64;
+    println!("QX speculative verification with real llama.cpp draft");
+    println!("target artifact:      {}", artifact_path.display());
+    println!("draft GGUF:           {}", draft_path.display());
+    println!("prompt tokens:        {}", prompt.len());
+    println!("width / rounds:       K={width} / {rounds}");
+    println!("draft vocab:          {}", draft.vocab());
+    println!("draft/target final position: {}/{}", draft.position(), target.position());
+    println!("proposed tokens:      {proposed}");
+    println!("accepted proposals:   {accepted}");
+    println!("accepted proposal %:   {:.2}%", 100.0 * accepted as f64 / proposed_f.max(1.0));
+    println!("mismatch rounds:      {mismatches}");
+    println!("delivered tokens:     {delivered}");
+    println!("draft wall / round:    {:.2} us", total_draft_wall / rounds_f);
+    println!("verify GPU / round:    {:.2} us", total_verify_gpu / rounds_f);
+    println!("round wall / token:    {:.2} us", total_wall / delivered_f.max(1.0));
+    println!("delivered tok/s:       {:.2}", delivered_f / (total_wall / 1_000_000.0).max(f64::MIN_POSITIVE));
+    println!("proposed tok/s:        {:.2}", proposed_f / (total_wall / 1_000_000.0).max(f64::MIN_POSITIVE));
     Ok(())
 }
 
