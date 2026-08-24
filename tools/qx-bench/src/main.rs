@@ -93,6 +93,9 @@ struct Args {
     /// Benchmark the real K-wide Q4 projection primitive used by the verifier.
     #[arg(long)]
     v2_batch_kernel_bench: bool,
+    /// Benchmark K-wide Q/K/V projections as one verifier stage.
+    #[arg(long)]
+    v2_batch_qkv_bench: bool,
     /// Profile each major fixed-shape V2 GPU kernel independently.
     #[arg(long)]
     v2_kernel_profile: bool,
@@ -363,6 +366,13 @@ fn main() -> Result<()> {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--v2-batch-kernel-bench requires an artifact path"))?;
         return benchmark_v2_batch_kernel(artifact, args.iterations);
+    }
+    if args.v2_batch_qkv_bench {
+        let artifact = args
+            .artifact
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--v2-batch-qkv-bench requires an artifact path"))?;
+        return benchmark_v2_batch_qkv(artifact, args.iterations);
     }
     if args.v2_kernel_profile {
         let artifact = args
@@ -858,6 +868,149 @@ fn benchmark_v2_batch_kernel(artifact_path: &std::path::Path, iterations: usize)
             1,
             tokens,
             HIDDEN,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn benchmark_v2_batch_qkv(artifact_path: &std::path::Path, iterations: usize) -> Result<()> {
+    use std::rc::Rc;
+
+    fn metal<T>(result: std::result::Result<T, String>) -> Result<T> {
+        result.map_err(anyhow::Error::msg)
+    }
+
+    if iterations == 0 {
+        bail!("batch QKV benchmark iterations must be positive");
+    }
+    let artifact = MappedArtifact::open(artifact_path)?;
+    let context = Rc::new(
+        qx_metal::platform::MetalContext::system_default()
+            .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
+    );
+    let find = |kind: TensorKind, rows: usize| -> Result<_> {
+        let index = artifact
+            .info()
+            .entries
+            .iter()
+            .position(|entry| entry.layer == 0 && entry.expert == u8::MAX && entry.kind == kind)
+            .ok_or_else(|| anyhow::anyhow!("artifact tensor {:?} not found", kind))?;
+        let tensor = artifact.quantized_tensor(index)?;
+        if tensor.rows != rows || tensor.cols != HIDDEN {
+            bail!(
+                "artifact tensor {:?} is {}x{}, expected {}x{}",
+                kind,
+                tensor.rows,
+                tensor.cols,
+                rows,
+                HIDDEN
+            );
+        }
+        Ok(tensor)
+    };
+    let q_tensor = find(TensorKind::QProj, HIDDEN)?;
+    let k_tensor = find(TensorKind::KProj, 512)?;
+    let v_tensor = find(TensorKind::VProj, 512)?;
+    let q = metal(context.prepare_q4_dense(&q_tensor))?;
+    let k = metal(context.prepare_q4_dense(&k_tensor))?;
+    let v = metal(context.prepare_q4_dense(&v_tensor))?;
+    let qkv = metal(context.prepare_q4_qkv(&q, &k, &v))?;
+
+    let input_one = metal(context.allocate_runtime_buffer(HIDDEN * std::mem::size_of::<f32>()))?;
+    let q_one = metal(context.allocate_runtime_buffer(HIDDEN * std::mem::size_of::<f32>()))?;
+    let k_one = metal(context.allocate_runtime_buffer(512 * std::mem::size_of::<f32>()))?;
+    let v_one = metal(context.allocate_runtime_buffer(512 * std::mem::size_of::<f32>()))?;
+    let ones = vec![1.0_f32; HIDDEN];
+    let ones_bytes = unsafe {
+        std::slice::from_raw_parts(
+            ones.as_ptr() as *const u8,
+            std::mem::size_of_val(ones.as_slice()),
+        )
+    };
+    metal(context.write_runtime_buffer(&input_one, ones_bytes))?;
+
+    let mut scalar = metal(context.begin_decode())?;
+    metal(scalar.encode_prepared_q4_qkv_simd(&qkv, &input_one, &q_one, &k_one, &v_one))?;
+    metal(scalar.finish(context.as_ref()))?;
+    let scalar_q = metal(context.read_runtime_f32(&q_one, HIDDEN))?;
+    let scalar_k = metal(context.read_runtime_f32(&k_one, 512))?;
+    let scalar_v = metal(context.read_runtime_f32(&v_one, 512))?;
+
+    println!("QX V2 K-wide QKV projection benchmark");
+    println!("artifact: {}", artifact_path.display());
+    println!("iterations: {iterations} (warmup 3)");
+    println!("width  GPU us  wall us  GPU/proposed  dispatches  numerical max_abs");
+
+    for tokens in [1_usize, 2, 4] {
+        let input_values = vec![1.0_f32; tokens * HIDDEN];
+        let input =
+            metal(context.allocate_runtime_buffer(std::mem::size_of_val(input_values.as_slice())))?;
+        let query =
+            metal(context.allocate_runtime_buffer(tokens * HIDDEN * std::mem::size_of::<f32>()))?;
+        let key =
+            metal(context.allocate_runtime_buffer(tokens * 512 * std::mem::size_of::<f32>()))?;
+        let value =
+            metal(context.allocate_runtime_buffer(tokens * 512 * std::mem::size_of::<f32>()))?;
+        let input_bytes = unsafe {
+            std::slice::from_raw_parts(
+                input_values.as_ptr() as *const u8,
+                std::mem::size_of_val(input_values.as_slice()),
+            )
+        };
+        metal(context.write_runtime_buffer(&input, input_bytes))?;
+        for _ in 0..3 {
+            let mut graph = metal(context.begin_decode())?;
+            metal(graph.encode_prepared_q4_qkv_simd_batch(
+                &q, &k, &v, &input, &query, &key, &value, tokens,
+            ))?;
+            metal(graph.finish(context.as_ref()))?;
+        }
+        let batch_q = metal(context.read_runtime_f32(&query, tokens * HIDDEN))?;
+        let batch_k = metal(context.read_runtime_f32(&key, tokens * 512))?;
+        let batch_v = metal(context.read_runtime_f32(&value, tokens * 512))?;
+        let max_abs = batch_q
+            .chunks_exact(HIDDEN)
+            .flat_map(|values| values.iter().zip(scalar_q.iter()))
+            .chain(
+                batch_k
+                    .chunks_exact(512)
+                    .flat_map(|values| values.iter().zip(scalar_k.iter())),
+            )
+            .chain(
+                batch_v
+                    .chunks_exact(512)
+                    .flat_map(|values| values.iter().zip(scalar_v.iter())),
+            )
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        println!("{tokens:>5} numerical max_abs_error: {max_abs:.8}");
+        if max_abs > 1.0e-5 {
+            bail!("K={tokens} batched QKV is not numerically equivalent to scalar QKV");
+        }
+        let mut gpu_samples = Vec::with_capacity(iterations);
+        let mut wall_samples = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let before = metal(context.metrics())?;
+            let start = Instant::now();
+            let mut graph = metal(context.begin_decode())?;
+            metal(graph.encode_prepared_q4_qkv_simd_batch(
+                &q, &k, &v, &input, &query, &key, &value, tokens,
+            ))?;
+            metal(graph.finish(context.as_ref()))?;
+            let after = metal(context.metrics())?;
+            gpu_samples
+                .push((after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1_000_000.0);
+            wall_samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+        }
+        let stats = summarize_kernel_samples(&mut gpu_samples, &mut wall_samples);
+        println!(
+            "{tokens:>5} {:>8.2} {:>8.2} {:>12.2} {:>11} {:>17.8}",
+            stats.gpu_median_us,
+            stats.wall_median_us,
+            stats.gpu_median_us / tokens as f64,
+            3,
+            max_abs,
         );
     }
     Ok(())
@@ -7091,6 +7244,11 @@ fn benchmark_v2_kernel_profile(
 #[cfg(not(target_os = "macos"))]
 fn benchmark_v2_kernel(_artifact_path: &std::path::Path, _iterations: usize) -> Result<()> {
     bail!("--v2-kernel-bench requires macOS Metal")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn benchmark_v2_batch_qkv(_artifact_path: &std::path::Path, _iterations: usize) -> Result<()> {
+    bail!("--v2-batch-qkv-bench requires macOS Metal")
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -1569,6 +1569,27 @@ pub mod platform {
             Ok(())
         }
 
+        /// Encode Q, K, and V for K verifier positions using the validated
+        /// token-major dense primitive. This is intentionally three
+        /// K-wide dispatches rather than K scalar QKV calls; the next
+        /// verifier stage can replace this with a fused batched QKV kernel
+        /// without changing its buffer contract.
+        pub fn encode_prepared_q4_qkv_simd_batch(
+            &mut self,
+            q: &PreparedQuantizedDense,
+            k: &PreparedQuantizedDense,
+            v: &PreparedQuantizedDense,
+            input: &RuntimeBuffer,
+            query: &RuntimeBuffer,
+            key: &RuntimeBuffer,
+            value: &RuntimeBuffer,
+            tokens: usize,
+        ) -> Result<(), String> {
+            self.encode_prepared_q4_dense_simd_batch(q, input, query, tokens)?;
+            self.encode_prepared_q4_dense_simd_batch(k, input, key, tokens)?;
+            self.encode_prepared_q4_dense_simd_batch(v, input, value, tokens)
+        }
+
         /// Encode an exact vocabulary projection that produces only partial
         /// maxima, then reduce those partials to the greedy token ID.
         pub fn encode_prepared_q4_dense_argmax(
