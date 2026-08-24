@@ -2838,6 +2838,73 @@ pub struct VerifierExecutionPlan {
     pub gpu_batch_kernels_required: bool,
 }
 
+/// One routed activation in the expert-major verifier schedule.  The GPU
+/// verifier consumes these pairs grouped by `expert`, while `token_index`
+/// points back into the K-wide activation matrix.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VerifierRoutePair {
+    pub token_index: u16,
+    pub expert: u16,
+    pub weight: f32,
+}
+
+/// Compact expert-major route bucket for a K-wide verification transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VerifierExpertBucket {
+    pub expert: u16,
+    pub pairs: Vec<VerifierRoutePair>,
+}
+
+/// Convert token-major top-k routes into the expert-major work schedule used
+/// by the future batched Metal MoE kernels.  This is deliberately executable
+/// on the CPU today so the route ordering and accounting have an oracle before
+/// any GPU implementation is attached.  It is not a performance fallback:
+/// callers still need a K-wide GPU consumer to claim verifier throughput.
+pub fn compact_verifier_routes(
+    width: VerifierWidth,
+    expert_ids: &[u32],
+    expert_weights: &[f32],
+) -> Result<Vec<VerifierExpertBucket>, String> {
+    let expected = width.tokens() * TOP_K;
+    if expert_ids.len() != expected || expert_weights.len() != expected {
+        return Err(format!(
+            "verifier routes have ids/weights lengths {}/{}; expected {expected}",
+            expert_ids.len(),
+            expert_weights.len()
+        ));
+    }
+
+    let mut buckets = (0..EXPERTS)
+        .map(|expert| VerifierExpertBucket {
+            expert: expert as u16,
+            pairs: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    for token_index in 0..width.tokens() {
+        for slot in 0..TOP_K {
+            let index = token_index * TOP_K + slot;
+            let expert = expert_ids[index];
+            if expert as usize >= EXPERTS {
+                return Err(format!(
+                    "verifier route expert {} at token {} is outside 0..{}",
+                    expert,
+                    token_index,
+                    EXPERTS
+                ));
+            }
+            buckets[expert as usize].pairs.push(VerifierRoutePair {
+                token_index: token_index as u16,
+                expert: expert as u16,
+                weight: expert_weights[index],
+            });
+        }
+    }
+    Ok(buckets
+        .into_iter()
+        .filter(|bucket| !bucket.pairs.is_empty())
+        .collect())
+}
+
 impl ExecutionPlan {
     pub fn verifier(&self, width: VerifierWidth) -> VerifierExecutionPlan {
         let k = width.tokens();
@@ -3294,6 +3361,41 @@ mod tests {
         assert_eq!(k4.logits_bytes, 4 * k1.logits_bytes);
         assert_eq!(k4.kv_candidate_bytes, 4 * k1.kv_candidate_bytes);
         assert!(k4.gpu_batch_kernels_required);
+    }
+
+    #[test]
+    fn verifier_routes_are_compacted_expert_major_without_reordering_tokens() {
+        let ids = vec![
+            3, 5, 3, 7, 5, 9, 12, 3,
+            5, 7, 12, 15, 3, 5, 7, 12,
+            3, 5, 7, 12, 3, 5, 7, 12,
+            3, 5, 7, 12, 3, 5, 7, 12,
+        ];
+        let weights = (0..ids.len()).map(|index| index as f32).collect::<Vec<_>>();
+        let buckets = compact_verifier_routes(VerifierWidth::K4, &ids, &weights).unwrap();
+        assert_eq!(buckets.first().map(|bucket| bucket.expert), Some(3));
+        assert_eq!(buckets.last().map(|bucket| bucket.expert), Some(15));
+        let expert_three = buckets.iter().find(|bucket| bucket.expert == 3).unwrap();
+        assert_eq!(
+            expert_three.pairs.iter().map(|pair| pair.token_index).collect::<Vec<_>>(),
+            vec![0, 0, 0, 1, 2, 2, 3, 3]
+        );
+        assert!(buckets
+            .iter()
+            .flat_map(|bucket| bucket.pairs.iter())
+            .all(|pair| pair.expert < EXPERTS as u16));
+    }
+
+    #[test]
+    fn verifier_routes_reject_shape_and_expert_errors() {
+        let ids = vec![0; TOP_K];
+        let weights = vec![0.0; TOP_K];
+        assert!(compact_verifier_routes(VerifierWidth::K2, &ids, &weights).is_err());
+
+        let mut ids = vec![0; TOP_K * 2];
+        ids[TOP_K + 1] = EXPERTS as u32;
+        let weights = vec![1.0; TOP_K * 2];
+        assert!(compact_verifier_routes(VerifierWidth::K2, &ids, &weights).is_err());
     }
 
     #[test]
