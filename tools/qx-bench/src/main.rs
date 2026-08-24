@@ -2444,20 +2444,40 @@ fn benchmark_v2_gpu_verifier(
     let qkv_probe = std::env::var("QX_V2_VERIFIER_QKV_PROBE")
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
-    if moe_probe.is_some() && qkv_probe {
-        bail!("QKV and MoE probes are mutually exclusive");
+    let attention_probe = std::env::var("QX_V2_VERIFIER_ATTENTION_PROBE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    let late_context = std::env::var("QX_V2_VERIFIER_LATE_CONTEXT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if moe_probe.is_some() as u8 + qkv_probe as u8 + attention_probe as u8 > 1 {
+        bail!("MoE, QKV, and attention probes are mutually exclusive");
     }
     generator
         .set_stage_counters(stage_profile)
         .map_err(anyhow::Error::msg)?;
     println!("QX V2 persistent GPU verifier benchmark");
     println!("artifact: {}", artifact_path.display());
-    println!("iterations: {iterations} (K=1/2/4, teacher-forced target stream)");
+    println!(
+        "iterations: {iterations} (K=1/2/4, teacher-forced target stream, context={late_context})"
+    );
     println!("width  GPU us  wall us  GPU/proposed  accepted  position");
+    let prepare_context = |generator: &mut qx_runtime_v2::GraniteV2Generator| -> Result<()> {
+        generator.reset();
+        if late_context != 0 {
+            let mut token = 1_u32;
+            for _ in 0..late_context {
+                token = generator.step(token).map_err(anyhow::Error::msg)?;
+            }
+        }
+        Ok(())
+    };
     for width in [1_usize, 2, 4] {
         let mut inputs = Vec::with_capacity(width);
         let mut expected = Vec::with_capacity(width);
-        generator.reset();
+        prepare_context(&mut generator)?;
+        let checkpoint = generator.checkpoint_kv();
         let mut input = 1_u32;
         for _ in 0..width {
             inputs.push(input);
@@ -2465,10 +2485,14 @@ fn benchmark_v2_gpu_verifier(
             expected.push(next);
             input = next;
         }
+        generator
+            .rollback_kv(checkpoint)
+            .map_err(anyhow::Error::msg)?;
         for _ in 0..3 {
-            generator.reset();
+            prepare_context(&mut generator)?;
             generator.clear_moe_probe();
             generator.clear_qkv_probe();
+            generator.clear_attention_probe();
             let result = generator
                 .verify_tokens_gpu(&inputs, &expected)
                 .map_err(anyhow::Error::msg)?;
@@ -2482,7 +2506,7 @@ fn benchmark_v2_gpu_verifier(
             }
         }
         if qkv_probe {
-            generator.reset();
+            prepare_context(&mut generator)?;
             generator.set_qkv_capture(true);
             let result = generator
                 .verify_tokens_gpu(&inputs, &expected)
@@ -2493,8 +2517,20 @@ fn benchmark_v2_gpu_verifier(
             generator.clear_qkv_probe();
             generator.set_qkv_replay(true);
         }
+        if attention_probe {
+            prepare_context(&mut generator)?;
+            generator.set_attention_capture(true);
+            let result = generator
+                .verify_tokens_gpu(&inputs, &expected)
+                .map_err(anyhow::Error::msg)?;
+            if result.accepted_prefix != width || result.next_token != expected[width - 1] {
+                bail!("K={width} attention capture baseline failed exact verification");
+            }
+            generator.clear_attention_probe();
+            generator.set_attention_replay(true);
+        }
         if let Some(probe) = moe_probe.as_deref() {
-            generator.reset();
+            prepare_context(&mut generator)?;
             match probe {
                 "whole" => generator.set_moe_capture(true),
                 "gateup" | "gate_up" => generator.set_gate_up_capture(true),
@@ -2522,7 +2558,7 @@ fn benchmark_v2_gpu_verifier(
         let mut accepted = 0_usize;
         let mut position = 0_usize;
         for _ in 0..iterations {
-            generator.reset();
+            prepare_context(&mut generator)?;
             let before = generator.metrics().map_err(anyhow::Error::msg)?;
             let start = Instant::now();
             let result = generator
@@ -2542,6 +2578,9 @@ fn benchmark_v2_gpu_verifier(
             gpu_samples.push((after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1e6);
             wall_samples.push(start.elapsed().as_secs_f64() * 1e6);
         }
+        generator.clear_attention_probe();
+        generator.clear_qkv_probe();
+        generator.clear_moe_probe();
         let stats = summarize_kernel_samples(&mut gpu_samples, &mut wall_samples);
         println!(
             "{width:>5} {:>8.2} {:>8.2} {:>12.2} {:>9} {:>8}",

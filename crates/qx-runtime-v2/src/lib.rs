@@ -762,6 +762,7 @@ struct KWideVerifierBuffers {
     moe_output: qx_metal::platform::RuntimeBuffer,
     moe_capture: Vec<qx_metal::platform::RuntimeBuffer>,
     qkv_capture: Vec<qx_metal::platform::RuntimeBuffer>,
+    attention_capture: Vec<qx_metal::platform::RuntimeBuffer>,
     logits_scratch: qx_metal::platform::RuntimeBuffer,
     token_output: qx_metal::platform::RuntimeBuffer,
 }
@@ -796,6 +797,7 @@ impl KWideVerifierBuffers {
         let moe_output = alloc(width * HIDDEN * f32_bytes)?;
         let mut moe_capture = Vec::with_capacity(LAYERS);
         let mut qkv_capture = Vec::with_capacity(LAYERS);
+        let mut attention_capture = Vec::with_capacity(LAYERS);
         for _ in 0..LAYERS {
             // Whole-MoE replay stores one vector per token; gate/up and down
             // probes store one vector per routed expert-token pair.
@@ -803,6 +805,7 @@ impl KWideVerifierBuffers {
             qkv_capture.push(alloc(
                 width * (HIDDEN + 2 * KV_HEADS * HEAD_DIM) * f32_bytes,
             )?);
+            attention_capture.push(alloc(width * HIDDEN * f32_bytes)?);
         }
         // The fused final head uses this only as a partial-max workspace. A
         // full logits matrix is intentionally not allocated for verification.
@@ -842,6 +845,7 @@ impl KWideVerifierBuffers {
             moe_output,
             moe_capture,
             qkv_capture,
+            attention_capture,
             logits_scratch,
             token_output,
         })
@@ -999,6 +1003,8 @@ pub struct GraniteV2Generator {
     verifier_moe_replay: bool,
     verifier_qkv_capture: bool,
     verifier_qkv_replay: bool,
+    verifier_attention_capture: bool,
+    verifier_attention_replay: bool,
     verifier_gate_up_capture: bool,
     verifier_gate_up_replay: bool,
     verifier_down_capture: bool,
@@ -1058,6 +1064,8 @@ impl GraniteV2Generator {
             verifier_moe_replay: false,
             verifier_qkv_capture: false,
             verifier_qkv_replay: false,
+            verifier_attention_capture: false,
+            verifier_attention_replay: false,
             verifier_gate_up_capture: false,
             verifier_gate_up_replay: false,
             verifier_down_capture: false,
@@ -1165,6 +1173,25 @@ impl GraniteV2Generator {
     pub fn clear_qkv_probe(&mut self) {
         self.verifier_qkv_capture = false;
         self.verifier_qkv_replay = false;
+    }
+
+    pub fn set_attention_capture(&mut self, enabled: bool) {
+        self.verifier_attention_capture = enabled;
+        if enabled {
+            self.verifier_attention_replay = false;
+        }
+    }
+
+    pub fn set_attention_replay(&mut self, enabled: bool) {
+        self.verifier_attention_replay = enabled;
+        if enabled {
+            self.verifier_attention_capture = false;
+        }
+    }
+
+    pub fn clear_attention_probe(&mut self) {
+        self.verifier_attention_capture = false;
+        self.verifier_attention_replay = false;
     }
 
     pub fn checkpoint_kv(&self) -> KvCheckpoint {
@@ -1457,15 +1484,32 @@ impl GraniteV2Generator {
             if profile_stages {
                 graph.stage_boundary(self.context.as_ref())?;
             }
-            graph.encode_attention_batch(
-                self.context.as_ref(),
-                &verifier.query_rotated,
-                &key_cache,
-                &value_cache,
-                &verifier.attention,
-                self.position,
-                width,
-            )?;
+            if self.verifier_attention_replay {
+                graph.encode_copy_f32(
+                    self.context.as_ref(),
+                    &verifier.attention_capture[layer],
+                    &verifier.attention,
+                    width * HIDDEN,
+                )?;
+            } else {
+                graph.encode_attention_batch(
+                    self.context.as_ref(),
+                    &verifier.query_rotated,
+                    &key_cache,
+                    &value_cache,
+                    &verifier.attention,
+                    self.position,
+                    width,
+                )?;
+                if self.verifier_attention_capture {
+                    graph.encode_copy_f32(
+                        self.context.as_ref(),
+                        &verifier.attention,
+                        &verifier.attention_capture[layer],
+                        width * HIDDEN,
+                    )?;
+                }
+            }
             if profile_stages {
                 graph.stage_boundary(self.context.as_ref())?;
             }
