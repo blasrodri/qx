@@ -11,7 +11,8 @@ captures two exact GPU tensors:
 - the post-MoE output for every layer.
 
 It then reruns the same explicit decode position with frozen top-8 routes and
-replaces either block with an identical GPU FP32 copy from the captured tensor.
+replaces either block, or both blocks, with an identical GPU FP32 copy from the
+captured tensor.
 The surrounding embedding, QKV, RoPE/KV, residual, router, final head, and
 command-buffer path remain live. This is materially different from the older
 no-op ablations: the downstream graph receives the exact production value.
@@ -33,6 +34,16 @@ The output reports:
 canonical_capture_control
 replace_attention_and_o
 replace_moe
+replace_attention_and_o_and_moe
+```
+
+The report computes average marginal effects and keeps the interaction term
+explicit:
+
+```text
+A = ((T00 - T10) + (T01 - T11)) / 2
+M = ((T00 - T01) + (T10 - T11)) / 2
+I = (T00 - T10) - (T01 - T11)
 ```
 
 The control and replacement each include one GPU copy at the probed boundary,
@@ -47,15 +58,17 @@ not an additive operator budget. It should be used to decide whether a block
 has at least `0.15–0.20 ms/token` of demonstrated end-to-end headroom before
 implementing a new exact kernel or representation.
 
-Initial general/context-512 diagnostic, 3 samples:
+General/context-512 diagnostic, 10 samples:
 
 | Path | GPU µs/token |
 | --- | ---: |
-| canonical capture control | 4082.12 |
-| attention + O replacement | 3603.50 |
-| MoE replacement | 2134.63 |
+| canonical capture control | 4088.87 |
+| attention + O replacement | 3629.87 |
+| MoE replacement | 2140.75 |
+| attention + O + MoE replacement | 1529.25 |
 
-The corresponding coarse marginal savings were approximately `0.479 ms` for
-attention+O and `1.948 ms` for MoE under this probe contract. These values are
-diagnostic and should be rerun with the sealed benchmark sample count and
-paired fixtures before drawing competitive conclusions.
+The resulting average marginal savings were approximately `0.535 ms` for
+attention+O and `2.024 ms` for MoE, with a `-0.153 ms` interaction term under
+this probe contract. These values are diagnostic and should be rerun with the
+sealed benchmark sample count and paired fixtures before drawing competitive
+conclusions. They are not additive operator costs.

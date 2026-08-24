@@ -19,15 +19,15 @@
     "replacement=GPU_copy_f32"
   ],
   "os_version": "26.5.2",
-  "power_state": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23199843)\t41%; discharging; 0:51 remaining present: true",
+  "power_state": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23199843)\t39%; discharging; 2:05 remaining present: true",
   "thermal_state": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
-  "memory_pressure": "The system has 25769803776 (1572864 pages with a page size of 16384).\nSystem-wide memory free percentage: 54%",
+  "memory_pressure": "The system has 25769803776 (1572864 pages with a page size of 16384).\nSystem-wide memory free percentage: 58%",
   "levels": [
     {
       "level": "canonical_capture_control",
       "timing": {
-        "gpu_us_per_sample": 4073.208081535995,
-        "wall_us_per_sample": 4421.167,
+        "gpu_us_per_sample": 4088.8747316785157,
+        "wall_us_per_sample": 4378.1669999999995,
         "dispatches_per_sample": 509.0,
         "command_buffers_per_sample": 147.0,
         "encoders_per_sample": 147.0
@@ -37,17 +37,17 @@
         "mapped_artifact_bytes": 751009792,
         "known_metal_allocated_bytes": 802570240,
         "recommended_metal_working_set_bytes": 19069665280,
-        "current_rss_bytes": 41025536,
-        "peak_rss_bytes": 41025536,
-        "current_physical_footprint_bytes": 141165240,
-        "peak_physical_footprint_bytes": 141165240
+        "current_rss_bytes": 41385984,
+        "peak_rss_bytes": 41385984,
+        "current_physical_footprint_bytes": 141460104,
+        "peak_physical_footprint_bytes": 141460104
       }
     },
     {
       "level": "replace_attention_and_o",
       "timing": {
-        "gpu_us_per_sample": 3611.000080127269,
-        "wall_us_per_sample": 3635.5,
+        "gpu_us_per_sample": 3629.8747872933745,
+        "wall_us_per_sample": 3592.125,
         "dispatches_per_sample": 461.0,
         "command_buffers_per_sample": 147.0,
         "encoders_per_sample": 147.0
@@ -57,17 +57,17 @@
         "mapped_artifact_bytes": 751009792,
         "known_metal_allocated_bytes": 802570240,
         "recommended_metal_working_set_bytes": 19069665280,
-        "current_rss_bytes": 41025536,
-        "peak_rss_bytes": 41025536,
-        "current_physical_footprint_bytes": 141165240,
-        "peak_physical_footprint_bytes": 141165240
+        "current_rss_bytes": 41385984,
+        "peak_rss_bytes": 41385984,
+        "current_physical_footprint_bytes": 141460104,
+        "peak_physical_footprint_bytes": 141460104
       }
     },
     {
       "level": "replace_moe",
       "timing": {
-        "gpu_us_per_sample": 2128.791355062276,
-        "wall_us_per_sample": 2778.333,
+        "gpu_us_per_sample": 2140.7504682429135,
+        "wall_us_per_sample": 2867.167,
         "dispatches_per_sample": 389.0,
         "command_buffers_per_sample": 147.0,
         "encoders_per_sample": 147.0
@@ -77,10 +77,30 @@
         "mapped_artifact_bytes": 751009792,
         "known_metal_allocated_bytes": 802570240,
         "recommended_metal_working_set_bytes": 19069665280,
-        "current_rss_bytes": 41025536,
-        "peak_rss_bytes": 41025536,
-        "current_physical_footprint_bytes": 141165240,
-        "peak_physical_footprint_bytes": 141165240
+        "current_rss_bytes": 41385984,
+        "peak_rss_bytes": 41385984,
+        "current_physical_footprint_bytes": 141460104,
+        "peak_physical_footprint_bytes": 141460104
+      }
+    },
+    {
+      "level": "replace_attention_and_o_and_moe",
+      "timing": {
+        "gpu_us_per_sample": 1529.2504103854299,
+        "wall_us_per_sample": 2611.1670000000004,
+        "dispatches_per_sample": 389.0,
+        "command_buffers_per_sample": 147.0,
+        "encoders_per_sample": 147.0
+      },
+      "memory": {
+        "artifact_bytes": 751009792,
+        "mapped_artifact_bytes": 751009792,
+        "known_metal_allocated_bytes": 802570240,
+        "recommended_metal_working_set_bytes": 19069665280,
+        "current_rss_bytes": 41385984,
+        "peak_rss_bytes": 41385984,
+        "current_physical_footprint_bytes": 141460104,
+        "peak_physical_footprint_bytes": 141460104
       }
     }
   ]

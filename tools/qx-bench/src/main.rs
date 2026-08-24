@@ -1390,6 +1390,7 @@ enum DifferentialBlock {
 enum ProductionProbeBlock {
     AttentionAndOutput,
     Moe,
+    AttentionAndOutputAndMoe,
 }
 
 #[cfg(target_os = "macos")]
@@ -1650,9 +1651,18 @@ fn encode_differential_token_with_probe(
         }
         graph.stage_boundary(context).map_err(anyhow::Error::msg)?;
 
-        if skip == Some(DifferentialBlock::Attention)
-            || probe == Some(ProductionProbeBlock::AttentionAndOutput)
-        {
+        let replace_attention = matches!(
+            probe,
+            Some(
+                ProductionProbeBlock::AttentionAndOutput
+                    | ProductionProbeBlock::AttentionAndOutputAndMoe
+            )
+        );
+        let replace_moe = matches!(
+            probe,
+            Some(ProductionProbeBlock::Moe | ProductionProbeBlock::AttentionAndOutputAndMoe)
+        );
+        if skip == Some(DifferentialBlock::Attention) || replace_attention {
             noop(graph, differential_attention_dispatches())?;
         } else if qx_metal::platform::three_stage_attention_enabled() {
             graph
@@ -1681,7 +1691,7 @@ fn encode_differential_token_with_probe(
         }
         graph.stage_boundary(context).map_err(anyhow::Error::msg)?;
 
-        if probe == Some(ProductionProbeBlock::AttentionAndOutput) {
+        if replace_attention {
             let capture = capture.ok_or_else(|| {
                 anyhow::anyhow!("attention production probe requires a capture buffer")
             })?;
@@ -1717,9 +1727,7 @@ fn encode_differential_token_with_probe(
                 )
                 .map_err(anyhow::Error::msg)?;
         }
-        if probe == Some(ProductionProbeBlock::AttentionAndOutput)
-            || skip != Some(DifferentialBlock::OutputResidual)
-        {
+        if replace_attention || skip != Some(DifferentialBlock::OutputResidual) {
             graph
                 .encode_residual(
                     context,
@@ -1803,7 +1811,7 @@ fn encode_differential_token_with_probe(
             .transpose()?
             .unwrap_or_else(|| buffers.buffer(qx_runtime_v2::BufferId::TopKWeights).clone());
 
-        if probe == Some(ProductionProbeBlock::Moe) {
+        if replace_moe {
             let capture = capture
                 .ok_or_else(|| anyhow::anyhow!("MoE production probe requires a capture buffer"))?;
             let source = ProductionBlockCapture::layer_buffer(&capture.moe_output, layer)?;
@@ -2552,6 +2560,25 @@ fn benchmark_v2_production_probe(
                 Some(ProductionProbeBlock::Moe),
             )
         })?;
+    let combined_probe =
+        profile_graph_stage_contextual(context.as_ref(), warmup, iterations, |graph| {
+            encode_differential_token_with_probe(
+                graph,
+                &buffers,
+                &stack,
+                &moe,
+                position,
+                None,
+                Some(&route_trace),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&capture),
+                Some(ProductionProbeBlock::AttentionAndOutputAndMoe),
+            )
+        })?;
     let levels = vec![
         ContextualLevelReport {
             level: "canonical_capture_control".to_owned(),
@@ -2566,6 +2593,11 @@ fn benchmark_v2_production_probe(
         ContextualLevelReport {
             level: "replace_moe".to_owned(),
             timing: moe_probe,
+            memory: contextual_memory(context.as_ref(), artifact_bytes),
+        },
+        ContextualLevelReport {
+            level: "replace_attention_and_o_and_moe".to_owned(),
+            timing: combined_probe,
             memory: contextual_memory(context.as_ref(), artifact_bytes),
         },
     ];
@@ -2587,9 +2619,13 @@ fn benchmark_v2_production_probe(
         );
     }
     println!(
-        "marginal saved: attention+O={:.2} us, MoE={:.2} us",
-        control.gpu_us_per_sample - attention_probe.gpu_us_per_sample,
-        control.gpu_us_per_sample - moe_probe.gpu_us_per_sample
+        "average marginal: attention+O={:.2} us, MoE={:.2} us, interaction={:.2} us",
+        0.5 * ((control.gpu_us_per_sample - attention_probe.gpu_us_per_sample)
+            + (moe_probe.gpu_us_per_sample - combined_probe.gpu_us_per_sample)),
+        0.5 * ((control.gpu_us_per_sample - moe_probe.gpu_us_per_sample)
+            + (attention_probe.gpu_us_per_sample - combined_probe.gpu_us_per_sample)),
+        (control.gpu_us_per_sample - attention_probe.gpu_us_per_sample)
+            - (moe_probe.gpu_us_per_sample - combined_probe.gpu_us_per_sample)
     );
 
     if let Some(path) = result_json {
