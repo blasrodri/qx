@@ -270,6 +270,20 @@ pub mod platform {
         })
     }
 
+    /// Experimental exact-Q4 vocabulary consumer. It keeps the existing
+    /// partial-max/argmax graph and changes only packed-code/scale ownership.
+    pub fn final_argmax_unique_packet_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            matches!(
+                std::env::var("QX_V2_FINAL_ARGMAX_UNIQUE_PACKET")
+                    .ok()
+                    .as_deref(),
+                Some("1") | Some("true") | Some("yes") | Some("on")
+            )
+        })
+    }
+
     /// Exact-Q4 row-inline candidate: skip per-threadgroup activation staging
     /// when the 4 KiB vector is already hot from the preceding router/RMS path.
     /// Set `QX_V2_MOE_INLINE_INPUT_CACHE=0` to evaluate the no-cache mapping.
@@ -1218,6 +1232,8 @@ pub mod platform {
         q4_dense_sweep_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_norm_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_argmax_unique_packet_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_argmax_unique_packet_norm_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_simd_norm_pipeline: Mutex<Option<Pipeline>>,
@@ -1525,7 +1541,13 @@ pub mod platform {
             let columns = prepared.columns as u32;
             let rows = prepared.rows as u32;
             let partial_count_u32 = partial_count as u32;
-            let pipeline = if norm_weights.is_some() {
+            let pipeline = if final_argmax_unique_packet_enabled() {
+                if norm_weights.is_some() {
+                    context.q4_dense_argmax_unique_packet_norm_pipeline()?
+                } else {
+                    context.q4_dense_argmax_unique_packet_pipeline()?
+                }
+            } else if norm_weights.is_some() {
                 context.q4_dense_argmax_norm_pipeline()?
             } else {
                 context.q4_dense_argmax_pipeline()?
@@ -6009,6 +6031,8 @@ pub mod platform {
                 q4_dense_sweep_pipeline: Mutex::new(None),
                 q4_dense_argmax_pipeline: Mutex::new(None),
                 q4_dense_argmax_norm_pipeline: Mutex::new(None),
+                q4_dense_argmax_unique_packet_pipeline: Mutex::new(None),
+                q4_dense_argmax_unique_packet_norm_pipeline: Mutex::new(None),
                 q4_qkv_pipeline: Mutex::new(None),
                 q4_qkv_simd_pipeline: Mutex::new(None),
                 q4_qkv_simd_norm_pipeline: Mutex::new(None),
@@ -6656,6 +6680,27 @@ pub mod platform {
             Ok(value)
         }
 
+        fn q4_dense_argmax_unique_packet_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_argmax_unique_packet_pipeline
+                .lock()
+                .map_err(|_| "Metal unique-packet argmax pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_argmax_unique_packet_partial");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal unique-packet argmax function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal unique-packet argmax pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
         fn q4_qkv_pipeline(&self) -> Result<Pipeline, String> {
             let mut pipeline = self
                 .q4_qkv_pipeline
@@ -6928,6 +6973,31 @@ pub mod platform {
                 .device
                 .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|_| "Metal normalized Q4 argmax pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_dense_argmax_unique_packet_norm_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_argmax_unique_packet_norm_pipeline
+                .lock()
+                .map_err(|_| {
+                    "Metal normalized unique-packet argmax pipeline cache is poisoned".to_owned()
+                })?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_argmax_unique_packet_norm_partial");
+            let function = library.newFunctionWithName(&name).ok_or_else(|| {
+                "Metal normalized unique-packet argmax function was not found".to_owned()
+            })?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| {
+                    "Metal normalized unique-packet argmax pipeline creation failed".to_owned()
+                })?;
             *pipeline = Some(value.clone());
             Ok(value)
         }

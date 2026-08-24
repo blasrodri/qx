@@ -65,6 +65,44 @@ impl ExpertWeights {
         mat_vec(&self.down, self.down_rows, self.down_cols, &activated)
     }
 
+    /// Exact reference execution for a neuron-cluster plan. The arithmetic is
+    /// intentionally kept in the CPU reference path so a future packed
+    /// Gate/Up/Down cluster consumer has a fixed semantic oracle. Clustering
+    /// changes the execution unit, not the model function: every
+    /// intermediate neuron is still evaluated and every down row still sees
+    /// the complete activated vector.
+    pub fn run_neuron_clusters(&self, hidden: &[f32], cluster_width: usize) -> Result<Vec<f32>> {
+        if cluster_width == 0 {
+            bail!("neuron cluster width must be positive");
+        }
+        if hidden.len() != self.gate_up_cols {
+            bail!(
+                "hidden size {} does not match expert input size {}",
+                hidden.len(),
+                self.gate_up_cols
+            );
+        }
+
+        let gate_up = mat_vec(&self.gate_up, self.gate_up_rows, self.gate_up_cols, hidden);
+        let intermediate = self.down_cols;
+        let mut output = vec![0.0f32; self.down_rows];
+        for start in (0..intermediate).step_by(cluster_width) {
+            let end = (start + cluster_width).min(intermediate);
+            let activated = (start..end)
+                .map(|index| silu(gate_up[index]) * gate_up[intermediate + index])
+                .collect::<Vec<_>>();
+            for row in 0..self.down_rows {
+                let down_row = &self.down[row * intermediate..(row + 1) * intermediate];
+                output[row] += down_row[start..end]
+                    .iter()
+                    .zip(&activated)
+                    .map(|(weight, value)| weight * value)
+                    .sum::<f32>();
+            }
+        }
+        Ok(output)
+    }
+
     pub fn quantize(&self, quant_type: QuantType, group_size: usize) -> QuantizedExpert {
         QuantizedExpert {
             gate_up: QuantizedTensor::quantize(
@@ -84,6 +122,11 @@ impl ExpertWeights {
         }
     }
 }
+
+/// Install-time candidate widths for the first exact neuron-cluster
+/// pre-screen. Keeping this list in the compiler makes the search explicit
+/// without enabling an unimplemented GPU artifact path.
+pub const MOE_NEURON_CLUSTER_CANDIDATES: &[usize] = &[16, 32];
 
 #[derive(Clone, Debug)]
 pub struct QuantizedExpert {
@@ -1167,5 +1210,36 @@ mod tests {
                 threshold_micros: 100,
             }
         )));
+    }
+
+    #[test]
+    fn neuron_cluster_reference_matches_whole_matrix_execution() {
+        let expert = ExpertWeights::new(
+            &[8, 4],
+            (0..32).map(|value| value as f32 * 0.03125 - 0.5).collect(),
+            &[3, 4],
+            (0..12).map(|value| value as f32 * -0.0625 + 0.25).collect(),
+        )
+        .unwrap();
+        let hidden = [0.25, -0.5, 0.75, 1.0];
+        let whole = expert.run(&hidden);
+        for width in MOE_NEURON_CLUSTER_CANDIDATES
+            .iter()
+            .copied()
+            .chain([1, 3, 5])
+        {
+            let clustered = expert.run_neuron_clusters(&hidden, width).unwrap();
+            assert_eq!(clustered.len(), whole.len());
+            for (actual, expected) in clustered.iter().zip(&whole) {
+                assert!((actual - expected).abs() < 1.0e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn neuron_cluster_reference_rejects_zero_width_and_bad_input() {
+        let expert = ExpertWeights::new(&[4, 2], vec![0.0; 8], &[2, 2], vec![0.0; 4]).unwrap();
+        assert!(expert.run_neuron_clusters(&[0.0, 0.0], 0).is_err());
+        assert!(expert.run_neuron_clusters(&[0.0], 16).is_err());
     }
 }

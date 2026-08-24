@@ -45,6 +45,12 @@ The planner should generate compatible storage × consumer candidates and let
 complete-model evidence select them. It must not encode a model/target special
 case such as `if Granite && M5 { unique_packet }`.
 
+The planning IR now also carries an optional `MoeExecutionUnit` descriptor:
+`Matrix`, `RowTile`, `QuantPacket`, or `MoeNeuronCluster`. This is deliberately
+only a planning surface for now. Cluster candidates must not be emitted as
+executable artifacts until their packed representation, exact consumer, and
+full sequential parity gate exist.
+
 ## What is deliberately deferred
 
 The following are valuable but should follow statistical sealing of Result #2:

@@ -180,6 +180,21 @@ pub enum ExpertTraversalKind {
     CrossExpertTile,
 }
 
+/// The physical unit the compiler uses when it plans sparse expert work.
+///
+/// This is separate from tensor representation and backend function IDs. A
+/// future cluster plan can therefore change the unit of execution without
+/// pretending that it is merely another Q4 layout. `MoeNeuronCluster` is a
+/// planning descriptor until a matching packed artifact and consumer exist.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MoeExecutionUnit {
+    Matrix,
+    RowTile { rows: u16 },
+    QuantPacket { weights: u16 },
+    MoeNeuronCluster { width: u16 },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExpertTraversalPlan {
     pub kind: ExpertTraversalKind,
@@ -258,6 +273,11 @@ pub struct ExecutionPlanManifest {
     /// may select different packet consumers on the target GPU.
     #[serde(default)]
     pub moe_down_consumer: Option<String>,
+    /// Optional execution-unit descriptor for sparse expert planning.
+    /// Cluster units are not executable until the corresponding packed
+    /// artifact and Metal consumer are available.
+    #[serde(default)]
+    pub moe_execution_unit: Option<MoeExecutionUnit>,
     /// Optional physical expert traversal metadata. It is absent on legacy
     /// artifacts and present only when a structural cross-expert stream is
     /// selected by the compiler.
@@ -321,6 +341,7 @@ impl ExecutionPlanManifest {
             moe_mapping: None,
             moe_consumer: None,
             moe_down_consumer: None,
+            moe_execution_unit: None,
             expert_traversal: None,
             schedule: DispatchSchedule {
                 command_buffers_per_token: 1,

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "measurement": "v2_parity",
+  "artifact": "external/models/granite-m5-pro-q4-rowinline-unique-packet.qx",
+  "plan_id": "granite-m5-top8-rowinline-unique-packet-final-head-experimental",
+  "candidate": "final_argmax_unique_packet",
+  "context": 512,
+  "checkpoint_positions": [0, 1, 7, 31, 63, 127, 255, 511],
+  "max_kv_key_error": 0.009853,
+  "max_kv_value_error": 0.001048,
+  "max_attention_error": 0.000127,
+  "max_absolute_logit_error": 0.009898,
+  "minimum_logit_cosine": 1.0,
+  "argmax_agreement": "8/8",
+  "exact_semantics_verified": true,
+  "decision": "reject_for_promotion"
+}

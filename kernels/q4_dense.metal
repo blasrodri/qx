@@ -204,6 +204,167 @@ kernel void qx_q4_dense_argmax_norm_partial(
     }
 }
 
+// Exact Q4 row-major vocabulary consumer using cooperative packet ownership.
+// Each SIMD group still owns one output row and the threadgroup still emits
+// one partial maximum, but two adjacent group-32 packets are consumed per
+// loop iteration. Packed bytes are loaded once per lane and each packet scale
+// is loaded once per half-group and broadcast, avoiding the repeated scale
+// loads in the canonical row-major consumer.
+kernel void qx_q4_dense_argmax_unique_packet_partial(
+    device const uchar* packed [[buffer(0)]],
+    device const half* scales [[buffer(1)]],
+    device const float* input [[buffer(2)]],
+    device qx_q4_argmax_partial_t* partials [[buffer(3)]],
+    constant uint& columns [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant float& multiplier [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint local_tid [[thread_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    constexpr uint group_size = 32;
+    constexpr uint bytes_per_group = 16;
+    constexpr int qmax = 7;
+    constexpr uint rows_per_threadgroup = 8;
+    threadgroup float values[rows_per_threadgroup];
+    threadgroup uint indices[rows_per_threadgroup];
+    if (local_tid < rows_per_threadgroup) {
+        values[local_tid] = -3.402823466e+38f;
+        indices[local_tid] = 0xffffffffu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row = threadgroup_id * rows_per_threadgroup + simdgroup;
+    float sum = 0.0f;
+    if (row < rows) {
+        uint groups = (columns + group_size - 1) / group_size;
+        uint row_base = row * groups * bytes_per_group;
+        for (uint group = 0; group < groups; group += 2) {
+            uint local = lane & 15u;
+            uint selected_group = group + (lane >= 16u ? 1u : 0u);
+            if (selected_group >= groups) continue;
+            uint packed_base = row_base + selected_group * bytes_per_group;
+            uint packed_byte = uint(packed[packed_base + local]);
+            float scale = 0.0f;
+            if (local == 0u) {
+                scale = float(scales[row * groups + selected_group]);
+            }
+            float scale0 = simd_broadcast(lane == 0u ? scale : 0.0f, 0);
+            float scale1 = simd_broadcast(lane == 16u ? scale : 0.0f, 16);
+            float selected_scale = lane < 16u ? scale0 : scale1;
+            uint input_base = selected_group * group_size + local * 2u;
+            uint lo = packed_byte & 0xfu;
+            uint hi = (packed_byte >> 4u) & 0xfu;
+            if (input_base < columns) {
+                sum += float(int(lo) - qmax) * selected_scale * input[input_base];
+            }
+            if (input_base + 1u < columns) {
+                sum += float(int(hi) - qmax) * selected_scale * input[input_base + 1u];
+            }
+        }
+        sum = simd_sum(sum) * multiplier;
+    }
+    if (lane == 0) {
+        values[simdgroup] = row < rows ? sum : -3.402823466e+38f;
+        indices[simdgroup] = row < rows ? row : 0xffffffffu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (local_tid == 0) {
+        float best_value = values[0];
+        uint best_index = indices[0];
+        for (uint i = 1; i < rows_per_threadgroup; ++i) {
+            float value = values[i];
+            uint index = indices[i];
+            if (value > best_value || (value == best_value && index < best_index)) {
+                best_value = value;
+                best_index = index;
+            }
+        }
+        partials[threadgroup_id].value = best_value;
+        partials[threadgroup_id].index = best_index;
+    }
+}
+
+kernel void qx_q4_dense_argmax_unique_packet_norm_partial(
+    device const uchar* packed [[buffer(0)]],
+    device const half* scales [[buffer(1)]],
+    device const float* input [[buffer(2)]],
+    device qx_q4_argmax_partial_t* partials [[buffer(3)]],
+    constant uint& columns [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant float& multiplier [[buffer(6)]],
+    device const float* norm_weights [[buffer(7)]],
+    device const float* inverse_rms [[buffer(8)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint local_tid [[thread_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    constexpr uint group_size = 32;
+    constexpr uint bytes_per_group = 16;
+    constexpr int qmax = 7;
+    constexpr uint rows_per_threadgroup = 8;
+    threadgroup float values[rows_per_threadgroup];
+    threadgroup uint indices[rows_per_threadgroup];
+    if (local_tid < rows_per_threadgroup) {
+        values[local_tid] = -3.402823466e+38f;
+        indices[local_tid] = 0xffffffffu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row = threadgroup_id * rows_per_threadgroup + simdgroup;
+    float sum = 0.0f;
+    float inverse = inverse_rms[0];
+    if (row < rows) {
+        uint groups = (columns + group_size - 1) / group_size;
+        uint row_base = row * groups * bytes_per_group;
+        for (uint group = 0; group < groups; group += 2) {
+            uint local = lane & 15u;
+            uint selected_group = group + (lane >= 16u ? 1u : 0u);
+            if (selected_group >= groups) continue;
+            uint packed_base = row_base + selected_group * bytes_per_group;
+            uint packed_byte = uint(packed[packed_base + local]);
+            float scale = 0.0f;
+            if (local == 0u) {
+                scale = float(scales[row * groups + selected_group]);
+            }
+            float scale0 = simd_broadcast(lane == 0u ? scale : 0.0f, 0);
+            float scale1 = simd_broadcast(lane == 16u ? scale : 0.0f, 16);
+            float selected_scale = lane < 16u ? scale0 : scale1;
+            uint input_base = selected_group * group_size + local * 2u;
+            uint lo = packed_byte & 0xfu;
+            uint hi = (packed_byte >> 4u) & 0xfu;
+            if (input_base < columns) {
+                float activation = input[input_base] * inverse * norm_weights[input_base];
+                sum += float(int(lo) - qmax) * selected_scale * activation;
+            }
+            if (input_base + 1u < columns) {
+                float activation = input[input_base + 1u] * inverse * norm_weights[input_base + 1u];
+                sum += float(int(hi) - qmax) * selected_scale * activation;
+            }
+        }
+        sum = simd_sum(sum) * multiplier;
+    }
+    if (lane == 0) {
+        values[simdgroup] = row < rows ? sum : -3.402823466e+38f;
+        indices[simdgroup] = row < rows ? row : 0xffffffffu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (local_tid == 0) {
+        float best_value = values[0];
+        uint best_index = indices[0];
+        for (uint i = 1; i < rows_per_threadgroup; ++i) {
+            float value = values[i];
+            uint index = indices[i];
+            if (value > best_value || (value == best_value && index < best_index)) {
+                best_value = value;
+                best_index = index;
+            }
+        }
+        partials[threadgroup_id].value = best_value;
+        partials[threadgroup_id].index = best_index;
+    }
+}
+
 // SIMD Q4 GEMV that applies RMSNorm projection-wise while consuming the raw
 // activation vector. This is used for the post-attention router boundary.
 kernel void qx_q4_simd_norm_gemv(
