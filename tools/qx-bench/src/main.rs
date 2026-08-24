@@ -964,6 +964,23 @@ fn benchmark_v2_batch_moe_gateup(artifact_path: &std::path::Path, iterations: us
     let scalar_gate_up = context
         .read_runtime_f32(&scalar_scratch, 8 * HIDDEN)
         .map_err(anyhow::Error::msg)?;
+    let mut scalar_full_graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+    scalar_full_graph
+        .encode_dynamic_q4_moe_batched_simd(
+            prepared,
+            &scalar_input,
+            &scalar_ids,
+            &scalar_weights,
+            &scalar_scratch,
+            &scalar_output,
+        )
+        .map_err(anyhow::Error::msg)?;
+    scalar_full_graph
+        .finish(context.as_ref())
+        .map_err(anyhow::Error::msg)?;
+    let scalar_full = context
+        .read_runtime_f32(&scalar_output, HIDDEN)
+        .map_err(anyhow::Error::msg)?;
 
     println!("QX V2 expert-major K-wide gate/up benchmark");
     println!("artifact: {}", artifact_path.display());
@@ -1006,6 +1023,19 @@ fn benchmark_v2_batch_moe_gateup(artifact_path: &std::path::Path, iterations: us
         let output = context
             .allocate_runtime_buffer(pair_count * HIDDEN * 4)
             .map_err(anyhow::Error::msg)?;
+        let activated = context
+            .allocate_runtime_buffer(pair_count * 512 * 4)
+            .map_err(anyhow::Error::msg)?;
+        let expert_output = context
+            .allocate_runtime_buffer(pair_count * HIDDEN * 4)
+            .map_err(anyhow::Error::msg)?;
+        let token_output = context
+            .allocate_runtime_buffer(tokens * HIDDEN * 4)
+            .map_err(anyhow::Error::msg)?;
+        let route_weights_values = vec![1.0_f32 / TOP_K as f32; pair_count];
+        let route_weights = context
+            .allocate_runtime_buffer(std::mem::size_of_val(route_weights_values.as_slice()))
+            .map_err(anyhow::Error::msg)?;
         for (buffer, bytes) in [
             (&input, unsafe {
                 std::slice::from_raw_parts(
@@ -1041,6 +1071,12 @@ fn benchmark_v2_batch_moe_gateup(artifact_path: &std::path::Path, iterations: us
                 std::slice::from_raw_parts(
                     bucket_pairs_values.as_ptr() as *const u8,
                     std::mem::size_of_val(bucket_pairs_values.as_slice()),
+                )
+            }),
+            (&route_weights, unsafe {
+                std::slice::from_raw_parts(
+                    route_weights_values.as_ptr() as *const u8,
+                    std::mem::size_of_val(route_weights_values.as_slice()),
                 )
             }),
         ] {
@@ -1111,6 +1147,113 @@ fn benchmark_v2_batch_moe_gateup(artifact_path: &std::path::Path, iterations: us
         for _ in 0..3 {
             let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
             graph
+                .encode_verifier_q4_gate_up_batch(
+                    prepared,
+                    &input,
+                    &route_experts,
+                    &route_tokens,
+                    &output,
+                    pair_count,
+                )
+                .map_err(anyhow::Error::msg)?;
+            graph
+                .encode_verifier_q4_silu_batch(prepared, &output, &activated, pair_count)
+                .map_err(anyhow::Error::msg)?;
+            graph
+                .encode_verifier_q4_down_batch(
+                    prepared,
+                    &route_experts,
+                    &activated,
+                    &expert_output,
+                    pair_count,
+                )
+                .map_err(anyhow::Error::msg)?;
+            graph
+                .encode_verifier_q4_accumulate_batch(
+                    prepared,
+                    &expert_output,
+                    &route_tokens,
+                    &route_weights,
+                    &token_output,
+                    pair_count,
+                    tokens,
+                )
+                .map_err(anyhow::Error::msg)?;
+            graph.finish(context.as_ref()).map_err(anyhow::Error::msg)?;
+        }
+        let full_values = context
+            .read_runtime_f32(&token_output, tokens * HIDDEN)
+            .map_err(anyhow::Error::msg)?;
+        let full_max_abs = if tokens == 1 {
+            full_values
+                .iter()
+                .zip(&scalar_full)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0_f32, f32::max)
+        } else {
+            0.0
+        };
+        if tokens == 1 && full_max_abs > 1.0e-3 {
+            bail!("K=1 pair verifier MoE mismatch: {full_max_abs:.8}");
+        }
+        let mut full_gpu_samples = Vec::with_capacity(iterations);
+        let mut full_wall_samples = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let before = context.metrics().map_err(anyhow::Error::msg)?;
+            let start = Instant::now();
+            let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+            graph
+                .encode_verifier_q4_gate_up_batch(
+                    prepared,
+                    &input,
+                    &route_experts,
+                    &route_tokens,
+                    &output,
+                    pair_count,
+                )
+                .map_err(anyhow::Error::msg)?;
+            graph
+                .encode_verifier_q4_silu_batch(prepared, &output, &activated, pair_count)
+                .map_err(anyhow::Error::msg)?;
+            graph
+                .encode_verifier_q4_down_batch(
+                    prepared,
+                    &route_experts,
+                    &activated,
+                    &expert_output,
+                    pair_count,
+                )
+                .map_err(anyhow::Error::msg)?;
+            graph
+                .encode_verifier_q4_accumulate_batch(
+                    prepared,
+                    &expert_output,
+                    &route_tokens,
+                    &route_weights,
+                    &token_output,
+                    pair_count,
+                    tokens,
+                )
+                .map_err(anyhow::Error::msg)?;
+            graph.finish(context.as_ref()).map_err(anyhow::Error::msg)?;
+            let after = context.metrics().map_err(anyhow::Error::msg)?;
+            full_gpu_samples
+                .push((after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1e6);
+            full_wall_samples.push(start.elapsed().as_secs_f64() * 1e6);
+        }
+        let full_stats = summarize_kernel_samples(&mut full_gpu_samples, &mut full_wall_samples);
+        println!(
+            "pair-moe  {tokens:>5} {pair_count:>5} {:>8.2} {:>8.2} {:>8.2} {:>11} {:>12.8}",
+            full_stats.gpu_median_us,
+            full_stats.wall_median_us,
+            full_stats.gpu_median_us / tokens as f64,
+            4,
+            full_max_abs,
+        );
+
+        for _ in 0..3 {
+            let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+            graph
                 .encode_verifier_q4_gate_up_expert_major(
                     prepared,
                     &input,
@@ -1168,6 +1311,68 @@ fn benchmark_v2_batch_moe_gateup(artifact_path: &std::path::Path, iterations: us
             expert_stats.gpu_median_us / pair_count as f64,
             1,
             expert_max_abs,
+        );
+
+        for _ in 0..3 {
+            let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+            graph
+                .encode_verifier_q4_gate_up_expert_major_direct(
+                    prepared,
+                    &input,
+                    &bucket_experts,
+                    &bucket_offsets,
+                    &bucket_pairs,
+                    &route_tokens,
+                    &output,
+                    TOP_K,
+                )
+                .map_err(anyhow::Error::msg)?;
+            graph.finish(context.as_ref()).map_err(anyhow::Error::msg)?;
+        }
+        let direct_values = context
+            .read_runtime_f32(&output, pair_count * HIDDEN)
+            .map_err(anyhow::Error::msg)?;
+        let direct_max_abs = direct_values
+            .iter()
+            .zip(&values)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        if direct_max_abs > 1.0e-3 {
+            bail!("direct expert-major mismatch against pair path: {direct_max_abs:.8}");
+        }
+        let mut direct_gpu_samples = Vec::with_capacity(iterations);
+        let mut direct_wall_samples = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let before = context.metrics().map_err(anyhow::Error::msg)?;
+            let start = Instant::now();
+            let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+            graph
+                .encode_verifier_q4_gate_up_expert_major_direct(
+                    prepared,
+                    &input,
+                    &bucket_experts,
+                    &bucket_offsets,
+                    &bucket_pairs,
+                    &route_tokens,
+                    &output,
+                    TOP_K,
+                )
+                .map_err(anyhow::Error::msg)?;
+            graph.finish(context.as_ref()).map_err(anyhow::Error::msg)?;
+            let after = context.metrics().map_err(anyhow::Error::msg)?;
+            direct_gpu_samples
+                .push((after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1e6);
+            direct_wall_samples.push(start.elapsed().as_secs_f64() * 1e6);
+        }
+        let direct_stats =
+            summarize_kernel_samples(&mut direct_gpu_samples, &mut direct_wall_samples);
+        println!(
+            "expert-direct {tokens:>5} {pair_count:>5} {:>8.2} {:>8.2} {:>8.2} {:>11} {:>12.8}",
+            direct_stats.gpu_median_us,
+            direct_stats.wall_median_us,
+            direct_stats.gpu_median_us / pair_count as f64,
+            1,
+            direct_max_abs,
         );
     }
     Ok(())

@@ -232,6 +232,150 @@ kernel void qx_verifier_q4_moe_gate_up_expert_major(
     }
 }
 
+// Same expert-major work unit without the 4 x 1024 threadgroup staging.
+// This is a controlled activation-access variant: packed weight ownership,
+// bucket order, output ownership, and arithmetic are unchanged.
+kernel void qx_verifier_q4_moe_gate_up_expert_major_direct(
+    device const uchar* stream [[buffer(0)]],
+    device const uint* bucket_experts [[buffer(1)]],
+    device const uint* bucket_offsets [[buffer(2)]],
+    device const uint* bucket_pairs [[buffer(3)]],
+    device const uint* route_tokens [[buffer(4)]],
+    device const float* input [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    constant uint& bucket_count [[buffer(7)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint max_tokens = 4;
+    constexpr uint threadgroups_per_bucket = hidden / rows_per_threadgroup;
+
+    uint bucket = threadgroup_id / threadgroups_per_bucket;
+    uint row_group = threadgroup_id % threadgroups_per_bucket;
+    if (bucket >= bucket_count) return;
+    uint begin = bucket_offsets[bucket];
+    uint end = bucket_offsets[bucket + 1];
+    uint active = min(end - begin, max_tokens);
+    uint row = row_group * rows_per_threadgroup + simdgroup;
+    uint expert = bucket_experts[bucket];
+    float sums[max_tokens] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (expert < 32 && row < hidden) {
+        uint row_base = expert * expert_stride + row * row_stride;
+        for (uint column = lane; column < hidden; column += 32) {
+            uint group = column / 32;
+            uint local = column % 32;
+            uint group_base = row_base + group * group_stride;
+            uint code = (uint(stream[group_base + local / 2])
+                >> ((local % 2) * 4)) & 0xf;
+            float weight = float(int(code) - 7)
+                * qx_q4_inline_scale(stream, group_base + 16);
+            for (uint token_slot = 0; token_slot < active; ++token_slot) {
+                uint pair = bucket_pairs[begin + token_slot];
+                uint token = route_tokens[pair];
+                sums[token_slot] += weight * input[token * hidden + column];
+            }
+        }
+    }
+    for (uint token_slot = 0; token_slot < active; ++token_slot) {
+        sums[token_slot] = simd_sum(sums[token_slot]);
+        if (lane == 0) {
+            uint pair = bucket_pairs[begin + token_slot];
+            output[pair * hidden + row] = sums[token_slot];
+        }
+    }
+}
+
+kernel void qx_verifier_q4_moe_silu_batch(
+    device const float* gate_up [[buffer(0)]],
+    device float* activated [[buffer(1)]],
+    constant uint& pair_count [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]) {
+    constexpr uint intermediate = 512;
+    uint pair = tid / intermediate;
+    uint row = tid % intermediate;
+    if (pair >= pair_count) return;
+    uint base = pair * 2 * intermediate;
+    float gate = gate_up[base + row];
+    float up = gate_up[base + intermediate + row];
+    activated[pair * intermediate + row] = (gate / (1.0f + exp(-gate))) * up;
+}
+
+kernel void qx_verifier_q4_moe_down_batch(
+    device const uchar* stream [[buffer(0)]],
+    device const uint* route_experts [[buffer(1)]],
+    device const float* activated [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& pair_count [[buffer(4)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint intermediate = 512;
+    constexpr uint groups = 16;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint threadgroups_per_pair = hidden / rows_per_threadgroup;
+    uint pair = threadgroup_id / threadgroups_per_pair;
+    uint row = (threadgroup_id % threadgroups_per_pair) * rows_per_threadgroup + simdgroup;
+    if (pair >= pair_count) return;
+    uint expert = route_experts[pair];
+    float sum = 0.0f;
+    if (expert < 32 && row < hidden) {
+        uint row_base = expert * expert_stride + row * row_stride;
+        for (uint group = 0; group < groups; group += 2) {
+            uint local = lane & 15u;
+            uint selected_group = group + (lane >= 16u ? 1u : 0u);
+            uint group_base = row_base + selected_group * group_stride;
+            uint packed = uint(stream[group_base + local]);
+            float scale = 0.0f;
+            if (local == 0u) {
+                scale = qx_q4_inline_scale(stream, group_base + 16u);
+            }
+            float scale0 = simd_broadcast(lane == 0u ? scale : 0.0f, 0);
+            float scale1 = simd_broadcast(lane == 16u ? scale : 0.0f, 16);
+            float selected_scale = lane < 16u ? scale0 : scale1;
+            uint input_base = selected_group * 32u + local * 2u;
+            uint lo = packed & 0xfu;
+            uint hi = (packed >> 4u) & 0xfu;
+            sum += float(int(lo) - 7) * selected_scale
+                * activated[pair * intermediate + input_base];
+            sum += float(int(hi) - 7) * selected_scale
+                * activated[pair * intermediate + input_base + 1u];
+        }
+    }
+    sum = simd_sum(sum);
+    if (lane == 0 && row < hidden) output[pair * hidden + row] = sum;
+}
+
+kernel void qx_verifier_q4_moe_accumulate_batch(
+    device const float* expert_output [[buffer(0)]],
+    device const uint* route_tokens [[buffer(1)]],
+    device const float* route_weights [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& pair_count [[buffer(4)]],
+    constant uint& token_count [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]) {
+    constexpr uint hidden = 1024;
+    uint token = tid / hidden;
+    uint row = tid % hidden;
+    if (token >= token_count) return;
+    float value = 0.0f;
+    for (uint pair = 0; pair < pair_count; ++pair) {
+        if (route_tokens[pair] == token) {
+            value += route_weights[pair] * expert_output[pair * hidden + row];
+        }
+    }
+    output[token * hidden + row] = value;
+}
+
 kernel void qx_dynamic_q4_moe_gate_up_inline_rows2_simd(
     device const uchar* stream [[buffer(0)]], device const float* input [[buffer(4)]],
     device const uint* expert_ids [[buffer(5)]], device float* output [[buffer(6)]],
