@@ -7060,6 +7060,61 @@ pub mod platform {
             Ok(())
         }
 
+        /// Preserve the five-dispatch MoE slot in a verifier probe without
+        /// performing expert work. This is intentionally diagnostic-only:
+        /// downstream values are not expected to preserve model semantics.
+        pub fn encode_verifier_moe_noop(
+            &mut self,
+            context: &MetalContext,
+        ) -> Result<(), String> {
+            for _ in 0..5 {
+                self.encode_noop(
+                    context,
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                )?;
+            }
+            Ok(())
+        }
+
+        /// Replay a captured K-wide MoE output while preserving the four
+        /// post-routing dispatch slots (gate/up, activation, down, and
+        /// accumulation). The route-compaction dispatch is emitted by the
+        /// caller, so the complete MoE region retains five dispatches.
+        pub fn encode_verifier_moe_replay(
+            &mut self,
+            context: &MetalContext,
+            captured: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            elements: usize,
+        ) -> Result<(), String> {
+            self.encode_copy_f32(context, captured, output, elements)?;
+            for _ in 0..3 {
+                self.encode_noop(
+                    context,
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                )?;
+            }
+            Ok(())
+        }
+
         /// Copy a fixed FP32 vector inside the GPU command stream. This is a
         /// diagnostic primitive used by production-preserving replacement
         /// probes; it is not part of the canonical token graph.

@@ -2428,6 +2428,15 @@ fn benchmark_v2_gpu_verifier(
     let stage_profile = std::env::var("QX_V2_VERIFIER_STAGE_PROFILE")
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    let moe_probe = std::env::var("QX_V2_VERIFIER_MOE_PROBE")
+        .ok()
+        .filter(|value| !value.is_empty() && value != "none")
+        .or_else(|| {
+            std::env::var("QX_V2_VERIFIER_MOE_REPLAY")
+                .ok()
+                .filter(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+                .map(|_| "whole".to_owned())
+        });
     generator
         .set_stage_counters(stage_profile)
         .map_err(anyhow::Error::msg)?;
@@ -2448,6 +2457,7 @@ fn benchmark_v2_gpu_verifier(
         }
         for _ in 0..3 {
             generator.reset();
+            generator.clear_moe_probe();
             let result = generator
                 .verify_tokens_gpu(&inputs, &expected)
                 .map_err(anyhow::Error::msg)?;
@@ -2458,6 +2468,28 @@ fn benchmark_v2_gpu_verifier(
                     result.next_token,
                     expected[width - 1]
                 );
+            }
+        }
+        if let Some(probe) = moe_probe.as_deref() {
+            generator.reset();
+            match probe {
+                "whole" => generator.set_moe_capture(true),
+                "gateup" | "gate_up" => generator.set_gate_up_capture(true),
+                "down" => generator.set_down_capture(true),
+                other => bail!("unsupported QX_V2_VERIFIER_MOE_PROBE={other}; use whole, gateup, or down"),
+            }
+            let result = generator
+                .verify_tokens_gpu(&inputs, &expected)
+                .map_err(anyhow::Error::msg)?;
+            if result.accepted_prefix != width || result.next_token != expected[width - 1] {
+                bail!("K={width} MoE capture baseline failed exact verification");
+            }
+            generator.clear_moe_probe();
+            match probe {
+                "whole" => generator.set_moe_replay(true),
+                "gateup" | "gate_up" => generator.set_gate_up_replay(true),
+                "down" => generator.set_down_replay(true),
+                _ => unreachable!(),
             }
         }
         let mut gpu_samples = Vec::with_capacity(iterations);

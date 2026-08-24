@@ -759,6 +759,7 @@ struct KWideVerifierBuffers {
     activated: qx_metal::platform::RuntimeBuffer,
     expert_output: qx_metal::platform::RuntimeBuffer,
     moe_output: qx_metal::platform::RuntimeBuffer,
+    moe_capture: Vec<qx_metal::platform::RuntimeBuffer>,
     logits_scratch: qx_metal::platform::RuntimeBuffer,
     token_output: qx_metal::platform::RuntimeBuffer,
 }
@@ -789,6 +790,12 @@ impl KWideVerifierBuffers {
         let activated = alloc(pair_count * INTERMEDIATE * f32_bytes)?;
         let expert_output = alloc(pair_count * HIDDEN * f32_bytes)?;
         let moe_output = alloc(width * HIDDEN * f32_bytes)?;
+        let mut moe_capture = Vec::with_capacity(LAYERS);
+        for _ in 0..LAYERS {
+            // Whole-MoE replay stores one vector per token; gate/up and down
+            // probes store one vector per routed expert-token pair.
+            moe_capture.push(alloc(width * TOP_K * HIDDEN * f32_bytes)?);
+        }
         // The fused final head uses this only as a partial-max workspace. A
         // full logits matrix is intentionally not allocated for verification.
         let logits_scratch = alloc(width * VOCAB * f32_bytes)?;
@@ -824,6 +831,7 @@ impl KWideVerifierBuffers {
             activated,
             expert_output,
             moe_output,
+            moe_capture,
             logits_scratch,
             token_output,
         })
@@ -971,6 +979,12 @@ pub struct GraniteV2Generator {
     stack: PreparedAttentionStack,
     moe: PreparedMoeStack,
     position: usize,
+    verifier_moe_capture: bool,
+    verifier_moe_replay: bool,
+    verifier_gate_up_capture: bool,
+    verifier_gate_up_replay: bool,
+    verifier_down_capture: bool,
+    verifier_down_replay: bool,
 }
 
 /// Logical KV cursor state used by speculative verification.  The KV arena is
@@ -1022,6 +1036,12 @@ impl GraniteV2Generator {
             stack,
             moe,
             position: 0,
+            verifier_moe_capture: false,
+            verifier_moe_replay: false,
+            verifier_gate_up_capture: false,
+            verifier_gate_up_replay: false,
+            verifier_down_capture: false,
+            verifier_down_replay: false,
         })
     }
 
@@ -1031,6 +1051,81 @@ impl GraniteV2Generator {
 
     pub fn position(&self) -> usize {
         self.position
+    }
+
+    pub fn set_moe_capture(&mut self, enabled: bool) {
+        self.verifier_moe_capture = enabled;
+        if enabled {
+            self.verifier_moe_replay = false;
+            self.verifier_gate_up_capture = false;
+            self.verifier_gate_up_replay = false;
+            self.verifier_down_capture = false;
+            self.verifier_down_replay = false;
+        }
+    }
+
+    pub fn set_moe_replay(&mut self, enabled: bool) {
+        self.verifier_moe_replay = enabled;
+        if enabled {
+            self.verifier_moe_capture = false;
+            self.verifier_gate_up_capture = false;
+            self.verifier_gate_up_replay = false;
+            self.verifier_down_capture = false;
+            self.verifier_down_replay = false;
+        }
+    }
+
+    pub fn set_gate_up_capture(&mut self, enabled: bool) {
+        self.verifier_gate_up_capture = enabled;
+        if enabled {
+            self.verifier_moe_capture = false;
+            self.verifier_moe_replay = false;
+            self.verifier_gate_up_replay = false;
+            self.verifier_down_capture = false;
+            self.verifier_down_replay = false;
+        }
+    }
+
+    pub fn set_gate_up_replay(&mut self, enabled: bool) {
+        self.verifier_gate_up_replay = enabled;
+        if enabled {
+            self.verifier_moe_capture = false;
+            self.verifier_moe_replay = false;
+            self.verifier_gate_up_capture = false;
+            self.verifier_down_capture = false;
+            self.verifier_down_replay = false;
+        }
+    }
+
+    pub fn set_down_capture(&mut self, enabled: bool) {
+        self.verifier_down_capture = enabled;
+        if enabled {
+            self.verifier_moe_capture = false;
+            self.verifier_moe_replay = false;
+            self.verifier_gate_up_capture = false;
+            self.verifier_gate_up_replay = false;
+            self.verifier_down_replay = false;
+        }
+    }
+
+    pub fn set_down_replay(&mut self, enabled: bool) {
+        self.verifier_down_replay = enabled;
+        if enabled {
+            self.verifier_moe_capture = false;
+            self.verifier_moe_replay = false;
+            self.verifier_gate_up_capture = false;
+            self.verifier_gate_up_replay = false;
+            self.verifier_down_capture = false;
+        }
+    }
+
+    pub fn clear_moe_probe(&mut self) {
+        self.verifier_moe_capture = false;
+        self.verifier_moe_replay = false;
+        self.verifier_gate_up_capture = false;
+        self.verifier_gate_up_replay = false;
+        self.verifier_down_capture = false;
+        self.verifier_down_replay = false;
     }
 
     pub fn checkpoint_kv(&self) -> KvCheckpoint {
@@ -1371,22 +1466,104 @@ impl GraniteV2Generator {
             if profile_stages {
                 graph.stage_boundary(self.context.as_ref())?;
             }
-            self.moe.encode_verifier_compact_packet_moe(
-                &mut graph,
-                layer,
-                &verifier.normalized,
-                &verifier.topk_ids,
-                &verifier.route_tokens,
-                &verifier.topk_weights,
-                &verifier.bucket_counts,
-                &verifier.bucket_pairs,
-                &verifier.gate_up,
-                &verifier.activated,
-                &verifier.expert_output,
-                &verifier.moe_output,
-                verifier.pair_count,
-                width,
-            )?;
+            if self.verifier_moe_replay {
+                let prepared = self
+                    .moe
+                    .layers
+                    .get(layer)
+                    .ok_or_else(|| format!("verifier MoE layer {layer} is outside the stack"))?;
+                graph.encode_verifier_compact_routes_fixed(
+                    prepared,
+                    &verifier.topk_ids,
+                    &verifier.bucket_counts,
+                    &verifier.bucket_pairs,
+                    verifier.pair_count,
+                )?;
+                graph.encode_verifier_moe_replay(
+                    self.context.as_ref(),
+                    &verifier.moe_capture[layer],
+                    &verifier.moe_output,
+                    width * HIDDEN,
+                )?;
+            } else {
+                let prepared = self
+                    .moe
+                    .layers
+                    .get(layer)
+                    .ok_or_else(|| format!("verifier MoE layer {layer} is outside the stack"))?;
+                graph.encode_verifier_compact_routes_fixed(
+                    prepared,
+                    &verifier.topk_ids,
+                    &verifier.bucket_counts,
+                    &verifier.bucket_pairs,
+                    verifier.pair_count,
+                )?;
+                if self.verifier_gate_up_replay {
+                    graph.encode_copy_f32(
+                        self.context.as_ref(),
+                        &verifier.moe_capture[layer],
+                        &verifier.gate_up,
+                        verifier.pair_count * 1024,
+                    )?;
+                } else {
+                    graph.encode_verifier_q4_gate_up_compact_unique_packet(
+                        prepared,
+                        &verifier.normalized,
+                        &verifier.bucket_counts,
+                        &verifier.bucket_pairs,
+                        &verifier.route_tokens,
+                        &verifier.gate_up,
+                        verifier.pair_count,
+                    )?;
+                }
+                if self.verifier_gate_up_capture {
+                    graph.encode_copy_f32(
+                        self.context.as_ref(),
+                        &verifier.gate_up,
+                        &verifier.moe_capture[layer],
+                        verifier.pair_count * 1024,
+                    )?;
+                }
+                graph.encode_verifier_q4_silu_batch(
+                    prepared,
+                    &verifier.gate_up,
+                    &verifier.activated,
+                    verifier.pair_count,
+                )?;
+                if self.verifier_down_replay {
+                    graph.encode_copy_f32(
+                        self.context.as_ref(),
+                        &verifier.moe_capture[layer],
+                        &verifier.expert_output,
+                        verifier.pair_count * 1024,
+                    )?;
+                } else {
+                    graph.encode_verifier_q4_down_batch(
+                        prepared,
+                        &verifier.topk_ids,
+                        &verifier.activated,
+                        &verifier.expert_output,
+                        verifier.pair_count,
+                    )?;
+                }
+                if self.verifier_down_capture {
+                    graph.encode_copy_f32(
+                        self.context.as_ref(),
+                        &verifier.expert_output,
+                        &verifier.moe_capture[layer],
+                        verifier.pair_count * 1024,
+                    )?;
+                }
+                graph.encode_verifier_q4_accumulate_batch(
+                    prepared,
+                    &verifier.expert_output,
+                    &verifier.route_tokens,
+                    &verifier.topk_weights,
+                    &verifier.moe_output,
+                    verifier.pair_count,
+                    width,
+                )?;
+            }
             if verifier_batch_stage_enabled("residual") {
                 graph.encode_residual_batch(
                     self.context.as_ref(),
@@ -1408,6 +1585,14 @@ impl GraniteV2Generator {
                         qx_model::RESIDUAL_MULTIPLIER,
                     )?;
                 }
+            }
+            if self.verifier_moe_capture {
+                graph.encode_copy_f32(
+                    self.context.as_ref(),
+                    &verifier.moe_output,
+                    &verifier.moe_capture[layer],
+                    width * HIDDEN,
+                )?;
             }
             if profile_stages {
                 graph.stage_boundary(self.context.as_ref())?;
