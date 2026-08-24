@@ -1,0 +1,84 @@
+{
+  "schema_version": 2,
+  "qx_revision": "unknown",
+  "artifact": "external/models/granite-m5-pro-q4-rowinline-unique-packet.qx",
+  "artifact_hash": "e0891fd697f49774",
+  "artifact_version": 2,
+  "plan_id": "granite-m5-top8-rowinline-unique-packet",
+  "target_id": "apple-m5-pro",
+  "fixture_name": "general-systems",
+  "fixture_domain": "general",
+  "context": 512,
+  "position": 384,
+  "routes_frozen": true,
+  "iterations": 10,
+  "warmup": 2,
+  "rows": [
+    {
+      "name": "baseline",
+      "gpu_us_per_token": 4393.1667460128665,
+      "dispatches": 461,
+      "marginal_saved_us": 0.0
+    },
+    {
+      "name": "without input RMS/QKV",
+      "gpu_us_per_token": 4106.3332464545965,
+      "dispatches": 461,
+      "marginal_saved_us": 286.83349955827
+    },
+    {
+      "name": "without RoPE/KV",
+      "gpu_us_per_token": 4493.375308811665,
+      "dispatches": 461,
+      "marginal_saved_us": -100.20856279879808
+    },
+    {
+      "name": "without attention",
+      "gpu_us_per_token": 4345.583496615291,
+      "dispatches": 461,
+      "marginal_saved_us": 47.583249397575855
+    },
+    {
+      "name": "without O/residual",
+      "gpu_us_per_token": 4546.541720628738,
+      "dispatches": 461,
+      "marginal_saved_us": -153.3749746158719
+    },
+    {
+      "name": "without router/top-k",
+      "gpu_us_per_token": 4593.291552737355,
+      "dispatches": 461,
+      "marginal_saved_us": -200.12480672448874
+    },
+    {
+      "name": "without MoE",
+      "gpu_us_per_token": 2180.541632696986,
+      "dispatches": 461,
+      "marginal_saved_us": 2212.6251133158803
+    },
+    {
+      "name": "without final RMSNorm",
+      "gpu_us_per_token": 4292.7502654492855,
+      "dispatches": 461,
+      "marginal_saved_us": 100.41648056358099
+    },
+    {
+      "name": "without LM head",
+      "gpu_us_per_token": 4104.791616555303,
+      "dispatches": 461,
+      "marginal_saved_us": 288.37512945756316
+    },
+    {
+      "name": "without argmax",
+      "gpu_us_per_token": 4371.583287138492,
+      "dispatches": 461,
+      "marginal_saved_us": 21.583458874374628
+    },
+    {
+      "name": "without final head",
+      "gpu_us_per_token": 4013.082943856716,
+      "dispatches": 461,
+      "marginal_saved_us": 380.08380215615034
+    }
+  ]
+}

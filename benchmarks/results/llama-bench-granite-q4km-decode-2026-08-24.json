@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "engine": "llama.cpp",
+  "commit": "1719747",
+  "model": "external/models/granite-3.0-1b-a400m-instruct-q4_k_m.gguf",
+  "gpu": "Apple M5 Pro",
+  "backend": "MTL,BLAS",
+  "n_prompt": 0,
+  "n_gen": 128,
+  "batch_size": 512,
+  "ubatch_size": 512,
+  "gpu_layers": 99,
+  "flash_attention": true,
+  "kv_k": "f16",
+  "kv_v": "f16",
+  "repetitions": 10,
+  "mean_ns": 392167279,
+  "stddev_ns": 5402814,
+  "mean_tokens_per_second": 326.447526,
+  "stddev_tokens_per_second": 4.532657,
+  "samples_tokens_per_second": [320.511, 324.218, 322.385, 325.901, 323.14, 327.987, 335.071, 331.874, 329.001, 324.386],
+  "model_size_bytes": 820107736
+}

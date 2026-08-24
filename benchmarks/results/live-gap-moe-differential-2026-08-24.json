@@ -1,0 +1,48 @@
+{
+  "schema_version": 2,
+  "qx_revision": "unknown",
+  "artifact": "external/models/granite-m5-pro-q4-rowinline-unique-packet.qx",
+  "artifact_hash": "e0891fd697f49774",
+  "artifact_version": 2,
+  "plan_id": "granite-m5-top8-rowinline-unique-packet",
+  "target_id": "apple-m5-pro",
+  "fixture_name": "general-systems",
+  "fixture_domain": "general",
+  "context": 512,
+  "position": 384,
+  "routes_frozen": true,
+  "iterations": 10,
+  "warmup": 2,
+  "rows": [
+    {
+      "name": "canonical MoE",
+      "gpu_us_per_token": 4369.5836793631315,
+      "dispatches": 461,
+      "marginal_saved_us": 0.0
+    },
+    {
+      "name": "without gate/up",
+      "gpu_us_per_token": 2940.791775472462,
+      "dispatches": 461,
+      "marginal_saved_us": 1428.7919038906693
+    },
+    {
+      "name": "without SiLU",
+      "gpu_us_per_token": 4382.041690405458,
+      "dispatches": 461,
+      "marginal_saved_us": -12.458011042326689
+    },
+    {
+      "name": "without down",
+      "gpu_us_per_token": 3621.332987677306,
+      "dispatches": 461,
+      "marginal_saved_us": 748.2506916858256
+    },
+    {
+      "name": "without accumulation",
+      "gpu_us_per_token": 4358.124919235706,
+      "dispatches": 461,
+      "marginal_saved_us": 11.458760127425194
+    }
+  ]
+}
