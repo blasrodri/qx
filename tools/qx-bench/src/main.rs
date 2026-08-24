@@ -10760,7 +10760,19 @@ fn print_v2_plan(artifact: &MappedArtifact, context: usize) -> Result<()> {
             .entries
             .iter()
             .fold((0_u64, 0_u64), |(expert, dense), entry| {
-                let bytes = entry.scale_length + entry.data_length;
+                // Inline and transaction-packed tensors can expose their scale and
+                // data views as overlapping ranges in the same artifact stream.
+                // Count the union of those ranges instead of charging the aliased
+                // bytes twice.
+                let scale_end = entry.scale_offset.saturating_add(entry.scale_length);
+                let data_end = entry.data_offset.saturating_add(entry.data_length);
+                let overlap = scale_end
+                    .min(data_end)
+                    .saturating_sub(entry.scale_offset.max(entry.data_offset));
+                let bytes = entry
+                    .scale_length
+                    .saturating_add(entry.data_length)
+                    .saturating_sub(overlap);
                 if entry.is_expert() {
                     (expert + bytes, dense)
                 } else {
