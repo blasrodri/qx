@@ -2425,6 +2425,12 @@ fn benchmark_v2_gpu_verifier(
     }
     let mut generator = qx_runtime_v2::GraniteV2Generator::load(artifact_path, context_length)
         .map_err(anyhow::Error::msg)?;
+    let stage_profile = std::env::var("QX_V2_VERIFIER_STAGE_PROFILE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    generator
+        .set_stage_counters(stage_profile)
+        .map_err(anyhow::Error::msg)?;
     println!("QX V2 persistent GPU verifier benchmark");
     println!("artifact: {}", artifact_path.display());
     println!("iterations: {iterations} (K=1/2/4, teacher-forced target stream)");
@@ -2488,6 +2494,89 @@ fn benchmark_v2_gpu_verifier(
             accepted,
             position,
         );
+        if stage_profile {
+            let timeline = generator
+                .last_stage_timeline()
+                .map_err(anyhow::Error::msg)?;
+            const STAGES_PER_LAYER: usize = 6;
+            const EXPECTED_MARKERS: usize = 2 + LAYERS * STAGES_PER_LAYER + 1;
+            if timeline.timestamps.len() == EXPECTED_MARKERS {
+                let first = timeline.timestamps[0] as f64;
+                let last = timeline.timestamps[EXPECTED_MARKERS - 1] as f64;
+                let tick_span = last - first;
+                if tick_span > 0.0 && timeline.gpu_duration_seconds > 0.0 {
+                    let us_per_tick = timeline.gpu_duration_seconds * 1e6 / tick_span;
+                    let interval = |a: usize, b: usize| {
+                        (timeline.timestamps[b] as f64 - timeline.timestamps[a] as f64)
+                            * us_per_tick
+                    };
+                    let mut totals = [interval(0, 1), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+                    for layer in 0..LAYERS {
+                        let base = 2 + layer * STAGES_PER_LAYER;
+                        let qkv_start = if layer == 0 { 1 } else { base - 1 };
+                        totals[1] += interval(qkv_start, base);
+                        for stage in 0..(STAGES_PER_LAYER - 1) {
+                            totals[stage + 2] += interval(base + stage, base + stage + 1);
+                        }
+                    }
+                    totals[7] = interval(EXPECTED_MARKERS - 2, EXPECTED_MARKERS - 1);
+                    println!("    stage GPU us (last measured transaction):");
+                    for (name, value) in [
+                        ("embedding", totals[0]),
+                        ("qkv", totals[1]),
+                        ("rope_kv", totals[2]),
+                        ("attention", totals[3]),
+                        ("o_residual", totals[4]),
+                        ("router_topk", totals[5]),
+                        ("moe_residual", totals[6]),
+                        ("final_head", totals[7]),
+                    ] {
+                        println!("      {name:<14} {value:>9.2}");
+                    }
+                }
+            } else {
+                let expected_segments = EXPECTED_MARKERS + 1;
+                if timeline.segment_gpu_seconds.len() >= expected_segments {
+                    let mut totals = [timeline.segment_gpu_seconds[1] * 1e6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+                    for layer in 0..LAYERS {
+                        let base = 2 + layer * STAGES_PER_LAYER;
+                        totals[1] += timeline.segment_gpu_seconds[base] * 1e6;
+                        for stage in 1..STAGES_PER_LAYER {
+                            totals[stage + 1] +=
+                                timeline.segment_gpu_seconds[base + stage] * 1e6;
+                        }
+                    }
+                    totals[7] = timeline.segment_gpu_seconds[EXPECTED_MARKERS - 1] * 1e6;
+                    println!(
+                        "    stage GPU us (diagnostic CB fallback; scheduling changed):"
+                    );
+                    for (name, value) in [
+                        ("embedding", totals[0]),
+                        ("qkv", totals[1]),
+                        ("rope_kv", totals[2]),
+                        ("attention", totals[3]),
+                        ("o_residual", totals[4]),
+                        ("router_topk", totals[5]),
+                        ("moe_residual", totals[6]),
+                        ("final_head", totals[7]),
+                    ] {
+                        println!("      {name:<14} {value:>9.2}");
+                    }
+                } else {
+                    println!(
+                        "    dispatch counters unavailable: {} markers, {} GPU segments (expected {} markers)",
+                        timeline.timestamps.len(),
+                        timeline.segment_gpu_seconds.len(),
+                        EXPECTED_MARKERS
+                    );
+                }
+            }
+        }
+    }
+    if stage_profile {
+        generator
+            .set_stage_counters(false)
+            .map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }

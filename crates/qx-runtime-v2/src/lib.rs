@@ -1088,6 +1088,17 @@ impl GraniteV2Generator {
         self.context.metrics()
     }
 
+    /// Enable dispatch-boundary timestamps for the diagnostic K-wide
+    /// verifier timeline. This changes only instrumentation, never the
+    /// execution plan, and is intentionally not enabled by default.
+    pub fn set_stage_counters(&self, enabled: bool) -> Result<(), String> {
+        self.context.set_stage_counters(enabled)
+    }
+
+    pub fn last_stage_timeline(&self) -> Result<qx_metal::platform::StageTimeline, String> {
+        self.context.last_stage_timeline()
+    }
+
     /// Evaluate one input token at the current sequential position and return
     /// the GPU-selected next token.
     pub fn step(&mut self, token: u32) -> Result<u32, String> {
@@ -1193,6 +1204,10 @@ impl GraniteV2Generator {
             .write_runtime_buffer(&verifier.tokens, token_bytes)?;
         let mut graph = self.context.begin_decode()?;
         let f32_bytes = std::mem::size_of::<f32>();
+        let profile_stages = verifier_stage_profile_enabled();
+        if profile_stages {
+            graph.stage_boundary(self.context.as_ref())?;
+        }
         graph.encode_q4_embedding_lookup_batch(
             &self.stack.embedding_lookup,
             &verifier.tokens,
@@ -1200,6 +1215,9 @@ impl GraniteV2Generator {
             width,
             qx_model::EMBEDDING_MULTIPLIER,
         )?;
+        if profile_stages {
+            graph.stage_boundary(self.context.as_ref())?;
+        }
 
         for (layer, weights) in self.stack.layers.iter().enumerate() {
             let (input, output) = if layer.is_multiple_of(2) {
@@ -1237,6 +1255,9 @@ impl GraniteV2Generator {
                 &verifier.value,
                 width,
             )?;
+            if profile_stages {
+                graph.stage_boundary(self.context.as_ref())?;
+            }
             let key_cache = self.buffers.kv_key_buffer(layer)?;
             let value_cache = self.buffers.kv_value_buffer(layer)?;
             graph.encode_rope_kv_batch(
@@ -1250,6 +1271,9 @@ impl GraniteV2Generator {
                 self.position,
                 width,
             )?;
+            if profile_stages {
+                graph.stage_boundary(self.context.as_ref())?;
+            }
             graph.encode_attention_batch(
                 self.context.as_ref(),
                 &verifier.query_rotated,
@@ -1259,6 +1283,9 @@ impl GraniteV2Generator {
                 self.position,
                 width,
             )?;
+            if profile_stages {
+                graph.stage_boundary(self.context.as_ref())?;
+            }
             graph.encode_prepared_q4_dense_simd_batch(
                 &weights.o_proj,
                 &verifier.attention,
@@ -1286,6 +1313,9 @@ impl GraniteV2Generator {
                         qx_model::RESIDUAL_MULTIPLIER,
                     )?;
                 }
+            }
+            if profile_stages {
+                graph.stage_boundary(self.context.as_ref())?;
             }
             if verifier_batch_stage_enabled("rms") {
                 graph.encode_rmsnorm_batch_scalar(
@@ -1338,6 +1368,9 @@ impl GraniteV2Generator {
                     )?;
                 }
             }
+            if profile_stages {
+                graph.stage_boundary(self.context.as_ref())?;
+            }
             self.moe.encode_verifier_compact_packet_moe(
                 &mut graph,
                 layer,
@@ -1375,6 +1408,9 @@ impl GraniteV2Generator {
                         qx_model::RESIDUAL_MULTIPLIER,
                     )?;
                 }
+            }
+            if profile_stages {
+                graph.stage_boundary(self.context.as_ref())?;
             }
         }
         let final_hidden = if LAYERS.is_multiple_of(2) {
@@ -1418,6 +1454,9 @@ impl GraniteV2Generator {
                 )?,
                 1.0 / qx_model::LOGITS_SCALING,
             )?;
+        }
+        if profile_stages {
+            graph.stage_boundary(self.context.as_ref())?;
         }
         graph.finish(self.context.as_ref())?;
         let predictions = self
@@ -3109,6 +3148,13 @@ fn verifier_batch_stage_enabled(stage: &str) -> bool {
         // opt-in until they demonstrate a complete-verifier win.
         Err(_) => stage == "rms",
     }
+}
+
+#[cfg(target_os = "macos")]
+fn verifier_stage_profile_enabled() -> bool {
+    std::env::var("QX_V2_VERIFIER_STAGE_PROFILE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
 }
 
 /// Diagnostic schedule selector. Values are deliberately not part of the
