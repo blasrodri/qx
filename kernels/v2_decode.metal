@@ -107,6 +107,39 @@ kernel void qx_v2_rmsnorm_scalar(
     }
 }
 
+// K-wide RMSNorm. One threadgroup owns one token row; the token dimension is
+// carried by the threadgroup Y coordinate so the verifier does not launch one
+// reduction dispatch per proposed token.
+kernel void qx_v2_rmsnorm_batch(
+    device const float* input [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant NormParams& params [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint token [[threadgroup_position_in_grid]]) {
+    threadgroup float partials[8];
+    uint base = token * params.n;
+    float sum = 0.0f;
+    for (uint i = tid; i < params.n; i += 256) {
+        float value = input[base + i];
+        sum += value * value;
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) partials[simdgroup] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0) {
+        float total = lane < 8 ? partials[lane] : 0.0f;
+        total = simd_sum(total);
+        if (lane == 0) partials[0] = rsqrt(total / float(params.n) + params.epsilon);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < params.n) {
+        output[base + tid] = input[base + tid] * partials[0] * weights[tid];
+    }
+}
+
 kernel void qx_v2_f32_to_f16(
     device const float* input [[buffer(0)]],
     device half* output [[buffer(1)]],
@@ -130,6 +163,18 @@ kernel void qx_v2_residual(
     constant ResidualParams& params [[buffer(3)]],
     uint tid [[thread_position_in_grid]]) {
     if (tid < params.n) output[tid] = left[tid] + params.scale * right[tid];
+}
+
+kernel void qx_v2_residual_batch(
+    device const float* left [[buffer(0)]],
+    device const float* right [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant ResidualParams& params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x < params.n) {
+        uint index = gid.y * params.n + gid.x;
+        output[index] = left[index] + params.scale * right[index];
+    }
 }
 
 kernel void qx_v2_rope_kv(
@@ -1145,6 +1190,43 @@ kernel void qx_v2_topk(
     }
     for (uint slot = 0; slot < 8; ++slot) weights[slot] /= denominator;
 }
+
+kernel void qx_v2_topk_batch(
+    device const float* logits [[buffer(0)]],
+    device uint* ids [[buffer(1)]],
+    device float* weights [[buffer(2)]],
+    constant VectorParams& params [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x != 0 || params.n != 32) return;
+    uint input_base = gid.y * params.n;
+    uint output_base = gid.y * 8;
+    bool used[32];
+    for (uint i = 0; i < 32; ++i) used[i] = false;
+    float maximum = -INFINITY;
+    for (uint slot = 0; slot < 8; ++slot) {
+        uint best = 0;
+        float best_value = -INFINITY;
+        for (uint i = 0; i < 32; ++i) {
+            if (!used[i] && logits[input_base + i] > best_value) {
+                best = i;
+                best_value = logits[input_base + i];
+            }
+        }
+        used[best] = true;
+        ids[output_base + slot] = best;
+        weights[output_base + slot] = best_value;
+        maximum = max(maximum, best_value);
+    }
+    float denominator = 0.0f;
+    for (uint slot = 0; slot < 8; ++slot) {
+        weights[output_base + slot] = exp(weights[output_base + slot] - maximum);
+        denominator += weights[output_base + slot];
+    }
+    for (uint slot = 0; slot < 8; ++slot) {
+        weights[output_base + slot] /= denominator;
+    }
+}
+
 
 // Opt-in active-k control for MoE experiments. The canonical top-k kernel
 // still selects and normalizes eight experts; this follow-up masks the tail,

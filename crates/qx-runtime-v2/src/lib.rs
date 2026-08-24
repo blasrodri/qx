@@ -791,7 +791,7 @@ impl KWideVerifierBuffers {
         let moe_output = alloc(width * HIDDEN * f32_bytes)?;
         // The fused final head uses this only as a partial-max workspace. A
         // full logits matrix is intentionally not allocated for verification.
-        let logits_scratch = alloc(EXPERTS * HIDDEN * f32_bytes)?;
+        let logits_scratch = alloc(width * VOCAB * f32_bytes)?;
         let token_output = alloc(width * u32_bytes)?;
 
         let route_tokens_values: Vec<u32> =
@@ -827,14 +827,6 @@ impl KWideVerifierBuffers {
             logits_scratch,
             token_output,
         })
-    }
-
-    fn token_slice(
-        buffer: &qx_metal::platform::RuntimeBuffer,
-        token: usize,
-        width: usize,
-    ) -> Result<qx_metal::platform::RuntimeBuffer, String> {
-        buffer.subregion(token * width, width)
     }
 }
 
@@ -1184,21 +1176,13 @@ impl GraniteV2Generator {
             .write_runtime_buffer(&verifier.tokens, token_bytes)?;
         let mut graph = self.context.begin_decode()?;
         let f32_bytes = std::mem::size_of::<f32>();
-        for token in 0..width {
-            let token_buffer = KWideVerifierBuffers::token_slice(
-                &verifier.tokens,
-                token,
-                std::mem::size_of::<u32>(),
-            )?;
-            let hidden_buffer =
-                KWideVerifierBuffers::token_slice(&verifier.hidden_a, token, HIDDEN * f32_bytes)?;
-            graph.encode_q4_embedding_lookup(
-                &self.stack.embedding_lookup,
-                &token_buffer,
-                &hidden_buffer,
-                qx_model::EMBEDDING_MULTIPLIER,
-            )?;
-        }
+        graph.encode_q4_embedding_lookup_batch(
+            &self.stack.embedding_lookup,
+            &verifier.tokens,
+            &verifier.hidden_a,
+            width,
+            qx_model::EMBEDDING_MULTIPLIER,
+        )?;
 
         for (layer, weights) in self.stack.layers.iter().enumerate() {
             let (input, output) = if layer.is_multiple_of(2) {
@@ -1207,18 +1191,13 @@ impl GraniteV2Generator {
                 (&verifier.hidden_b, &verifier.hidden_a)
             };
             for token in 0..width {
-                let input_token =
-                    KWideVerifierBuffers::token_slice(input, token, HIDDEN * f32_bytes)?;
-                let normalized_token = KWideVerifierBuffers::token_slice(
-                    &verifier.normalized,
-                    token,
-                    HIDDEN * f32_bytes,
-                )?;
                 graph.encode_rmsnorm(
                     self.context.as_ref(),
-                    &input_token,
+                    &input.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
                     &weights.input_norm,
-                    &normalized_token,
+                    &verifier
+                        .normalized
+                        .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
                 )?;
             }
             graph.encode_prepared_q4_qkv_simd_batch(
@@ -1260,31 +1239,22 @@ impl GraniteV2Generator {
                 width,
             )?;
             for token in 0..width {
-                let input_token =
-                    KWideVerifierBuffers::token_slice(input, token, HIDDEN * f32_bytes)?;
-                let output_token =
-                    KWideVerifierBuffers::token_slice(output, token, HIDDEN * f32_bytes)?;
-                let projection_token = KWideVerifierBuffers::token_slice(
-                    &verifier.moe_output,
-                    token,
-                    HIDDEN * f32_bytes,
-                )?;
                 graph.encode_residual(
                     self.context.as_ref(),
-                    &input_token,
-                    &projection_token,
-                    &output_token,
+                    &input.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                    &verifier
+                        .moe_output
+                        .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                    &output.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
                     qx_model::RESIDUAL_MULTIPLIER,
                 )?;
                 graph.encode_rmsnorm(
                     self.context.as_ref(),
-                    &output_token,
+                    &output.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
                     &weights.post_attention_norm,
-                    &KWideVerifierBuffers::token_slice(
-                        &verifier.normalized,
-                        token,
-                        HIDDEN * f32_bytes,
-                    )?,
+                    &verifier
+                        .normalized
+                        .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
                 )?;
             }
             graph.encode_prepared_q4_dense_simd_batch(
@@ -1296,21 +1266,16 @@ impl GraniteV2Generator {
             for token in 0..width {
                 graph.encode_topk(
                     self.context.as_ref(),
-                    &KWideVerifierBuffers::token_slice(
-                        &verifier.router_scores,
-                        token,
-                        EXPERTS * f32_bytes,
-                    )?,
-                    &KWideVerifierBuffers::token_slice(
-                        &verifier.topk_ids,
-                        token,
+                    &verifier
+                        .router_scores
+                        .subregion(token * EXPERTS * f32_bytes, EXPERTS * f32_bytes)?,
+                    &verifier.topk_ids.subregion(
+                        token * TOP_K * std::mem::size_of::<u32>(),
                         TOP_K * std::mem::size_of::<u32>(),
                     )?,
-                    &KWideVerifierBuffers::token_slice(
-                        &verifier.topk_weights,
-                        token,
-                        TOP_K * f32_bytes,
-                    )?,
+                    &verifier
+                        .topk_weights
+                        .subregion(token * TOP_K * f32_bytes, TOP_K * f32_bytes)?,
                 )?;
             }
             self.moe.encode_verifier_compact_packet_moe(
@@ -1330,18 +1295,13 @@ impl GraniteV2Generator {
                 width,
             )?;
             for token in 0..width {
-                let output_token =
-                    KWideVerifierBuffers::token_slice(output, token, HIDDEN * f32_bytes)?;
-                let moe_token = KWideVerifierBuffers::token_slice(
-                    &verifier.moe_output,
-                    token,
-                    HIDDEN * f32_bytes,
-                )?;
                 graph.encode_residual(
                     self.context.as_ref(),
-                    &output_token,
-                    &moe_token,
-                    &output_token,
+                    &output.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                    &verifier
+                        .moe_output
+                        .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
+                    &output.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
                     qx_model::RESIDUAL_MULTIPLIER,
                 )?;
             }
@@ -1352,24 +1312,27 @@ impl GraniteV2Generator {
             &verifier.hidden_b
         };
         for token in 0..width {
-            let hidden_token =
-                KWideVerifierBuffers::token_slice(final_hidden, token, HIDDEN * f32_bytes)?;
-            let normalized_token =
-                KWideVerifierBuffers::token_slice(&verifier.normalized, token, HIDDEN * f32_bytes)?;
             graph.encode_rmsnorm(
                 self.context.as_ref(),
-                &hidden_token,
+                &final_hidden.subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
                 &self.stack.final_norm,
-                &normalized_token,
+                &verifier
+                    .normalized
+                    .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?,
             )?;
+        }
+        let f32_bytes = std::mem::size_of::<f32>();
+        for token in 0..width {
+            let normalized_token = verifier
+                .normalized
+                .subregion(token * HIDDEN * f32_bytes, HIDDEN * f32_bytes)?;
             graph.encode_prepared_q4_dense_argmax(
                 self.context.as_ref(),
                 &self.stack.embedding,
                 &normalized_token,
                 &verifier.logits_scratch,
-                &KWideVerifierBuffers::token_slice(
-                    &verifier.token_output,
-                    token,
+                &verifier.token_output.subregion(
+                    token * std::mem::size_of::<u32>(),
                     std::mem::size_of::<u32>(),
                 )?,
                 1.0 / qx_model::LOGITS_SCALING,

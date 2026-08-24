@@ -1014,6 +1014,7 @@ pub mod platform {
 
     pub struct PreparedQ4Embedding {
         pipeline: Pipeline,
+        batch_pipeline: Pipeline,
         packed: RuntimeBuffer,
         scales: RuntimeBuffer,
         rows: usize,
@@ -1084,6 +1085,9 @@ pub mod platform {
         RopeQueryBatchSimd,
         RopeKvBatchSimd,
         AttentionBatch,
+        RmsNormBatch,
+        ResidualBatch,
+        TopKBatch,
     }
 
     fn bytes_of<T>(value: &T) -> &[u8] {
@@ -1276,10 +1280,11 @@ pub mod platform {
         dynamic_moe_library: Mutex<Option<Retained<ProtocolObject<dyn MTLLibrary>>>>,
         dynamic_moe_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_embedding_pipeline: Mutex<Option<Pipeline>>,
+        q4_embedding_batch_pipeline: Mutex<Option<Pipeline>>,
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
-        v2_pipelines: Mutex<[Option<Pipeline>; 35]>,
+        v2_pipelines: Mutex<[Option<Pipeline>; 38]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
         stage_counters: Mutex<bool>,
@@ -5607,6 +5612,79 @@ pub mod platform {
             Ok(())
         }
 
+        pub fn encode_q4_embedding_lookup_batch(
+            &mut self,
+            prepared: &PreparedQ4Embedding,
+            tokens: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            count: usize,
+            multiplier: f32,
+        ) -> Result<(), String> {
+            if count == 0
+                || tokens.length < count * std::mem::size_of::<u32>()
+                || output.length < count * prepared.columns * std::mem::size_of::<f32>()
+            {
+                return Err(
+                    "batched embedding buffers are smaller than their fixed shape".to_owned(),
+                );
+            }
+            self.encoder
+                .setComputePipelineState(&prepared.batch_pipeline);
+            let rows = prepared.rows as u32;
+            let columns = prepared.columns as u32;
+            let count_u32 = count as u32;
+            unsafe {
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.packed.buffer),
+                    prepared.packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.scales.buffer),
+                    prepared.scales.offset,
+                    1,
+                );
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&tokens.buffer), tokens.offset, 2);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&output.buffer), output.offset, 3);
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&rows).cast(),
+                    std::mem::size_of_val(&rows),
+                    4,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&columns).cast(),
+                    std::mem::size_of_val(&columns),
+                    5,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&multiplier).cast(),
+                    std::mem::size_of_val(&multiplier),
+                    6,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&count_u32).cast(),
+                    std::mem::size_of_val(&count_u32),
+                    7,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: count,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
         pub fn encode_prepared_logits(
             &mut self,
             prepared: &PreparedLogits,
@@ -5836,6 +5914,38 @@ pub mod platform {
                 MTLSize {
                     width: 256,
                     height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+        }
+
+        /// Encode RMSNorm for token-major `[tokens, 1024]` storage in one
+        /// dispatch. Each threadgroup owns one token row.
+        pub fn encode_rmsnorm_batch(
+            &mut self,
+            context: &MetalContext,
+            input: &RuntimeBuffer,
+            weights: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            tokens: usize,
+        ) -> Result<(), String> {
+            if tokens == 0 {
+                return Err("batched RMSNorm requires at least one token".to_owned());
+            }
+            let params = [1024u32.to_ne_bytes(), 1e-5f32.to_ne_bytes()].concat();
+            self.encode_decode_kernel(
+                context,
+                DecodeKernel::RmsNormBatch,
+                &[input, weights, output],
+                &params,
+                MTLSize {
+                    width: 256,
+                    height: tokens,
                     depth: 1,
                 },
                 MTLSize {
@@ -6739,6 +6849,42 @@ pub mod platform {
             )
         }
 
+        pub fn encode_residual_batch(
+            &mut self,
+            context: &MetalContext,
+            left: &RuntimeBuffer,
+            right: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            tokens: usize,
+            scale: f32,
+        ) -> Result<(), String> {
+            if tokens == 0 {
+                return Err("batched residual requires at least one token".to_owned());
+            }
+            #[repr(C)]
+            struct Params {
+                n: u32,
+                scale: f32,
+            }
+            let params = Params { n: 1024, scale };
+            self.encode_decode_kernel(
+                context,
+                DecodeKernel::ResidualBatch,
+                &[left, right, output],
+                bytes_of(&params),
+                MTLSize {
+                    width: 1024,
+                    height: tokens,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+        }
+
         pub fn encode_topk(
             &mut self,
             context: &MetalContext,
@@ -6759,6 +6905,38 @@ pub mod platform {
                 MTLSize {
                     width: 1,
                     height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+        }
+
+        /// Encode top-8 selection for token-major `[tokens, 32]` router
+        /// logits and `[tokens, 8]` route outputs in one dispatch.
+        pub fn encode_topk_batch(
+            &mut self,
+            context: &MetalContext,
+            logits: &RuntimeBuffer,
+            ids: &RuntimeBuffer,
+            weights: &RuntimeBuffer,
+            tokens: usize,
+        ) -> Result<(), String> {
+            if tokens == 0 {
+                return Err("batched top-k requires at least one token".to_owned());
+            }
+            let params = 32u32;
+            self.encode_decode_kernel(
+                context,
+                DecodeKernel::TopKBatch,
+                &[logits, ids, weights],
+                bytes_of(&params),
+                MTLSize {
+                    width: 1,
+                    height: tokens,
                     depth: 1,
                 },
                 MTLSize {
@@ -7028,13 +7206,14 @@ pub mod platform {
                 dynamic_moe_library: Mutex::new(None),
                 dynamic_moe_simd_pipeline: Mutex::new(None),
                 q4_embedding_pipeline: Mutex::new(None),
+                q4_embedding_batch_pipeline: Mutex::new(None),
                 argmax_partial_pipeline: Mutex::new(None),
                 argmax_reduce_pipeline: Mutex::new(None),
                 argmax_reduce_partials_pipeline: Mutex::new(None),
                 v2_pipelines: Mutex::new([
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
-                    None, None, None, None, None, None, None, None, None,
+                    None, None, None, None, None, None, None, None, None, None, None, None,
                 ]),
                 scratch: Mutex::new(MetalScratch {
                     input_f32: None,
@@ -7884,6 +8063,31 @@ pub mod platform {
             Ok(value)
         }
 
+        fn q4_embedding_batch_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_embedding_batch_pipeline
+                .lock()
+                .map_err(|_| "Metal Q4 batch embedding pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let source = NSString::from_str(Q4_EMBEDDING_KERNEL_SOURCE);
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&source, None)
+                .map_err(|_| "Metal Q4 embedding library compilation failed".to_owned())?;
+            let name = NSString::from_str("qx_q4_embedding_lookup_batch");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal Q4 batch embedding function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal Q4 batch embedding pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
         fn argmax_partial_pipeline(&self) -> Result<Pipeline, String> {
             let mut pipeline = self
                 .argmax_partial_pipeline
@@ -8044,6 +8248,9 @@ pub mod platform {
                 DecodeKernel::RopeQueryBatchSimd => 32,
                 DecodeKernel::RopeKvBatchSimd => 33,
                 DecodeKernel::AttentionBatch => 34,
+                DecodeKernel::RmsNormBatch => 35,
+                DecodeKernel::ResidualBatch => 36,
+                DecodeKernel::TopKBatch => 37,
             };
             let mut pipelines = self
                 .v2_pipelines
@@ -8093,6 +8300,9 @@ pub mod platform {
                 DecodeKernel::RopeQueryBatchSimd => "qx_v2_rope_query_batch_simd",
                 DecodeKernel::RopeKvBatchSimd => "qx_v2_rope_kv_batch_simd",
                 DecodeKernel::AttentionBatch => "qx_v2_attention_batch",
+                DecodeKernel::RmsNormBatch => "qx_v2_rmsnorm_batch",
+                DecodeKernel::ResidualBatch => "qx_v2_residual_batch",
+                DecodeKernel::TopKBatch => "qx_v2_topk_batch",
             });
             let function = library
                 .newFunctionWithName(&name)
@@ -10164,6 +10374,7 @@ pub mod platform {
             let scales = self.input_runtime_buffer(&scale_bytes)?;
             Ok(PreparedQ4Embedding {
                 pipeline: self.q4_embedding_pipeline()?,
+                batch_pipeline: self.q4_embedding_batch_pipeline()?,
                 packed,
                 scales,
                 rows: weights.rows,
@@ -10177,6 +10388,7 @@ pub mod platform {
         ) -> Result<PreparedQ4Embedding, String> {
             Ok(PreparedQ4Embedding {
                 pipeline: self.q4_embedding_pipeline()?,
+                batch_pipeline: self.q4_embedding_batch_pipeline()?,
                 packed: weights.packed.clone(),
                 scales: weights.scales.clone(),
                 rows: weights.rows,
