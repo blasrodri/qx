@@ -1070,6 +1070,7 @@ pub mod platform {
         AttentionStreamGqa,
         AttentionChunkedGqa,
         AttentionChunkedMerge,
+        CopyF32,
     }
 
     fn bytes_of<T>(value: &T) -> &[u8] {
@@ -1264,7 +1265,7 @@ pub mod platform {
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
-        v2_pipelines: Mutex<[Option<Pipeline>; 31]>,
+        v2_pipelines: Mutex<[Option<Pipeline>; 32]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
         stage_counters: Mutex<bool>,
@@ -5925,6 +5926,39 @@ pub mod platform {
             Ok(())
         }
 
+        /// Copy a fixed FP32 vector inside the GPU command stream. This is a
+        /// diagnostic primitive used by production-preserving replacement
+        /// probes; it is not part of the canonical token graph.
+        pub fn encode_copy_f32(
+            &mut self,
+            context: &MetalContext,
+            source: &RuntimeBuffer,
+            destination: &RuntimeBuffer,
+            n: usize,
+        ) -> Result<(), String> {
+            #[repr(C)]
+            struct Params {
+                n: u32,
+            }
+            let params = Params { n: n as u32 };
+            self.encode_decode_kernel(
+                context,
+                DecodeKernel::CopyF32,
+                &[source, destination],
+                bytes_of(&params),
+                MTLSize {
+                    width: n,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+        }
+
         /// End and commit the current command buffer, then continue encoding
         /// on the same queue without waiting on the CPU. Metal command queues
         /// preserve submission order, so the next segment observes all writes
@@ -6080,7 +6114,7 @@ pub mod platform {
                 v2_pipelines: Mutex::new([
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
-                    None, None, None, None, None,
+                    None, None, None, None, None, None,
                 ]),
                 scratch: Mutex::new(MetalScratch {
                     input_f32: None,
@@ -7065,6 +7099,7 @@ pub mod platform {
                 DecodeKernel::AttentionStreamGqa => 28,
                 DecodeKernel::AttentionChunkedGqa => 29,
                 DecodeKernel::AttentionChunkedMerge => 30,
+                DecodeKernel::CopyF32 => 31,
             };
             let mut pipelines = self
                 .v2_pipelines
@@ -7110,6 +7145,7 @@ pub mod platform {
                 DecodeKernel::AttentionStreamGqa => "qx_v2_attention_stream_gqa",
                 DecodeKernel::AttentionChunkedGqa => "qx_v2_attention_chunked_gqa",
                 DecodeKernel::AttentionChunkedMerge => "qx_v2_attention_chunked_merge",
+                DecodeKernel::CopyF32 => "qx_v2_copy_f32",
             });
             let function = library
                 .newFunctionWithName(&name)

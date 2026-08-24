@@ -27,6 +27,14 @@ kernel void qx_v2_noop(uint tid [[thread_position_in_grid]]) {
     (void)tid;
 }
 
+kernel void qx_v2_copy_f32(
+    device const float* source [[buffer(0)]],
+    device float* destination [[buffer(1)]],
+    constant VectorParams& params [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]) {
+    if (tid < params.n) destination[tid] = source[tid];
+}
+
 // These first V2 kernels use one control thread for reductions. They are
 // intentionally simple correctness kernels; fixed SIMD reductions can replace
 // their bodies without changing the graph ABI.

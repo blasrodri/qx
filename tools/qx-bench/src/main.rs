@@ -108,6 +108,9 @@ struct Args {
     /// Measure marginal GPU cost by ablating major blocks in the complete V2 token graph.
     #[arg(long)]
     v2_differential_profile: bool,
+    /// Measure production-preserving block replacement probes using exact GPU-captured outputs.
+    #[arg(long)]
+    v2_production_probe: bool,
     /// Measure marginal GPU cost of each canonical GPU-resident MoE stage.
     #[arg(long)]
     v2_moe_differential_profile: bool,
@@ -396,6 +399,25 @@ fn main() -> Result<()> {
             .and_then(|fixture| fixture.context)
             .unwrap_or(args.context);
         return benchmark_v2_differential_profile(
+            artifact,
+            context,
+            args.warmup,
+            args.iterations,
+            fixture.as_ref(),
+            args.result_json.as_deref(),
+        );
+    }
+    if args.v2_production_probe {
+        let artifact = args
+            .artifact
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--v2-production-probe requires an artifact path"))?;
+        let fixture = args.fixture.as_deref().map(load_fixture).transpose()?;
+        let context = fixture
+            .as_ref()
+            .and_then(|fixture| fixture.context)
+            .unwrap_or(args.context);
+        return benchmark_v2_production_probe(
             artifact,
             context,
             args.warmup,
@@ -1364,6 +1386,34 @@ enum DifferentialBlock {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProductionProbeBlock {
+    AttentionAndOutput,
+    Moe,
+}
+
+#[cfg(target_os = "macos")]
+struct ProductionBlockCapture {
+    attention_output: qx_metal::platform::RuntimeBuffer,
+    moe_output: qx_metal::platform::RuntimeBuffer,
+}
+
+#[cfg(target_os = "macos")]
+impl ProductionBlockCapture {
+    fn layer_buffer(
+        buffer: &qx_metal::platform::RuntimeBuffer,
+        layer: usize,
+    ) -> Result<qx_metal::platform::RuntimeBuffer> {
+        buffer
+            .subregion(
+                layer * HIDDEN * std::mem::size_of::<f32>(),
+                HIDDEN * std::mem::size_of::<f32>(),
+            )
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+#[cfg(target_os = "macos")]
 struct RouteTrace {
     ids: qx_metal::platform::RuntimeBuffer,
     weights: qx_metal::platform::RuntimeBuffer,
@@ -1459,6 +1509,42 @@ fn encode_differential_token(
     gate_up_control: Option<GateUpControl>,
     traffic_buffer: Option<&qx_metal::platform::RuntimeBuffer>,
     prefetch_route_ids: Option<&[[u32; 8]]>,
+) -> Result<()> {
+    encode_differential_token_with_probe(
+        graph,
+        buffers,
+        stack,
+        moe,
+        position,
+        skip,
+        route_trace,
+        direct_route_ids,
+        moe_stage_skip,
+        gate_up_control,
+        traffic_buffer,
+        prefetch_route_ids,
+        None,
+        None,
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_differential_token_with_probe(
+    graph: &mut qx_metal::platform::DecodeGraph,
+    buffers: &qx_runtime_v2::GpuRuntimeBuffers,
+    stack: &qx_runtime_v2::PreparedAttentionStack,
+    moe: &qx_runtime_v2::PreparedMoeStack,
+    position: usize,
+    skip: Option<DifferentialBlock>,
+    route_trace: Option<&RouteTrace>,
+    direct_route_ids: Option<&[[u32; 8]]>,
+    moe_stage_skip: Option<u8>,
+    gate_up_control: Option<GateUpControl>,
+    traffic_buffer: Option<&qx_metal::platform::RuntimeBuffer>,
+    prefetch_route_ids: Option<&[[u32; 8]]>,
+    capture: Option<&ProductionBlockCapture>,
+    probe: Option<ProductionProbeBlock>,
 ) -> Result<()> {
     let context = buffers.context().as_ref();
     let noop = |graph: &mut qx_metal::platform::DecodeGraph, count: usize| {
@@ -1564,7 +1650,9 @@ fn encode_differential_token(
         }
         graph.stage_boundary(context).map_err(anyhow::Error::msg)?;
 
-        if skip == Some(DifferentialBlock::Attention) {
+        if skip == Some(DifferentialBlock::Attention)
+            || probe == Some(ProductionProbeBlock::AttentionAndOutput)
+        {
             noop(graph, differential_attention_dispatches())?;
         } else if qx_metal::platform::three_stage_attention_enabled() {
             graph
@@ -1593,7 +1681,20 @@ fn encode_differential_token(
         }
         graph.stage_boundary(context).map_err(anyhow::Error::msg)?;
 
-        if skip == Some(DifferentialBlock::OutputResidual) {
+        if probe == Some(ProductionProbeBlock::AttentionAndOutput) {
+            let capture = capture.ok_or_else(|| {
+                anyhow::anyhow!("attention production probe requires a capture buffer")
+            })?;
+            let source = ProductionBlockCapture::layer_buffer(&capture.attention_output, layer)?;
+            graph
+                .encode_copy_f32(
+                    context,
+                    &source,
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeOutput),
+                    HIDDEN,
+                )
+                .map_err(anyhow::Error::msg)?;
+        } else if skip == Some(DifferentialBlock::OutputResidual) {
             noop(graph, 2)?;
         } else {
             graph
@@ -1603,6 +1704,22 @@ fn encode_differential_token(
                     buffers.buffer(qx_runtime_v2::BufferId::MoeOutput),
                 )
                 .map_err(anyhow::Error::msg)?;
+        }
+        if let Some(capture) = capture.filter(|_| probe.is_none()) {
+            let destination =
+                ProductionBlockCapture::layer_buffer(&capture.attention_output, layer)?;
+            graph
+                .encode_copy_f32(
+                    context,
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeOutput),
+                    &destination,
+                    HIDDEN,
+                )
+                .map_err(anyhow::Error::msg)?;
+        }
+        if probe == Some(ProductionProbeBlock::AttentionAndOutput)
+            || skip != Some(DifferentialBlock::OutputResidual)
+        {
             graph
                 .encode_residual(
                     context,
@@ -1686,7 +1803,19 @@ fn encode_differential_token(
             .transpose()?
             .unwrap_or_else(|| buffers.buffer(qx_runtime_v2::BufferId::TopKWeights).clone());
 
-        if skip == Some(DifferentialBlock::Moe) {
+        if probe == Some(ProductionProbeBlock::Moe) {
+            let capture = capture
+                .ok_or_else(|| anyhow::anyhow!("MoE production probe requires a capture buffer"))?;
+            let source = ProductionBlockCapture::layer_buffer(&capture.moe_output, layer)?;
+            graph
+                .encode_copy_f32(
+                    context,
+                    &source,
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeOutput),
+                    HIDDEN,
+                )
+                .map_err(anyhow::Error::msg)?;
+        } else if skip == Some(DifferentialBlock::Moe) {
             noop(graph, 4)?;
         } else if let Some(stage_skip) = moe_stage_skip {
             for stage in 0_u8..4 {
@@ -1822,9 +1951,16 @@ fn encode_differential_token(
                 .map_err(anyhow::Error::msg)?;
         }
 
-        if skip == Some(DifferentialBlock::Moe) {
-            // The ablated path already replaced the MoE block; preserve the
-            // residual write so later layers retain the canonical dependency shape.
+        if let Some(capture) = capture.filter(|_| probe.is_none()) {
+            let destination = ProductionBlockCapture::layer_buffer(&capture.moe_output, layer)?;
+            graph
+                .encode_copy_f32(
+                    context,
+                    buffers.buffer(qx_runtime_v2::BufferId::MoeOutput),
+                    &destination,
+                    HIDDEN,
+                )
+                .map_err(anyhow::Error::msg)?;
         }
         graph
             .encode_residual(
@@ -2282,6 +2418,232 @@ fn benchmark_v2_differential_profile(
         "Ablations can change cache residency and dependency scheduling; use them to rank targets, then validate any replacement on the complete graph and parity gate."
     );
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn benchmark_v2_production_probe(
+    artifact_path: &std::path::Path,
+    context_length: usize,
+    warmup: usize,
+    iterations: usize,
+    fixture: Option<&BenchmarkFixture>,
+    result_json: Option<&std::path::Path>,
+) -> Result<()> {
+    use std::rc::Rc;
+
+    if iterations == 0 {
+        bail!("production probe iterations must be positive");
+    }
+    qx_runtime_v2::activate_artifact_execution_plan(artifact_path).map_err(anyhow::Error::msg)?;
+    let (artifact_bytes, artifact_hash) = artifact_fingerprint(artifact_path)?;
+    let context = Rc::new(
+        qx_metal::platform::MetalContext::system_default()
+            .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
+    );
+    let plan = ExecutionPlan::granite(context_length).map_err(anyhow::Error::msg)?;
+    let buffers =
+        qx_runtime_v2::GpuRuntimeBuffers::new(context.clone(), plan).map_err(anyhow::Error::msg)?;
+    let mapped_artifact = std::sync::Arc::new(MappedArtifact::open(artifact_path)?);
+    let stack = qx_runtime_v2::PreparedAttentionStack::load_from_mapped_artifact(
+        context.as_ref(),
+        mapped_artifact.clone(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let moe = qx_runtime_v2::PreparedMoeStack::load_from_mapped_artifact(
+        context.as_ref(),
+        mapped_artifact,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let position = replay_contextual_fixture(
+        context.as_ref(),
+        &buffers,
+        &stack,
+        &moe,
+        fixture,
+        context_length,
+    )?;
+
+    let capture = ProductionBlockCapture {
+        attention_output: context
+            .allocate_runtime_buffer(LAYERS * HIDDEN * std::mem::size_of::<f32>())
+            .map_err(anyhow::Error::msg)?,
+        moe_output: context
+            .allocate_runtime_buffer(LAYERS * HIDDEN * std::mem::size_of::<f32>())
+            .map_err(anyhow::Error::msg)?,
+    };
+
+    // Capture exact intermediate tensors from the real production graph. The
+    // explicit position makes the next runs overwrite the same KV slot, so the
+    // candidate and control see the same prefill state without a CPU KV copy.
+    let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+    encode_differential_token_with_probe(
+        &mut graph,
+        &buffers,
+        &stack,
+        &moe,
+        position,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&capture),
+        None,
+    )?;
+    buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+    let route_trace = capture_route_trace(context.as_ref(), &buffers, &stack, &moe, position)?;
+
+    let warmup = warmup.min(iterations);
+    let control = profile_graph_stage_contextual(context.as_ref(), warmup, iterations, |graph| {
+        encode_differential_token_with_probe(
+            graph,
+            &buffers,
+            &stack,
+            &moe,
+            position,
+            None,
+            Some(&route_trace),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&capture),
+            None,
+        )
+    })?;
+    let attention_probe =
+        profile_graph_stage_contextual(context.as_ref(), warmup, iterations, |graph| {
+            encode_differential_token_with_probe(
+                graph,
+                &buffers,
+                &stack,
+                &moe,
+                position,
+                None,
+                Some(&route_trace),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&capture),
+                Some(ProductionProbeBlock::AttentionAndOutput),
+            )
+        })?;
+    let moe_probe =
+        profile_graph_stage_contextual(context.as_ref(), warmup, iterations, |graph| {
+            encode_differential_token_with_probe(
+                graph,
+                &buffers,
+                &stack,
+                &moe,
+                position,
+                None,
+                Some(&route_trace),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&capture),
+                Some(ProductionProbeBlock::Moe),
+            )
+        })?;
+    let levels = vec![
+        ContextualLevelReport {
+            level: "canonical_capture_control".to_owned(),
+            timing: control,
+            memory: contextual_memory(context.as_ref(), artifact_bytes),
+        },
+        ContextualLevelReport {
+            level: "replace_attention_and_o".to_owned(),
+            timing: attention_probe,
+            memory: contextual_memory(context.as_ref(), artifact_bytes),
+        },
+        ContextualLevelReport {
+            level: "replace_moe".to_owned(),
+            timing: moe_probe,
+            memory: contextual_memory(context.as_ref(), artifact_bytes),
+        },
+    ];
+    println!("QX V2 production-preserving block probes");
+    println!("artifact:           {}", artifact_path.display());
+    println!("context/position:   {context_length}/{position}");
+    println!("iterations/warmup:  {iterations}/{warmup}");
+    println!("routes frozen:      true (captured after exact canonical capture)");
+    println!("level                              GPU us     wall us  dispatches  CBs");
+    for level in &levels {
+        let timing = level.timing;
+        println!(
+            "{:<34} {:>9.2}  {:>9.2}  {:>10.2}  {:>4.2}",
+            level.level,
+            timing.gpu_us_per_sample,
+            timing.wall_us_per_sample,
+            timing.dispatches_per_sample,
+            timing.command_buffers_per_sample,
+        );
+    }
+    println!(
+        "marginal saved: attention+O={:.2} us, MoE={:.2} us",
+        control.gpu_us_per_sample - attention_probe.gpu_us_per_sample,
+        control.gpu_us_per_sample - moe_probe.gpu_us_per_sample
+    );
+
+    if let Some(path) = result_json {
+        let mapped = MappedArtifact::open(artifact_path)?;
+        let report = ContextualProfileReport {
+            schema_version: 1,
+            mode: "v2_production_preserving_probe",
+            candidate: "exact_gpu_boundary_injection".to_owned(),
+            artifact: artifact_path.display().to_string(),
+            artifact_hash: format!("{artifact_hash:016x}"),
+            fixture_name: fixture.map(|value| value.name.clone()),
+            fixture_domain: fixture.map(|value| value.domain.clone()),
+            context: context_length,
+            position,
+            iterations,
+            warmup,
+            routes_frozen: true,
+            route_source: "canonical production capture at the same explicit decode position",
+            topology: vec![
+                format!(
+                    "plan_id={}",
+                    mapped
+                        .info()
+                        .execution_plan
+                        .as_ref()
+                        .map(|p| p.plan_id.as_str())
+                        .unwrap_or("unknown")
+                ),
+                "attention_probe=attention+o_projection_output".to_owned(),
+                "moe_probe=post_router_moe_output".to_owned(),
+                "replacement=GPU_copy_f32".to_owned(),
+            ],
+            os_version: command_output("sw_vers", &["-productVersion"]),
+            power_state: command_output("pmset", &["-g", "batt"]),
+            thermal_state: command_output("pmset", &["-g", "therm"]),
+            memory_pressure: command_output("memory_pressure", &["-Q"]),
+            levels,
+        };
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
+        println!("probe result JSON:   {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn benchmark_v2_production_probe(
+    _artifact_path: &std::path::Path,
+    _context_length: usize,
+    _warmup: usize,
+    _iterations: usize,
+    _fixture: Option<&BenchmarkFixture>,
+    _result_json: Option<&std::path::Path>,
+) -> Result<()> {
+    bail!("--v2-production-probe requires macOS Metal")
 }
 
 #[cfg(target_os = "macos")]

@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "mode": "v2_production_preserving_probe",
+  "candidate": "exact_gpu_boundary_injection",
+  "artifact": "external/models/granite-m5-pro-q4-rowinline-unique-packet.qx",
+  "artifact_hash": "e0891fd697f49774",
+  "fixture_name": "general-systems",
+  "fixture_domain": "general",
+  "context": 512,
+  "position": 384,
+  "iterations": 10,
+  "warmup": 3,
+  "routes_frozen": true,
+  "route_source": "canonical production capture at the same explicit decode position",
+  "topology": [
+    "plan_id=granite-m5-top8-rowinline-unique-packet",
+    "attention_probe=attention+o_projection_output",
+    "moe_probe=post_router_moe_output",
+    "replacement=GPU_copy_f32"
+  ],
+  "os_version": "26.5.2",
+  "power_state": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=23199843)\t41%; discharging; 0:51 remaining present: true",
+  "thermal_state": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+  "memory_pressure": "The system has 25769803776 (1572864 pages with a page size of 16384).\nSystem-wide memory free percentage: 54%",
+  "levels": [
+    {
+      "level": "canonical_capture_control",
+      "timing": {
+        "gpu_us_per_sample": 4073.208081535995,
+        "wall_us_per_sample": 4421.167,
+        "dispatches_per_sample": 509.0,
+        "command_buffers_per_sample": 147.0,
+        "encoders_per_sample": 147.0
+      },
+      "memory": {
+        "artifact_bytes": 751009792,
+        "mapped_artifact_bytes": 751009792,
+        "known_metal_allocated_bytes": 802570240,
+        "recommended_metal_working_set_bytes": 19069665280,
+        "current_rss_bytes": 41025536,
+        "peak_rss_bytes": 41025536,
+        "current_physical_footprint_bytes": 141165240,
+        "peak_physical_footprint_bytes": 141165240
+      }
+    },
+    {
+      "level": "replace_attention_and_o",
+      "timing": {
+        "gpu_us_per_sample": 3611.000080127269,
+        "wall_us_per_sample": 3635.5,
+        "dispatches_per_sample": 461.0,
+        "command_buffers_per_sample": 147.0,
+        "encoders_per_sample": 147.0
+      },
+      "memory": {
+        "artifact_bytes": 751009792,
+        "mapped_artifact_bytes": 751009792,
+        "known_metal_allocated_bytes": 802570240,
+        "recommended_metal_working_set_bytes": 19069665280,
+        "current_rss_bytes": 41025536,
+        "peak_rss_bytes": 41025536,
+        "current_physical_footprint_bytes": 141165240,
+        "peak_physical_footprint_bytes": 141165240
+      }
+    },
+    {
+      "level": "replace_moe",
+      "timing": {
+        "gpu_us_per_sample": 2128.791355062276,
+        "wall_us_per_sample": 2778.333,
+        "dispatches_per_sample": 389.0,
+        "command_buffers_per_sample": 147.0,
+        "encoders_per_sample": 147.0
+      },
+      "memory": {
+        "artifact_bytes": 751009792,
+        "mapped_artifact_bytes": 751009792,
+        "known_metal_allocated_bytes": 802570240,
+        "recommended_metal_working_set_bytes": 19069665280,
+        "current_rss_bytes": 41025536,
+        "peak_rss_bytes": 41025536,
+        "current_physical_footprint_bytes": 141165240,
+        "peak_physical_footprint_bytes": 141165240
+      }
+    }
+  ]
+}
