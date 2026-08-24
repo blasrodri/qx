@@ -182,6 +182,24 @@ pub mod platform {
         })
     }
 
+    /// K-wide verifier attention candidate. Each threadgroup owns one
+    /// speculative token and each SIMD group owns one query head, so the
+    /// Q·K score vector is computed once and reused across all 64 output
+    /// dimensions. It is opt-in until the complete verifier parity gate.
+    pub fn attention_batch_simd_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("QX_V2_ATTENTION_BATCH_SIMD")
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
     /// Experimental topology B: compute only inverse RMS before QKV, then
     /// let the SIMD QKV consumer apply the norm weights while reading input.
     pub fn rms_scalar_qkv_enabled() -> bool {
@@ -1097,6 +1115,7 @@ pub mod platform {
         RopeQueryBatchSimd,
         RopeKvBatchSimd,
         AttentionBatch,
+        AttentionBatchSimd,
         RmsNormBatch,
         ResidualBatch,
         TopKBatch,
@@ -1297,7 +1316,7 @@ pub mod platform {
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
-        v2_pipelines: Mutex<[Option<Pipeline>; 39]>,
+        v2_pipelines: Mutex<[Option<Pipeline>; 40]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
         stage_counters: Mutex<bool>,
@@ -5911,8 +5930,13 @@ pub mod platform {
                     buffers.len(),
                 );
             }
-            self.encoder
-                .dispatchThreads_threadsPerThreadgroup(threads, group);
+            if matches!(kernel, DecodeKernel::AttentionBatchSimd) {
+                self.encoder
+                    .dispatchThreadgroups_threadsPerThreadgroup(threads, group);
+            } else {
+                self.encoder
+                    .dispatchThreads_threadsPerThreadgroup(threads, group);
+            }
             self.dispatches += 1;
             Ok(())
         }
@@ -6359,18 +6383,32 @@ pub mod platform {
                 start_position: start_position as u32,
                 tokens: tokens as u32,
             };
+            let kernel = if attention_batch_simd_enabled() {
+                DecodeKernel::AttentionBatchSimd
+            } else {
+                DecodeKernel::AttentionBatch
+            };
+            let threads = if attention_batch_simd_enabled() {
+                512
+            } else {
+                256
+            };
             self.encode_decode_kernel(
                 context,
-                DecodeKernel::AttentionBatch,
+                kernel,
                 &[query, key_cache, value_cache, output],
                 bytes_of(&params),
                 MTLSize {
-                    width: tokens * hidden,
+                    width: if attention_batch_simd_enabled() {
+                        tokens
+                    } else {
+                        tokens * hidden
+                    },
                     height: 1,
                     depth: 1,
                 },
                 MTLSize {
-                    width: 256,
+                    width: threads,
                     height: 1,
                     depth: 1,
                 },
@@ -7363,6 +7401,7 @@ pub mod platform {
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
+                    None,
                 ]),
                 scratch: Mutex::new(MetalScratch {
                     input_f32: None,
@@ -8401,6 +8440,7 @@ pub mod platform {
                 DecodeKernel::ResidualBatch => 36,
                 DecodeKernel::TopKBatch => 37,
                 DecodeKernel::RmsNormBatchScalar => 38,
+                DecodeKernel::AttentionBatchSimd => 39,
             };
             let mut pipelines = self
                 .v2_pipelines
@@ -8454,6 +8494,7 @@ pub mod platform {
                 DecodeKernel::ResidualBatch => "qx_v2_residual_batch",
                 DecodeKernel::TopKBatch => "qx_v2_topk_batch",
                 DecodeKernel::RmsNormBatchScalar => "qx_v2_rmsnorm_batch_scalar",
+                DecodeKernel::AttentionBatchSimd => "qx_v2_attention_batch_simd",
             });
             let function = library
                 .newFunctionWithName(&name)

@@ -616,6 +616,71 @@ kernel void qx_v2_attention_batch(
     output[token * hidden + local] = value;
 }
 
+// K-wide attention candidate. One threadgroup owns one speculative token;
+// each of the 16 SIMD groups owns one query head. A head's Q.K scores are
+// computed once and reused for all 64 output dimensions, unlike the scalar
+// batch kernel above which repeats the three context passes per dimension.
+kernel void qx_v2_attention_batch_simd(
+    device const float* query [[buffer(0)]],
+    device const float* key_cache [[buffer(1)]],
+    device const float* value_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant BatchRopeParams& params [[buffer(4)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint token [[threadgroup_position_in_grid]]) {
+    constexpr uint head_dim = 64;
+    constexpr uint q_heads = 16;
+    constexpr uint kv_heads = 8;
+    constexpr uint hidden = q_heads * head_dim;
+    constexpr uint max_context = 512;
+    constexpr float scale = 0.015625f;
+    if (token >= params.tokens || simdgroup >= q_heads) return;
+
+    uint q_head = simdgroup;
+    uint kv_head = q_head / 2;
+    uint query_offset = token * hidden + q_head * head_dim;
+    uint score_offset = q_head * max_context;
+    uint length = params.start_position + token + 1;
+    threadgroup float scores[q_heads * max_context];
+
+    for (uint position = lane; position < length; position += 32) {
+        uint cache_offset = (position * kv_heads + kv_head) * head_dim;
+        float score = 0.0f;
+        for (uint d = 0; d < head_dim; ++d) {
+            score += query[query_offset + d] * key_cache[cache_offset + d];
+        }
+        scores[score_offset + position] = score * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float maximum = -INFINITY;
+        for (uint position = 0; position < length; ++position) {
+            maximum = max(maximum, scores[score_offset + position]);
+        }
+        float denominator = 0.0f;
+        for (uint position = 0; position < length; ++position) {
+            float weight = exp(scores[score_offset + position] - maximum);
+            scores[score_offset + position] = weight;
+            denominator += weight;
+        }
+        for (uint position = 0; position < length; ++position) {
+            scores[score_offset + position] /= denominator;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint dimension = lane; dimension < head_dim; dimension += 32) {
+        float value = 0.0f;
+        for (uint position = 0; position < length; ++position) {
+            uint cache_offset = (position * kv_heads + kv_head) * head_dim;
+            value += scores[score_offset + position] * value_cache[cache_offset + dimension];
+        }
+        output[query_offset + dimension] = value;
+    }
+}
+
 // One SIMD group owns one query head. The group computes each key score once,
 // normalizes those scores in-place, and then produces two output dimensions
 // per lane. The reference kernel recomputed every dot product for every output
