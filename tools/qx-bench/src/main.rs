@@ -954,7 +954,9 @@ fn benchmark_v2_batch_qkv(artifact_path: &std::path::Path, iterations: usize) ->
             metal(context.allocate_runtime_buffer(tokens * 512 * std::mem::size_of::<f32>()))?;
         let query_rotated =
             metal(context.allocate_runtime_buffer(tokens * HIDDEN * std::mem::size_of::<f32>()))?;
-        let start_position = 128_usize;
+        let attention_output =
+            metal(context.allocate_runtime_buffer(tokens * HIDDEN * std::mem::size_of::<f32>()))?;
+        let start_position = 0_usize;
         let key_cache = metal(context.allocate_runtime_buffer(
             (start_position + tokens) * 512 * std::mem::size_of::<f32>(),
         ))?;
@@ -988,6 +990,17 @@ fn benchmark_v2_batch_qkv(artifact_path: &std::path::Path, iterations: usize) ->
             tokens,
         ))?;
         metal(rope_graph.finish(context.as_ref()))?;
+        let mut attention_graph = metal(context.begin_decode())?;
+        metal(attention_graph.encode_attention_batch(
+            context.as_ref(),
+            &query_rotated,
+            &key_cache,
+            &value_cache,
+            &attention_output,
+            start_position,
+            tokens,
+        ))?;
+        metal(attention_graph.finish(context.as_ref()))?;
         let batch_q = metal(context.read_runtime_f32(&query, tokens * HIDDEN))?;
         let batch_k = metal(context.read_runtime_f32(&key, tokens * 512))?;
         let batch_v = metal(context.read_runtime_f32(&value, tokens * 512))?;
@@ -1015,6 +1028,8 @@ fn benchmark_v2_batch_qkv(artifact_path: &std::path::Path, iterations: usize) ->
             metal(context.read_runtime_f32(&key_cache, (start_position + tokens) * 512))?;
         let cached_v =
             metal(context.read_runtime_f32(&value_cache, (start_position + tokens) * 512))?;
+        let batched_attention =
+            metal(context.read_runtime_f32(&attention_output, tokens * HIDDEN))?;
         let mut rope_max_abs = 0.0_f32;
         for token in 0..tokens {
             let position = (start_position + token) as f32;
@@ -1051,6 +1066,46 @@ fn benchmark_v2_batch_qkv(artifact_path: &std::path::Path, iterations: usize) ->
         if rope_max_abs > 2.0e-5 {
             bail!("K={tokens} batched RoPE/KV is not numerically equivalent to its reference");
         }
+        let mut attention_max_abs = 0.0_f32;
+        for token in 0..tokens {
+            let length = token + 1;
+            for head in 0..16 {
+                for dimension in 0..64 {
+                    let query_offset = token * HIDDEN + head * 64;
+                    let mut scores = Vec::with_capacity(length);
+                    let mut maximum = f32::NEG_INFINITY;
+                    for position in 0..length {
+                        let cache_offset = position * 512 + (head / 2) * 64;
+                        let score = (0..64)
+                            .map(|d| rotated_q[query_offset + d] * cached_k[cache_offset + d])
+                            .sum::<f32>()
+                            * 0.015625;
+                        maximum = maximum.max(score);
+                        scores.push(score);
+                    }
+                    let denominator = scores
+                        .iter()
+                        .map(|score| (*score - maximum).exp())
+                        .sum::<f32>();
+                    let expected = scores
+                        .iter()
+                        .enumerate()
+                        .map(|(position, score)| {
+                            let weight = (*score - maximum).exp() / denominator;
+                            weight * cached_v[position * 512 + (head / 2) * 64 + dimension]
+                        })
+                        .sum::<f32>();
+                    let actual = batched_attention[token * HIDDEN + head * 64 + dimension];
+                    attention_max_abs = attention_max_abs.max((actual - expected).abs());
+                }
+            }
+        }
+        println!("K={tokens} causal attention CPU-reference max_abs_error: {attention_max_abs:.8}");
+        if attention_max_abs > 3.0e-5 {
+            bail!(
+                "K={tokens} batched causal attention is not numerically equivalent to its reference"
+            );
+        }
         let mut gpu_samples = Vec::with_capacity(iterations);
         let mut wall_samples = Vec::with_capacity(iterations);
         for _ in 0..iterations {
@@ -1074,6 +1129,48 @@ fn benchmark_v2_batch_qkv(artifact_path: &std::path::Path, iterations: usize) ->
             stats.gpu_median_us / tokens as f64,
             3,
             max_abs,
+        );
+        let mut stage_gpu_samples = Vec::with_capacity(iterations);
+        let mut stage_wall_samples = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let before = metal(context.metrics())?;
+            let start = Instant::now();
+            let mut graph = metal(context.begin_decode())?;
+            metal(graph.encode_prepared_q4_qkv_simd_batch(
+                &q, &k, &v, &input, &query, &key, &value, tokens,
+            ))?;
+            metal(graph.encode_rope_kv_batch(
+                context.as_ref(),
+                &query,
+                &key,
+                &value,
+                &query_rotated,
+                &key_cache,
+                &value_cache,
+                start_position,
+                tokens,
+            ))?;
+            metal(graph.encode_attention_batch(
+                context.as_ref(),
+                &query_rotated,
+                &key_cache,
+                &value_cache,
+                &attention_output,
+                start_position,
+                tokens,
+            ))?;
+            metal(graph.finish(context.as_ref()))?;
+            let after = metal(context.metrics())?;
+            stage_gpu_samples
+                .push((after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1_000_000.0);
+            stage_wall_samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+        }
+        let stage_stats = summarize_kernel_samples(&mut stage_gpu_samples, &mut stage_wall_samples);
+        println!(
+            "      front-end QKV+RoPE+attention: {:.2} GPU us, {:.2} GPU us/proposed, {} dispatches",
+            stage_stats.gpu_median_us,
+            stage_stats.gpu_median_us / tokens as f64,
+            6,
         );
     }
     Ok(())

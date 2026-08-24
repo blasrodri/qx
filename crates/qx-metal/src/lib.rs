@@ -1074,6 +1074,7 @@ pub mod platform {
         CopyF32,
         RopeQueryBatchSimd,
         RopeKvBatchSimd,
+        AttentionBatch,
     }
 
     fn bytes_of<T>(value: &T) -> &[u8] {
@@ -1269,7 +1270,7 @@ pub mod platform {
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
-        v2_pipelines: Mutex<[Option<Pipeline>; 34]>,
+        v2_pipelines: Mutex<[Option<Pipeline>; 35]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
         stage_counters: Mutex<bool>,
@@ -5435,6 +5436,62 @@ pub mod platform {
             )
         }
 
+        /// Encode causal attention for K speculative positions in one GPU
+        /// dispatch. The cache already contains the committed prefix and
+        /// the batch RoPE stage has written positions
+        /// `[start_position, start_position + tokens)`.
+        pub fn encode_attention_batch(
+            &mut self,
+            context: &MetalContext,
+            query: &RuntimeBuffer,
+            key_cache: &RuntimeBuffer,
+            value_cache: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            start_position: usize,
+            tokens: usize,
+        ) -> Result<(), String> {
+            if tokens == 0 {
+                return Err("batched attention requires at least one token".to_owned());
+            }
+            let hidden = 16 * 64;
+            let cache_values = (start_position + tokens) * 8 * 64;
+            let f32_bytes = std::mem::size_of::<f32>();
+            if query.length < tokens * hidden * f32_bytes
+                || output.length < tokens * hidden * f32_bytes
+                || key_cache.length < cache_values * f32_bytes
+                || value_cache.length < cache_values * f32_bytes
+            {
+                return Err(
+                    "batched attention buffers are smaller than their fixed shape".to_owned(),
+                );
+            }
+            #[repr(C)]
+            struct Params {
+                start_position: u32,
+                tokens: u32,
+            }
+            let params = Params {
+                start_position: start_position as u32,
+                tokens: tokens as u32,
+            };
+            self.encode_decode_kernel(
+                context,
+                DecodeKernel::AttentionBatch,
+                &[query, key_cache, value_cache, output],
+                bytes_of(&params),
+                MTLSize {
+                    width: tokens * hidden,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+        }
+
         pub fn encode_attention(
             &mut self,
             context: &MetalContext,
@@ -6299,7 +6356,7 @@ pub mod platform {
                 v2_pipelines: Mutex::new([
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
-                    None, None, None, None, None, None, None, None,
+                    None, None, None, None, None, None, None, None, None,
                 ]),
                 scratch: Mutex::new(MetalScratch {
                     input_f32: None,
@@ -7308,6 +7365,7 @@ pub mod platform {
                 DecodeKernel::CopyF32 => 31,
                 DecodeKernel::RopeQueryBatchSimd => 32,
                 DecodeKernel::RopeKvBatchSimd => 33,
+                DecodeKernel::AttentionBatch => 34,
             };
             let mut pipelines = self
                 .v2_pipelines
@@ -7356,6 +7414,7 @@ pub mod platform {
                 DecodeKernel::CopyF32 => "qx_v2_copy_f32",
                 DecodeKernel::RopeQueryBatchSimd => "qx_v2_rope_query_batch_simd",
                 DecodeKernel::RopeKvBatchSimd => "qx_v2_rope_kv_batch_simd",
+                DecodeKernel::AttentionBatch => "qx_v2_attention_batch",
             });
             let function = library
                 .newFunctionWithName(&name)

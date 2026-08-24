@@ -497,6 +497,60 @@ kernel void qx_v2_attention(
     output[tid] = value;
 }
 
+// Reference-correct K-wide causal attention for speculative verification.
+// The candidate dimension is a single GPU dispatch; each thread owns one
+// output dimension and preserves the scalar path's three-pass softmax.
+kernel void qx_v2_attention_batch(
+    device const float* query [[buffer(0)]],
+    device const float* key_cache [[buffer(1)]],
+    device const float* value_cache [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant BatchRopeParams& params [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]) {
+    constexpr uint head_dim = 64;
+    constexpr uint q_heads = 16;
+    constexpr uint kv_heads = 8;
+    constexpr uint hidden = q_heads * head_dim;
+    constexpr float scale = 0.015625f;
+    uint token = tid / hidden;
+    uint local = tid % hidden;
+    if (token >= params.tokens) return;
+    uint q_head = local / head_dim;
+    uint dimension = local % head_dim;
+    uint kv_head = q_head / 2;
+    uint query_base = token * hidden + q_head * head_dim;
+    uint length = params.start_position + token + 1;
+    float maximum = -INFINITY;
+    for (uint position = 0; position < length; ++position) {
+        uint cache_offset = (position * kv_heads + kv_head) * head_dim;
+        float score = 0.0f;
+        for (uint d = 0; d < head_dim; ++d) {
+            score += query[query_base + d] * key_cache[cache_offset + d];
+        }
+        maximum = max(maximum, score * scale);
+    }
+    float denominator = 0.0f;
+    for (uint position = 0; position < length; ++position) {
+        uint cache_offset = (position * kv_heads + kv_head) * head_dim;
+        float score = 0.0f;
+        for (uint d = 0; d < head_dim; ++d) {
+            score += query[query_base + d] * key_cache[cache_offset + d];
+        }
+        denominator += exp(score * scale - maximum);
+    }
+    float value = 0.0f;
+    for (uint position = 0; position < length; ++position) {
+        uint cache_offset = (position * kv_heads + kv_head) * head_dim;
+        float score = 0.0f;
+        for (uint d = 0; d < head_dim; ++d) {
+            score += query[query_base + d] * key_cache[cache_offset + d];
+        }
+        value += exp(score * scale - maximum) / denominator
+            * value_cache[cache_offset + dimension];
+    }
+    output[token * hidden + local] = value;
+}
+
 // One SIMD group owns one query head. The group computes each key score once,
 // normalizes those scores in-place, and then produces two output dimensions
 // per lane. The reference kernel recomputed every dot product for every output
