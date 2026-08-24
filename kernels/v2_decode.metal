@@ -238,6 +238,76 @@ kernel void qx_v2_rope_kv_simd(
     value_cache[cache_offset + paired_offset] = value_input[paired_offset];
 }
 
+struct BatchRopeParams {
+    uint start_position;
+    uint tokens;
+};
+
+// K-wide verifier RoPE. The candidate dimension is folded into the global
+// pair index, so one dispatch handles all proposed positions without
+// re-encoding the scalar position kernel.
+kernel void qx_v2_rope_query_batch_simd(
+    device const float* query_input [[buffer(0)]],
+    device float* query_output [[buffer(1)]],
+    constant BatchRopeParams& params [[buffer(2)]],
+    uint pair_id [[thread_position_in_grid]]) {
+    constexpr uint head_dim = 64;
+    constexpr uint q_heads = 16;
+    constexpr uint pairs_per_head = head_dim / 2;
+    constexpr uint pairs_per_token = q_heads * pairs_per_head;
+    uint token = pair_id / pairs_per_token;
+    if (token >= params.tokens) return;
+    uint local = pair_id % pairs_per_token;
+    uint head = local / pairs_per_head;
+    uint pair = local % pairs_per_head;
+    uint offset = head * head_dim + pair;
+    uint paired_offset = offset + pairs_per_head;
+    uint input_base = token * q_heads * head_dim;
+    constexpr float theta = 10000.0f;
+    float inverse = pow(theta, -float(2 * pair) / float(head_dim));
+    float angle = float(params.start_position + token) * inverse;
+    float c = cos(angle);
+    float s = sin(angle);
+    float x = query_input[input_base + offset];
+    float y = query_input[input_base + paired_offset];
+    uint output_base = input_base;
+    query_output[output_base + offset] = x * c - y * s;
+    query_output[output_base + paired_offset] = x * s + y * c;
+}
+
+kernel void qx_v2_rope_kv_batch_simd(
+    device const float* key_input [[buffer(0)]],
+    device const float* value_input [[buffer(1)]],
+    device float* key_cache [[buffer(2)]],
+    device float* value_cache [[buffer(3)]],
+    constant BatchRopeParams& params [[buffer(4)]],
+    uint pair_id [[thread_position_in_grid]]) {
+    constexpr uint head_dim = 64;
+    constexpr uint kv_heads = 8;
+    constexpr uint pairs_per_head = head_dim / 2;
+    constexpr uint pairs_per_token = kv_heads * pairs_per_head;
+    uint token = pair_id / pairs_per_token;
+    if (token >= params.tokens) return;
+    uint local = pair_id % pairs_per_token;
+    uint head = local / pairs_per_head;
+    uint pair = local % pairs_per_head;
+    uint offset = head * head_dim + pair;
+    uint paired_offset = offset + pairs_per_head;
+    uint input_base = token * kv_heads * head_dim;
+    uint cache_base = (params.start_position + token) * kv_heads * head_dim;
+    constexpr float theta = 10000.0f;
+    float inverse = pow(theta, -float(2 * pair) / float(head_dim));
+    float angle = float(params.start_position + token) * inverse;
+    float c = cos(angle);
+    float s = sin(angle);
+    float x = key_input[input_base + offset];
+    float y = key_input[input_base + paired_offset];
+    key_cache[cache_base + offset] = x * c - y * s;
+    key_cache[cache_base + paired_offset] = x * s + y * c;
+    value_cache[cache_base + offset] = value_input[input_base + offset];
+    value_cache[cache_base + paired_offset] = value_input[input_base + paired_offset];
+}
+
 kernel void qx_v2_rope_kv_f16(
     device const float* query_input [[buffer(0)]],
     device const float* key_input [[buffer(1)]],

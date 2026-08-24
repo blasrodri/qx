@@ -1072,6 +1072,8 @@ pub mod platform {
         AttentionChunkedGqa,
         AttentionChunkedMerge,
         CopyF32,
+        RopeQueryBatchSimd,
+        RopeKvBatchSimd,
     }
 
     fn bytes_of<T>(value: &T) -> &[u8] {
@@ -1267,7 +1269,7 @@ pub mod platform {
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
-        v2_pipelines: Mutex<[Option<Pipeline>; 32]>,
+        v2_pipelines: Mutex<[Option<Pipeline>; 34]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
         stage_counters: Mutex<bool>,
@@ -5357,6 +5359,82 @@ pub mod platform {
             )
         }
 
+        /// Encode RoPE and speculative KV writes for K consecutive positions
+        /// in two GPU dispatches. Inputs and query output are token-major;
+        /// cache positions begin at `start_position` and are committed by the
+        /// caller only after verification accepts a prefix.
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_rope_kv_batch(
+            &mut self,
+            context: &MetalContext,
+            query: &RuntimeBuffer,
+            key: &RuntimeBuffer,
+            value: &RuntimeBuffer,
+            query_output: &RuntimeBuffer,
+            key_cache: &RuntimeBuffer,
+            value_cache: &RuntimeBuffer,
+            start_position: usize,
+            tokens: usize,
+        ) -> Result<(), String> {
+            if tokens == 0 {
+                return Err("batched RoPE/KV requires at least one token".to_owned());
+            }
+            let q_values = tokens * 16 * 64;
+            let kv_values = tokens * 8 * 64;
+            let cache_values = (start_position + tokens) * 8 * 64;
+            let f32_bytes = std::mem::size_of::<f32>();
+            if query.length < q_values * f32_bytes
+                || query_output.length < q_values * f32_bytes
+                || key.length < kv_values * f32_bytes
+                || value.length < kv_values * f32_bytes
+                || key_cache.length < cache_values * f32_bytes
+                || value_cache.length < cache_values * f32_bytes
+            {
+                return Err("batched RoPE/KV buffers are smaller than their fixed shape".to_owned());
+            }
+            #[repr(C)]
+            struct Params {
+                start_position: u32,
+                tokens: u32,
+            }
+            let params = Params {
+                start_position: start_position as u32,
+                tokens: tokens as u32,
+            };
+            self.encode_decode_kernel(
+                context,
+                DecodeKernel::RopeQueryBatchSimd,
+                &[query, query_output],
+                bytes_of(&params),
+                MTLSize {
+                    width: q_values,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            )?;
+            self.encode_decode_kernel(
+                context,
+                DecodeKernel::RopeKvBatchSimd,
+                &[key, value, key_cache, value_cache],
+                bytes_of(&params),
+                MTLSize {
+                    width: kv_values,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            )
+        }
+
         pub fn encode_attention(
             &mut self,
             context: &MetalContext,
@@ -6221,7 +6299,7 @@ pub mod platform {
                 v2_pipelines: Mutex::new([
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
-                    None, None, None, None, None, None,
+                    None, None, None, None, None, None, None, None,
                 ]),
                 scratch: Mutex::new(MetalScratch {
                     input_f32: None,
@@ -7228,6 +7306,8 @@ pub mod platform {
                 DecodeKernel::AttentionChunkedGqa => 29,
                 DecodeKernel::AttentionChunkedMerge => 30,
                 DecodeKernel::CopyF32 => 31,
+                DecodeKernel::RopeQueryBatchSimd => 32,
+                DecodeKernel::RopeKvBatchSimd => 33,
             };
             let mut pipelines = self
                 .v2_pipelines
@@ -7274,6 +7354,8 @@ pub mod platform {
                 DecodeKernel::AttentionChunkedGqa => "qx_v2_attention_chunked_gqa",
                 DecodeKernel::AttentionChunkedMerge => "qx_v2_attention_chunked_merge",
                 DecodeKernel::CopyF32 => "qx_v2_copy_f32",
+                DecodeKernel::RopeQueryBatchSimd => "qx_v2_rope_query_batch_simd",
+                DecodeKernel::RopeKvBatchSimd => "qx_v2_rope_kv_batch_simd",
             });
             let function = library
                 .newFunctionWithName(&name)

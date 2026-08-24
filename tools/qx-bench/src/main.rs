@@ -952,6 +952,15 @@ fn benchmark_v2_batch_qkv(artifact_path: &std::path::Path, iterations: usize) ->
             metal(context.allocate_runtime_buffer(tokens * 512 * std::mem::size_of::<f32>()))?;
         let value =
             metal(context.allocate_runtime_buffer(tokens * 512 * std::mem::size_of::<f32>()))?;
+        let query_rotated =
+            metal(context.allocate_runtime_buffer(tokens * HIDDEN * std::mem::size_of::<f32>()))?;
+        let start_position = 128_usize;
+        let key_cache = metal(context.allocate_runtime_buffer(
+            (start_position + tokens) * 512 * std::mem::size_of::<f32>(),
+        ))?;
+        let value_cache = metal(context.allocate_runtime_buffer(
+            (start_position + tokens) * 512 * std::mem::size_of::<f32>(),
+        ))?;
         let input_bytes = unsafe {
             std::slice::from_raw_parts(
                 input_values.as_ptr() as *const u8,
@@ -966,6 +975,19 @@ fn benchmark_v2_batch_qkv(artifact_path: &std::path::Path, iterations: usize) ->
             ))?;
             metal(graph.finish(context.as_ref()))?;
         }
+        let mut rope_graph = metal(context.begin_decode())?;
+        metal(rope_graph.encode_rope_kv_batch(
+            context.as_ref(),
+            &query,
+            &key,
+            &value,
+            &query_rotated,
+            &key_cache,
+            &value_cache,
+            start_position,
+            tokens,
+        ))?;
+        metal(rope_graph.finish(context.as_ref()))?;
         let batch_q = metal(context.read_runtime_f32(&query, tokens * HIDDEN))?;
         let batch_k = metal(context.read_runtime_f32(&key, tokens * 512))?;
         let batch_v = metal(context.read_runtime_f32(&value, tokens * 512))?;
@@ -987,6 +1009,47 @@ fn benchmark_v2_batch_qkv(artifact_path: &std::path::Path, iterations: usize) ->
         println!("{tokens:>5} numerical max_abs_error: {max_abs:.8}");
         if max_abs > 1.0e-5 {
             bail!("K={tokens} batched QKV is not numerically equivalent to scalar QKV");
+        }
+        let rotated_q = metal(context.read_runtime_f32(&query_rotated, tokens * HIDDEN))?;
+        let cached_k =
+            metal(context.read_runtime_f32(&key_cache, (start_position + tokens) * 512))?;
+        let cached_v =
+            metal(context.read_runtime_f32(&value_cache, (start_position + tokens) * 512))?;
+        let mut rope_max_abs = 0.0_f32;
+        for token in 0..tokens {
+            let position = (start_position + token) as f32;
+            for pair in 0..32 {
+                let inverse = 10000.0_f32.powf(-((2 * pair) as f32) / 64.0);
+                let (s, c) = (position * inverse).sin_cos();
+                for head in 0..16 {
+                    let offset = token * HIDDEN + head * 64 + pair;
+                    let paired = offset + 32;
+                    let x = batch_q[offset];
+                    let y = batch_q[paired];
+                    rope_max_abs = rope_max_abs.max((rotated_q[offset] - (x * c - y * s)).abs());
+                    rope_max_abs = rope_max_abs.max((rotated_q[paired] - (x * s + y * c)).abs());
+                }
+                for head in 0..8 {
+                    let input_offset = token * 512 + head * 64 + pair;
+                    let paired = input_offset + 32;
+                    let cache_offset = (start_position + token) * 512 + head * 64 + pair;
+                    let cache_paired = cache_offset + 32;
+                    let x = batch_k[input_offset];
+                    let y = batch_k[paired];
+                    rope_max_abs =
+                        rope_max_abs.max((cached_k[cache_offset] - (x * c - y * s)).abs());
+                    rope_max_abs =
+                        rope_max_abs.max((cached_k[cache_paired] - (x * s + y * c)).abs());
+                    rope_max_abs =
+                        rope_max_abs.max((cached_v[cache_offset] - batch_v[input_offset]).abs());
+                    rope_max_abs =
+                        rope_max_abs.max((cached_v[cache_paired] - batch_v[paired]).abs());
+                }
+            }
+        }
+        println!("K={tokens} RoPE/KV CPU-reference max_abs_error: {rope_max_abs:.8}");
+        if rope_max_abs > 2.0e-5 {
+            bail!("K={tokens} batched RoPE/KV is not numerically equivalent to its reference");
         }
         let mut gpu_samples = Vec::with_capacity(iterations);
         let mut wall_samples = Vec::with_capacity(iterations);
