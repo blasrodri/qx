@@ -135,6 +135,9 @@ struct Args {
     /// Measure top-8 expert-set overlap across sequential artifact-only tokens.
     #[arg(long)]
     v2_route_overlap: bool,
+    /// Measure expert-union/reuse available to K-wide verifier windows.
+    #[arg(long)]
+    v2_verifier_route_stats: bool,
     /// Replay hot, realistic, and low-overlap route sequences against the live MoE graph.
     #[arg(long)]
     v2_route_churn_profile: bool,
@@ -516,6 +519,12 @@ fn main() -> Result<()> {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--v2-route-overlap requires an artifact path"))?;
         return benchmark_v2_route_overlap(artifact, args.context, args.iterations);
+    }
+    if args.v2_verifier_route_stats {
+        let artifact = args.artifact.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--v2-verifier-route-stats requires an artifact path")
+        })?;
+        return benchmark_v2_verifier_route_stats(artifact, args.context, args.iterations);
     }
     if args.v2_route_churn_profile {
         let artifact = args
@@ -1421,6 +1430,13 @@ fn benchmark_v2_batch_qkv(artifact_path: &std::path::Path, iterations: usize) ->
     let k = metal(context.prepare_q4_dense(&k_tensor))?;
     let v = metal(context.prepare_q4_dense(&v_tensor))?;
     let qkv = metal(context.prepare_q4_qkv(&q, &k, &v))?;
+    qx_runtime_v2::activate_artifact_execution_plan(artifact_path).map_err(anyhow::Error::msg)?;
+    let moe = qx_runtime_v2::PreparedMoeStack::load(context.as_ref(), artifact_path)
+        .map_err(anyhow::Error::msg)?;
+    let moe_layer = moe
+        .layers
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("artifact contains no MoE layers"))?;
 
     let input_one = metal(context.allocate_runtime_buffer(HIDDEN * std::mem::size_of::<f32>()))?;
     let q_one = metal(context.allocate_runtime_buffer(HIDDEN * std::mem::size_of::<f32>()))?;
@@ -1475,6 +1491,58 @@ fn benchmark_v2_batch_qkv(artifact_path: &std::path::Path, iterations: usize) ->
             )
         };
         metal(context.write_runtime_buffer(&input, input_bytes))?;
+
+        // Use the same deterministic route shape as the standalone K-wide MoE
+        // benchmark. This is deliberately a synthetic route plan: the command
+        // measures front-end + pair-MoE scaling, while real route-union reuse is
+        // reported separately by --v2-verifier-route-stats.
+        let pair_count = tokens * TOP_K;
+        let route_experts_values: Vec<u32> =
+            (0..pair_count).map(|pair| (pair % TOP_K) as u32).collect();
+        let route_tokens_values: Vec<u32> =
+            (0..pair_count).map(|pair| (pair / TOP_K) as u32).collect();
+        let route_weights_values = vec![1.0_f32 / TOP_K as f32; pair_count];
+        let route_experts = metal(
+            context.allocate_runtime_buffer(std::mem::size_of_val(route_experts_values.as_slice())),
+        )?;
+        let route_tokens = metal(
+            context.allocate_runtime_buffer(std::mem::size_of_val(route_tokens_values.as_slice())),
+        )?;
+        let route_weights = metal(
+            context.allocate_runtime_buffer(std::mem::size_of_val(route_weights_values.as_slice())),
+        )?;
+        let gate_up = metal(
+            context.allocate_runtime_buffer(pair_count * HIDDEN * std::mem::size_of::<f32>()),
+        )?;
+        let activated =
+            metal(context.allocate_runtime_buffer(pair_count * 512 * std::mem::size_of::<f32>()))?;
+        let expert_output = metal(
+            context.allocate_runtime_buffer(pair_count * HIDDEN * std::mem::size_of::<f32>()),
+        )?;
+        let token_moe_output =
+            metal(context.allocate_runtime_buffer(tokens * HIDDEN * std::mem::size_of::<f32>()))?;
+        for (buffer, bytes) in [
+            (&route_experts, unsafe {
+                std::slice::from_raw_parts(
+                    route_experts_values.as_ptr() as *const u8,
+                    std::mem::size_of_val(route_experts_values.as_slice()),
+                )
+            }),
+            (&route_tokens, unsafe {
+                std::slice::from_raw_parts(
+                    route_tokens_values.as_ptr() as *const u8,
+                    std::mem::size_of_val(route_tokens_values.as_slice()),
+                )
+            }),
+            (&route_weights, unsafe {
+                std::slice::from_raw_parts(
+                    route_weights_values.as_ptr() as *const u8,
+                    std::mem::size_of_val(route_weights_values.as_slice()),
+                )
+            }),
+        ] {
+            metal(context.write_runtime_buffer(buffer, bytes))?;
+        }
         for _ in 0..3 {
             let mut graph = metal(context.begin_decode())?;
             metal(graph.encode_prepared_q4_qkv_simd_batch(
@@ -1676,6 +1744,131 @@ fn benchmark_v2_batch_qkv(artifact_path: &std::path::Path, iterations: usize) ->
             stage_stats.gpu_median_us,
             stage_stats.gpu_median_us / tokens as f64,
             6,
+        );
+
+        for _ in 0..3 {
+            let mut graph = metal(context.begin_decode())?;
+            metal(graph.encode_prepared_q4_qkv_simd_batch(
+                &q, &k, &v, &input, &query, &key, &value, tokens,
+            ))?;
+            metal(graph.encode_rope_kv_batch(
+                context.as_ref(),
+                &query,
+                &key,
+                &value,
+                &query_rotated,
+                &key_cache,
+                &value_cache,
+                start_position,
+                tokens,
+            ))?;
+            metal(graph.encode_attention_batch(
+                context.as_ref(),
+                &query_rotated,
+                &key_cache,
+                &value_cache,
+                &attention_output,
+                start_position,
+                tokens,
+            ))?;
+            metal(graph.encode_verifier_q4_gate_up_batch(
+                moe_layer,
+                &attention_output,
+                &route_experts,
+                &route_tokens,
+                &gate_up,
+                pair_count,
+            ))?;
+            metal(
+                graph.encode_verifier_q4_silu_batch(moe_layer, &gate_up, &activated, pair_count),
+            )?;
+            metal(graph.encode_verifier_q4_down_batch(
+                moe_layer,
+                &route_experts,
+                &activated,
+                &expert_output,
+                pair_count,
+            ))?;
+            metal(graph.encode_verifier_q4_accumulate_batch(
+                moe_layer,
+                &expert_output,
+                &route_tokens,
+                &route_weights,
+                &token_moe_output,
+                pair_count,
+                tokens,
+            ))?;
+            metal(graph.finish(context.as_ref()))?;
+        }
+        let mut combined_gpu_samples = Vec::with_capacity(iterations);
+        let mut combined_wall_samples = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let before = metal(context.metrics())?;
+            let start = Instant::now();
+            let mut graph = metal(context.begin_decode())?;
+            metal(graph.encode_prepared_q4_qkv_simd_batch(
+                &q, &k, &v, &input, &query, &key, &value, tokens,
+            ))?;
+            metal(graph.encode_rope_kv_batch(
+                context.as_ref(),
+                &query,
+                &key,
+                &value,
+                &query_rotated,
+                &key_cache,
+                &value_cache,
+                start_position,
+                tokens,
+            ))?;
+            metal(graph.encode_attention_batch(
+                context.as_ref(),
+                &query_rotated,
+                &key_cache,
+                &value_cache,
+                &attention_output,
+                start_position,
+                tokens,
+            ))?;
+            metal(graph.encode_verifier_q4_gate_up_batch(
+                moe_layer,
+                &attention_output,
+                &route_experts,
+                &route_tokens,
+                &gate_up,
+                pair_count,
+            ))?;
+            metal(
+                graph.encode_verifier_q4_silu_batch(moe_layer, &gate_up, &activated, pair_count),
+            )?;
+            metal(graph.encode_verifier_q4_down_batch(
+                moe_layer,
+                &route_experts,
+                &activated,
+                &expert_output,
+                pair_count,
+            ))?;
+            metal(graph.encode_verifier_q4_accumulate_batch(
+                moe_layer,
+                &expert_output,
+                &route_tokens,
+                &route_weights,
+                &token_moe_output,
+                pair_count,
+                tokens,
+            ))?;
+            metal(graph.finish(context.as_ref()))?;
+            let after = metal(context.metrics())?;
+            combined_gpu_samples
+                .push((after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1_000_000.0);
+            combined_wall_samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+        }
+        let combined_stats =
+            summarize_kernel_samples(&mut combined_gpu_samples, &mut combined_wall_samples);
+        println!(
+            "      front-end + pair-MoE: {:.2} GPU us, {:.2} GPU us/proposed, {} dispatches",
+            combined_stats.gpu_median_us,
+            combined_stats.gpu_median_us / tokens as f64,
+            10,
         );
     }
     Ok(())
@@ -5504,6 +5697,57 @@ fn benchmark_v2_route_overlap(
 }
 
 #[cfg(target_os = "macos")]
+fn benchmark_v2_verifier_route_stats(
+    artifact_path: &std::path::Path,
+    context_length: usize,
+    requested_positions: usize,
+) -> Result<()> {
+    if requested_positions < 4 {
+        bail!("--v2-verifier-route-stats requires at least four positions");
+    }
+    let positions = requested_positions.min(128).min(context_length);
+    let steps = capture_sequential_route_steps(artifact_path, context_length, positions)?;
+    println!("QX V2 real-route verifier reuse statistics");
+    println!("artifact: {}", artifact_path.display());
+    println!("positions: {positions}");
+    println!("width  windows  mean_union  mean_pairs/expert  min_union  max_union");
+    for width in [2_usize, 4] {
+        let mut windows = 0_usize;
+        let mut union_sum = 0.0_f64;
+        let mut reuse_sum = 0.0_f64;
+        let mut min_union = usize::MAX;
+        let mut max_union = 0_usize;
+        for window in steps.windows(width) {
+            for layer in 0..LAYERS {
+                let mut union = std::collections::BTreeSet::new();
+                for step in window {
+                    union.extend(step.ids[layer]);
+                }
+                let union_count = union.len();
+                if union_count == 0 {
+                    continue;
+                }
+                let pair_count = (width * 8) as f64;
+                union_sum += union_count as f64;
+                reuse_sum += pair_count / union_count as f64;
+                min_union = min_union.min(union_count);
+                max_union = max_union.max(union_count);
+                windows += 1;
+            }
+        }
+        if windows == 0 {
+            bail!("route statistics produced no non-empty windows");
+        }
+        println!(
+            "{width:>5} {windows:>7} {:>10.2} {:>17.3} {min_union:>9} {max_union:>9}",
+            union_sum / windows as f64,
+            reuse_sum / windows as f64,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn capture_sequential_route_steps(
     artifact_path: &std::path::Path,
     context_length: usize,
@@ -6287,6 +6531,15 @@ fn benchmark_v2_moe_permutation_profile(
     _iterations: usize,
 ) -> Result<()> {
     bail!("--v2-moe-permutation-profile requires macOS Metal")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn benchmark_v2_verifier_route_stats(
+    _artifact_path: &std::path::Path,
+    _context_length: usize,
+    _requested_positions: usize,
+) -> Result<()> {
+    bail!("--v2-verifier-route-stats requires macOS Metal")
 }
 
 #[cfg(not(target_os = "macos"))]
