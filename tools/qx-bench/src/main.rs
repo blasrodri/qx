@@ -153,6 +153,12 @@ struct Args {
     /// Print the V2 static memory/dispatch audit and exit.
     #[arg(long)]
     v2_plan: bool,
+    /// Enumerate Metal counter sets visible to this process and exit.
+    #[arg(long)]
+    v2_metal_counter_inventory: bool,
+    /// Compile the dynamic-MoE source and print target pipeline metadata.
+    #[arg(long)]
+    v2_metal_kernel_inventory: bool,
     /// Attribute V2 memory ownership across load and steady-state phases.
     #[arg(long)]
     v2_memory_profile: bool,
@@ -186,6 +192,15 @@ struct Args {
     /// Execute the persistent GPU K=1/2/4 transactional verifier path.
     #[arg(long)]
     v2_gpu_verifier: bool,
+    /// Select the verifier width represented by top-level JSON metrics.
+    #[arg(long, value_parser = parse_verifier_width)]
+    verifier_width: Option<usize>,
+    /// Compare final-head predictions from an intermediate exact layer state.
+    #[arg(long)]
+    v2_exit_probe: bool,
+    /// Transformer layer at which --v2-exit-probe applies the diagnostic head.
+    #[arg(long, default_value_t = 8)]
+    exit_depth: usize,
     /// Run a real llama.cpp draft against the QX K-wide verifier.
     #[arg(long)]
     v2_speculative: bool,
@@ -293,6 +308,17 @@ struct Args {
     quality_sample_stride: u32,
 }
 
+fn parse_verifier_width(value: &str) -> Result<usize, String> {
+    let width = value
+        .parse::<usize>()
+        .map_err(|_| "verifier width must be 1, 2, or 4".to_owned())?;
+    if matches!(width, 1 | 2 | 4) {
+        Ok(width)
+    } else {
+        Err("verifier width must be 1, 2, or 4".to_owned())
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 struct KernelStats {
@@ -349,6 +375,12 @@ fn main() -> Result<()> {
     let args = Args::parse();
     if args.iterations == 0 || args.max_new_tokens == 0 {
         bail!("iterations must be positive");
+    }
+    if args.v2_metal_counter_inventory {
+        return print_v2_metal_counter_inventory();
+    }
+    if args.v2_metal_kernel_inventory {
+        return print_v2_metal_kernel_inventory();
     }
     if args.v2_quality_trace {
         let artifact = args
@@ -408,6 +440,24 @@ fn main() -> Result<()> {
             iterations,
             fixture.as_ref(),
             args.result_json.as_deref(),
+        );
+    }
+    if args.v2_exit_probe {
+        let artifact = args
+            .artifact
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--v2-exit-probe requires an artifact path"))?;
+        let fixture = args.fixture.as_deref().map(load_fixture).transpose()?;
+        let context = fixture
+            .as_ref()
+            .and_then(|fixture| fixture.context)
+            .unwrap_or(args.context);
+        return benchmark_v2_exit_probe(
+            artifact,
+            context,
+            fixture.as_ref(),
+            args.exit_depth,
+            args.iterations,
         );
     }
     if args.v2_generate {
@@ -493,7 +543,13 @@ fn main() -> Result<()> {
             .artifact
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--v2-gpu-verifier requires an artifact path"))?;
-        return benchmark_v2_gpu_verifier(artifact, args.context, args.iterations);
+        return benchmark_v2_gpu_verifier(
+            artifact,
+            args.context,
+            args.iterations,
+            args.verifier_width,
+            args.result_json.as_deref(),
+        );
     }
     if args.v2_speculative {
         let artifact = args
@@ -890,6 +946,44 @@ fn main() -> Result<()> {
     #[cfg(target_os = "macos")]
     benchmark_gpu_expert(&expert, args.iterations, info)?;
     println!("note:           CPU reference and, on macOS, real Metal dispatch");
+    Ok(())
+}
+
+fn print_v2_metal_counter_inventory() -> Result<()> {
+    let context = qx_metal::platform::MetalContext::system_default()
+        .ok_or_else(|| anyhow::anyhow!("Metal system default device unavailable"))?;
+    let sets = context.counter_inventory();
+    println!("QX_METAL_COUNTER_INVENTORY");
+    if sets.is_empty() {
+        println!("counter_sets=0");
+        println!("note=Metal exposed no counter sets to this process");
+        return Ok(());
+    }
+    println!("counter_sets={}", sets.len());
+    for set in sets {
+        println!("set={}", set.name);
+        println!("counters={}", set.counters.join(","));
+    }
+    Ok(())
+}
+
+fn print_v2_metal_kernel_inventory() -> Result<()> {
+    let context = qx_metal::platform::MetalContext::system_default()
+        .ok_or_else(|| anyhow::anyhow!("Metal system default device unavailable"))?;
+    let kernels = context
+        .dynamic_moe_kernel_inventory()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    println!("QX_METAL_DYNAMIC_MOE_KERNEL_INVENTORY");
+    println!("kernels={}", kernels.len());
+    for kernel in kernels {
+        println!(
+            "kernel={} simd_width={} max_threads={} static_tg_bytes={}",
+            kernel.name,
+            kernel.thread_execution_width,
+            kernel.max_threads_per_threadgroup,
+            kernel.static_threadgroup_memory_bytes
+        );
+    }
     Ok(())
 }
 
@@ -2423,6 +2517,8 @@ fn benchmark_v2_gpu_verifier(
     artifact_path: &std::path::Path,
     context_length: usize,
     iterations: usize,
+    verifier_width: Option<usize>,
+    result_json: Option<&std::path::Path>,
 ) -> Result<()> {
     if iterations == 0 {
         bail!("GPU verifier benchmark iterations must be positive");
@@ -2463,6 +2559,16 @@ fn benchmark_v2_gpu_verifier(
         "iterations: {iterations} (K=1/2/4, teacher-forced target stream, context={late_context})"
     );
     println!("width  GPU us  wall us  GPU/proposed  accepted  position");
+    #[derive(Serialize)]
+    struct WidthReport {
+        width: usize,
+        gpu_us: f64,
+        wall_us: f64,
+        gpu_us_per_proposed: f64,
+        accepted_prefix: usize,
+        position: usize,
+    }
+    let mut width_reports = Vec::new();
     let prepare_context = |generator: &mut qx_runtime_v2::GraniteV2Generator| -> Result<()> {
         generator.reset();
         if late_context != 0 {
@@ -2507,7 +2613,9 @@ fn benchmark_v2_gpu_verifier(
         }
         if qkv_probe {
             prepare_context(&mut generator)?;
-            generator.set_qkv_capture(true);
+            generator
+                .set_qkv_capture(true)
+                .map_err(anyhow::Error::msg)?;
             let result = generator
                 .verify_tokens_gpu(&inputs, &expected)
                 .map_err(anyhow::Error::msg)?;
@@ -2515,11 +2623,13 @@ fn benchmark_v2_gpu_verifier(
                 bail!("K={width} QKV capture baseline failed exact verification");
             }
             generator.clear_qkv_probe();
-            generator.set_qkv_replay(true);
+            generator.set_qkv_replay(true).map_err(anyhow::Error::msg)?;
         }
         if attention_probe {
             prepare_context(&mut generator)?;
-            generator.set_attention_capture(true);
+            generator
+                .set_attention_capture(true)
+                .map_err(anyhow::Error::msg)?;
             let result = generator
                 .verify_tokens_gpu(&inputs, &expected)
                 .map_err(anyhow::Error::msg)?;
@@ -2527,14 +2637,22 @@ fn benchmark_v2_gpu_verifier(
                 bail!("K={width} attention capture baseline failed exact verification");
             }
             generator.clear_attention_probe();
-            generator.set_attention_replay(true);
+            generator
+                .set_attention_replay(true)
+                .map_err(anyhow::Error::msg)?;
         }
         if let Some(probe) = moe_probe.as_deref() {
             prepare_context(&mut generator)?;
             match probe {
-                "whole" => generator.set_moe_capture(true),
-                "gateup" | "gate_up" => generator.set_gate_up_capture(true),
-                "down" => generator.set_down_capture(true),
+                "whole" => generator
+                    .set_moe_capture(true)
+                    .map_err(anyhow::Error::msg)?,
+                "gateup" | "gate_up" => generator
+                    .set_gate_up_capture(true)
+                    .map_err(anyhow::Error::msg)?,
+                "down" => generator
+                    .set_down_capture(true)
+                    .map_err(anyhow::Error::msg)?,
                 other => bail!(
                     "unsupported QX_V2_VERIFIER_MOE_PROBE={other}; use whole, gateup, or down"
                 ),
@@ -2547,9 +2665,13 @@ fn benchmark_v2_gpu_verifier(
             }
             generator.clear_moe_probe();
             match probe {
-                "whole" => generator.set_moe_replay(true),
-                "gateup" | "gate_up" => generator.set_gate_up_replay(true),
-                "down" => generator.set_down_replay(true),
+                "whole" => generator.set_moe_replay(true).map_err(anyhow::Error::msg)?,
+                "gateup" | "gate_up" => generator
+                    .set_gate_up_replay(true)
+                    .map_err(anyhow::Error::msg)?,
+                "down" => generator
+                    .set_down_replay(true)
+                    .map_err(anyhow::Error::msg)?,
                 _ => unreachable!(),
             }
         }
@@ -2590,6 +2712,14 @@ fn benchmark_v2_gpu_verifier(
             accepted,
             position,
         );
+        width_reports.push(WidthReport {
+            width,
+            gpu_us: stats.gpu_median_us,
+            wall_us: stats.wall_median_us,
+            gpu_us_per_proposed: stats.gpu_median_us / width as f64,
+            accepted_prefix: accepted,
+            position,
+        });
         if stage_profile {
             let timeline = generator
                 .last_stage_timeline()
@@ -2679,6 +2809,63 @@ fn benchmark_v2_gpu_verifier(
         generator
             .set_stage_counters(false)
             .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(path) = result_json {
+        let selected_width = verifier_width.unwrap_or(4);
+        let selected = width_reports
+            .iter()
+            .find(|report| report.width == selected_width)
+            .ok_or_else(|| anyhow::anyhow!("missing verifier width {selected_width}"))?;
+        let plan_id = qx_format::MappedArtifact::open(artifact_path)?
+            .info()
+            .execution_plan
+            .as_ref()
+            .map(|plan| plan.plan_id.clone())
+            .unwrap_or_else(|| "legacy-v1-unsealed".to_owned());
+        let (artifact_bytes, _) = artifact_fingerprint(artifact_path)?;
+        let (current_physical_footprint_bytes, peak_physical_footprint_bytes) =
+            physical_footprint();
+        #[derive(Serialize)]
+        struct VerifierReport<'a> {
+            schema_version: u32,
+            implementation: &'static str,
+            artifact: String,
+            plan_id: String,
+            context: usize,
+            iterations: usize,
+            selected_width: usize,
+            wall_ms_per_token: f64,
+            gpu_ms_per_token: f64,
+            current_rss_bytes: u64,
+            peak_rss_bytes: u64,
+            current_physical_footprint_bytes: u64,
+            peak_physical_footprint_bytes: u64,
+            mapped_artifact_bytes: u64,
+            known_metal_allocated_bytes: u64,
+            internal_cpu_waits: u64,
+            widths: &'a [WidthReport],
+        }
+        let report = VerifierReport {
+            schema_version: 1,
+            implementation: "qx-v2-gpu-verifier",
+            artifact: artifact_path.display().to_string(),
+            plan_id,
+            context: context_length,
+            iterations,
+            selected_width,
+            wall_ms_per_token: selected.wall_us / 1_000.0 / selected_width as f64,
+            gpu_ms_per_token: selected.gpu_us / 1_000.0 / selected_width as f64,
+            current_rss_bytes: current_rss_bytes(),
+            peak_rss_bytes: peak_rss_bytes(),
+            current_physical_footprint_bytes,
+            peak_physical_footprint_bytes,
+            mapped_artifact_bytes: artifact_bytes,
+            known_metal_allocated_bytes: 0,
+            internal_cpu_waits: 0,
+            widths: &width_reports,
+        };
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)?;
+        println!("result JSON:            {}", path.display());
     }
     Ok(())
 }
@@ -3390,6 +3577,7 @@ fn encode_interference_variant(
                 &weights.input_norm,
                 &weights.qkv,
                 &weights.o_proj,
+                false,
                 position,
             )
             .map_err(anyhow::Error::msg)?;
@@ -4265,6 +4453,7 @@ fn capture_route_trace(
                     &layer_weights.input_norm,
                     &layer_weights.qkv,
                     &layer_weights.o_proj,
+                    false,
                     position,
                 )
                 .map_err(anyhow::Error::msg)?;
@@ -5383,6 +5572,7 @@ fn encode_canonical_pre_moe(
                 &weights.input_norm,
                 &weights.qkv,
                 &weights.o_proj,
+                false,
                 position,
             )
             .map_err(anyhow::Error::msg)?;
@@ -7525,6 +7715,8 @@ fn benchmark_v2_gpu_verifier(
     _artifact_path: &std::path::Path,
     _context_length: usize,
     _iterations: usize,
+    _verifier_width: Option<usize>,
+    _result_json: Option<&std::path::Path>,
 ) -> Result<()> {
     bail!("--v2-gpu-verifier requires macOS Metal")
 }
@@ -9936,6 +10128,75 @@ fn benchmark_v2_token(
 }
 
 #[cfg(target_os = "macos")]
+fn benchmark_v2_exit_probe(
+    artifact_path: &std::path::Path,
+    context_length: usize,
+    fixture: Option<&BenchmarkFixture>,
+    exit_depth: usize,
+    iterations: usize,
+) -> Result<()> {
+    let default_tokens = [0_u32];
+    let tokens = fixture
+        .map(|fixture| fixture.tokens.as_slice())
+        .unwrap_or(default_tokens.as_slice());
+    if tokens.is_empty() {
+        bail!("exit probe requires at least one token");
+    }
+    let prefill = std::env::var("QX_V2_EXIT_PROBE_PREFILL")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let measured = iterations.min(tokens.len().saturating_sub(prefill));
+    if prefill.saturating_add(measured) > context_length {
+        bail!("exit probe prefix plus measured positions exceed context");
+    }
+    if measured == 0 {
+        bail!("exit probe has no measured positions");
+    }
+
+    let mut generator = qx_runtime_v2::GraniteV2Generator::load(artifact_path, context_length)
+        .map_err(anyhow::Error::msg)?;
+    for &token in &tokens[..prefill] {
+        generator.step(token).map_err(anyhow::Error::msg)?;
+    }
+    let before = generator.metrics().map_err(anyhow::Error::msg)?;
+    let start = std::time::Instant::now();
+    let mut agree = 0_usize;
+    let mut mismatches = Vec::new();
+    for (index, &token) in tokens[prefill..prefill + measured].iter().enumerate() {
+        let (full, exit) = generator
+            .step_with_exit_probe(token, exit_depth)
+            .map_err(anyhow::Error::msg)?;
+        if full == exit {
+            agree += 1;
+        } else if mismatches.len() < 8 {
+            mismatches.push((prefill + index, full, exit));
+        }
+    }
+    let wall = start.elapsed();
+    let after = generator.metrics().map_err(anyhow::Error::msg)?;
+    let gpu_us =
+        (after.gpu_time_seconds - before.gpu_time_seconds).max(0.0) * 1_000_000.0 / measured as f64;
+    println!("QX intermediate exit-head agreement probe");
+    println!("artifact:             {}", artifact_path.display());
+    println!("context:              {context_length}");
+    println!("exit depth:           {exit_depth}");
+    println!("prefill:              {prefill}");
+    println!("measured positions:   {measured}");
+    println!(
+        "top-1 agreement:      {:.2}%",
+        100.0 * agree as f64 / measured as f64
+    );
+    println!("GPU µs/token:         {gpu_us:.2}");
+    println!(
+        "wall µs/token:        {:.2}",
+        wall.as_secs_f64() * 1_000_000.0 / measured as f64
+    );
+    println!("mismatches (first 8): {mismatches:?}");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn benchmark_v2_generate(
     model_path: &std::path::Path,
     artifact_path: &std::path::Path,
@@ -10436,6 +10697,17 @@ fn benchmark_v2_token(
     bail!("--v2-token requires macOS Metal")
 }
 
+#[cfg(not(target_os = "macos"))]
+fn benchmark_v2_exit_probe(
+    _artifact_path: &std::path::Path,
+    _context_length: usize,
+    _fixture: Option<&BenchmarkFixture>,
+    _exit_depth: usize,
+    _iterations: usize,
+) -> Result<()> {
+    bail!("--v2-exit-probe requires macOS Metal")
+}
+
 #[cfg(target_os = "macos")]
 fn benchmark_gpu_expert(
     expert: &QuantizedExpert,
@@ -10760,7 +11032,19 @@ fn print_v2_plan(artifact: &MappedArtifact, context: usize) -> Result<()> {
             .entries
             .iter()
             .fold((0_u64, 0_u64), |(expert, dense), entry| {
-                let bytes = entry.scale_length + entry.data_length;
+                // Inline and transaction-packed tensors can expose their scale and
+                // data views as overlapping ranges in the same artifact stream.
+                // Count the union of those ranges instead of charging the aliased
+                // bytes twice.
+                let scale_end = entry.scale_offset.saturating_add(entry.scale_length);
+                let data_end = entry.data_offset.saturating_add(entry.data_length);
+                let overlap = scale_end
+                    .min(data_end)
+                    .saturating_sub(entry.scale_offset.max(entry.data_offset));
+                let bytes = entry
+                    .scale_length
+                    .saturating_add(entry.data_length)
+                    .saturating_sub(overlap);
                 if entry.is_expert() {
                     (expert + bytes, dense)
                 } else {

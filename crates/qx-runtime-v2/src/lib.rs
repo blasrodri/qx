@@ -6,6 +6,228 @@
 
 use qx_model::{ATTENTION_HEADS, EXPERTS, HIDDEN, KV_HEADS, LAYERS, TOP_K, VOCAB};
 
+/// The artifact manifest after install-time choices and diagnostic overrides
+/// have been resolved. This is the runtime-facing plan object; graph builders
+/// can consume it directly instead of repeatedly asking process-global
+/// environment variables what topology was selected.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedExecutionPlan {
+    pub command_buffers_per_token: usize,
+    pub qkv: qx_format::QkvTopology,
+    pub scalar_rms_qkv: bool,
+    pub scalar_rms_router: bool,
+    pub rope_kv: qx_format::RopeKvTopology,
+    pub attention: qx_format::AttentionTopology,
+    pub moe: qx_format::MoeTopology,
+    pub cross_expert_tile8: bool,
+    pub moe_unique_packet: bool,
+    pub moe_unique_packet_down: bool,
+    pub kv_precision: qx_format::KvPrecision,
+    pub verifier_batch_rms: bool,
+    pub verifier_batch_residual: bool,
+    pub verifier_batch_topk: bool,
+    pub verifier_attention: VerifierAttentionPlan,
+    pub verifier_k4_vector_packet: bool,
+    pub verifier_k4_split_accumulation: bool,
+    pub verifier_k4_direct_activation: bool,
+    pub verifier_k4_rows16: bool,
+    pub verifier_k4_unroll4: bool,
+    pub verifier_k4_unroll4_max_context: Option<u32>,
+    pub verifier_k4_down_unroll4: bool,
+    pub verifier_active_expert_dispatch: bool,
+    pub verifier_stage_profile: bool,
+    active_k_by_layer: Vec<Option<usize>>,
+}
+
+impl Default for ResolvedExecutionPlan {
+    fn default() -> Self {
+        Self {
+            command_buffers_per_token: 1,
+            qkv: qx_format::QkvTopology::Fused,
+            scalar_rms_qkv: true,
+            scalar_rms_router: true,
+            rope_kv: qx_format::RopeKvTopology::SplitDirect,
+            attention: qx_format::AttentionTopology::HierarchicalGqa,
+            moe: qx_format::MoeTopology::FourStage,
+            cross_expert_tile8: false,
+            moe_unique_packet: false,
+            moe_unique_packet_down: false,
+            kv_precision: qx_format::KvPrecision::Fp32,
+            verifier_batch_rms: true,
+            verifier_batch_residual: false,
+            verifier_batch_topk: false,
+            verifier_attention: VerifierAttentionPlan::Canonical,
+            verifier_k4_vector_packet: false,
+            verifier_k4_split_accumulation: false,
+            verifier_k4_direct_activation: false,
+            verifier_k4_rows16: false,
+            verifier_k4_unroll4: false,
+            verifier_k4_unroll4_max_context: None,
+            verifier_k4_down_unroll4: false,
+            verifier_active_expert_dispatch: false,
+            verifier_stage_profile: false,
+            active_k_by_layer: vec![None; LAYERS],
+        }
+    }
+}
+
+impl ResolvedExecutionPlan {
+    pub fn from_manifest(manifest: &qx_format::ExecutionPlanManifest) -> Result<Self, String> {
+        if manifest.schema_version != 1 {
+            return Err(format!(
+                "unsupported execution-plan schema {}",
+                manifest.schema_version
+            ));
+        }
+        let command_buffers_per_token = std::env::var("QX_V2_COMMAND_BUFFERS_OVERRIDE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&count| (1..=LAYERS).contains(&count))
+            .unwrap_or(manifest.schedule.command_buffers_per_token as usize);
+        if command_buffers_per_token == 0 || command_buffers_per_token > LAYERS {
+            return Err(format!(
+                "compiled plan requests {command_buffers_per_token} command buffers/token; supported range is 1..={LAYERS}"
+            ));
+        }
+
+        let active_k_by_layer = match &manifest.sparse_experts {
+            qx_format::SparseExpertPolicy::Top8 => vec![None; LAYERS],
+            qx_format::SparseExpertPolicy::FixedK { active_k, .. } => {
+                if !(1..=TOP_K as u8).contains(active_k) {
+                    return Err(format!("invalid fixed active-k value {active_k}"));
+                }
+                vec![Some(*active_k as usize); LAYERS]
+            }
+            qx_format::SparseExpertPolicy::PerLayer { active_k, .. } => {
+                if active_k.len() != LAYERS {
+                    return Err(format!(
+                        "per-layer active-k has {} entries; expected {LAYERS}",
+                        active_k.len()
+                    ));
+                }
+                active_k
+                    .iter()
+                    .map(|value| {
+                        if !(1..=TOP_K as u8).contains(value) {
+                            return Err(format!("invalid per-layer active-k value {value}"));
+                        }
+                        Ok(Some(*value as usize))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+            }
+            qx_format::SparseExpertPolicy::CumulativeMass { .. } => {
+                return Err("cumulative-mass sparse plans are not executable yet".to_owned());
+            }
+        };
+
+        let cross_expert_tile8 = match manifest.expert_traversal.as_ref() {
+            Some(traversal)
+                if traversal.kind == qx_format::ExpertTraversalKind::CrossExpertTile =>
+            {
+                if traversal.tile_rows != 8
+                    || traversal.expert_count != EXPERTS as u16
+                    || traversal.active_k != TOP_K as u8
+                {
+                    return Err("unsupported cross-expert traversal in execution plan".to_owned());
+                }
+                true
+            }
+            _ => false,
+        };
+
+        let consumer_override = std::env::var("QX_V2_MOE_CONSUMER_OVERRIDE").ok();
+        let moe_unique_packet = match consumer_override
+            .as_deref()
+            .or(manifest.moe_consumer.as_deref())
+        {
+            None | Some("canonical") | Some("qx") => false,
+            Some("unique-packet") | Some("unique_packet") => true,
+            Some(other) => return Err(format!("unsupported MoE consumer {other}")),
+        };
+        let moe_unique_packet_down = match manifest.moe_down_consumer.as_deref() {
+            None | Some("canonical") | Some("qx") => false,
+            Some("unique-packet") | Some("unique_packet") => true,
+            Some(other) => return Err(format!("unsupported MoE down consumer {other}")),
+        };
+
+        let verifier_attention = match manifest.verifier_attention {
+            Some(qx_format::VerifierAttentionTopology::Canonical) => {
+                VerifierAttentionPlan::Canonical
+            }
+            Some(qx_format::VerifierAttentionTopology::BatchSimd) => {
+                VerifierAttentionPlan::BatchSimd
+            }
+            Some(qx_format::VerifierAttentionTopology::ScoreReuse) => {
+                return Err(
+                    "score-reuse verifier attention has no executable Metal backend".to_owned(),
+                );
+            }
+            None if env_flag("QX_V2_ATTENTION_BATCH_SIMD", false) => {
+                VerifierAttentionPlan::BatchSimd
+            }
+            None => VerifierAttentionPlan::Canonical,
+        };
+        let verifier_k4_vector_packet = match manifest.verifier_moe_consumer {
+            Some(qx_format::VerifierMoeConsumerTopology::K4VectorPacket) => true,
+            Some(qx_format::VerifierMoeConsumerTopology::UniquePacket) => false,
+            None => env_flag("QX_V2_VERIFIER_K4_VECTOR_PACKET", false),
+        };
+        let verifier_active_expert_dispatch = manifest
+            .verifier_active_expert_dispatch
+            .unwrap_or_else(|| env_flag("QX_V2_VERIFIER_ACTIVE_EXPERT_DISPATCH", false));
+        let verifier_k4_split_accumulation =
+            manifest.verifier_k4_split_accumulation.unwrap_or(false);
+        let verifier_k4_direct_activation = manifest.verifier_k4_direct_activation.unwrap_or(false);
+        let verifier_k4_rows16 = manifest.verifier_k4_rows16.unwrap_or(false);
+        let verifier_k4_unroll4 = manifest.verifier_k4_unroll4.unwrap_or(false);
+        let verifier_k4_unroll4_max_context = manifest.verifier_k4_unroll4_max_context;
+        let verifier_k4_down_unroll4 = manifest.verifier_k4_down_unroll4.unwrap_or(false);
+
+        Ok(Self {
+            command_buffers_per_token,
+            qkv: manifest.topology.qkv,
+            scalar_rms_qkv: manifest.topology.input_rms == qx_format::RmsTopology::ScalarConsumer,
+            scalar_rms_router: manifest.topology.post_attention_rms
+                == qx_format::RmsTopology::ScalarConsumer,
+            rope_kv: manifest.topology.rope_kv,
+            attention: manifest.topology.attention,
+            moe: manifest.topology.moe,
+            cross_expert_tile8,
+            moe_unique_packet,
+            moe_unique_packet_down,
+            kv_precision: manifest.topology.kv_precision,
+            verifier_batch_rms: env_flag("QX_V2_VERIFIER_BATCH_RMS", true),
+            verifier_batch_residual: env_flag("QX_V2_VERIFIER_BATCH_RESIDUAL", false),
+            verifier_batch_topk: env_flag("QX_V2_VERIFIER_BATCH_TOPK", false),
+            verifier_attention,
+            verifier_k4_vector_packet,
+            verifier_k4_split_accumulation,
+            verifier_k4_direct_activation,
+            verifier_k4_rows16,
+            verifier_k4_unroll4,
+            verifier_k4_unroll4_max_context,
+            verifier_k4_down_unroll4,
+            verifier_active_expert_dispatch,
+            verifier_stage_profile: env_flag("QX_V2_VERIFIER_STAGE_PROFILE", false),
+            active_k_by_layer,
+        })
+    }
+
+    pub fn active_k_for_layer(&self, layer: usize) -> Option<usize> {
+        self.active_k_by_layer.get(layer).copied().flatten()
+    }
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
 pub fn activate_artifact_execution_plan(
     artifact_path: impl AsRef<std::path::Path>,
 ) -> Result<Option<qx_format::ExecutionPlanManifest>, String> {
@@ -124,24 +346,19 @@ pub fn activate_artifact_execution_plan(
     // artifact, while the logical top-k IDs remain in the normal TopKIds
     // buffer. Keep this separate from the older activation-sharing topology.
     set_plan_bool_env("QX_V2_MOE_CROSS_EXPERT_TILE8", cross_expert_tile8);
-    // The consumer dataflow is sealed in the artifact so autotuning compares
-    // real plans rather than process-wide ad hoc environment variants.
-    set_plan_bool_env("QX_V2_MOE_UNIQUE_PACKET", false);
-    set_plan_bool_env("QX_V2_MOE_UNIQUE_PACKET_DOWN", false);
-    if let Some(consumer) = plan.moe_consumer.as_deref() {
-        match consumer {
-            "canonical" | "qx" => {}
-            "unique-packet" | "unique_packet" => set_plan_bool_env("QX_V2_MOE_UNIQUE_PACKET", true),
-            other => return Err(format!("unsupported sealed MoE consumer {other}")),
-        }
-    }
-    if let Some(consumer) = plan.moe_down_consumer.as_deref() {
-        match consumer {
-            "canonical" | "qx" => {}
-            "unique-packet" | "unique_packet" => {
-                set_plan_bool_env("QX_V2_MOE_UNIQUE_PACKET_DOWN", true)
+    // MoE consumer selection is carried by ResolvedExecutionPlan and passed
+    // explicitly to production encoders. Do not mirror it into Metal-side
+    // process-global environment flags: those made a benchmark override look
+    // like an installed execution plan and could leak across generators.
+    for (name, consumer) in [
+        ("MoE", plan.moe_consumer.as_deref()),
+        ("MoE down", plan.moe_down_consumer.as_deref()),
+    ] {
+        if let Some(consumer) = consumer {
+            match consumer {
+                "canonical" | "qx" | "unique-packet" | "unique_packet" => {}
+                other => return Err(format!("unsupported sealed {name} consumer {other}")),
             }
-            other => return Err(format!("unsupported sealed MoE down consumer {other}")),
         }
     }
     match plan.representations.gate_up {
@@ -168,6 +385,9 @@ pub fn activate_artifact_execution_plan(
         }
         qx_format::ExpertRepresentation::Group32Q4Transaction160 => {
             set_plan_env("QX_V2_MOE_LAYOUT", "transaction-160")
+        }
+        qx_format::ExpertRepresentation::Group32Q4Superblock144 => {
+            set_plan_env("QX_V2_MOE_LAYOUT", "superblock-144")
         }
         qx_format::ExpertRepresentation::MixedQ2Q3Q4 => set_plan_env("QX_V2_MOE_LAYOUT", "mixed"),
         qx_format::ExpertRepresentation::Q4K => set_plan_env("QX_V2_MOE_LAYOUT", "rowmajor"),
@@ -481,6 +701,7 @@ impl PreparedAttentionStack {
                 &weights.input_norm,
                 &weights.qkv,
                 &weights.o_proj,
+                false,
                 position,
             )?;
         }
@@ -519,6 +740,27 @@ impl PreparedAttentionStack {
         start_layer: usize,
         end_layer: usize,
     ) -> Result<(), String> {
+        self.encode_full_layer_range_with_plan(
+            graph,
+            buffers,
+            moe,
+            position,
+            start_layer,
+            end_layer,
+            None,
+        )
+    }
+
+    pub fn encode_full_layer_range_with_plan(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        buffers: &GpuRuntimeBuffers,
+        moe: &PreparedMoeStack,
+        position: usize,
+        start_layer: usize,
+        end_layer: usize,
+        resolved_plan: Option<&ResolvedExecutionPlan>,
+    ) -> Result<(), String> {
         if start_layer > end_layer || end_layer > LAYERS {
             return Err(format!(
                 "layer range {start_layer}..{end_layer} is outside 0..{LAYERS}"
@@ -528,7 +770,19 @@ impl PreparedAttentionStack {
         // canonical one-buffer layer plan. If a caller is already testing a
         // layer-sliced schedule, adding MoE boundaries would confound the
         // comparison with accidental empty/duplicate boundaries.
-        let isolate_moe = command_buffers_per_token() == 1;
+        let command_buffers = resolved_plan
+            .map(|plan| plan.command_buffers_per_token)
+            .unwrap_or_else(command_buffers_per_token);
+        let scalar_router = resolved_plan
+            .map(|plan| plan.scalar_rms_router)
+            .unwrap_or_else(qx_metal::platform::rms_scalar_router_enabled);
+        let moe_consumer_plan = resolved_plan
+            .map(|plan| qx_metal::platform::DynamicMoeConsumerPlan {
+                unique_packet: plan.moe_unique_packet,
+                unique_packet_down: plan.moe_unique_packet_down,
+            })
+            .unwrap_or_default();
+        let isolate_moe = command_buffers == 1;
         for (layer, weights) in self
             .layers
             .iter()
@@ -546,7 +800,7 @@ impl PreparedAttentionStack {
             } else {
                 BufferId::HiddenA
             };
-            buffers.encode_attention_layer(
+            buffers.encode_attention_layer_with_plan(
                 graph,
                 layer,
                 input,
@@ -554,19 +808,15 @@ impl PreparedAttentionStack {
                 &weights.input_norm,
                 &weights.qkv,
                 &weights.o_proj,
+                layer > 0,
                 position,
+                resolved_plan,
             )?;
             let context = buffers.context().as_ref();
-            if qx_metal::platform::rms_scalar_router_enabled() {
+            if scalar_router {
                 let inverse_rms = buffers
                     .buffer(BufferId::MoeScratch)
                     .subregion(81_916, std::mem::size_of::<f32>())?;
-                graph.encode_rmsnorm_scalar(
-                    context,
-                    buffers.buffer(output),
-                    &weights.post_attention_norm,
-                    &inverse_rms,
-                )?;
                 graph.encode_prepared_q4_dense_simd_normalized(
                     &weights.router,
                     buffers.buffer(output),
@@ -581,6 +831,16 @@ impl PreparedAttentionStack {
                     &weights.post_attention_norm,
                     buffers.buffer(BufferId::MoeInput),
                 )?;
+                // The non-scalar router path still needs the router
+                // projection. The scalar-consumer path folds normalization
+                // and projection into one normalized GEMV, but the ordinary
+                // path produces MoeInput first and must explicitly write
+                // RouterScores before TopK consumes it.
+                graph.encode_prepared_q4_dense_simd(
+                    &weights.router,
+                    buffers.buffer(BufferId::MoeInput),
+                    buffers.buffer(BufferId::RouterScores),
+                )?;
             }
             graph.encode_topk(
                 context,
@@ -588,7 +848,10 @@ impl PreparedAttentionStack {
                 buffers.buffer(BufferId::TopKIds),
                 buffers.buffer(BufferId::TopKWeights),
             )?;
-            if let Some(active_k) = active_k_for_layer(layer).filter(|&active_k| active_k < TOP_K) {
+            let active_k = resolved_plan
+                .and_then(|plan| plan.active_k_for_layer(layer))
+                .or_else(|| active_k_for_layer(layer));
+            if let Some(active_k) = active_k.filter(|&active_k| active_k < TOP_K) {
                 graph.encode_topk_mask(
                     context,
                     buffers.buffer(BufferId::TopKIds),
@@ -605,8 +868,8 @@ impl PreparedAttentionStack {
             if isolate_moe && moe_boundary_enabled("encoder-entry") {
                 graph.begin_next_encoder()?;
             }
-            if qx_metal::platform::rms_scalar_router_enabled() {
-                graph.encode_dynamic_q4_moe_batched_simd_normalized(
+            if scalar_router {
+                graph.encode_dynamic_q4_moe_batched_simd_normalized_with_plan(
                     &moe.layers[layer],
                     buffers.buffer(output),
                     &weights.post_attention_norm,
@@ -617,22 +880,25 @@ impl PreparedAttentionStack {
                     buffers.buffer(BufferId::TopKWeights),
                     buffers.buffer(BufferId::MoeScratch),
                     buffers.buffer(BufferId::MoeOutput),
+                    moe_consumer_plan,
                 )?;
             } else {
-                graph.encode_dynamic_q4_moe_batched_simd(
+                graph.encode_dynamic_q4_moe_batched_simd_with_plan(
                     &moe.layers[layer],
                     buffers.buffer(BufferId::MoeInput),
                     buffers.buffer(BufferId::TopKIds),
                     buffers.buffer(BufferId::TopKWeights),
                     buffers.buffer(BufferId::MoeScratch),
                     buffers.buffer(BufferId::MoeOutput),
+                    moe_consumer_plan,
                 )?;
             }
-            graph.encode_residual(
+            graph.encode_residual_rms_scalar(
                 context,
                 buffers.buffer(output),
                 buffers.buffer(BufferId::MoeOutput),
                 buffers.buffer(output),
+                buffers.buffer(BufferId::MoeScratch),
                 qx_model::RESIDUAL_MULTIPLIER,
             )?;
             if isolate_moe && layer + 1 < LAYERS && moe_boundary_enabled("cb-exit") {
@@ -655,6 +921,17 @@ impl PreparedAttentionStack {
         moe: &PreparedMoeStack,
         position: usize,
     ) -> Result<(), String> {
+        self.encode_token_with_plan(graph, buffers, moe, position, None)
+    }
+
+    pub fn encode_token_with_plan(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        buffers: &GpuRuntimeBuffers,
+        moe: &PreparedMoeStack,
+        position: usize,
+        resolved_plan: Option<&ResolvedExecutionPlan>,
+    ) -> Result<(), String> {
         let context = buffers.context().as_ref();
         graph.encode_q4_embedding_lookup(
             &self.embedding_lookup,
@@ -662,11 +939,21 @@ impl PreparedAttentionStack {
             buffers.buffer(BufferId::HiddenA),
             qx_model::EMBEDDING_MULTIPLIER,
         )?;
-        let command_buffers = command_buffers_per_token();
+        let command_buffers = resolved_plan
+            .map(|plan| plan.command_buffers_per_token)
+            .unwrap_or_else(command_buffers_per_token);
         for segment in 0..command_buffers {
             let start = segment * LAYERS / command_buffers;
             let end = (segment + 1) * LAYERS / command_buffers;
-            self.encode_full_layer_range(graph, buffers, moe, position, start, end)?;
+            self.encode_full_layer_range_with_plan(
+                graph,
+                buffers,
+                moe,
+                position,
+                start,
+                end,
+                resolved_plan,
+            )?;
             if segment + 1 < command_buffers {
                 graph.begin_next_command_buffer(context)?;
             }
@@ -679,13 +966,7 @@ impl PreparedAttentionStack {
         if qx_metal::platform::final_argmax_normalized_enabled() {
             let inverse_rms = buffers
                 .buffer(BufferId::MoeScratch)
-                .subregion(81_916, std::mem::size_of::<f32>())?;
-            graph.encode_rmsnorm_scalar(
-                context,
-                buffers.buffer(final_hidden),
-                &self.final_norm,
-                &inverse_rms,
-            )?;
+                .subregion(0, std::mem::size_of::<f32>())?;
             graph.encode_prepared_q4_dense_argmax_normalized(
                 context,
                 &self.embedding,
@@ -738,6 +1019,15 @@ pub struct PreparedMoeStack {
 }
 
 #[cfg(target_os = "macos")]
+struct VerifierProbeBuffers {
+    moe_capture: Vec<qx_metal::platform::RuntimeBuffer>,
+    gate_up_capture: Vec<qx_metal::platform::RuntimeBuffer>,
+    down_capture: Vec<qx_metal::platform::RuntimeBuffer>,
+    qkv_capture: Vec<qx_metal::platform::RuntimeBuffer>,
+    attention_capture: Vec<qx_metal::platform::RuntimeBuffer>,
+}
+
+#[cfg(target_os = "macos")]
 struct KWideVerifierBuffers {
     tokens: qx_metal::platform::RuntimeBuffer,
     hidden_a: qx_metal::platform::RuntimeBuffer,
@@ -760,9 +1050,10 @@ struct KWideVerifierBuffers {
     activated: qx_metal::platform::RuntimeBuffer,
     expert_output: qx_metal::platform::RuntimeBuffer,
     moe_output: qx_metal::platform::RuntimeBuffer,
-    moe_capture: Vec<qx_metal::platform::RuntimeBuffer>,
-    qkv_capture: Vec<qx_metal::platform::RuntimeBuffer>,
-    attention_capture: Vec<qx_metal::platform::RuntimeBuffer>,
+    /// Diagnostic replay/capture storage is intentionally absent from the
+    /// production verifier allocation. It is created only when a probe is
+    /// enabled by the benchmark harness.
+    probe: Option<VerifierProbeBuffers>,
     logits_scratch: qx_metal::platform::RuntimeBuffer,
     token_output: qx_metal::platform::RuntimeBuffer,
 }
@@ -790,26 +1081,18 @@ impl KWideVerifierBuffers {
         let bucket_counts = alloc(EXPERTS * u32_bytes)?;
         let bucket_pairs = alloc(EXPERTS * pair_count * u32_bytes)?;
         let active_experts = alloc(EXPERTS * u32_bytes)?;
-        let gate_up_dispatch_args = alloc(3 * u32_bytes)?;
+        let gate_up_dispatch_args = alloc(6 * u32_bytes)?;
         let gate_up = alloc(pair_count * HIDDEN * f32_bytes)?;
         let activated = alloc(pair_count * INTERMEDIATE * f32_bytes)?;
         let expert_output = alloc(pair_count * HIDDEN * f32_bytes)?;
         let moe_output = alloc(width * HIDDEN * f32_bytes)?;
-        let mut moe_capture = Vec::with_capacity(LAYERS);
-        let mut qkv_capture = Vec::with_capacity(LAYERS);
-        let mut attention_capture = Vec::with_capacity(LAYERS);
-        for _ in 0..LAYERS {
-            // Whole-MoE replay stores one vector per token; gate/up and down
-            // probes store one vector per routed expert-token pair.
-            moe_capture.push(alloc(width * TOP_K * HIDDEN * f32_bytes)?);
-            qkv_capture.push(alloc(
-                width * (HIDDEN + 2 * KV_HEADS * HEAD_DIM) * f32_bytes,
-            )?);
-            attention_capture.push(alloc(width * HIDDEN * f32_bytes)?);
-        }
-        // The fused final head uses this only as a partial-max workspace. A
-        // full logits matrix is intentionally not allocated for verification.
-        let logits_scratch = alloc(width * VOCAB * f32_bytes)?;
+        // The fused final head uses this only as a partial-max workspace. It
+        // is reused sequentially for each token, so allocating width * VOCAB
+        // would reserve a fake logits matrix and needlessly inflate the
+        // verifier's steady-state footprint.
+        let vocab_partial_count = VOCAB.div_ceil(8);
+        let logits_scratch_bytes = (vocab_partial_count + 256) * 2 * std::mem::size_of::<u32>();
+        let logits_scratch = alloc(logits_scratch_bytes)?;
         let token_output = alloc(width * u32_bytes)?;
 
         let route_tokens_values: Vec<u32> =
@@ -843,12 +1126,50 @@ impl KWideVerifierBuffers {
             activated,
             expert_output,
             moe_output,
-            moe_capture,
-            qkv_capture,
-            attention_capture,
+            probe: None,
             logits_scratch,
             token_output,
         })
+    }
+
+    fn ensure_probe_buffers(
+        &mut self,
+        context: &qx_metal::platform::MetalContext,
+        width: usize,
+    ) -> Result<(), String> {
+        if self.probe.is_some() {
+            return Ok(());
+        }
+        let f32_bytes = std::mem::size_of::<f32>();
+        let alloc = |bytes: usize| context.allocate_runtime_buffer(bytes.max(1));
+        let mut moe_capture = Vec::with_capacity(LAYERS);
+        let mut gate_up_capture = Vec::with_capacity(LAYERS);
+        let mut down_capture = Vec::with_capacity(LAYERS);
+        let mut qkv_capture = Vec::with_capacity(LAYERS);
+        let mut attention_capture = Vec::with_capacity(LAYERS);
+        for _ in 0..LAYERS {
+            moe_capture.push(alloc(width * TOP_K * HIDDEN * f32_bytes)?);
+            gate_up_capture.push(alloc(width * TOP_K * HIDDEN * f32_bytes)?);
+            down_capture.push(alloc(width * TOP_K * HIDDEN * f32_bytes)?);
+            qkv_capture.push(alloc(
+                width * (HIDDEN + 2 * KV_HEADS * HEAD_DIM) * f32_bytes,
+            )?);
+            attention_capture.push(alloc(width * HIDDEN * f32_bytes)?);
+        }
+        self.probe = Some(VerifierProbeBuffers {
+            moe_capture,
+            gate_up_capture,
+            down_capture,
+            qkv_capture,
+            attention_capture,
+        });
+        Ok(())
+    }
+
+    fn probe(&self) -> Result<&VerifierProbeBuffers, String> {
+        self.probe
+            .as_ref()
+            .ok_or_else(|| "verifier diagnostic buffers are not enabled".to_owned())
     }
 }
 
@@ -994,6 +1315,7 @@ impl PreparedMoeStack {
 #[cfg(target_os = "macos")]
 pub struct GraniteV2Generator {
     context: Rc<qx_metal::platform::MetalContext>,
+    resolved_plan: ResolvedExecutionPlan,
     buffers: GpuRuntimeBuffers,
     verifier_buffers: KWideVerifierBuffers,
     stack: PreparedAttentionStack,
@@ -1033,6 +1355,11 @@ impl GraniteV2Generator {
         context_length: usize,
     ) -> Result<Self, String> {
         let sealed_plan = activate_artifact_execution_plan(&artifact_path)?;
+        let resolved_plan = sealed_plan
+            .as_ref()
+            .map(ResolvedExecutionPlan::from_manifest)
+            .transpose()?
+            .unwrap_or_default();
         if let Some(plan) = &sealed_plan {
             if plan.workload.context_limit as usize != context_length {
                 return Err(format!(
@@ -1055,6 +1382,7 @@ impl GraniteV2Generator {
         let verifier_buffers = KWideVerifierBuffers::new(context.as_ref(), 4)?;
         Ok(Self {
             context,
+            resolved_plan,
             buffers,
             verifier_buffers,
             stack,
@@ -1081,7 +1409,11 @@ impl GraniteV2Generator {
         self.position
     }
 
-    pub fn set_moe_capture(&mut self, enabled: bool) {
+    pub fn set_moe_capture(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            self.verifier_buffers
+                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+        }
         self.verifier_moe_capture = enabled;
         if enabled {
             self.verifier_moe_replay = false;
@@ -1090,9 +1422,14 @@ impl GraniteV2Generator {
             self.verifier_down_capture = false;
             self.verifier_down_replay = false;
         }
+        Ok(())
     }
 
-    pub fn set_moe_replay(&mut self, enabled: bool) {
+    pub fn set_moe_replay(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            self.verifier_buffers
+                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+        }
         self.verifier_moe_replay = enabled;
         if enabled {
             self.verifier_moe_capture = false;
@@ -1101,9 +1438,14 @@ impl GraniteV2Generator {
             self.verifier_down_capture = false;
             self.verifier_down_replay = false;
         }
+        Ok(())
     }
 
-    pub fn set_gate_up_capture(&mut self, enabled: bool) {
+    pub fn set_gate_up_capture(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            self.verifier_buffers
+                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+        }
         self.verifier_gate_up_capture = enabled;
         if enabled {
             self.verifier_moe_capture = false;
@@ -1112,9 +1454,14 @@ impl GraniteV2Generator {
             self.verifier_down_capture = false;
             self.verifier_down_replay = false;
         }
+        Ok(())
     }
 
-    pub fn set_gate_up_replay(&mut self, enabled: bool) {
+    pub fn set_gate_up_replay(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            self.verifier_buffers
+                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+        }
         self.verifier_gate_up_replay = enabled;
         if enabled {
             self.verifier_moe_capture = false;
@@ -1123,9 +1470,14 @@ impl GraniteV2Generator {
             self.verifier_down_capture = false;
             self.verifier_down_replay = false;
         }
+        Ok(())
     }
 
-    pub fn set_down_capture(&mut self, enabled: bool) {
+    pub fn set_down_capture(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            self.verifier_buffers
+                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+        }
         self.verifier_down_capture = enabled;
         if enabled {
             self.verifier_moe_capture = false;
@@ -1134,9 +1486,14 @@ impl GraniteV2Generator {
             self.verifier_gate_up_replay = false;
             self.verifier_down_replay = false;
         }
+        Ok(())
     }
 
-    pub fn set_down_replay(&mut self, enabled: bool) {
+    pub fn set_down_replay(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            self.verifier_buffers
+                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+        }
         self.verifier_down_replay = enabled;
         if enabled {
             self.verifier_moe_capture = false;
@@ -1145,6 +1502,7 @@ impl GraniteV2Generator {
             self.verifier_gate_up_replay = false;
             self.verifier_down_capture = false;
         }
+        Ok(())
     }
 
     pub fn clear_moe_probe(&mut self) {
@@ -1156,18 +1514,28 @@ impl GraniteV2Generator {
         self.verifier_down_replay = false;
     }
 
-    pub fn set_qkv_capture(&mut self, enabled: bool) {
+    pub fn set_qkv_capture(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            self.verifier_buffers
+                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+        }
         self.verifier_qkv_capture = enabled;
         if enabled {
             self.verifier_qkv_replay = false;
         }
+        Ok(())
     }
 
-    pub fn set_qkv_replay(&mut self, enabled: bool) {
+    pub fn set_qkv_replay(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            self.verifier_buffers
+                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+        }
         self.verifier_qkv_replay = enabled;
         if enabled {
             self.verifier_qkv_capture = false;
         }
+        Ok(())
     }
 
     pub fn clear_qkv_probe(&mut self) {
@@ -1175,18 +1543,28 @@ impl GraniteV2Generator {
         self.verifier_qkv_replay = false;
     }
 
-    pub fn set_attention_capture(&mut self, enabled: bool) {
+    pub fn set_attention_capture(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            self.verifier_buffers
+                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+        }
         self.verifier_attention_capture = enabled;
         if enabled {
             self.verifier_attention_replay = false;
         }
+        Ok(())
     }
 
-    pub fn set_attention_replay(&mut self, enabled: bool) {
+    pub fn set_attention_replay(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled {
+            self.verifier_buffers
+                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+        }
         self.verifier_attention_replay = enabled;
         if enabled {
             self.verifier_attention_capture = false;
         }
+        Ok(())
     }
 
     pub fn clear_attention_probe(&mut self) {
@@ -1276,6 +1654,159 @@ impl GraniteV2Generator {
             .read_runtime_f32(self.buffers.buffer(BufferId::Logits), VOCAB)
     }
 
+    /// Execute one exact scalar token while also probing an intermediate
+    /// hidden state with the final tied vocabulary head. This is diagnostic
+    /// support for shared-prefix/early-exit drafting; the production token
+    /// still runs through all layers. The returned pair is
+    /// `(full_target_prediction, exit_prediction)`.
+    pub fn step_with_exit_probe(
+        &mut self,
+        token: u32,
+        exit_layer: usize,
+    ) -> Result<(u32, u32), String> {
+        if token as usize >= VOCAB {
+            return Err(format!("token {token} is outside vocabulary"));
+        }
+        if !(1..LAYERS).contains(&exit_layer) {
+            return Err(format!(
+                "exit layer {exit_layer} must be in the range 1..{LAYERS}"
+            ));
+        }
+        if self.position >= self.context_length() {
+            return Err(format!(
+                "generation position {} exceeds context {}",
+                self.position,
+                self.context_length()
+            ));
+        }
+
+        let context = self.buffers.context().as_ref();
+        context.write_runtime_buffer(
+            self.buffers.buffer(BufferId::TokenOutput),
+            &token.to_le_bytes(),
+        )?;
+        let mut graph = self.buffers.begin_token()?;
+        graph.encode_q4_embedding_lookup(
+            &self.stack.embedding_lookup,
+            self.buffers.buffer(BufferId::TokenOutput),
+            self.buffers.buffer(BufferId::HiddenA),
+            qx_model::EMBEDDING_MULTIPLIER,
+        )?;
+        self.stack.encode_full_layer_range_with_plan(
+            &mut graph,
+            &self.buffers,
+            &self.moe,
+            self.position,
+            0,
+            exit_layer,
+            Some(&self.resolved_plan),
+        )?;
+
+        let exit_hidden = if exit_layer.is_multiple_of(2) {
+            BufferId::HiddenA
+        } else {
+            BufferId::HiddenB
+        };
+        let inverse_rms = self
+            .buffers
+            .buffer(BufferId::MoeScratch)
+            .subregion(81_916, std::mem::size_of::<f32>())?;
+        if qx_metal::platform::final_argmax_normalized_enabled() {
+            graph.encode_rmsnorm_scalar(
+                context,
+                self.buffers.buffer(exit_hidden),
+                &self.stack.final_norm,
+                &inverse_rms,
+            )?;
+            graph.encode_prepared_q4_dense_argmax_normalized(
+                context,
+                &self.stack.embedding,
+                self.buffers.buffer(exit_hidden),
+                &self.stack.final_norm,
+                &inverse_rms,
+                self.buffers.buffer(BufferId::MoeScratch),
+                &self.verifier_buffers.token_output,
+                1.0 / qx_model::LOGITS_SCALING,
+            )?;
+        } else {
+            let normalized = self
+                .verifier_buffers
+                .normalized
+                .subregion(0, HIDDEN * std::mem::size_of::<f32>())?;
+            graph.encode_rmsnorm(
+                context,
+                self.buffers.buffer(exit_hidden),
+                &self.stack.final_norm,
+                &normalized,
+            )?;
+            graph.encode_prepared_q4_dense_argmax(
+                context,
+                &self.stack.embedding,
+                &normalized,
+                &self.verifier_buffers.logits_scratch,
+                &self.verifier_buffers.token_output,
+                1.0 / qx_model::LOGITS_SCALING,
+            )?;
+        }
+
+        self.stack.encode_full_layer_range_with_plan(
+            &mut graph,
+            &self.buffers,
+            &self.moe,
+            self.position,
+            exit_layer,
+            LAYERS,
+            Some(&self.resolved_plan),
+        )?;
+        let final_hidden = if LAYERS.is_multiple_of(2) {
+            BufferId::HiddenA
+        } else {
+            BufferId::HiddenB
+        };
+        if qx_metal::platform::final_argmax_normalized_enabled() {
+            graph.encode_rmsnorm_scalar(
+                context,
+                self.buffers.buffer(final_hidden),
+                &self.stack.final_norm,
+                &inverse_rms,
+            )?;
+            graph.encode_prepared_q4_dense_argmax_normalized(
+                context,
+                &self.stack.embedding,
+                self.buffers.buffer(final_hidden),
+                &self.stack.final_norm,
+                &inverse_rms,
+                self.buffers.buffer(BufferId::MoeScratch),
+                self.buffers.buffer(BufferId::TokenOutput),
+                1.0 / qx_model::LOGITS_SCALING,
+            )?;
+        } else {
+            graph.encode_rmsnorm(
+                context,
+                self.buffers.buffer(final_hidden),
+                &self.stack.final_norm,
+                self.buffers.buffer(BufferId::MoeInput),
+            )?;
+            graph.encode_prepared_q4_dense_argmax(
+                context,
+                &self.stack.embedding,
+                self.buffers.buffer(BufferId::MoeInput),
+                self.buffers.buffer(BufferId::Logits),
+                self.buffers.buffer(BufferId::TokenOutput),
+                1.0 / qx_model::LOGITS_SCALING,
+            )?;
+        }
+        self.buffers.finish_token(graph)?;
+        let full = self
+            .context
+            .read_runtime_u32(self.buffers.buffer(BufferId::TokenOutput))?;
+        let exit = self
+            .context
+            .read_runtime_u32(&self.verifier_buffers.token_output)?;
+        self.position += 1;
+        Ok((full, exit))
+    }
+
     /// Correctness-only verifier for the future multi-position verifier.
     /// `inputs[i]` is evaluated at the current cursor and its target output is
     /// compared with `expected_next[i]`.  It intentionally uses the existing
@@ -1336,6 +1867,19 @@ impl GraniteV2Generator {
         if inputs.iter().any(|&token| token as usize >= VOCAB) {
             return Err("GPU verification input contains an out-of-range token".to_owned());
         }
+        let verifier_plan = self.resolved_plan.verifier(
+            VerifierWidth::from_tokens(width).expect("validated verifier width"),
+            self.position,
+        );
+        let verifier_attention_batch_simd = match verifier_plan.attention {
+            VerifierAttentionPlan::Canonical => false,
+            VerifierAttentionPlan::BatchSimd => true,
+            VerifierAttentionPlan::ScoreReuse => {
+                return Err(
+                    "score-reuse verifier attention has no executable Metal backend".to_owned(),
+                );
+            }
+        };
         // K=1 is the scalar control, not a request to run every generic
         // K-wide kernel with a degenerate width. The latter pays verifier-only
         // route compaction, packet staging, and batch-kernel overhead while
@@ -1369,7 +1913,7 @@ impl GraniteV2Generator {
             .write_runtime_buffer(&verifier.tokens, token_bytes)?;
         let mut graph = self.context.begin_decode()?;
         let f32_bytes = std::mem::size_of::<f32>();
-        let profile_stages = verifier_stage_profile_enabled();
+        let profile_stages = verifier_plan.stage_profile;
         if profile_stages {
             graph.stage_boundary(self.context.as_ref())?;
         }
@@ -1390,7 +1934,7 @@ impl GraniteV2Generator {
             } else {
                 (&verifier.hidden_b, &verifier.hidden_a)
             };
-            if verifier_batch_stage_enabled("rms") {
+            if verifier_plan.batch_rms {
                 graph.encode_rmsnorm_batch_scalar(
                     self.context.as_ref(),
                     input,
@@ -1413,7 +1957,7 @@ impl GraniteV2Generator {
             let q_bytes = width * HIDDEN * f32_bytes;
             let kv_bytes = width * KV_HEADS * HEAD_DIM * f32_bytes;
             if self.verifier_qkv_replay {
-                let capture = &verifier.qkv_capture[layer];
+                let capture = &verifier.probe()?.qkv_capture[layer];
                 graph.encode_copy_f32(
                     self.context.as_ref(),
                     &capture.subregion(0, q_bytes)?,
@@ -1444,7 +1988,7 @@ impl GraniteV2Generator {
                     width,
                 )?;
                 if self.verifier_qkv_capture {
-                    let capture = &verifier.qkv_capture[layer];
+                    let capture = &verifier.probe()?.qkv_capture[layer];
                     graph.encode_copy_f32(
                         self.context.as_ref(),
                         &verifier.query,
@@ -1487,12 +2031,12 @@ impl GraniteV2Generator {
             if self.verifier_attention_replay {
                 graph.encode_copy_f32(
                     self.context.as_ref(),
-                    &verifier.attention_capture[layer],
+                    &verifier.probe()?.attention_capture[layer],
                     &verifier.attention,
                     width * HIDDEN,
                 )?;
             } else {
-                graph.encode_attention_batch(
+                graph.encode_attention_batch_with_plan(
                     self.context.as_ref(),
                     &verifier.query_rotated,
                     &key_cache,
@@ -1500,12 +2044,13 @@ impl GraniteV2Generator {
                     &verifier.attention,
                     self.position,
                     width,
+                    verifier_attention_batch_simd,
                 )?;
                 if self.verifier_attention_capture {
                     graph.encode_copy_f32(
                         self.context.as_ref(),
                         &verifier.attention,
-                        &verifier.attention_capture[layer],
+                        &verifier.probe()?.attention_capture[layer],
                         width * HIDDEN,
                     )?;
                 }
@@ -1528,7 +2073,7 @@ impl GraniteV2Generator {
                     width,
                 )?;
             }
-            if verifier_batch_stage_enabled("residual") {
+            if verifier_plan.batch_residual {
                 graph.encode_residual_batch(
                     self.context.as_ref(),
                     input,
@@ -1553,7 +2098,7 @@ impl GraniteV2Generator {
             if profile_stages {
                 graph.stage_boundary(self.context.as_ref())?;
             }
-            if verifier_batch_stage_enabled("rms") {
+            if verifier_plan.batch_rms {
                 graph.encode_rmsnorm_batch_scalar(
                     self.context.as_ref(),
                     output,
@@ -1579,7 +2124,7 @@ impl GraniteV2Generator {
                 &verifier.router_scores,
                 width,
             )?;
-            if verifier_batch_stage_enabled("topk") {
+            if verifier_plan.batch_topk {
                 graph.encode_topk_batch(
                     self.context.as_ref(),
                     &verifier.router_scores,
@@ -1623,7 +2168,7 @@ impl GraniteV2Generator {
                 )?;
                 graph.encode_verifier_moe_replay(
                     self.context.as_ref(),
-                    &verifier.moe_capture[layer],
+                    &verifier.probe()?.moe_capture[layer],
                     &verifier.moe_output,
                     width * HIDDEN,
                 )?;
@@ -1644,12 +2189,12 @@ impl GraniteV2Generator {
                 if self.verifier_gate_up_replay {
                     graph.encode_copy_f32(
                         self.context.as_ref(),
-                        &verifier.moe_capture[layer],
+                        &verifier.probe()?.gate_up_capture[layer],
                         &verifier.gate_up,
                         pair_count * 1024,
                     )?;
                 } else {
-                    graph.encode_verifier_q4_gate_up_compact_unique_packet(
+                    graph.encode_verifier_q4_gate_up_compact_unique_packet_with_plan(
                         prepared,
                         &verifier.normalized,
                         &verifier.bucket_counts,
@@ -1659,13 +2204,19 @@ impl GraniteV2Generator {
                         pair_count,
                         &verifier.active_experts,
                         &verifier.gate_up_dispatch_args,
+                        verifier_plan.k4_vector_packet && width == 4,
+                        verifier_plan.k4_split_accumulation,
+                        verifier_plan.k4_direct_activation,
+                        verifier_plan.k4_rows16,
+                        verifier_plan.k4_unroll4,
+                        verifier_plan.active_expert_dispatch,
                     )?;
                 }
                 if self.verifier_gate_up_capture {
                     graph.encode_copy_f32(
                         self.context.as_ref(),
                         &verifier.gate_up,
-                        &verifier.moe_capture[layer],
+                        &verifier.probe()?.gate_up_capture[layer],
                         pair_count * 1024,
                     )?;
                 }
@@ -1678,9 +2229,22 @@ impl GraniteV2Generator {
                 if self.verifier_down_replay {
                     graph.encode_copy_f32(
                         self.context.as_ref(),
-                        &verifier.moe_capture[layer],
+                        &verifier.probe()?.down_capture[layer],
                         &verifier.expert_output,
                         pair_count * 1024,
+                    )?;
+                } else if verifier_plan.moe_consumer == VerifierMoeConsumer::UniquePacket {
+                    graph.encode_verifier_q4_down_compact_unique_packet_with_plan(
+                        prepared,
+                        &verifier.bucket_counts,
+                        &verifier.bucket_pairs,
+                        &verifier.activated,
+                        &verifier.expert_output,
+                        pair_count,
+                        &verifier.active_experts,
+                        &verifier.gate_up_dispatch_args,
+                        verifier_plan.active_expert_dispatch,
+                        verifier_plan.k4_down_unroll4,
                     )?;
                 } else {
                     graph.encode_verifier_q4_down_batch(
@@ -1695,7 +2259,7 @@ impl GraniteV2Generator {
                     graph.encode_copy_f32(
                         self.context.as_ref(),
                         &verifier.expert_output,
-                        &verifier.moe_capture[layer],
+                        &verifier.probe()?.down_capture[layer],
                         pair_count * 1024,
                     )?;
                 }
@@ -1709,7 +2273,7 @@ impl GraniteV2Generator {
                     width,
                 )?;
             }
-            if verifier_batch_stage_enabled("residual") {
+            if verifier_plan.batch_residual {
                 graph.encode_residual_batch(
                     self.context.as_ref(),
                     output,
@@ -1735,7 +2299,7 @@ impl GraniteV2Generator {
                 graph.encode_copy_f32(
                     self.context.as_ref(),
                     &verifier.moe_output,
-                    &verifier.moe_capture[layer],
+                    &verifier.probe()?.moe_capture[layer],
                     width * HIDDEN,
                 )?;
             }
@@ -1748,7 +2312,7 @@ impl GraniteV2Generator {
         } else {
             &verifier.hidden_b
         };
-        if verifier_batch_stage_enabled("rms") {
+        if verifier_plan.batch_rms {
             graph.encode_rmsnorm_batch_scalar(
                 self.context.as_ref(),
                 final_hidden,
@@ -1830,8 +2394,13 @@ impl GraniteV2Generator {
             &token.to_le_bytes(),
         )?;
         let mut graph = self.buffers.begin_token()?;
-        self.stack
-            .encode_token(&mut graph, &self.buffers, &self.moe, self.position)?;
+        self.stack.encode_token_with_plan(
+            &mut graph,
+            &self.buffers,
+            &self.moe,
+            self.position,
+            Some(&self.resolved_plan),
+        )?;
         self.buffers.finish_token(graph)?;
         self.position += 1;
         Ok(())
@@ -1903,6 +2472,10 @@ fn moe_requested_layout() -> Option<qx_quant::PackingLayout> {
         | Some("transaction160")
         | Some("q4-transaction-160")
         | Some("q4-transaction160") => Some(qx_quant::PackingLayout::Q4Transaction160),
+        Some("superblock-144")
+        | Some("superblock144")
+        | Some("q4-superblock-144")
+        | Some("q4-superblock144") => Some(qx_quant::PackingLayout::Q4Superblock144),
         Some("tile") | Some("tile32") | Some("lane") | Some("lane-native") => {
             Some(qx_quant::PackingLayout::MetalTile32)
         }
@@ -2036,6 +2609,10 @@ fn quantized_bytes_for_layout(
         let stream = tensor.transaction_block_bytes(block_bytes == 160)?;
         return Ok((stream.clone(), stream));
     }
+    if layout.is_q4_superblock() {
+        let stream = tensor.superblock_bytes()?;
+        return Ok((stream.clone(), stream));
+    }
     tensor.repack(layout)?;
     let scales = unsafe {
         std::slice::from_raw_parts(
@@ -2060,6 +2637,10 @@ fn quantized_row_range_bytes_for_layout(
         .row_range(start, count)?;
     if let Some(block_bytes) = layout.transaction_block_bytes() {
         let stream = tensor.transaction_block_bytes(block_bytes == 160)?;
+        return Ok((stream.clone(), stream));
+    }
+    if layout.is_q4_superblock() {
+        let stream = tensor.superblock_bytes()?;
         return Ok((stream.clone(), stream));
     }
     tensor.repack(layout)?;
@@ -3462,31 +4043,6 @@ fn command_buffers_per_token() -> usize {
         .unwrap_or(1)
 }
 
-#[cfg(target_os = "macos")]
-fn verifier_batch_stage_enabled(stage: &str) -> bool {
-    let variable = match stage {
-        "rms" => "QX_V2_VERIFIER_BATCH_RMS",
-        "residual" => "QX_V2_VERIFIER_BATCH_RESIDUAL",
-        "topk" => "QX_V2_VERIFIER_BATCH_TOPK",
-        _ => return false,
-    };
-    match std::env::var(variable) {
-        Ok(value) => matches!(value.as_str(), "1" | "true" | "yes"),
-        // The scalar-semantics RMS path is now the canonical K>1 verifier
-        // stage. An explicit zero keeps the old per-token dispatches
-        // available for A/B attribution; the other experimental stages stay
-        // opt-in until they demonstrate a complete-verifier win.
-        Err(_) => stage == "rms",
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn verifier_stage_profile_enabled() -> bool {
-    std::env::var("QX_V2_VERIFIER_STAGE_PROFILE")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-}
-
 /// Diagnostic schedule selector. Values are deliberately not part of the
 /// sealed artifact vocabulary yet; they distinguish kernel cost from command
 /// buffer/encoder boundary effects. Example values are `cb-entry`,
@@ -3548,12 +4104,15 @@ fn prepare_matrix(
             .ok_or_else(|| format!("dense Q4 artifact is missing {kind:?} for layer {layer}"))?;
         let entry = &artifact.info().entries[index];
         if entry.quant_type != qx_quant::QuantType::Q4
-            || entry.layout != qx_quant::PackingLayout::RowMajor
+            || !matches!(
+                entry.layout,
+                qx_quant::PackingLayout::RowMajor | qx_quant::PackingLayout::Q4Superblock144
+            )
             || entry.rows as usize != rows
             || entry.cols as usize != columns
         {
             return Err(format!(
-                "artifact tensor {kind:?} layer {layer} is not row-major Q4 [{rows}, {columns}]"
+                "artifact tensor {kind:?} layer {layer} is not supported Q4 [{rows}, {columns}]"
             ));
         }
         if let Some(slab) = artifact_slab {
@@ -3565,6 +4124,7 @@ fn prepare_matrix(
                 slab.subregion(scales.start, scales.len())?,
                 rows,
                 columns,
+                entry.layout,
             );
         }
         let quantized = artifact
@@ -3672,6 +4232,28 @@ pub enum BufferId {
     TokenOutput,
 }
 
+impl BufferId {
+    const fn index(self) -> usize {
+        match self {
+            Self::HiddenA => 0,
+            Self::HiddenB => 1,
+            Self::Query => 2,
+            Self::Key => 3,
+            Self::Value => 4,
+            Self::Attention => 5,
+            Self::AttentionScratch => 6,
+            Self::MoeInput => 7,
+            Self::RouterScores => 8,
+            Self::TopKIds => 9,
+            Self::TopKWeights => 10,
+            Self::MoeScratch => 11,
+            Self::MoeOutput => 12,
+            Self::Logits => 13,
+            Self::TokenOutput => 14,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelVariant {
     FusedRmsNormQkv,
@@ -3740,6 +4322,67 @@ impl VerifierWidth {
             2 => Some(Self::K2),
             4 => Some(Self::K4),
             _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerifierAttentionPlan {
+    Canonical,
+    BatchSimd,
+    ScoreReuse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedVerifierPlan {
+    pub width: VerifierWidth,
+    pub attention: VerifierAttentionPlan,
+    pub moe_consumer: VerifierMoeConsumer,
+    pub k4_vector_packet: bool,
+    pub k4_split_accumulation: bool,
+    pub k4_direct_activation: bool,
+    pub k4_rows16: bool,
+    pub k4_unroll4: bool,
+    pub k4_down_unroll4: bool,
+    pub active_expert_dispatch: bool,
+    pub batch_rms: bool,
+    pub batch_residual: bool,
+    pub batch_topk: bool,
+    pub stage_profile: bool,
+}
+
+impl ResolvedExecutionPlan {
+    pub fn verifier(&self, width: VerifierWidth, context: usize) -> ResolvedVerifierPlan {
+        let attention = if width == VerifierWidth::K1 {
+            VerifierAttentionPlan::Canonical
+        } else {
+            let _ = context;
+            self.verifier_attention
+        };
+        ResolvedVerifierPlan {
+            width,
+            attention,
+            moe_consumer: VerifierMoeConsumer::UniquePacket,
+            k4_vector_packet: width == VerifierWidth::K4 && self.verifier_k4_vector_packet,
+            k4_split_accumulation: width == VerifierWidth::K4
+                && self.verifier_k4_split_accumulation,
+            k4_direct_activation: width == VerifierWidth::K4 && self.verifier_k4_direct_activation,
+            k4_rows16: width == VerifierWidth::K4 && self.verifier_k4_rows16,
+            k4_unroll4: width == VerifierWidth::K4
+                && self.verifier_k4_unroll4
+                && self
+                    .verifier_k4_unroll4_max_context
+                    .map_or(true, |max_context| context as u32 <= max_context),
+            k4_down_unroll4: width == VerifierWidth::K4
+                && self.verifier_k4_down_unroll4
+                && self
+                    .verifier_k4_unroll4_max_context
+                    .map_or(true, |max_context| context as u32 <= max_context),
+            active_expert_dispatch: self.verifier_active_expert_dispatch,
+            batch_rms: self.verifier_batch_rms,
+            batch_residual: self.verifier_batch_residual,
+            batch_topk: self.verifier_batch_topk,
+            stage_profile: self.verifier_stage_profile,
         }
     }
 }
@@ -4056,6 +4699,8 @@ pub struct GpuRuntimeBuffers {
     arena: qx_metal::platform::RuntimeBuffer,
     kv: qx_metal::platform::RuntimeBuffer,
     regions: Vec<(BufferId, qx_metal::platform::RuntimeBuffer)>,
+    region_indices: [usize; 15],
+    kv_layer_offsets: [usize; LAYERS],
 }
 
 #[cfg(target_os = "macos")]
@@ -4065,11 +4710,12 @@ impl GpuRuntimeBuffers {
         plan: ExecutionPlan,
     ) -> Result<Self, String> {
         let arena = context.allocate_runtime_buffer(plan.arena_bytes)?;
-        let kv_bytes: usize = (0..LAYERS)
-            .map(|layer| {
-                Self::key_layer_bytes(&plan, layer) + Self::value_layer_bytes(&plan, layer)
-            })
-            .sum();
+        let mut kv_layer_offsets = [0usize; LAYERS];
+        let mut kv_bytes = 0usize;
+        for layer in 0..LAYERS {
+            kv_layer_offsets[layer] = kv_bytes;
+            kv_bytes += Self::key_layer_bytes(&plan, layer) + Self::value_layer_bytes(&plan, layer);
+        }
         let kv = context.allocate_runtime_buffer(kv_bytes.max(1))?;
         let regions = plan
             .regions
@@ -4080,12 +4726,21 @@ impl GpuRuntimeBuffers {
                     .map(|view| (region.id, view))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut region_indices = [usize::MAX; 15];
+        for (index, (id, _)) in regions.iter().enumerate() {
+            region_indices[id.index()] = index;
+        }
+        if region_indices.contains(&usize::MAX) {
+            return Err("V2 execution plan is missing a required runtime buffer region".to_owned());
+        }
         Ok(Self {
             context,
             plan,
             arena,
             kv,
             regions,
+            region_indices,
+            kv_layer_offsets,
         })
     }
 
@@ -4094,11 +4749,7 @@ impl GpuRuntimeBuffers {
     }
 
     pub fn buffer(&self, id: BufferId) -> &qx_metal::platform::RuntimeBuffer {
-        self.regions
-            .iter()
-            .find(|(region_id, _)| *region_id == id)
-            .map(|(_, buffer)| buffer)
-            .expect("static V2 buffer region")
+        &self.regions[self.region_indices[id.index()]].1
     }
 
     pub fn kv_buffer(&self) -> &qx_metal::platform::RuntimeBuffer {
@@ -4124,12 +4775,7 @@ impl GpuRuntimeBuffers {
     }
 
     fn kv_layer_offset(&self, layer: usize) -> usize {
-        (0..layer)
-            .map(|previous| {
-                Self::key_layer_bytes(&self.plan, previous)
-                    + Self::value_layer_bytes(&self.plan, previous)
-            })
-            .sum()
+        self.kv_layer_offsets[layer]
     }
 
     pub fn kv_key_buffer(&self, layer: usize) -> Result<qx_metal::platform::RuntimeBuffer, String> {
@@ -4167,7 +4813,36 @@ impl GpuRuntimeBuffers {
         input_norm: &qx_metal::platform::RuntimeBuffer,
         qkv: &qx_metal::platform::PreparedQuantizedQkv,
         o_proj: &qx_metal::platform::PreparedQuantizedDense,
+        inverse_rms_ready: bool,
         position: usize,
+    ) -> Result<(), String> {
+        self.encode_attention_layer_with_plan(
+            graph,
+            layer,
+            input,
+            output,
+            input_norm,
+            qkv,
+            o_proj,
+            inverse_rms_ready,
+            position,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_attention_layer_with_plan(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        layer: usize,
+        input: BufferId,
+        output: BufferId,
+        input_norm: &qx_metal::platform::RuntimeBuffer,
+        qkv: &qx_metal::platform::PreparedQuantizedQkv,
+        o_proj: &qx_metal::platform::PreparedQuantizedDense,
+        inverse_rms_ready: bool,
+        position: usize,
+        resolved_plan: Option<&ResolvedExecutionPlan>,
     ) -> Result<(), String> {
         if layer >= LAYERS {
             return Err(format!("layer {layer} is outside the Granite plan"));
@@ -4182,9 +4857,19 @@ impl GpuRuntimeBuffers {
         let key_cache = self.kv_key_buffer(layer)?;
         let value_cache = self.kv_value_buffer(layer)?;
 
-        if qx_metal::platform::rms_scalar_qkv_enabled() {
+        let scalar_rms_qkv = resolved_plan
+            .map(|plan| plan.scalar_rms_qkv)
+            .unwrap_or_else(qx_metal::platform::rms_scalar_qkv_enabled);
+        if scalar_rms_qkv {
             let inverse_rms = self.buffer(BufferId::MoeScratch);
-            graph.encode_rmsnorm_scalar(context, self.buffer(input), input_norm, inverse_rms)?;
+            if !inverse_rms_ready {
+                graph.encode_rmsnorm_scalar(
+                    context,
+                    self.buffer(input),
+                    input_norm,
+                    inverse_rms,
+                )?;
+            }
             graph.encode_prepared_q4_qkv_simd_normalized(
                 qkv,
                 self.buffer(input),
@@ -4209,7 +4894,16 @@ impl GpuRuntimeBuffers {
             layer,
             position,
         )?;
-        if qx_metal::platform::three_stage_attention_enabled() {
+        let three_stage_attention = resolved_plan
+            .map(|plan| {
+                matches!(
+                    plan.attention,
+                    qx_format::AttentionTopology::ThreeStage
+                        | qx_format::AttentionTopology::HierarchicalGqa
+                )
+            })
+            .unwrap_or_else(qx_metal::platform::three_stage_attention_enabled);
+        if three_stage_attention {
             graph.encode_attention_three_stage_for_layer(
                 context,
                 query,
@@ -4231,11 +4925,15 @@ impl GpuRuntimeBuffers {
             )?;
         }
         graph.encode_prepared_q4_dense_simd(o_proj, attention, projection)?;
-        graph.encode_residual(
+        let router_inverse = self
+            .buffer(BufferId::MoeScratch)
+            .subregion(81_916, std::mem::size_of::<f32>())?;
+        graph.encode_residual_rms_scalar(
             context,
             self.buffer(input),
             projection,
             self.buffer(output),
+            &router_inverse,
             qx_model::RESIDUAL_MULTIPLIER,
         )?;
         Ok(())
@@ -4261,6 +4959,48 @@ const fn align(value: usize, alignment: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn score_reuse_is_explicitly_rejected_until_backend_exists() {
+        let mut manifest = qx_format::ExecutionPlanManifest::granite_m5_canonical(
+            "model",
+            "target",
+            512,
+            qx_format::MemoryPlan::default(),
+        );
+        manifest.verifier_attention = Some(qx_format::VerifierAttentionTopology::ScoreReuse);
+        let error = ResolvedExecutionPlan::from_manifest(&manifest).unwrap_err();
+        assert!(error.contains("score-reuse verifier attention"));
+    }
+
+    #[test]
+    fn verifier_k4_vector_packet_is_selected_from_manifest() {
+        let mut manifest = qx_format::ExecutionPlanManifest::granite_m5_canonical(
+            "model",
+            "target",
+            512,
+            qx_format::MemoryPlan::default(),
+        );
+        manifest.verifier_moe_consumer =
+            Some(qx_format::VerifierMoeConsumerTopology::K4VectorPacket);
+        manifest.verifier_active_expert_dispatch = Some(true);
+        manifest.verifier_k4_split_accumulation = Some(true);
+        manifest.verifier_k4_direct_activation = Some(true);
+        manifest.verifier_k4_unroll4 = Some(true);
+        manifest.verifier_k4_unroll4_max_context = Some(128);
+        manifest.verifier_k4_down_unroll4 = Some(true);
+        let plan = ResolvedExecutionPlan::from_manifest(&manifest).unwrap();
+        let k4 = plan.verifier(VerifierWidth::K4, 128);
+        assert!(k4.k4_vector_packet);
+        assert!(k4.k4_split_accumulation);
+        assert!(k4.k4_direct_activation);
+        assert!(k4.k4_unroll4);
+        assert!(k4.k4_down_unroll4);
+        assert!(k4.active_expert_dispatch);
+        assert!(!plan.verifier(VerifierWidth::K4, 256).k4_unroll4);
+        assert!(!plan.verifier(VerifierWidth::K2, 512).k4_vector_packet);
+        assert!(!plan.verifier(VerifierWidth::K1, 512).k4_vector_packet);
+    }
 
     #[test]
     fn plan_is_fixed_and_ping_pongs_hidden_buffers() {
@@ -4481,6 +5221,7 @@ mod tests {
                 &norm,
                 &qkv,
                 &o_proj,
+                false,
                 0,
             )
             .unwrap();
@@ -4488,6 +5229,6 @@ mod tests {
         let after = context.metrics().unwrap();
         assert_eq!(after.command_buffers - before.command_buffers, 1);
         assert_eq!(after.encoders - before.encoders, 1);
-        assert_eq!(after.dispatches - before.dispatches, 11);
+        assert_eq!(after.dispatches - before.dispatches, 10);
     }
 }

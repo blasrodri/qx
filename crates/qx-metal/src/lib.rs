@@ -69,9 +69,9 @@ pub mod platform {
     use objc2_metal::{
         MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
         MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePipelineState,
-        MTLCounterResultTimestamp, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor,
-        MTLCounterSamplingPoint, MTLCounterSet, MTLCreateSystemDefaultDevice, MTLDevice,
-        MTLLibrary, MTLResourceOptions, MTLStorageMode,
+        MTLCounter, MTLCounterResultTimestamp, MTLCounterSampleBuffer,
+        MTLCounterSampleBufferDescriptor, MTLCounterSamplingPoint, MTLCounterSet,
+        MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLStorageMode,
     };
 
     use super::{
@@ -83,6 +83,24 @@ pub mod platform {
     const HIDDEN: usize = 1024;
     const INTERMEDIATE: usize = 512;
     const GROUP_SIZE: usize = 32;
+
+    /// Consumer choices supplied by the compiled Runtime V2 plan.  Production
+    /// graph encoding passes this explicitly; the environment-backed wrapper
+    /// remains only for legacy benchmark entry points.
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct DynamicMoeConsumerPlan {
+        pub unique_packet: bool,
+        pub unique_packet_down: bool,
+    }
+
+    impl DynamicMoeConsumerPlan {
+        fn from_legacy_environment() -> Self {
+            Self {
+                unique_packet: moe_unique_packet_enabled(),
+                unique_packet_down: moe_unique_packet_down_enabled(),
+            }
+        }
+    }
 
     /// Select the validated three-dispatch attention topology.
     ///
@@ -464,6 +482,29 @@ pub mod platform {
         )
     }
 
+    /// Legacy diagnostic override for the K4 packet consumer. Production
+    /// Runtime V2 passes this choice through its resolved execution plan.
+    pub fn verifier_k4_vector_packet_enabled() -> bool {
+        matches!(
+            std::env::var("QX_V2_VERIFIER_K4_VECTOR_PACKET")
+                .ok()
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    }
+
+    /// Enables the experimental packet-stationary K-wide Down consumer.
+    pub fn verifier_down_unique_packet_enabled() -> bool {
+        matches!(
+            std::env::var("QX_V2_VERIFIER_DOWN_UNIQUE_PACKET")
+                .ok()
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    }
+
     /// Experimental Down-side neuron-cluster pre-screen. Accepted values are
     /// `16` and `32`; the switch is intentionally independent from the sealed
     /// artifact plan until a complete clustered path exists.
@@ -584,6 +625,23 @@ pub mod platform {
                 Some("1") | Some("true") | Some("yes") | Some("on") => true,
                 _ => false,
             }
+        })
+    }
+
+    /// Experimental llama-derived dataflow for exact Q4 row-inline gate/up.
+    /// It keeps QX's representation but adopts the production llama shape:
+    /// two output rows per SIMD group and two SIMD groups per threadgroup,
+    /// with packet-owned code/scale loads. It is intentionally separate from
+    /// the earlier two-row control, which did not change weight ownership.
+    pub fn moe_two_row_unique_packet_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            matches!(
+                std::env::var("QX_V2_MOE_TWO_ROW_UNIQUE_PACKET")
+                    .ok()
+                    .as_deref(),
+                Some("1") | Some("true") | Some("yes") | Some("on")
+            )
         })
     }
 
@@ -907,6 +965,7 @@ pub mod platform {
         scales: RuntimeBuffer,
         rows: usize,
         columns: usize,
+        layout: PackingLayout,
     }
 
     /// Dense row-major Q4 weights prepared for the SIMD-cooperative control
@@ -955,6 +1014,7 @@ pub mod platform {
         v_packed: RuntimeBuffer,
         v_scales: RuntimeBuffer,
         columns: usize,
+        layout: PackingLayout,
     }
 
     pub struct PreparedDynamicQ4Moe {
@@ -975,8 +1035,16 @@ pub mod platform {
         verifier_gate_up_expert_major_unique_packet_pipeline: Pipeline,
         verifier_compact_routes_pipeline: Pipeline,
         verifier_gate_up_compact_unique_packet_pipeline: Pipeline,
+        verifier_gate_up_compact_unique_packet_k2_pipeline: Pipeline,
+        verifier_gate_up_compact_unique_packet_k4_vector_pipeline: Pipeline,
+        verifier_gate_up_compact_unique_packet_k4_split_accum_pipeline: Pipeline,
+        verifier_gate_up_compact_unique_packet_k4_direct_activation_pipeline: Pipeline,
+        verifier_gate_up_compact_unique_packet_k4_rows16_pipeline: Pipeline,
+        verifier_gate_up_compact_unique_packet_k4_unroll4_pipeline: Pipeline,
         verifier_silu_pipeline: Pipeline,
         verifier_down_pipeline: Pipeline,
+        verifier_down_compact_unique_packet_pipeline: Pipeline,
+        verifier_down_compact_unique_packet_k4_unroll4_pipeline: Pipeline,
         verifier_accumulate_pipeline: Pipeline,
         unique_packet_gate_up_norm_pipeline: Pipeline,
         unique_packet_down_pipeline: Pipeline,
@@ -994,6 +1062,8 @@ pub mod platform {
         decode_direct_gate_up_norm_pipeline: Pipeline,
         two_row_dataflow_gate_up_pipeline: Option<Pipeline>,
         two_row_dataflow_gate_up_norm_pipeline: Option<Pipeline>,
+        two_row_unique_packet_gate_up_pipeline: Option<Pipeline>,
+        two_row_unique_packet_gate_up_norm_pipeline: Option<Pipeline>,
         gate_up_instrument_load_only_pipeline: Pipeline,
         gate_up_instrument_staging_only_pipeline: Pipeline,
         gate_up_instrument_address_only_pipeline: Pipeline,
@@ -1184,6 +1254,23 @@ pub mod platform {
         pub cpu_wait_seconds: f64,
     }
 
+    /// Counter sets exposed by the current Metal device. This is diagnostic
+    /// inventory only; querying it does not alter the canonical execution
+    /// path or allocate a sample buffer.
+    #[derive(Clone, Debug, Default)]
+    pub struct MetalCounterSetInfo {
+        pub name: String,
+        pub counters: Vec<String>,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    pub struct MetalKernelInfo {
+        pub name: String,
+        pub thread_execution_width: usize,
+        pub max_threads_per_threadgroup: usize,
+        pub static_threadgroup_memory_bytes: usize,
+    }
+
     /// Timestamp samples recorded at dispatch-boundary markers in one decode
     /// graph. This is intentionally separate from aggregate metrics: enabling
     /// it changes command encoding and is reserved for diagnostic profiles.
@@ -1339,18 +1426,26 @@ pub mod platform {
         dense_pipeline: Mutex<Option<Pipeline>>,
         f16_dense_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_library: Mutex<Option<Retained<ProtocolObject<dyn MTLLibrary>>>>,
+        residual_rms_pipeline: Mutex<Option<Pipeline>>,
+        attention_softmax_onepass_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_simd_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_superblock_simd_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_superblock_norm_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_batch_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_weight_stationary_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_sweep_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_norm_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_argmax_superblock_pipeline: Mutex<Option<Pipeline>>,
+        q4_dense_argmax_superblock_norm_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_unique_packet_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_argmax_unique_packet_norm_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_simd_norm_pipeline: Mutex<Option<Pipeline>>,
+        q4_qkv_superblock_simd_pipeline: Mutex<Option<Pipeline>>,
+        q4_qkv_superblock_norm_pipeline: Mutex<Option<Pipeline>>,
         q4_qkv_sweep_pipeline: Mutex<Option<Pipeline>>,
         q4_gemv_pipeline: Mutex<Option<Pipeline>>,
         q4_simd_gemv_pipeline: Mutex<Option<Pipeline>>,
@@ -1360,6 +1455,8 @@ pub mod platform {
         dynamic_moe_simd_pipeline: Mutex<Option<Pipeline>>,
         q4_embedding_pipeline: Mutex<Option<Pipeline>>,
         q4_embedding_batch_pipeline: Mutex<Option<Pipeline>>,
+        q4_embedding_superblock_pipeline: Mutex<Option<Pipeline>>,
+        q4_embedding_superblock_batch_pipeline: Mutex<Option<Pipeline>>,
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
@@ -1447,6 +1544,9 @@ pub mod platform {
             output: &RuntimeBuffer,
             multiplier: f32,
         ) -> Result<(), String> {
+            if prepared.layout != PackingLayout::RowMajor {
+                return Err("scalar Q4 dense only supports row-major weights".to_owned());
+            }
             if input.length < prepared.columns * std::mem::size_of::<f32>()
                 || output.length < prepared.rows * std::mem::size_of::<f32>()
             {
@@ -1517,7 +1617,7 @@ pub mod platform {
             {
                 return Err("V2 SIMD Q4 dense buffer is smaller than its fixed shape".to_owned());
             }
-            if prepared.rows >= 16_384 {
+            if prepared.layout == PackingLayout::RowMajor && prepared.rows >= 16_384 {
                 if let Some((rows_per_simd, simd_groups, cache_input)) = final_head_sweep_geometry()
                 {
                     return self.encode_prepared_q4_dense_sweep_scaled(
@@ -1568,7 +1668,13 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: prepared.rows.div_ceil(8),
+                    width: prepared.rows.div_ceil(
+                        if prepared.layout == PackingLayout::Q4Superblock144 {
+                            16
+                        } else {
+                            8
+                        },
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -1593,6 +1699,9 @@ pub mod platform {
             output: &RuntimeBuffer,
             tokens: usize,
         ) -> Result<(), String> {
+            if prepared.layout != PackingLayout::RowMajor {
+                return Err("batched Q4 dense only supports row-major weights".to_owned());
+            }
             if tokens == 0 {
                 return Err("batched Q4 dense requires at least one token".to_owned());
             }
@@ -1672,6 +1781,11 @@ pub mod platform {
             output: &RuntimeBuffer,
             tokens: usize,
         ) -> Result<(), String> {
+            if prepared.layout != PackingLayout::RowMajor {
+                return Err(
+                    "weight-stationary Q4 verifier only supports row-major weights".to_owned(),
+                );
+            }
             if tokens == 0 || tokens > 4 {
                 return Err("weight-stationary Q4 verifier supports K=1..4".to_owned());
             }
@@ -1759,9 +1873,8 @@ pub mod platform {
             if qkv_weight_stationary_enabled() && tokens > 1 {
                 self.encode_prepared_q4_dense_weight_stationary_batch(q, input, query, tokens)?;
                 self.encode_prepared_q4_dense_weight_stationary_batch(k, input, key, tokens)?;
-                return self.encode_prepared_q4_dense_weight_stationary_batch(
-                    v, input, value, tokens,
-                );
+                return self
+                    .encode_prepared_q4_dense_weight_stationary_batch(v, input, value, tokens);
             }
             self.encode_prepared_q4_dense_simd_batch(q, input, query, tokens)?;
             self.encode_prepared_q4_dense_simd_batch(k, input, key, tokens)?;
@@ -1832,7 +1945,12 @@ pub mod platform {
             {
                 return Err("V2 fused final head buffer is smaller than its fixed shape".to_owned());
             }
-            let partial_count = prepared.rows.div_ceil(8);
+            let rows_per_threadgroup = if prepared.layout == PackingLayout::Q4Superblock144 {
+                32
+            } else {
+                8
+            };
+            let partial_count = prepared.rows.div_ceil(rows_per_threadgroup);
             let partial_bytes = partial_count * 2 * std::mem::size_of::<u32>();
             if partials.length < partial_bytes {
                 return Err(
@@ -1842,7 +1960,13 @@ pub mod platform {
             let columns = prepared.columns as u32;
             let rows = prepared.rows as u32;
             let partial_count_u32 = partial_count as u32;
-            let pipeline = if final_argmax_unique_packet_enabled() {
+            let pipeline = if prepared.layout == PackingLayout::Q4Superblock144 {
+                if norm_weights.is_some() {
+                    context.q4_dense_argmax_superblock_norm_pipeline()?
+                } else {
+                    context.q4_dense_argmax_superblock_pipeline()?
+                }
+            } else if final_argmax_unique_packet_enabled() {
                 if norm_weights.is_some() {
                     context.q4_dense_argmax_unique_packet_norm_pipeline()?
                 } else {
@@ -2109,7 +2233,13 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: prepared.rows.div_ceil(8),
+                    width: prepared.rows.div_ceil(
+                        if prepared.layout == PackingLayout::Q4Superblock144 {
+                            16
+                        } else {
+                            8
+                        },
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -2131,6 +2261,9 @@ pub mod platform {
             key: &RuntimeBuffer,
             value: &RuntimeBuffer,
         ) -> Result<(), String> {
+            if prepared.layout != PackingLayout::RowMajor {
+                return Err("scalar fused QKV only supports row-major weights".to_owned());
+            }
             if input.length < prepared.columns * std::mem::size_of::<f32>()
                 || query.length < 1024 * std::mem::size_of::<f32>()
                 || key.length < 512 * std::mem::size_of::<f32>()
@@ -2215,7 +2348,7 @@ pub mod platform {
             key: &RuntimeBuffer,
             value: &RuntimeBuffer,
         ) -> Result<(), String> {
-            if qkv_split_enabled() {
+            if prepared.layout == PackingLayout::RowMajor && qkv_split_enabled() {
                 return self.encode_prepared_q4_qkv_split(prepared, input, query, key, value);
             }
             if input.length < prepared.columns * std::mem::size_of::<f32>()
@@ -2267,7 +2400,12 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: 2048 / 8,
+                    width: 2048
+                        / if prepared.layout == PackingLayout::Q4Superblock144 {
+                            16
+                        } else {
+                            8
+                        },
                     height: 1,
                     depth: 1,
                 },
@@ -2362,7 +2500,7 @@ pub mod platform {
             key: &RuntimeBuffer,
             value: &RuntimeBuffer,
         ) -> Result<(), String> {
-            if qkv_split_enabled() {
+            if prepared.layout == PackingLayout::RowMajor && qkv_split_enabled() {
                 return self.encode_prepared_q4_qkv_split_normalized(
                     prepared,
                     input,
@@ -2373,7 +2511,7 @@ pub mod platform {
                     value,
                 );
             }
-            if qkv_geometry_enabled() {
+            if prepared.layout == PackingLayout::RowMajor && qkv_geometry_enabled() {
                 return self.encode_prepared_q4_qkv_geometry_normalized(
                     prepared,
                     input,
@@ -2446,7 +2584,12 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: 2048 / 8,
+                    width: 2048
+                        / if prepared.layout == PackingLayout::Q4Superblock144 {
+                            16
+                        } else {
+                            8
+                        },
                     height: 1,
                     depth: 1,
                 },
@@ -2640,6 +2783,12 @@ pub mod platform {
             expert_weights: &RuntimeBuffer,
             output: &RuntimeBuffer,
         ) -> Result<(), String> {
+            if prepared.gate_up_layout.is_q4_superblock() || prepared.down_layout.is_q4_superblock()
+            {
+                return Err(
+                    "Q4 superblocks require the four-stage batched SIMD MoE path".to_owned(),
+                );
+            }
             if input.length < 1024 * std::mem::size_of::<f32>()
                 || expert_ids.length < 8 * std::mem::size_of::<u32>()
                 || expert_weights.length < 8 * std::mem::size_of::<f32>()
@@ -2692,7 +2841,7 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: 1,
+                    width: 256,
                     height: 1,
                     depth: 1,
                 },
@@ -2714,6 +2863,12 @@ pub mod platform {
             expert_weights: &RuntimeBuffer,
             output: &RuntimeBuffer,
         ) -> Result<(), String> {
+            if prepared.gate_up_layout.is_q4_superblock() || prepared.down_layout.is_q4_superblock()
+            {
+                return Err(
+                    "Q4 superblocks require the four-stage batched SIMD MoE path".to_owned(),
+                );
+            }
             if input.length < 1024 * std::mem::size_of::<f32>()
                 || expert_ids.length < 8 * std::mem::size_of::<u32>()
                 || expert_weights.length < 8 * std::mem::size_of::<f32>()
@@ -2767,7 +2922,7 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: 1,
+                    width: 256,
                     height: 1,
                     depth: 1,
                 },
@@ -3287,6 +3442,44 @@ pub mod platform {
             active_experts: &RuntimeBuffer,
             dispatch_args: &RuntimeBuffer,
         ) -> Result<(), String> {
+            self.encode_verifier_q4_gate_up_compact_unique_packet_with_plan(
+                prepared,
+                input,
+                bucket_counts,
+                bucket_pairs,
+                route_tokens,
+                output,
+                pair_count,
+                active_experts,
+                dispatch_args,
+                verifier_k4_vector_packet_enabled(),
+                false,
+                false,
+                false,
+                false,
+                verifier_active_expert_dispatch_enabled(),
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_verifier_q4_gate_up_compact_unique_packet_with_plan(
+            &mut self,
+            prepared: &PreparedDynamicQ4Moe,
+            input: &RuntimeBuffer,
+            bucket_counts: &RuntimeBuffer,
+            bucket_pairs: &RuntimeBuffer,
+            route_tokens: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            pair_count: usize,
+            active_experts: &RuntimeBuffer,
+            dispatch_args: &RuntimeBuffer,
+            use_k4_vector_packet: bool,
+            use_k4_split_accumulation: bool,
+            use_k4_direct_activation: bool,
+            use_k4_rows16: bool,
+            use_k4_unroll4: bool,
+            use_active_expert_dispatch: bool,
+        ) -> Result<(), String> {
             if prepared.gate_up_layout != PackingLayout::Q4RowInline {
                 return Err("K-wide compact gate/up requires Q4 row-inline".to_owned());
             }
@@ -3299,18 +3492,56 @@ pub mod platform {
                 || route_tokens.length < pair_count * std::mem::size_of::<u32>()
                 || output.length < pair_count * 1024 * std::mem::size_of::<f32>()
                 || active_experts.length < 32 * std::mem::size_of::<u32>()
-                || dispatch_args.length < 3 * std::mem::size_of::<u32>()
+                || dispatch_args.length
+                    < if use_k4_rows16 {
+                        6 * std::mem::size_of::<u32>()
+                    } else {
+                        3 * std::mem::size_of::<u32>()
+                    }
             {
                 return Err("K-wide compact gate/up buffers are too small".to_owned());
             }
             let pair_count = pair_count as u32;
-            let active_mode = if verifier_active_expert_dispatch_enabled() {
+            let active_mode = if use_active_expert_dispatch {
                 1_u32
             } else {
                 0_u32
             };
-            self.encoder
-                .setComputePipelineState(&prepared.verifier_gate_up_compact_unique_packet_pipeline);
+            // K2 has at most two routed tokens per expert bucket.  Selecting
+            // the width-specialized kernel removes the unused K4 activation
+            // storage and accumulator state; K4 keeps the established path.
+            if pair_count > 16 && use_k4_vector_packet {
+                if use_k4_unroll4 {
+                    self.encoder.setComputePipelineState(
+                        &prepared.verifier_gate_up_compact_unique_packet_k4_unroll4_pipeline,
+                    );
+                } else if use_k4_direct_activation {
+                    self.encoder.setComputePipelineState(
+                        &prepared
+                            .verifier_gate_up_compact_unique_packet_k4_direct_activation_pipeline,
+                    );
+                } else if use_k4_split_accumulation {
+                    self.encoder.setComputePipelineState(
+                        &prepared.verifier_gate_up_compact_unique_packet_k4_split_accum_pipeline,
+                    );
+                } else if use_k4_rows16 {
+                    self.encoder.setComputePipelineState(
+                        &prepared.verifier_gate_up_compact_unique_packet_k4_rows16_pipeline,
+                    );
+                } else {
+                    self.encoder.setComputePipelineState(
+                        &prepared.verifier_gate_up_compact_unique_packet_k4_vector_pipeline,
+                    );
+                }
+            } else if pair_count <= 16 {
+                self.encoder.setComputePipelineState(
+                    &prepared.verifier_gate_up_compact_unique_packet_k2_pipeline,
+                );
+            } else {
+                self.encoder.setComputePipelineState(
+                    &prepared.verifier_gate_up_compact_unique_packet_pipeline,
+                );
+            }
             unsafe {
                 self.encoder.setBuffer_offset_atIndex(
                     Some(&prepared.gate_up_packed.buffer),
@@ -3352,14 +3583,17 @@ pub mod platform {
                     8,
                 );
             }
-            if verifier_active_expert_dispatch_enabled() {
+            let threadgroups_per_bucket = if use_k4_rows16 { 1024 / 16 } else { 1024 / 8 };
+            let threads_per_threadgroup = if use_k4_rows16 { 512 } else { 256 };
+            if use_active_expert_dispatch {
                 unsafe {
                     self.encoder
                         .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
                             &dispatch_args.buffer,
-                            dispatch_args.offset,
+                            dispatch_args.offset
+                                + if use_k4_rows16 { 3 * std::mem::size_of::<u32>() } else { 0 },
                             MTLSize {
-                                width: 256,
+                                width: threads_per_threadgroup,
                                 height: 1,
                                 depth: 1,
                             },
@@ -3368,12 +3602,12 @@ pub mod platform {
             } else {
                 self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: 32 * (1024 / 8),
+                        width: 32 * threadgroups_per_bucket,
                         height: 1,
                         depth: 1,
                     },
                     MTLSize {
-                        width: 256,
+                        width: threads_per_threadgroup,
                         height: 1,
                         depth: 1,
                     },
@@ -3490,6 +3724,146 @@ pub mod platform {
             Ok(())
         }
 
+        /// Encode the packet-stationary K-wide Down consumer. Route pairs are
+        /// already grouped by expert; the kernel reuses each expert's packed
+        /// Down packet across all active token pairs in that bucket.
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_verifier_q4_down_compact_unique_packet(
+            &mut self,
+            prepared: &PreparedDynamicQ4Moe,
+            bucket_counts: &RuntimeBuffer,
+            bucket_pairs: &RuntimeBuffer,
+            activated: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            pair_count: usize,
+            active_experts: &RuntimeBuffer,
+            dispatch_args: &RuntimeBuffer,
+        ) -> Result<(), String> {
+            self.encode_verifier_q4_down_compact_unique_packet_with_plan(
+                prepared,
+                bucket_counts,
+                bucket_pairs,
+                activated,
+                output,
+                pair_count,
+                active_experts,
+                dispatch_args,
+                verifier_active_expert_dispatch_enabled(),
+                false,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_verifier_q4_down_compact_unique_packet_with_plan(
+            &mut self,
+            prepared: &PreparedDynamicQ4Moe,
+            bucket_counts: &RuntimeBuffer,
+            bucket_pairs: &RuntimeBuffer,
+            activated: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            pair_count: usize,
+            active_experts: &RuntimeBuffer,
+            dispatch_args: &RuntimeBuffer,
+            use_active_expert_dispatch: bool,
+            use_k4_unroll4: bool,
+        ) -> Result<(), String> {
+            if prepared.down_layout != PackingLayout::Q4RowInline {
+                return Err("K-wide compact Down requires Q4 row-inline".to_owned());
+            }
+            if pair_count == 0 || pair_count > 32 {
+                return Err("K-wide compact Down supports pair counts 1..=32".to_owned());
+            }
+            if bucket_counts.length < 32 * std::mem::size_of::<u32>()
+                || bucket_pairs.length < 32 * pair_count * std::mem::size_of::<u32>()
+                || activated.length < pair_count * 512 * std::mem::size_of::<f32>()
+                || output.length < pair_count * 1024 * std::mem::size_of::<f32>()
+                || active_experts.length < 32 * std::mem::size_of::<u32>()
+                || dispatch_args.length < 3 * std::mem::size_of::<u32>()
+            {
+                return Err("K-wide compact Down buffers are too small".to_owned());
+            }
+            let pair_count = pair_count as u32;
+            let active_mode = if use_active_expert_dispatch {
+                1_u32
+            } else {
+                0_u32
+            };
+            if use_k4_unroll4 && pair_count > 16 {
+                self.encoder.setComputePipelineState(
+                    &prepared.verifier_down_compact_unique_packet_k4_unroll4_pipeline,
+                );
+            } else {
+                self.encoder.setComputePipelineState(
+                    &prepared.verifier_down_compact_unique_packet_pipeline,
+                );
+            }
+            unsafe {
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.down_packed.buffer),
+                    prepared.down_packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&bucket_counts.buffer),
+                    bucket_counts.offset,
+                    1,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&bucket_pairs.buffer),
+                    bucket_pairs.offset,
+                    2,
+                );
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&activated.buffer), activated.offset, 3);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&output.buffer), output.offset, 4);
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&pair_count).cast(),
+                    std::mem::size_of_val(&pair_count),
+                    5,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&active_experts.buffer),
+                    active_experts.offset,
+                    6,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&active_mode).cast(),
+                    std::mem::size_of_val(&active_mode),
+                    7,
+                );
+            }
+            if use_active_expert_dispatch {
+                unsafe {
+                    self.encoder
+                        .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                            &dispatch_args.buffer,
+                            dispatch_args.offset,
+                            MTLSize {
+                                width: 256,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                }
+            } else {
+                self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: 32 * (1024 / 8),
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            }
+            self.dispatches += 1;
+            Ok(())
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub fn encode_verifier_q4_accumulate_batch(
             &mut self,
@@ -3573,7 +3947,29 @@ pub mod platform {
             scratch: &RuntimeBuffer,
             output: &RuntimeBuffer,
         ) -> Result<(), String> {
-            self.encode_dynamic_q4_moe_batched_simd_with_norm(
+            self.encode_dynamic_q4_moe_batched_simd_with_plan(
+                prepared,
+                input,
+                expert_ids,
+                expert_weights,
+                scratch,
+                output,
+                DynamicMoeConsumerPlan::from_legacy_environment(),
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_dynamic_q4_moe_batched_simd_with_plan(
+            &mut self,
+            prepared: &PreparedDynamicQ4Moe,
+            input: &RuntimeBuffer,
+            expert_ids: &RuntimeBuffer,
+            expert_weights: &RuntimeBuffer,
+            scratch: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            consumer_plan: DynamicMoeConsumerPlan,
+        ) -> Result<(), String> {
+            self.encode_dynamic_q4_moe_batched_simd_with_norm_and_plan(
                 prepared,
                 input,
                 expert_ids,
@@ -3581,6 +3977,7 @@ pub mod platform {
                 scratch,
                 output,
                 None,
+                consumer_plan,
             )
         }
 
@@ -3596,7 +3993,7 @@ pub mod platform {
             scratch: &RuntimeBuffer,
             output: &RuntimeBuffer,
         ) -> Result<(), String> {
-            self.encode_dynamic_q4_moe_batched_simd_with_norm(
+            self.encode_dynamic_q4_moe_batched_simd_with_norm_and_plan(
                 prepared,
                 input,
                 expert_ids,
@@ -3604,11 +4001,37 @@ pub mod platform {
                 scratch,
                 output,
                 Some((norm_weights, inverse_rms)),
+                DynamicMoeConsumerPlan::from_legacy_environment(),
             )
         }
 
         #[allow(clippy::too_many_arguments)]
-        fn encode_dynamic_q4_moe_batched_simd_with_norm(
+        pub fn encode_dynamic_q4_moe_batched_simd_normalized_with_plan(
+            &mut self,
+            prepared: &PreparedDynamicQ4Moe,
+            input: &RuntimeBuffer,
+            norm_weights: &RuntimeBuffer,
+            inverse_rms: &RuntimeBuffer,
+            expert_ids: &RuntimeBuffer,
+            expert_weights: &RuntimeBuffer,
+            scratch: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            consumer_plan: DynamicMoeConsumerPlan,
+        ) -> Result<(), String> {
+            self.encode_dynamic_q4_moe_batched_simd_with_norm_and_plan(
+                prepared,
+                input,
+                expert_ids,
+                expert_weights,
+                scratch,
+                output,
+                Some((norm_weights, inverse_rms)),
+                consumer_plan,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn encode_dynamic_q4_moe_batched_simd_with_norm_and_plan(
             &mut self,
             prepared: &PreparedDynamicQ4Moe,
             input: &RuntimeBuffer,
@@ -3617,6 +4040,7 @@ pub mod platform {
             scratch: &RuntimeBuffer,
             output: &RuntimeBuffer,
             norm: Option<(&RuntimeBuffer, &RuntimeBuffer)>,
+            consumer_plan: DynamicMoeConsumerPlan,
         ) -> Result<(), String> {
             if prepared.expertwise {
                 return self.encode_dynamic_q4_moe_expertwise_with_norm(
@@ -3660,11 +4084,11 @@ pub mod platform {
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none();
-            let unique_packet = moe_unique_packet_enabled()
+            let unique_packet = consumer_plan.unique_packet
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none();
-            let unique_packet_down = moe_unique_packet_down_enabled()
+            let unique_packet_down = consumer_plan.unique_packet_down
                 && prepared.down_inline_layout
                 && prepared.down_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none();
@@ -3674,12 +4098,15 @@ pub mod platform {
                 && prepared.down_scales.length == 32 * 1024 * 2 * 2 * 2;
             let q4k_mature_gate_up = is_q4k && moe_q4k_mature_gate_up_enabled();
             let q4k_mature_down = is_q4k && moe_q4k_mature_down_enabled();
+            let superblock_gate_up = prepared.gate_up_layout.is_q4_superblock();
+            let superblock_down = prepared.down_layout.is_q4_superblock();
             let expert_wave_width = moe_expert_wave_width();
             let wide_expert =
                 moe_wide_expert_enabled() && prepared.wide_supported && q3_block_bytes.is_none();
             let inline_input_cache = moe_inline_input_cache_enabled();
             let fused_block_mapping = moe_fused_transaction_block_mapping();
-            let transaction_gate_up = prepared.gate_up_layout.is_q4_transaction();
+            let transaction_gate_up =
+                prepared.gate_up_layout.is_q4_transaction() || superblock_gate_up;
             let fused_block_active = q3_block_bytes.is_none()
                 && (transaction_gate_up
                     || (fused_block_mapping.is_some()
@@ -3696,6 +4123,10 @@ pub mod platform {
                 && prepared.down_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none();
             let two_row_dataflow = moe_two_row_dataflow_enabled()
+                && prepared.inline_layout
+                && prepared.gate_up_layout == PackingLayout::Q4RowInline
+                && q3_block_bytes.is_none();
+            let two_row_unique_packet = moe_two_row_unique_packet_enabled()
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
                 && q3_block_bytes.is_none();
@@ -3735,6 +4166,15 @@ pub mod platform {
                 } else if q4k_mature_gate_up {
                     self.encoder
                         .setComputePipelineState(&prepared.q4k_mature_gate_up_norm_pipeline);
+                } else if two_row_unique_packet {
+                    self.encoder.setComputePipelineState(
+                        prepared
+                            .two_row_unique_packet_gate_up_norm_pipeline
+                            .as_ref()
+                            .ok_or_else(|| {
+                                "two-row unique-packet pipeline is missing".to_owned()
+                            })?,
+                    );
                 } else if two_row_dataflow {
                     self.encoder.setComputePipelineState(
                         prepared
@@ -3746,7 +4186,7 @@ pub mod platform {
                     self.encoder
                         .setComputePipelineState(&prepared.decode_direct_gate_up_norm_pipeline);
                 } else if fused_block_active {
-                    let pipeline = if fused_block_mapping == Some(true) {
+                    let pipeline = if fused_block_mapping == Some(true) && !superblock_gate_up {
                         prepared.fused_block_llama_gate_up_norm_pipeline.as_ref()
                     } else {
                         prepared.fused_block_qx_gate_up_norm_pipeline.as_ref()
@@ -3832,6 +4272,15 @@ pub mod platform {
                 } else if q4k_mature_gate_up {
                     self.encoder
                         .setComputePipelineState(&prepared.q4k_mature_gate_up_pipeline);
+                } else if two_row_unique_packet {
+                    self.encoder.setComputePipelineState(
+                        prepared
+                            .two_row_unique_packet_gate_up_pipeline
+                            .as_ref()
+                            .ok_or_else(|| {
+                                "two-row unique-packet pipeline is missing".to_owned()
+                            })?,
+                    );
                 } else if two_row_dataflow {
                     self.encoder.setComputePipelineState(
                         prepared
@@ -3843,7 +4292,7 @@ pub mod platform {
                     self.encoder
                         .setComputePipelineState(&prepared.decode_direct_gate_up_pipeline);
                 } else if fused_block_active {
-                    let pipeline = if fused_block_mapping == Some(true) {
+                    let pipeline = if fused_block_mapping == Some(true) && !superblock_gate_up {
                         prepared.fused_block_llama_gate_up_pipeline.as_ref()
                     } else {
                         prepared.fused_block_qx_gate_up_pipeline.as_ref()
@@ -3974,7 +4423,9 @@ pub mod platform {
             } else {
                 self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: if q4k_mature_gate_up {
+                        width: if superblock_gate_up {
+                            8 * (1024 / 32)
+                        } else if q4k_mature_gate_up {
                             8 * (1024 / 8)
                         } else if fused_block_active && fused_block_mapping == Some(true) {
                             8 * (1024 / 4)
@@ -3982,7 +4433,7 @@ pub mod platform {
                             8 * (1024 / 8)
                         } else if llama_like_mapping {
                             8 * (1024 / 4)
-                        } else if two_row_dataflow {
+                        } else if two_row_unique_packet || two_row_dataflow {
                             8 * (1024 / 4)
                         } else if decode_direct {
                             8 * (1024 / 2)
@@ -4006,7 +4457,9 @@ pub mod platform {
                         depth: 1,
                     },
                     MTLSize {
-                        width: if q4k_mature_gate_up {
+                        width: if superblock_gate_up {
+                            256
+                        } else if q4k_mature_gate_up {
                             128
                         } else if fused_block_active && fused_block_mapping == Some(true) {
                             64
@@ -4014,7 +4467,7 @@ pub mod platform {
                             256
                         } else if llama_like_mapping {
                             64
-                        } else if two_row_dataflow {
+                        } else if two_row_unique_packet || two_row_dataflow {
                             64
                         } else if decode_direct {
                             64
@@ -4166,7 +4619,9 @@ pub mod platform {
             } else {
                 self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: if q4k_mature_down {
+                        width: if superblock_down {
+                            8 * (1024 / 32)
+                        } else if q4k_mature_down {
                             8 * (1024 / 8)
                         } else if decode_direct {
                             8 * (1024 / 2)
@@ -4179,7 +4634,9 @@ pub mod platform {
                         depth: 1,
                     },
                     MTLSize {
-                        width: if q4k_mature_down {
+                        width: if superblock_down {
+                            256
+                        } else if q4k_mature_down {
                             256
                         } else if decode_direct {
                             64
@@ -5022,11 +5479,12 @@ pub mod platform {
                     norm,
                 );
             }
-            let unique_packet = moe_unique_packet_enabled()
+            let legacy_consumer_plan = DynamicMoeConsumerPlan::from_legacy_environment();
+            let unique_packet = legacy_consumer_plan.unique_packet
                 && prepared.inline_layout
                 && prepared.gate_up_layout == PackingLayout::Q4RowInline
                 && prepared.q3_gate_up_block_bytes.is_none();
-            let unique_packet_down = moe_unique_packet_down_enabled()
+            let unique_packet_down = legacy_consumer_plan.unique_packet_down
                 && prepared.down_inline_layout
                 && prepared.down_layout == PackingLayout::Q4RowInline
                 && prepared.q3_down_block_bytes.is_none();
@@ -5062,6 +5520,8 @@ pub mod platform {
                 && prepared.down_scales.length == 32 * 1024 * 2 * 2 * 2;
             let q4k_mature_gate_up = is_q4k && moe_q4k_mature_gate_up_enabled();
             let q4k_mature_down = is_q4k && moe_q4k_mature_down_enabled();
+            let superblock_gate_up = prepared.gate_up_layout.is_q4_superblock();
+            let superblock_down = prepared.down_layout.is_q4_superblock();
             let wide_expert =
                 moe_wide_expert_enabled() && prepared.wide_supported && q3_block_bytes.is_none();
             let row_inline_streaming = moe_row_inline_streaming_enabled()
@@ -5094,6 +5554,15 @@ pub mod platform {
                         } else if gate_up_instrument
                             && self.select_gate_up_instrument_pipeline(prepared, true)?
                         {
+                        } else if superblock_gate_up {
+                            self.encoder.setComputePipelineState(
+                                prepared
+                                    .fused_block_qx_gate_up_norm_pipeline
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        "superblock gate/up pipeline is missing".to_owned()
+                                    })?,
+                            );
                         } else if let Some(pipeline) = prepared.q3_gate_up_norm_pipeline.as_ref() {
                             self.encoder.setComputePipelineState(pipeline);
                         } else if q4k_mature_gate_up {
@@ -5176,7 +5645,8 @@ pub mod platform {
                         } else if gate_up_instrument
                             && self.select_gate_up_instrument_pipeline(prepared, false)?
                         {
-                        } else if prepared.gate_up_layout.is_q4_transaction() {
+                        } else if prepared.gate_up_layout.is_q4_transaction() || superblock_gate_up
+                        {
                             self.encoder.setComputePipelineState(
                                 prepared
                                     .fused_block_qx_gate_up_pipeline
@@ -5300,7 +5770,9 @@ pub mod platform {
                     }
                     self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: if q4k_mature_gate_up {
+                            width: if superblock_gate_up {
+                                8 * (1024 / 32)
+                            } else if q4k_mature_gate_up {
                                 8 * (1024 / 8)
                             } else if two_row_dataflow {
                                 8 * (1024 / 4)
@@ -5322,7 +5794,9 @@ pub mod platform {
                             depth: 1,
                         },
                         MTLSize {
-                            width: if q4k_mature_gate_up {
+                            width: if superblock_gate_up {
+                                256
+                            } else if q4k_mature_gate_up {
                                 128
                             } else if two_row_dataflow {
                                 64
@@ -5475,7 +5949,9 @@ pub mod platform {
                     }
                     self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: if q4k_mature_down {
+                            width: if superblock_down {
+                                8 * (1024 / 32)
+                            } else if q4k_mature_down {
                                 8 * (1024 / 8)
                             } else if decode_direct {
                                 8 * (1024 / 2)
@@ -5488,7 +5964,9 @@ pub mod platform {
                             depth: 1,
                         },
                         MTLSize {
-                            width: if q4k_mature_down {
+                            width: if superblock_down {
+                                256
+                            } else if q4k_mature_down {
                                 256
                             } else if decode_direct {
                                 64
@@ -5812,7 +6290,7 @@ pub mod platform {
                     depth: 1,
                 },
                 MTLSize {
-                    width: 1,
+                    width: 256,
                     height: 1,
                     depth: 1,
                 },
@@ -6511,6 +6989,33 @@ pub mod platform {
             start_position: usize,
             tokens: usize,
         ) -> Result<(), String> {
+            self.encode_attention_batch_with_plan(
+                context,
+                query,
+                key_cache,
+                value_cache,
+                output,
+                start_position,
+                tokens,
+                attention_batch_simd_enabled(),
+            )
+        }
+
+        /// Encode batched verifier attention with an explicit planner choice.
+        /// The legacy method above remains for standalone benchmark callers;
+        /// Runtime V2 production verification must pass the resolved plan so
+        /// attention selection is not read from process-global environment.
+        pub fn encode_attention_batch_with_plan(
+            &mut self,
+            context: &MetalContext,
+            query: &RuntimeBuffer,
+            key_cache: &RuntimeBuffer,
+            value_cache: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            start_position: usize,
+            tokens: usize,
+            use_batch_simd: bool,
+        ) -> Result<(), String> {
             if tokens == 0 {
                 return Err("batched attention requires at least one token".to_owned());
             }
@@ -6535,23 +7040,19 @@ pub mod platform {
                 start_position: start_position as u32,
                 tokens: tokens as u32,
             };
-            let kernel = if attention_batch_simd_enabled() {
+            let kernel = if use_batch_simd {
                 DecodeKernel::AttentionBatchSimd
             } else {
                 DecodeKernel::AttentionBatch
             };
-            let threads = if attention_batch_simd_enabled() {
-                512
-            } else {
-                256
-            };
+            let threads = if use_batch_simd { 512 } else { 256 };
             self.encode_decode_kernel(
                 context,
                 kernel,
                 &[query, key_cache, value_cache, output],
                 bytes_of(&params),
                 MTLSize {
-                    width: if attention_batch_simd_enabled() {
+                    width: if use_batch_simd {
                         tokens
                     } else {
                         tokens * hidden
@@ -6886,7 +7387,35 @@ pub mod platform {
             length: usize,
         ) -> Result<(), String> {
             if attention_softmax_simd_enabled() {
-                return self.encode_attention_softmax_simd(context, scores, length);
+                if length == 0 || length > 512 {
+                    return Err("one-pass attention softmax length is outside 1..=512".to_owned());
+                }
+                let pipeline = context.attention_softmax_onepass_pipeline()?;
+                let length = length as u32;
+                self.encoder.setComputePipelineState(&pipeline);
+                unsafe {
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(&scores.buffer), scores.offset, 0);
+                    self.encoder.setBytes_length_atIndex(
+                        NonNull::from(&length).cast(),
+                        std::mem::size_of_val(&length),
+                        1,
+                    );
+                }
+                self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: 16,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                self.dispatches += 1;
+                return Ok(());
             }
             #[repr(C)]
             struct Params {
@@ -6913,6 +7442,7 @@ pub mod platform {
             )
         }
 
+        #[allow(dead_code)]
         fn encode_attention_softmax_simd(
             &mut self,
             context: &MetalContext,
@@ -7134,6 +7664,56 @@ pub mod platform {
                     depth: 1,
                 },
             )
+        }
+
+        pub fn encode_residual_rms_scalar(
+            &mut self,
+            context: &MetalContext,
+            left: &RuntimeBuffer,
+            right: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            inverse_rms: &RuntimeBuffer,
+            scale: f32,
+        ) -> Result<(), String> {
+            if left.length < 1024 * std::mem::size_of::<f32>()
+                || right.length < 1024 * std::mem::size_of::<f32>()
+                || output.length < 1024 * std::mem::size_of::<f32>()
+                || inverse_rms.length < std::mem::size_of::<f32>()
+            {
+                return Err("residual/RMS buffers are smaller than the fixed shape".to_owned());
+            }
+            let pipeline = context.residual_rms_pipeline()?;
+            self.encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                for (buffer, offset, index) in [
+                    (&left.buffer, left.offset, 0),
+                    (&right.buffer, right.offset, 1),
+                    (&output.buffer, output.offset, 2),
+                    (&inverse_rms.buffer, inverse_rms.offset, 3),
+                ] {
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(buffer), offset, index);
+                }
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&scale).cast(),
+                    std::mem::size_of_val(&scale),
+                    4,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
         }
 
         pub fn encode_residual_batch(
@@ -7526,18 +8106,26 @@ pub mod platform {
                 dense_pipeline: Mutex::new(None),
                 f16_dense_pipeline: Mutex::new(None),
                 q4_dense_library: Mutex::new(None),
+                residual_rms_pipeline: Mutex::new(None),
+                attention_softmax_onepass_pipeline: Mutex::new(None),
                 q4_dense_pipeline: Mutex::new(None),
                 q4_dense_simd_pipeline: Mutex::new(None),
+                q4_dense_superblock_simd_pipeline: Mutex::new(None),
+                q4_dense_superblock_norm_pipeline: Mutex::new(None),
                 q4_dense_batch_simd_pipeline: Mutex::new(None),
                 q4_dense_weight_stationary_pipeline: Mutex::new(None),
                 q4_dense_sweep_pipeline: Mutex::new(None),
                 q4_dense_argmax_pipeline: Mutex::new(None),
                 q4_dense_argmax_norm_pipeline: Mutex::new(None),
+                q4_dense_argmax_superblock_pipeline: Mutex::new(None),
+                q4_dense_argmax_superblock_norm_pipeline: Mutex::new(None),
                 q4_dense_argmax_unique_packet_pipeline: Mutex::new(None),
                 q4_dense_argmax_unique_packet_norm_pipeline: Mutex::new(None),
                 q4_qkv_pipeline: Mutex::new(None),
                 q4_qkv_simd_pipeline: Mutex::new(None),
                 q4_qkv_simd_norm_pipeline: Mutex::new(None),
+                q4_qkv_superblock_simd_pipeline: Mutex::new(None),
+                q4_qkv_superblock_norm_pipeline: Mutex::new(None),
                 q4_qkv_sweep_pipeline: Mutex::new(None),
                 q4_gemv_pipeline: Mutex::new(None),
                 q4_simd_gemv_pipeline: Mutex::new(None),
@@ -7547,6 +8135,8 @@ pub mod platform {
                 dynamic_moe_simd_pipeline: Mutex::new(None),
                 q4_embedding_pipeline: Mutex::new(None),
                 q4_embedding_batch_pipeline: Mutex::new(None),
+                q4_embedding_superblock_pipeline: Mutex::new(None),
+                q4_embedding_superblock_batch_pipeline: Mutex::new(None),
                 argmax_partial_pipeline: Mutex::new(None),
                 argmax_reduce_pipeline: Mutex::new(None),
                 argmax_reduce_partials_pipeline: Mutex::new(None),
@@ -7554,8 +8144,7 @@ pub mod platform {
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
-                    None,
-                    None,
+                    None, None,
                 ]),
                 scratch: Mutex::new(MetalScratch {
                     input_f32: None,
@@ -7606,6 +8195,74 @@ pub mod platform {
 
         pub fn current_allocated_bytes(&self) -> u64 {
             self.device.currentAllocatedSize() as u64
+        }
+
+        /// Enumerate the counter sets visible to the process. Keep this
+        /// separate from stage timestamps: timestamps are broadly available,
+        /// while stage-utilization/statistic counters are device- and
+        /// entitlement-dependent on Apple platforms.
+        pub fn counter_inventory(&self) -> Vec<MetalCounterSetInfo> {
+            let Some(sets) = self.device.counterSets() else {
+                return Vec::new();
+            };
+            (0..sets.count())
+                .map(|index| {
+                    let set = sets.objectAtIndex(index);
+                    let counters = set.counters();
+                    MetalCounterSetInfo {
+                        name: set.name().to_string(),
+                        counters: (0..counters.count())
+                            .map(|counter_index| {
+                                counters.objectAtIndex(counter_index).name().to_string()
+                            })
+                            .collect(),
+                    }
+                })
+                .collect()
+        }
+
+        /// Compile the production dynamic-MoE source and expose the target's
+        /// pipeline metadata for the selected entry points. This is not a
+        /// performance benchmark: it is the compiler-visible hardware shape
+        /// used to distinguish a real consumer change from a source-only
+        /// change.
+        pub fn dynamic_moe_kernel_inventory(&self) -> Result<Vec<MetalKernelInfo>, String> {
+            let source = NSString::from_str(DYNAMIC_MOE_KERNEL_SOURCE);
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&source, None)
+                .map_err(|_| "Metal dynamic-MoE library compilation failed".to_owned())?;
+            let mut names = Vec::new();
+            for index in 0..library.functionNames().count() {
+                let name = library.functionNames().objectAtIndex(index).to_string();
+                if name.contains("gate_up_inline")
+                    || name.contains("down")
+                    || name.contains("verifier")
+                {
+                    names.push(name);
+                }
+            }
+            names.sort();
+            names
+                .into_iter()
+                .map(|name| {
+                    let function = library
+                        .newFunctionWithName(&NSString::from_str(&name))
+                        .ok_or_else(|| format!("Metal function not found: {name}"))?;
+                    let pipeline = self
+                        .device
+                        .newComputePipelineStateWithFunction_error(&function)
+                        .map_err(|_| format!("Metal pipeline creation failed: {name}"))?;
+                    Ok(MetalKernelInfo {
+                        name,
+                        thread_execution_width: pipeline.threadExecutionWidth() as usize,
+                        max_threads_per_threadgroup: pipeline.maxTotalThreadsPerThreadgroup()
+                            as usize,
+                        static_threadgroup_memory_bytes: pipeline.staticThreadgroupMemoryLength()
+                            as usize,
+                    })
+                })
+                .collect()
         }
 
         pub fn recommended_working_set_bytes(&self) -> u64 {
@@ -8101,6 +8758,50 @@ pub mod platform {
             Ok(value)
         }
 
+        fn residual_rms_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .residual_rms_pipeline
+                .lock()
+                .map_err(|_| "Metal residual/RMS pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_residual_rms_scalar");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal residual/RMS function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal residual/RMS pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn attention_softmax_onepass_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .attention_softmax_onepass_pipeline
+                .lock()
+                .map_err(|_| "Metal one-pass attention softmax cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_attention_softmax_onepass_simd");
+            let function = library.newFunctionWithName(&name).ok_or_else(|| {
+                "Metal one-pass attention softmax function was not found".to_owned()
+            })?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| {
+                    "Metal one-pass attention softmax pipeline creation failed".to_owned()
+                })?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
         fn q4_dense_pipeline(&self) -> Result<Pipeline, String> {
             let mut pipeline = self
                 .q4_dense_pipeline
@@ -8139,6 +8840,50 @@ pub mod platform {
                 .device
                 .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|_| "Metal SIMD Q4 dense pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_dense_superblock_simd_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_superblock_simd_pipeline
+                .lock()
+                .map_err(|_| "Metal superblock Q4 dense pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_superblock144_simd_gemv");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal superblock Q4 dense function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal superblock Q4 dense pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_dense_superblock_norm_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_superblock_norm_pipeline
+                .lock()
+                .map_err(|_| "Metal normalized superblock Q4 dense cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_superblock144_norm_simd_gemv");
+            let function = library.newFunctionWithName(&name).ok_or_else(|| {
+                "Metal normalized superblock Q4 dense function was not found".to_owned()
+            })?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| {
+                    "Metal normalized superblock Q4 dense pipeline creation failed".to_owned()
+                })?;
             *pipeline = Some(value.clone());
             Ok(value)
         }
@@ -8311,6 +9056,50 @@ pub mod platform {
             Ok(value)
         }
 
+        fn q4_qkv_superblock_simd_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_qkv_superblock_simd_pipeline
+                .lock()
+                .map_err(|_| "Metal superblock QKV pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_qkv_superblock144_simd_gemv");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal superblock QKV function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal superblock QKV pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_qkv_superblock_norm_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_qkv_superblock_norm_pipeline
+                .lock()
+                .map_err(|_| "Metal normalized superblock QKV cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_qkv_superblock144_norm_simd_gemv");
+            let function = library.newFunctionWithName(&name).ok_or_else(|| {
+                "Metal normalized superblock QKV function was not found".to_owned()
+            })?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| {
+                    "Metal normalized superblock QKV pipeline creation failed".to_owned()
+                })?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
         fn q4_qkv_sweep_pipeline(&self) -> Result<Pipeline, String> {
             let mut pipeline = self
                 .q4_qkv_sweep_pipeline
@@ -8451,6 +9240,60 @@ pub mod platform {
             Ok(value)
         }
 
+        fn q4_embedding_superblock_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_embedding_superblock_pipeline
+                .lock()
+                .map_err(|_| "Metal superblock embedding cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let source = NSString::from_str(Q4_EMBEDDING_KERNEL_SOURCE);
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&source, None)
+                .map_err(|_| "Metal superblock embedding library compilation failed".to_owned())?;
+            let name = NSString::from_str("qx_q4_embedding_superblock144_lookup");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal superblock embedding function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal superblock embedding pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_embedding_superblock_batch_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_embedding_superblock_batch_pipeline
+                .lock()
+                .map_err(|_| "Metal batch superblock embedding cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let source = NSString::from_str(Q4_EMBEDDING_KERNEL_SOURCE);
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&source, None)
+                .map_err(|_| {
+                    "Metal batch superblock embedding library compilation failed".to_owned()
+                })?;
+            let name = NSString::from_str("qx_q4_embedding_superblock144_lookup_batch");
+            let function = library.newFunctionWithName(&name).ok_or_else(|| {
+                "Metal batch superblock embedding function was not found".to_owned()
+            })?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| {
+                    "Metal batch superblock embedding pipeline creation failed".to_owned()
+                })?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
         fn argmax_partial_pipeline(&self) -> Result<Pipeline, String> {
             let mut pipeline = self
                 .argmax_partial_pipeline
@@ -8545,6 +9388,52 @@ pub mod platform {
                 .device
                 .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|_| "Metal normalized Q4 argmax pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_dense_argmax_superblock_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_argmax_superblock_pipeline
+                .lock()
+                .map_err(|_| "Metal superblock Q4 argmax cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_argmax_superblock144_partial");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal superblock Q4 argmax function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal superblock Q4 argmax pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn q4_dense_argmax_superblock_norm_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .q4_dense_argmax_superblock_norm_pipeline
+                .lock()
+                .map_err(|_| {
+                    "Metal normalized superblock Q4 argmax cache is poisoned".to_owned()
+                })?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_q4_dense_argmax_superblock144_norm_partial");
+            let function = library.newFunctionWithName(&name).ok_or_else(|| {
+                "Metal normalized superblock Q4 argmax function was not found".to_owned()
+            })?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| {
+                    "Metal normalized superblock Q4 argmax pipeline creation failed".to_owned()
+                })?;
             *pipeline = Some(value.clone());
             Ok(value)
         }
@@ -8837,23 +9726,44 @@ pub mod platform {
                 scales,
                 rows: weights.rows,
                 columns: weights.cols,
+                layout: PackingLayout::RowMajor,
             })
         }
 
-        /// Prepare a row-major group-32 Q4 dense matrix from views into a
-        /// static artifact slab without reconstructing a QuantizedTensor.
+        /// Prepare a group-32 Q4 dense matrix from views into a static
+        /// artifact slab without reconstructing a QuantizedTensor.
         pub fn prepare_q4_dense_runtime_views(
             &self,
             packed: RuntimeBuffer,
             scales: RuntimeBuffer,
             rows: usize,
             columns: usize,
+            layout: PackingLayout,
         ) -> Result<PreparedQuantizedDense, String> {
             if rows == 0 || columns == 0 || columns % 32 != 0 {
                 return Err("no-copy Q4 dense has an invalid shape".to_owned());
             }
-            let expected_packed = rows * columns / 2;
-            let expected_scales = rows * (columns / 32) * 2;
+            if !matches!(
+                layout,
+                PackingLayout::RowMajor | PackingLayout::Q4Superblock144
+            ) {
+                return Err("no-copy Q4 dense has an unsupported layout".to_owned());
+            }
+            if layout == PackingLayout::Q4Superblock144 && columns % 256 != 0 {
+                return Err(
+                    "no-copy superblock Q4 dense columns must be divisible by 256".to_owned(),
+                );
+            }
+            let expected_packed = if layout == PackingLayout::Q4Superblock144 {
+                rows * (columns / 256) * 144
+            } else {
+                rows * columns / 2
+            };
+            let expected_scales = if layout == PackingLayout::Q4Superblock144 {
+                expected_packed
+            } else {
+                rows * (columns / 32) * 2
+            };
             if packed.length != expected_packed || scales.length != expected_scales {
                 return Err(format!(
                     "no-copy Q4 dense byte lengths are {}/{}, expected {expected_packed}/{expected_scales}",
@@ -8862,15 +9772,24 @@ pub mod platform {
             }
             Ok(PreparedQuantizedDense {
                 pipeline: self.q4_dense_pipeline()?,
-                simd_pipeline: self.q4_dense_simd_pipeline()?,
+                simd_pipeline: if layout == PackingLayout::Q4Superblock144 {
+                    self.q4_dense_superblock_simd_pipeline()?
+                } else {
+                    self.q4_dense_simd_pipeline()?
+                },
                 batch_simd_pipeline: self.q4_dense_batch_simd_pipeline()?,
                 weight_stationary_batch_pipeline: self.q4_dense_weight_stationary_pipeline()?,
                 sweep_pipeline: self.q4_dense_sweep_pipeline()?,
-                simd_norm_pipeline: self.q4_simd_norm_gemv_pipeline()?,
+                simd_norm_pipeline: if layout == PackingLayout::Q4Superblock144 {
+                    self.q4_dense_superblock_norm_pipeline()?
+                } else {
+                    self.q4_simd_norm_gemv_pipeline()?
+                },
                 packed,
                 scales,
                 rows,
                 columns,
+                layout,
             })
         }
 
@@ -9247,13 +10166,23 @@ pub mod platform {
                 || query.columns != 1024
                 || key.columns != 1024
                 || value.columns != 1024
+                || query.layout != key.layout
+                || query.layout != value.layout
             {
                 return Err("fused QKV requires Granite 1024x1024/512 projections".to_owned());
             }
             Ok(PreparedQuantizedQkv {
                 pipeline: self.q4_qkv_pipeline()?,
-                simd_pipeline: self.q4_qkv_simd_pipeline()?,
-                simd_norm_pipeline: self.q4_qkv_simd_norm_pipeline()?,
+                simd_pipeline: if query.layout == PackingLayout::Q4Superblock144 {
+                    self.q4_qkv_superblock_simd_pipeline()?
+                } else {
+                    self.q4_qkv_simd_pipeline()?
+                },
+                simd_norm_pipeline: if query.layout == PackingLayout::Q4Superblock144 {
+                    self.q4_qkv_superblock_norm_pipeline()?
+                } else {
+                    self.q4_qkv_simd_norm_pipeline()?
+                },
                 split_simd_pipeline: self.q4_dense_simd_pipeline()?,
                 split_simd_norm_pipeline: self.q4_simd_norm_gemv_pipeline()?,
                 sweep_pipeline: self.q4_qkv_sweep_pipeline()?,
@@ -9264,6 +10193,7 @@ pub mod platform {
                 v_packed: value.packed.clone(),
                 v_scales: value.scales.clone(),
                 columns: query.columns,
+                layout: query.layout,
             })
         }
 
@@ -9335,14 +10265,26 @@ pub mod platform {
                             _ => 0,
                         }
                 && down_scales.len() == down_packed.len();
+            let is_q4_superblock_gate = gate_up_layout.is_q4_superblock()
+                && gate_up_packed.len() == EXPERTS * Q4_TRANSACTION_GATE_UP_144
+                && gate_up_scales.len() == gate_up_packed.len();
+            let is_q4_superblock_down = down_layout.is_q4_superblock()
+                && down_packed.len() == EXPERTS * Q4_TRANSACTION_DOWN_144
+                && down_scales.len() == down_packed.len();
             let is_q4_cross_expert_gate = gate_up_layout == PackingLayout::Q4CrossExpertTile8
                 && gate_up_packed.len() == Q4_CROSS_EXPERT_GATE_UP
                 && gate_up_scales.len() == Q4_CROSS_EXPERT_GATE_UP;
             let is_q4_cross_expert_down = down_layout == PackingLayout::Q4CrossExpertTile8
                 && down_packed.len() == Q4_CROSS_EXPERT_DOWN
                 && down_scales.len() == Q4_CROSS_EXPERT_DOWN;
-            let is_q4_gate = is_q4_gate || is_q4_transaction_gate || is_q4_cross_expert_gate;
-            let is_q4_down = is_q4_down || is_q4_transaction_down || is_q4_cross_expert_down;
+            let is_q4_gate = is_q4_gate
+                || is_q4_transaction_gate
+                || is_q4_superblock_gate
+                || is_q4_cross_expert_gate;
+            let is_q4_down = is_q4_down
+                || is_q4_transaction_down
+                || is_q4_superblock_down
+                || is_q4_cross_expert_down;
             let is_q4 = is_q4_gate && is_q4_down;
             let is_q4k = gate_up_packed.len() == EXPERTS * Q4K_GATE_UP_PACKED
                 && gate_up_scales.len() == EXPERTS * Q4K_GATE_UP_SCALES
@@ -9351,6 +10293,8 @@ pub mod platform {
             if (!is_q4 && !is_q4k)
                 || (gate_up_layout.is_q4_transaction() && !is_q4_transaction_gate)
                 || (down_layout.is_q4_transaction() && !is_q4_transaction_down)
+                || (gate_up_layout.is_q4_superblock() && !is_q4_superblock_gate)
+                || (down_layout.is_q4_superblock() && !is_q4_superblock_down)
                 || (gate_up_layout == PackingLayout::Q4CrossExpertTile8 && !is_q4_cross_expert_gate)
                 || (down_layout == PackingLayout::Q4CrossExpertTile8 && !is_q4_cross_expert_down)
             {
@@ -9368,20 +10312,36 @@ pub mod platform {
             } else {
                 self.input_runtime_buffer(down_scales)?
             };
-            let gate_up_pipeline = if is_q4k {
+            let gate_up_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_simd"
+            } else if is_q4k {
                 "qx_dynamic_q4k_moe_gate_up_simd"
             } else {
                 "qx_dynamic_q4_moe_gate_up_simd"
             };
-            let gate_up_norm_pipeline = if is_q4k {
+            let gate_up_norm_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_norm_simd"
+            } else if is_q4k {
                 "qx_dynamic_q4k_moe_gate_up_norm_simd"
             } else {
                 "qx_dynamic_q4_moe_gate_up_norm_simd"
             };
-            let down_pipeline = if is_q4k {
+            let down_pipeline = if down_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_down_superblock144_simd"
+            } else if is_q4k {
                 "qx_dynamic_q4k_moe_down_simd"
             } else {
                 "qx_dynamic_q4_moe_down_simd"
+            };
+            let fused_block_qx_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_simd"
+            } else {
+                "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd"
+            };
+            let fused_block_qx_norm_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_norm_simd"
+            } else {
+                "qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd"
             };
             Ok(PreparedDynamicQ4Moe {
                 unique_packet_gate_up_pipeline: self.dynamic_moe_named_pipeline(
@@ -9402,10 +10362,40 @@ pub mod platform {
                 verifier_gate_up_compact_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_verifier_q4_moe_gate_up_compact_unique_packet",
                 )?,
+                verifier_gate_up_compact_unique_packet_k2_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k2",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_vector_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_vector",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_split_accum_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_split_accum",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_direct_activation_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_direct_activation",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_rows16_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_rows16",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_unroll4_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_unroll4",
+                    )?,
                 verifier_silu_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_silu_batch")?,
                 verifier_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_down_batch")?,
+                verifier_down_compact_unique_packet_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_q4_moe_down_compact_unique_packet")?,
+                verifier_down_compact_unique_packet_k4_unroll4_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_down_compact_unique_packet_k4_unroll4",
+                    )?,
                 verifier_accumulate_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_accumulate_batch")?,
                 unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
@@ -9480,6 +10470,14 @@ pub mod platform {
                 two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
                 )?),
+                two_row_unique_packet_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_two_row_unique_packet_simd",
+                )?),
+                two_row_unique_packet_gate_up_norm_pipeline: Some(
+                    self.dynamic_moe_named_pipeline(
+                        "qx_dynamic_q4_moe_gate_up_two_row_unique_packet_norm_simd",
+                    )?,
+                ),
                 gate_up_instrument_staging_only_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_staging_only_simd",
                 )?,
@@ -9522,13 +10520,11 @@ pub mod platform {
                 q4k_mature_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_norm_simd")?,
                 fused_block_qx_gate_up_pipeline: Some(
-                    self.dynamic_moe_named_pipeline(
-                        "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
-                    )?,
+                    self.dynamic_moe_named_pipeline(fused_block_qx_pipeline)?,
                 ),
-                fused_block_qx_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
-                    "qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd",
-                )?),
+                fused_block_qx_gate_up_norm_pipeline: Some(
+                    self.dynamic_moe_named_pipeline(fused_block_qx_norm_pipeline)?,
+                ),
                 fused_block_llama_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_fused_block_llama_simd",
                 )?),
@@ -9695,14 +10691,26 @@ pub mod platform {
                             _ => 0,
                         }
                 && down_scales.length == down_packed.length;
+            let is_q4_superblock_gate = gate_up_layout.is_q4_superblock()
+                && gate_up_packed.length == EXPERTS * Q4_TRANSACTION_GATE_UP_144
+                && gate_up_scales.length == gate_up_packed.length;
+            let is_q4_superblock_down = down_layout.is_q4_superblock()
+                && down_packed.length == EXPERTS * Q4_TRANSACTION_DOWN_144
+                && down_scales.length == down_packed.length;
             let is_q4_cross_expert_gate = gate_up_layout == PackingLayout::Q4CrossExpertTile8
                 && gate_up_packed.length == Q4_CROSS_EXPERT_GATE_UP
                 && gate_up_scales.length == Q4_CROSS_EXPERT_GATE_UP;
             let is_q4_cross_expert_down = down_layout == PackingLayout::Q4CrossExpertTile8
                 && down_packed.length == Q4_CROSS_EXPERT_DOWN
                 && down_scales.length == Q4_CROSS_EXPERT_DOWN;
-            let is_q4_gate = is_q4_gate || is_q4_transaction_gate || is_q4_cross_expert_gate;
-            let is_q4_down = is_q4_down || is_q4_transaction_down || is_q4_cross_expert_down;
+            let is_q4_gate = is_q4_gate
+                || is_q4_transaction_gate
+                || is_q4_superblock_gate
+                || is_q4_cross_expert_gate;
+            let is_q4_down = is_q4_down
+                || is_q4_transaction_down
+                || is_q4_superblock_down
+                || is_q4_cross_expert_down;
             let is_q4 = is_q4_gate && is_q4_down;
             let is_q4k = gate_up_packed.length == EXPERTS * Q4K_GATE_UP_PACKED
                 && gate_up_scales.length == EXPERTS * Q4K_GATE_UP_SCALES
@@ -9729,25 +10737,43 @@ pub mod platform {
                 && !is_q4_gate_q3_down)
                 || (gate_up_layout.is_q4_transaction() && !is_q4_transaction_gate)
                 || (down_layout.is_q4_transaction() && !is_q4_transaction_down)
+                || (gate_up_layout.is_q4_superblock() && !is_q4_superblock_gate)
+                || (down_layout.is_q4_superblock() && !is_q4_superblock_down)
                 || (gate_up_layout == PackingLayout::Q4CrossExpertTile8 && !is_q4_cross_expert_gate)
                 || (down_layout == PackingLayout::Q4CrossExpertTile8 && !is_q4_cross_expert_down)
             {
                 return Err("dynamic Q4 MoE slab views have an invalid Granite shape".to_owned());
             }
-            let gate_up_pipeline = if is_q4k {
+            let gate_up_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_simd"
+            } else if is_q4k {
                 "qx_dynamic_q4k_moe_gate_up_simd"
             } else {
                 "qx_dynamic_q4_moe_gate_up_simd"
             };
-            let gate_up_norm_pipeline = if is_q4k {
+            let gate_up_norm_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_norm_simd"
+            } else if is_q4k {
                 "qx_dynamic_q4k_moe_gate_up_norm_simd"
             } else {
                 "qx_dynamic_q4_moe_gate_up_norm_simd"
             };
-            let down_pipeline = if is_q4k {
+            let down_pipeline = if down_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_down_superblock144_simd"
+            } else if is_q4k {
                 "qx_dynamic_q4k_moe_down_simd"
             } else {
                 "qx_dynamic_q4_moe_down_simd"
+            };
+            let fused_block_qx_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_simd"
+            } else {
+                "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd"
+            };
+            let fused_block_qx_norm_pipeline = if gate_up_layout.is_q4_superblock() {
+                "qx_dynamic_q4_moe_gate_up_superblock144_norm_simd"
+            } else {
+                "qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd"
             };
             let mut prepared = PreparedDynamicQ4Moe {
                 unique_packet_gate_up_pipeline: self.dynamic_moe_named_pipeline(
@@ -9768,10 +10794,40 @@ pub mod platform {
                 verifier_gate_up_compact_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_verifier_q4_moe_gate_up_compact_unique_packet",
                 )?,
+                verifier_gate_up_compact_unique_packet_k2_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k2",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_vector_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_vector",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_split_accum_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_split_accum",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_direct_activation_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_direct_activation",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_rows16_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_rows16",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_unroll4_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_unroll4",
+                    )?,
                 verifier_silu_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_silu_batch")?,
                 verifier_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_down_batch")?,
+                verifier_down_compact_unique_packet_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_q4_moe_down_compact_unique_packet")?,
+                verifier_down_compact_unique_packet_k4_unroll4_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_down_compact_unique_packet_k4_unroll4",
+                    )?,
                 verifier_accumulate_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_accumulate_batch")?,
                 unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
@@ -9853,6 +10909,14 @@ pub mod platform {
                 two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
                 )?),
+                two_row_unique_packet_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_two_row_unique_packet_simd",
+                )?),
+                two_row_unique_packet_gate_up_norm_pipeline: Some(
+                    self.dynamic_moe_named_pipeline(
+                        "qx_dynamic_q4_moe_gate_up_two_row_unique_packet_norm_simd",
+                    )?,
+                ),
                 gate_up_instrument_staging_only_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_staging_only_simd",
                 )?,
@@ -9888,13 +10952,11 @@ pub mod platform {
                 q4k_mature_gate_up_norm_pipeline: self
                     .dynamic_moe_named_pipeline("qx_dynamic_q4k_moe_gate_up_mature_norm_simd")?,
                 fused_block_qx_gate_up_pipeline: Some(
-                    self.dynamic_moe_named_pipeline(
-                        "qx_dynamic_q4_moe_gate_up_fused_block_qx_simd",
-                    )?,
+                    self.dynamic_moe_named_pipeline(fused_block_qx_pipeline)?,
                 ),
-                fused_block_qx_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
-                    "qx_dynamic_q4_moe_gate_up_fused_block_qx_norm_simd",
-                )?),
+                fused_block_qx_gate_up_norm_pipeline: Some(
+                    self.dynamic_moe_named_pipeline(fused_block_qx_norm_pipeline)?,
+                ),
                 fused_block_llama_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_fused_block_llama_simd",
                 )?),
@@ -10090,10 +11152,40 @@ pub mod platform {
                 verifier_gate_up_compact_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_verifier_q4_moe_gate_up_compact_unique_packet",
                 )?,
+                verifier_gate_up_compact_unique_packet_k2_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k2",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_vector_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_vector",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_split_accum_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_split_accum",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_direct_activation_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_direct_activation",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_rows16_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_rows16",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_unroll4_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_unroll4",
+                    )?,
                 verifier_silu_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_silu_batch")?,
                 verifier_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_down_batch")?,
+                verifier_down_compact_unique_packet_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_q4_moe_down_compact_unique_packet")?,
+                verifier_down_compact_unique_packet_k4_unroll4_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_down_compact_unique_packet_k4_unroll4",
+                    )?,
                 verifier_accumulate_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_accumulate_batch")?,
                 unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
@@ -10172,6 +11264,14 @@ pub mod platform {
                 two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
                 )?),
+                two_row_unique_packet_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_two_row_unique_packet_simd",
+                )?),
+                two_row_unique_packet_gate_up_norm_pipeline: Some(
+                    self.dynamic_moe_named_pipeline(
+                        "qx_dynamic_q4_moe_gate_up_two_row_unique_packet_norm_simd",
+                    )?,
+                ),
                 gate_up_instrument_staging_only_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_staging_only_simd",
                 )?,
@@ -10492,10 +11592,40 @@ pub mod platform {
                 verifier_gate_up_compact_unique_packet_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_verifier_q4_moe_gate_up_compact_unique_packet",
                 )?,
+                verifier_gate_up_compact_unique_packet_k2_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k2",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_vector_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_vector",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_split_accum_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_split_accum",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_direct_activation_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_direct_activation",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_rows16_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_rows16",
+                    )?,
+                verifier_gate_up_compact_unique_packet_k4_unroll4_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_unroll4",
+                    )?,
                 verifier_silu_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_silu_batch")?,
                 verifier_down_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_down_batch")?,
+                verifier_down_compact_unique_packet_pipeline: self
+                    .dynamic_moe_named_pipeline("qx_verifier_q4_moe_down_compact_unique_packet")?,
+                verifier_down_compact_unique_packet_k4_unroll4_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_down_compact_unique_packet_k4_unroll4",
+                    )?,
                 verifier_accumulate_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_accumulate_batch")?,
                 unique_packet_gate_up_norm_pipeline: self.dynamic_moe_named_pipeline(
@@ -10574,6 +11704,14 @@ pub mod platform {
                 two_row_dataflow_gate_up_norm_pipeline: Some(self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_two_row_dataflow_norm_simd",
                 )?),
+                two_row_unique_packet_gate_up_pipeline: Some(self.dynamic_moe_named_pipeline(
+                    "qx_dynamic_q4_moe_gate_up_two_row_unique_packet_simd",
+                )?),
+                two_row_unique_packet_gate_up_norm_pipeline: Some(
+                    self.dynamic_moe_named_pipeline(
+                        "qx_dynamic_q4_moe_gate_up_two_row_unique_packet_norm_simd",
+                    )?,
+                ),
                 gate_up_instrument_staging_only_pipeline: self.dynamic_moe_named_pipeline(
                     "qx_dynamic_q4_moe_gate_up_inline_staging_only_simd",
                 )?,
@@ -10760,8 +11898,16 @@ pub mod platform {
             weights: &PreparedQuantizedDense,
         ) -> Result<PreparedQ4Embedding, String> {
             Ok(PreparedQ4Embedding {
-                pipeline: self.q4_embedding_pipeline()?,
-                batch_pipeline: self.q4_embedding_batch_pipeline()?,
+                pipeline: if weights.layout == PackingLayout::Q4Superblock144 {
+                    self.q4_embedding_superblock_pipeline()?
+                } else {
+                    self.q4_embedding_pipeline()?
+                },
+                batch_pipeline: if weights.layout == PackingLayout::Q4Superblock144 {
+                    self.q4_embedding_superblock_batch_pipeline()?
+                } else {
+                    self.q4_embedding_batch_pipeline()?
+                },
                 packed: weights.packed.clone(),
                 scales: weights.scales.clone(),
                 rows: weights.rows,
@@ -11709,11 +12855,33 @@ pub mod platform {
 
 #[cfg(not(target_os = "macos"))]
 pub mod platform {
+    #[derive(Clone, Debug, Default)]
+    pub struct MetalCounterSetInfo {
+        pub name: String,
+        pub counters: Vec<String>,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    pub struct MetalKernelInfo {
+        pub name: String,
+        pub thread_execution_width: usize,
+        pub max_threads_per_threadgroup: usize,
+        pub static_threadgroup_memory_bytes: usize,
+    }
+
     pub struct MetalContext;
 
     impl MetalContext {
         pub fn system_default() -> Option<Self> {
             None
+        }
+
+        pub fn counter_inventory(&self) -> Vec<MetalCounterSetInfo> {
+            Vec::new()
+        }
+
+        pub fn dynamic_moe_kernel_inventory(&self) -> Result<Vec<MetalKernelInfo>, String> {
+            Err("Metal kernel inventory requires macOS".to_owned())
         }
     }
 }
@@ -11744,6 +12912,16 @@ mod tests {
         }
         assert!(DYNAMIC_MOE_KERNEL_SOURCE.contains("layout == 7 || layout == 8"));
         assert!(DYNAMIC_MOE_KERNEL_SOURCE.contains("layout == 8 ? 160 : 144"));
+        for name in [
+            "qx_dynamic_q4_moe_gate_up_superblock144_simd",
+            "qx_dynamic_q4_moe_gate_up_superblock144_norm_simd",
+            "qx_dynamic_q4_moe_down_superblock144_simd",
+        ] {
+            assert!(
+                DYNAMIC_MOE_KERNEL_SOURCE.contains(name),
+                "missing Metal entry point: {name}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -12616,7 +13794,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn transaction_144_and_160_dispatches_have_identical_projection_results() {
+    fn block_layout_dispatches_have_identical_projection_results() {
         use half::f16;
 
         fn transaction_stream(
@@ -12645,13 +13823,41 @@ mod tests {
             stream
         }
 
+        fn superblock_stream(experts: usize, rows: usize, groups: usize) -> Vec<u8> {
+            let blocks = groups / 8;
+            let expert_bytes = rows * blocks * 144;
+            let mut stream = vec![0_u8; experts * expert_bytes];
+            for expert in 0..experts {
+                for row in 0..rows {
+                    for block in 0..blocks {
+                        let block_start = expert * expert_bytes + (row * blocks + block) * 144;
+                        stream[block_start..block_start + 128].fill(0x88);
+                        for group in 0..8 {
+                            let scale_start = block_start + 128 + group * 2;
+                            stream[scale_start..scale_start + 2]
+                                .copy_from_slice(&f16::from_f32(1.0).to_bits().to_le_bytes());
+                        }
+                    }
+                }
+            }
+            stream
+        }
+
         let context = platform::MetalContext::system_default().expect("Metal device");
         let input_values = [1.0_f32; 1024];
         let ids_values = [0_u32, 1, 2, 3, 4, 5, 6, 7];
         let weights_values = [0.125_f32; 8];
         let run = |layout, block_bytes| {
-            let gate_up = transaction_stream(32, 1024, 32, block_bytes);
-            let down = transaction_stream(32, 1024, 16, block_bytes);
+            let gate_up = if layout == PackingLayout::Q4Superblock144 {
+                superblock_stream(32, 1024, 32)
+            } else {
+                transaction_stream(32, 1024, 32, block_bytes)
+            };
+            let down = if layout == PackingLayout::Q4Superblock144 {
+                superblock_stream(32, 1024, 16)
+            } else {
+                transaction_stream(32, 1024, 16, block_bytes)
+            };
             let prepared = context
                 .prepare_dynamic_q4_moe_with_layouts(
                     &gate_up, &gate_up, &down, &down, layout, layout,
@@ -12714,7 +13920,9 @@ mod tests {
                 .unwrap();
             let mut graph = context.begin_decode().unwrap();
             graph
-                .encode_dynamic_q4_moe(&prepared, &input, &ids, &weights, &output)
+                .encode_dynamic_q4_moe_batched_simd(
+                    &prepared, &input, &ids, &weights, &scratch, &output,
+                )
                 .unwrap();
             graph.finish(&context).unwrap();
             (
@@ -12726,6 +13934,8 @@ mod tests {
 
         let (dense_stage, dense_down, dense) = run(PackingLayout::Q4Transaction144, 144);
         let (padded_stage, padded_down, padded) = run(PackingLayout::Q4Transaction160, 160);
+        let (superblock_stage, superblock_down, superblock) =
+            run(PackingLayout::Q4Superblock144, 144);
         let stage_error = dense_stage
             .iter()
             .zip(&padded_stage)
@@ -12741,6 +13951,21 @@ mod tests {
             .zip(&padded_down)
             .map(|(left, right)| (left - right).abs())
             .fold(0.0_f32, f32::max);
+        let superblock_stage_error = dense_stage
+            .iter()
+            .zip(&superblock_stage)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        let superblock_down_error = dense_down
+            .iter()
+            .zip(&superblock_down)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
+        let superblock_error = dense
+            .iter()
+            .zip(&superblock)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max);
         assert!(dense.iter().all(|value| value.is_finite() && *value > 0.0));
         assert!(
             max_error < 1.0e-2,
@@ -12751,6 +13976,12 @@ mod tests {
             padded_down[0],
             dense_stage[0],
             padded_stage[0]
+        );
+        assert!(
+            superblock_error < 1.0e-2
+                && superblock_stage_error < 1.0e-2
+                && superblock_down_error < 1.0e-2,
+            "superblock error: output={superblock_error}, stage={superblock_stage_error}, down={superblock_down_error}"
         );
     }
 

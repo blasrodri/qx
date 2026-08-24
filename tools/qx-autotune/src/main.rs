@@ -92,6 +92,13 @@ struct CandidateSuite {
     schema_version: u32,
     qx_bench: PathBuf,
     fixtures: Vec<PathBuf>,
+    /// Optional benchmark argv template. When omitted, retain the original
+    /// scalar decode contract (`--v2-token --fixture ...`). Templates may
+    /// contain `{artifact}`, `{fixture}`, and `{result}`. This lets the same
+    /// candidate runner select verifier-width plans without hard-coding a
+    /// second optimizer.
+    #[serde(default)]
+    benchmark_args: Vec<String>,
     #[serde(default = "default_rounds")]
     rounds: usize,
     #[serde(default = "default_warmup")]
@@ -391,13 +398,27 @@ fn run_suite(suite: &CandidateSuite) -> Result<SuiteRun> {
                     std::process::id()
                 ));
                 run_index += 1;
-                let status = Command::new(&suite.qx_bench)
-                    .envs(&candidate.env)
-                    .arg(&candidate.artifact)
-                    .args(["--v2-token", "--fixture"])
-                    .arg(fixture)
-                    .args(["--warmup", &suite.warmup.to_string(), "--result-json"])
-                    .arg(&result_path)
+                let mut command = Command::new(&suite.qx_bench);
+                command.envs(&candidate.env).arg(&candidate.artifact);
+                if suite.benchmark_args.is_empty() {
+                    command
+                        .args(["--v2-token", "--fixture"])
+                        .arg(fixture)
+                        .args(["--warmup", &suite.warmup.to_string(), "--result-json"])
+                        .arg(&result_path);
+                } else {
+                    let expanded_args = suite
+                        .benchmark_args
+                        .iter()
+                        .map(|arg| {
+                            arg.replace("{artifact}", &candidate.artifact.display().to_string())
+                                .replace("{fixture}", &fixture.display().to_string())
+                                .replace("{result}", &result_path.display().to_string())
+                        })
+                        .collect::<Vec<_>>();
+                    command.args(expanded_args);
+                }
+                let status = command
                     .status()
                     .with_context(|| format!("run {}", suite.qx_bench.display()))?;
                 if !status.success() {
@@ -715,6 +736,7 @@ fn verify_exact_semantics(candidate_path: &PathBuf, reference_path: &PathBuf) ->
                         | qx_format::ExpertRepresentation::Group32Q4RowInlineRows2
                         | qx_format::ExpertRepresentation::Group32Q4RowInlineRows4
                         | qx_format::ExpertRepresentation::Group32Q4RowInlineRows8
+                        | qx_format::ExpertRepresentation::Group32Q4Superblock144
                         | qx_format::ExpertRepresentation::Group32Q4Transaction144
                         | qx_format::ExpertRepresentation::Group32Q4Transaction160
                 )
@@ -729,6 +751,12 @@ fn verify_exact_semantics(candidate_path: &PathBuf, reference_path: &PathBuf) ->
                     ) | (
                         qx_format::ExpertRepresentation::Group32Q4RowMajor,
                         qx_format::ExpertRepresentation::Group32Q4RowInline
+                    ) | (
+                        qx_format::ExpertRepresentation::Group32Q4Superblock144,
+                        qx_format::ExpertRepresentation::Group32Q4RowMajor
+                    ) | (
+                        qx_format::ExpertRepresentation::Group32Q4RowMajor,
+                        qx_format::ExpertRepresentation::Group32Q4Superblock144
                     )
                 )
         };
@@ -754,7 +782,10 @@ fn verify_exact_semantics(candidate_path: &PathBuf, reference_path: &PathBuf) ->
     }
     // Likewise, memory ownership/budget is an evaluated plan dimension, not
     // a reason to reject an otherwise exact transport/dataflow candidate.
-    if candidate_plan.representations.dense != reference_plan.representations.dense {
+    if !compatible_expert_layout(
+        candidate_plan.representations.dense,
+        reference_plan.representations.dense,
+    ) {
         plan_mismatches.push("dense_representation");
     }
     if !compatible_expert_layout(
@@ -952,6 +983,7 @@ mod tests {
             schema_version: 1,
             qx_bench: PathBuf::from("qx-bench"),
             fixtures: vec![PathBuf::from("fixture.json")],
+            benchmark_args: Vec::new(),
             rounds: 2,
             warmup: 0,
             interaction_matrix: None,
@@ -989,6 +1021,7 @@ mod tests {
             schema_version: 1,
             qx_bench: PathBuf::from("qx-bench"),
             fixtures: vec![PathBuf::from("fixture.json")],
+            benchmark_args: Vec::new(),
             rounds: 1,
             warmup: 0,
             interaction_matrix: None,

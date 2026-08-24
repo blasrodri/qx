@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "mode": "superblock144_implementation_evidence",
+  "date": "2026-08-24",
+  "machine": "Apple M5 Pro, 16 GPU cores, 24 GB unified memory",
+  "qx_base_revision": "5b32612",
+  "fixture": "benchmarks/fixtures/general.json",
+  "context": 512,
+  "prefill_tokens": 384,
+  "measured_decode_tokens": 128,
+  "control": {
+    "artifact": "/Users/blas/projects/qx/external/models/granite-m5-pro-q4-rowinline-unique-packet.qx",
+    "artifact_hash": "e0891fd697f49774",
+    "plan": "granite-m5-top8-rowinline-unique-packet",
+    "wall_ms_per_token": [4.354, 4.380, 4.506],
+    "gpu_ms_per_token": [3.883, 3.896, 4.026],
+    "tokens_per_second": [229.66, 228.32, 221.93],
+    "mean_wall_ms_per_token": 4.413333,
+    "mean_gpu_ms_per_token": 3.935,
+    "mean_tokens_per_second": 226.636667
+  },
+  "candidate": {
+    "artifact": "/tmp/granite-m5-pro-q4-superblock144.qx",
+    "artifact_hash": "9628bca972a0df38",
+    "plan": "granite-m5-top8-superblock144",
+    "artifact_bytes": 751009792,
+    "metal_allocated_bytes": 802373632,
+    "wall_ms_per_token": [3.473, 3.388, 3.500],
+    "gpu_ms_per_token": [2.961, 2.944, 3.020],
+    "tokens_per_second": [287.90, 295.17, 285.70],
+    "mean_wall_ms_per_token": 3.453667,
+    "mean_gpu_ms_per_token": 2.975,
+    "mean_tokens_per_second": 289.59
+  },
+  "relative_result": {
+    "wall_time_reduction_percent": 21.744,
+    "gpu_time_reduction_percent": 24.396,
+    "throughput_increase_percent": 27.777
+  },
+  "contextual_profile_gpu_us": {
+    "control": {
+      "gate_up_boundary_24_layers": 1268.75,
+      "fixed_route_moe_24_layers": 1970.00,
+      "complete_token_fixed_route": 4319.50
+    },
+    "candidate": {
+      "gate_up_boundary_24_layers": 596.62,
+      "fixed_route_moe_24_layers": 1042.87,
+      "complete_token_fixed_route": 3369.71
+    }
+  },
+  "correctness": {
+    "artifact_storage_is_exact_relayout": true,
+    "minimum_logit_cosine": 1.0,
+    "argmax_agreement": "8/8",
+    "checkpoint_positions": [0, 1, 7, 31, 63, 127, 255, 511]
+  },
+  "notes": [
+    "Control and candidate were run in alternating order on AC power with no thermal warning.",
+    "The candidate artifact is reproducible and intentionally not checked into Git.",
+    "The committed result contains raw three-run samples rather than a confidence interval; a longer randomized promotion suite remains required."
+  ]
+}

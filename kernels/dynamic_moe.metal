@@ -411,6 +411,9 @@ kernel void qx_verifier_compact_routes_fixed(
         dispatch_args[0] = active * (1024 / 8);
         dispatch_args[1] = 1;
         dispatch_args[2] = 1;
+        dispatch_args[3] = active * (1024 / 16);
+        dispatch_args[4] = 1;
+        dispatch_args[5] = 1;
     }
 }
 
@@ -491,6 +494,550 @@ kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet(
     }
 }
 
+kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet_k2(
+    device const uchar* stream [[buffer(0)]],
+    device const uint* bucket_counts [[buffer(1)]],
+    device const uint* bucket_pairs [[buffer(2)]],
+    device const uint* route_tokens [[buffer(3)]],
+    device const float* input [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    constant uint& pair_count [[buffer(6)]],
+    device const uint* active_experts [[buffer(7)]],
+    constant uint& active_mode [[buffer(8)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint max_tokens = 2;
+    constexpr uint threadgroups_per_bucket = hidden / rows_per_threadgroup;
+    threadgroup float cached_input[max_tokens * hidden];
+
+    uint active_bucket = threadgroup_id / threadgroups_per_bucket;
+    uint row_group = threadgroup_id % threadgroups_per_bucket;
+    if (active_bucket >= 32) return;
+    uint bucket = active_mode != 0 ? active_experts[active_bucket] : active_bucket;
+    uint active = min(bucket_counts[bucket], max_tokens);
+    uint bucket_base = bucket * pair_count;
+    for (uint token_slot = 0; token_slot < max_tokens; ++token_slot) {
+        if (token_slot < active) {
+            uint pair = bucket_pairs[bucket_base + token_slot];
+            uint token = route_tokens[pair];
+            for (uint column = thread_index; column < hidden; column += 256) {
+                cached_input[token_slot * hidden + column] = input[token * hidden + column];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row = row_group * rows_per_threadgroup + simdgroup;
+    float sums[max_tokens] = {0.0f, 0.0f};
+    if (active > 0) {
+        uint row_base = bucket * expert_stride + row * row_stride;
+        for (uint group = 0; group < groups; group += 2) {
+            uint local = lane & 15u;
+            uint selected_group = group + (lane >= 16u ? 1u : 0u);
+            uint group_base = row_base + selected_group * group_stride;
+            uint packed = uint(stream[group_base + local]);
+            float scale = 0.0f;
+            if (local == 0u) scale = qx_q4_inline_scale(stream, group_base + 16u);
+            float scale0 = simd_broadcast(lane == 0u ? scale : 0.0f, 0);
+            float scale1 = simd_broadcast(lane == 16u ? scale : 0.0f, 16);
+            float selected_scale = lane < 16u ? scale0 : scale1;
+            uint input_base = selected_group * 32u + local * 2u;
+            float weight0 = float(int(packed & 0xfu) - 7) * selected_scale;
+            float weight1 = float(int((packed >> 4u) & 0xfu) - 7) * selected_scale;
+            for (uint token_slot = 0; token_slot < active; ++token_slot) {
+                uint token_base = token_slot * hidden;
+                sums[token_slot] += weight0 * cached_input[token_base + input_base]
+                    + weight1 * cached_input[token_base + input_base + 1u];
+            }
+        }
+    }
+    for (uint token_slot = 0; token_slot < active; ++token_slot) {
+        sums[token_slot] = simd_sum(sums[token_slot]);
+        if (lane == 0) {
+            uint pair = bucket_pairs[bucket_base + token_slot];
+            output[pair * hidden + row] = sums[token_slot];
+        }
+    }
+}
+
+// K4 packet consumer. The decoded packet is shared across a float4 of token
+// activations so the K dimension is explicit in the dataflow. Production
+// selection is carried by the installed verifier execution plan; the legacy
+// environment flag remains available only to standalone diagnostics.
+kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_vector(
+    device const uchar* stream [[buffer(0)]],
+    device const uint* bucket_counts [[buffer(1)]],
+    device const uint* bucket_pairs [[buffer(2)]],
+    device const uint* route_tokens [[buffer(3)]],
+    device const float* input [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    constant uint& pair_count [[buffer(6)]],
+    device const uint* active_experts [[buffer(7)]],
+    constant uint& active_mode [[buffer(8)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint max_tokens = 4;
+    constexpr uint threadgroups_per_bucket = hidden / rows_per_threadgroup;
+    threadgroup float cached_input[max_tokens * hidden];
+
+    uint active_bucket = threadgroup_id / threadgroups_per_bucket;
+    uint row_group = threadgroup_id % threadgroups_per_bucket;
+    if (active_bucket >= 32) return;
+    uint bucket = active_mode != 0 ? active_experts[active_bucket] : active_bucket;
+    uint active = min(bucket_counts[bucket], max_tokens);
+    uint bucket_base = bucket * pair_count;
+    for (uint token_slot = 0; token_slot < max_tokens; ++token_slot) {
+        if (token_slot < active) {
+            uint pair = bucket_pairs[bucket_base + token_slot];
+            uint token = route_tokens[pair];
+            for (uint column = thread_index; column < hidden; column += 256) {
+                cached_input[token_slot * hidden + column] = input[token * hidden + column];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row = row_group * rows_per_threadgroup + simdgroup;
+    float4 sums = float4(0.0f);
+    if (active > 0) {
+        uint row_base = bucket * expert_stride + row * row_stride;
+        for (uint group = 0; group < groups; group += 2) {
+            uint local = lane & 15u;
+            uint selected_group = group + (lane >= 16u ? 1u : 0u);
+            uint group_base = row_base + selected_group * group_stride;
+            uint packed = uint(stream[group_base + local]);
+            float scale = 0.0f;
+            if (local == 0u) scale = qx_q4_inline_scale(stream, group_base + 16u);
+            float scale0 = simd_broadcast(lane == 0u ? scale : 0.0f, 0);
+            float scale1 = simd_broadcast(lane == 16u ? scale : 0.0f, 16);
+            float selected_scale = lane < 16u ? scale0 : scale1;
+            uint input_base = selected_group * 32u + local * 2u;
+            float weight0 = float(int(packed & 0xfu) - 7) * selected_scale;
+            float weight1 = float(int((packed >> 4u) & 0xfu) - 7) * selected_scale;
+            float4 x0 = float4(0.0f);
+            float4 x1 = float4(0.0f);
+            if (active > 0) {
+                x0.x = cached_input[input_base];
+                x1.x = cached_input[input_base + 1u];
+            }
+            if (active > 1) {
+                x0.y = cached_input[hidden + input_base];
+                x1.y = cached_input[hidden + input_base + 1u];
+            }
+            if (active > 2) {
+                x0.z = cached_input[2u * hidden + input_base];
+                x1.z = cached_input[2u * hidden + input_base + 1u];
+            }
+            if (active > 3) {
+                x0.w = cached_input[3u * hidden + input_base];
+                x1.w = cached_input[3u * hidden + input_base + 1u];
+            }
+            sums += x0 * weight0 + x1 * weight1;
+        }
+    }
+    if (active > 0) sums.x = simd_sum(sums.x);
+    if (active > 1) sums.y = simd_sum(sums.y);
+    if (active > 2) sums.z = simd_sum(sums.z);
+    if (active > 3) sums.w = simd_sum(sums.w);
+    if (lane == 0) {
+        if (active > 0) output[bucket_pairs[bucket_base] * hidden + row] = sums.x;
+        if (active > 1) output[bucket_pairs[bucket_base + 1u] * hidden + row] = sums.y;
+        if (active > 2) output[bucket_pairs[bucket_base + 2u] * hidden + row] = sums.z;
+        if (active > 3) output[bucket_pairs[bucket_base + 3u] * hidden + row] = sums.w;
+    }
+}
+
+// K4 diagnostic consumer.  It preserves packet reuse within pairs of tokens,
+// but only keeps two accumulators live at a time.  This is intentionally not a
+// production default: it reloads each weight packet for the second token pair
+// so that a benchmark can separate accumulator/register pressure from the
+// benefit of keeping all four K4 accumulators live.
+kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_split_accum(
+    device const uchar* stream [[buffer(0)]],
+    device const uint* bucket_counts [[buffer(1)]],
+    device const uint* bucket_pairs [[buffer(2)]],
+    device const uint* route_tokens [[buffer(3)]],
+    device const float* input [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    constant uint& pair_count [[buffer(6)]],
+    device const uint* active_experts [[buffer(7)]],
+    constant uint& active_mode [[buffer(8)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint max_tokens = 4;
+    constexpr uint threadgroups_per_bucket = hidden / rows_per_threadgroup;
+    threadgroup float cached_input[max_tokens * hidden];
+
+    uint active_bucket = threadgroup_id / threadgroups_per_bucket;
+    uint row_group = threadgroup_id % threadgroups_per_bucket;
+    if (active_bucket >= 32) return;
+    uint bucket = active_mode != 0 ? active_experts[active_bucket] : active_bucket;
+    uint active = min(bucket_counts[bucket], max_tokens);
+    uint bucket_base = bucket * pair_count;
+    for (uint token_slot = 0; token_slot < max_tokens; ++token_slot) {
+        if (token_slot < active) {
+            uint pair = bucket_pairs[bucket_base + token_slot];
+            uint token = route_tokens[pair];
+            for (uint column = thread_index; column < hidden; column += 256) {
+                cached_input[token_slot * hidden + column] = input[token * hidden + column];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row = row_group * rows_per_threadgroup + simdgroup;
+    if (active == 0 || row >= hidden) return;
+    uint row_base = bucket * expert_stride + row * row_stride;
+    for (uint pass = 0; pass < 2; ++pass) {
+        uint token0 = pass * 2;
+        uint token1 = token0 + 1;
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+        for (uint group = 0; group < groups; group += 2) {
+            uint local = lane & 15u;
+            uint selected_group = group + (lane >= 16u ? 1u : 0u);
+            uint group_base = row_base + selected_group * group_stride;
+            uint packed = uint(stream[group_base + local]);
+            float scale = 0.0f;
+            if (local == 0u) scale = qx_q4_inline_scale(stream, group_base + 16u);
+            float scale0 = simd_broadcast(lane == 0u ? scale : 0.0f, 0);
+            float scale1 = simd_broadcast(lane == 16u ? scale : 0.0f, 16);
+            float selected_scale = lane < 16u ? scale0 : scale1;
+            uint input_base = selected_group * 32u + local * 2u;
+            float weight0 = float(int(packed & 0xfu) - 7) * selected_scale;
+            float weight1 = float(int((packed >> 4u) & 0xfu) - 7) * selected_scale;
+            if (token0 < active) {
+                sum0 += weight0 * cached_input[token0 * hidden + input_base]
+                    + weight1 * cached_input[token0 * hidden + input_base + 1u];
+            }
+            if (token1 < active) {
+                sum1 += weight0 * cached_input[token1 * hidden + input_base]
+                    + weight1 * cached_input[token1 * hidden + input_base + 1u];
+            }
+        }
+        if (token0 < active) sum0 = simd_sum(sum0);
+        if (token1 < active) sum1 = simd_sum(sum1);
+        if (lane == 0) {
+            if (token0 < active) {
+                output[bucket_pairs[bucket_base + token0] * hidden + row] = sum0;
+            }
+            if (token1 < active) {
+                output[bucket_pairs[bucket_base + token1] * hidden + row] = sum1;
+            }
+        }
+    }
+}
+
+// K4 packet consumer without threadgroup activation staging. Packet decode
+// and four-token reuse remain identical in spirit to the production K4 path;
+// only activation placement changes. This isolates staging/barrier cost from
+// packet reuse and is intentionally diagnostic-only.
+kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_direct_activation(
+    device const uchar* stream [[buffer(0)]],
+    device const uint* bucket_counts [[buffer(1)]],
+    device const uint* bucket_pairs [[buffer(2)]],
+    device const uint* route_tokens [[buffer(3)]],
+    device const float* input [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    constant uint& pair_count [[buffer(6)]],
+    device const uint* active_experts [[buffer(7)]],
+    constant uint& active_mode [[buffer(8)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint max_tokens = 4;
+    constexpr uint threadgroups_per_bucket = hidden / rows_per_threadgroup;
+
+    uint active_bucket = threadgroup_id / threadgroups_per_bucket;
+    uint row_group = threadgroup_id % threadgroups_per_bucket;
+    if (active_bucket >= 32) return;
+    uint bucket = active_mode != 0 ? active_experts[active_bucket] : active_bucket;
+    uint active = min(bucket_counts[bucket], max_tokens);
+    uint bucket_base = bucket * pair_count;
+    uint row = row_group * rows_per_threadgroup + simdgroup;
+    float4 sums = float4(0.0f);
+    if (active > 0 && row < hidden) {
+        uint row_base = bucket * expert_stride + row * row_stride;
+        for (uint group = 0; group < groups; group += 2) {
+            uint local = lane & 15u;
+            uint selected_group = group + (lane >= 16u ? 1u : 0u);
+            uint group_base = row_base + selected_group * group_stride;
+            uint packed = uint(stream[group_base + local]);
+            float scale = 0.0f;
+            if (local == 0u) scale = qx_q4_inline_scale(stream, group_base + 16u);
+            float scale0 = simd_broadcast(lane == 0u ? scale : 0.0f, 0);
+            float scale1 = simd_broadcast(lane == 16u ? scale : 0.0f, 16);
+            float selected_scale = lane < 16u ? scale0 : scale1;
+            uint input_base = selected_group * 32u + local * 2u;
+            float weight0 = float(int(packed & 0xfu) - 7) * selected_scale;
+            float weight1 = float(int((packed >> 4u) & 0xfu) - 7) * selected_scale;
+            if (active > 0) {
+                sums.x += weight0 * input[route_tokens[bucket_pairs[bucket_base]] * hidden + input_base]
+                    + weight1 * input[route_tokens[bucket_pairs[bucket_base]] * hidden + input_base + 1u];
+            }
+            if (active > 1) {
+                sums.y += weight0 * input[route_tokens[bucket_pairs[bucket_base + 1u]] * hidden + input_base]
+                    + weight1 * input[route_tokens[bucket_pairs[bucket_base + 1u]] * hidden + input_base + 1u];
+            }
+            if (active > 2) {
+                sums.z += weight0 * input[route_tokens[bucket_pairs[bucket_base + 2u]] * hidden + input_base]
+                    + weight1 * input[route_tokens[bucket_pairs[bucket_base + 2u]] * hidden + input_base + 1u];
+            }
+            if (active > 3) {
+                sums.w += weight0 * input[route_tokens[bucket_pairs[bucket_base + 3u]] * hidden + input_base]
+                    + weight1 * input[route_tokens[bucket_pairs[bucket_base + 3u]] * hidden + input_base + 1u];
+            }
+        }
+    }
+    if (active > 0) sums.x = simd_sum(sums.x);
+    if (active > 1) sums.y = simd_sum(sums.y);
+    if (active > 2) sums.z = simd_sum(sums.z);
+    if (active > 3) sums.w = simd_sum(sums.w);
+    if (lane == 0) {
+        if (active > 0) output[bucket_pairs[bucket_base] * hidden + row] = sums.x;
+        if (active > 1) output[bucket_pairs[bucket_base + 1u] * hidden + row] = sums.y;
+        if (active > 2) output[bucket_pairs[bucket_base + 2u] * hidden + row] = sums.z;
+        if (active > 3) output[bucket_pairs[bucket_base + 3u] * hidden + row] = sums.w;
+    }
+}
+
+// K4 packet consumer with sixteen output rows per threadgroup. This keeps
+// four-token packet reuse and activation staging, but stages each routed input
+// set across half as many row groups. It is a width-specific mapping probe.
+kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_rows16(
+    device const uchar* stream [[buffer(0)]],
+    device const uint* bucket_counts [[buffer(1)]],
+    device const uint* bucket_pairs [[buffer(2)]],
+    device const uint* route_tokens [[buffer(3)]],
+    device const float* input [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    constant uint& pair_count [[buffer(6)]],
+    device const uint* active_experts [[buffer(7)]],
+    constant uint& active_mode [[buffer(8)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 16;
+    constexpr uint max_tokens = 4;
+    constexpr uint threadgroups_per_bucket = hidden / rows_per_threadgroup;
+    threadgroup float cached_input[max_tokens * hidden];
+
+    uint active_bucket = threadgroup_id / threadgroups_per_bucket;
+    uint row_group = threadgroup_id % threadgroups_per_bucket;
+    if (active_bucket >= 32) return;
+    uint bucket = active_mode != 0 ? active_experts[active_bucket] : active_bucket;
+    uint active = min(bucket_counts[bucket], max_tokens);
+    uint bucket_base = bucket * pair_count;
+    for (uint token_slot = 0; token_slot < max_tokens; ++token_slot) {
+        if (token_slot < active) {
+            uint pair = bucket_pairs[bucket_base + token_slot];
+            uint token = route_tokens[pair];
+            for (uint column = thread_index; column < hidden; column += 512) {
+                cached_input[token_slot * hidden + column] = input[token * hidden + column];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row = row_group * rows_per_threadgroup + simdgroup;
+    float4 sums = float4(0.0f);
+    if (active > 0 && row < hidden) {
+        uint row_base = bucket * expert_stride + row * row_stride;
+        for (uint group = 0; group < groups; group += 2) {
+            uint local = lane & 15u;
+            uint selected_group = group + (lane >= 16u ? 1u : 0u);
+            uint group_base = row_base + selected_group * group_stride;
+            uint packed = uint(stream[group_base + local]);
+            float scale = 0.0f;
+            if (local == 0u) scale = qx_q4_inline_scale(stream, group_base + 16u);
+            float scale0 = simd_broadcast(lane == 0u ? scale : 0.0f, 0);
+            float scale1 = simd_broadcast(lane == 16u ? scale : 0.0f, 16);
+            float selected_scale = lane < 16u ? scale0 : scale1;
+            uint input_base = selected_group * 32u + local * 2u;
+            float weight0 = float(int(packed & 0xfu) - 7) * selected_scale;
+            float weight1 = float(int((packed >> 4u) & 0xfu) - 7) * selected_scale;
+            if (active > 0) {
+                uint pair = bucket_pairs[bucket_base];
+                uint token = route_tokens[pair];
+                sums.x += weight0 * cached_input[input_base]
+                    + weight1 * cached_input[input_base + 1u];
+                if (active > 1) {
+                    sums.y += weight0 * cached_input[hidden + input_base]
+                        + weight1 * cached_input[hidden + input_base + 1u];
+                }
+                if (active > 2) {
+                    sums.z += weight0 * cached_input[2u * hidden + input_base]
+                        + weight1 * cached_input[2u * hidden + input_base + 1u];
+                }
+                if (active > 3) {
+                    sums.w += weight0 * cached_input[3u * hidden + input_base]
+                        + weight1 * cached_input[3u * hidden + input_base + 1u];
+                }
+                (void)token;
+            }
+        }
+    }
+    if (active > 0) sums.x = simd_sum(sums.x);
+    if (active > 1) sums.y = simd_sum(sums.y);
+    if (active > 2) sums.z = simd_sum(sums.z);
+    if (active > 3) sums.w = simd_sum(sums.w);
+    if (lane == 0 && row < hidden) {
+        if (active > 0) output[bucket_pairs[bucket_base] * hidden + row] = sums.x;
+        if (active > 1) output[bucket_pairs[bucket_base + 1u] * hidden + row] = sums.y;
+        if (active > 2) output[bucket_pairs[bucket_base + 2u] * hidden + row] = sums.z;
+        if (active > 3) output[bucket_pairs[bucket_base + 3u] * hidden + row] = sums.w;
+    }
+}
+
+// K4 packet consumer with two packet pairs in flight. This keeps the
+// production K4 ownership, staging, and four accumulators, while exposing
+// independent Q4 loads to the compiler. It is a load-issue diagnostic.
+kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_unroll4(
+    device const uchar* stream [[buffer(0)]],
+    device const uint* bucket_counts [[buffer(1)]],
+    device const uint* bucket_pairs [[buffer(2)]],
+    device const uint* route_tokens [[buffer(3)]],
+    device const float* input [[buffer(4)]],
+    device float* output [[buffer(5)]],
+    constant uint& pair_count [[buffer(6)]],
+    device const uint* active_experts [[buffer(7)]],
+    constant uint& active_mode [[buffer(8)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint max_tokens = 4;
+    constexpr uint threadgroups_per_bucket = hidden / rows_per_threadgroup;
+    threadgroup float cached_input[max_tokens * hidden];
+
+    uint active_bucket = threadgroup_id / threadgroups_per_bucket;
+    uint row_group = threadgroup_id % threadgroups_per_bucket;
+    if (active_bucket >= 32) return;
+    uint bucket = active_mode != 0 ? active_experts[active_bucket] : active_bucket;
+    uint active = min(bucket_counts[bucket], max_tokens);
+    uint bucket_base = bucket * pair_count;
+    for (uint token_slot = 0; token_slot < max_tokens; ++token_slot) {
+        if (token_slot < active) {
+            uint pair = bucket_pairs[bucket_base + token_slot];
+            uint token = route_tokens[pair];
+            for (uint column = thread_index; column < hidden; column += 256) {
+                cached_input[token_slot * hidden + column] = input[token * hidden + column];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row = row_group * rows_per_threadgroup + simdgroup;
+    float4 sums = float4(0.0f);
+    if (active > 0 && row < hidden) {
+        uint row_base = bucket * expert_stride + row * row_stride;
+        for (uint group = 0; group < groups; group += 4) {
+            uint local = lane & 15u;
+            uint half_group = lane >= 16u ? 1u : 0u;
+            uint selected0 = group + half_group;
+            uint selected1 = group + 2u + half_group;
+            uint base0 = row_base + selected0 * group_stride;
+            uint base1 = row_base + selected1 * group_stride;
+            uint packed0 = uint(stream[base0 + local]);
+            uint packed1 = uint(stream[base1 + local]);
+            float scale0 = 0.0f;
+            float scale1 = 0.0f;
+            if (local == 0u) {
+                scale0 = qx_q4_inline_scale(stream, base0 + 16u);
+                scale1 = qx_q4_inline_scale(stream, base1 + 16u);
+            }
+            float scale00 = simd_broadcast(lane == 0u ? scale0 : 0.0f, 0);
+            float scale01 = simd_broadcast(lane == 16u ? scale0 : 0.0f, 16);
+            float scale10 = simd_broadcast(lane == 0u ? scale1 : 0.0f, 0);
+            float scale11 = simd_broadcast(lane == 16u ? scale1 : 0.0f, 16);
+            float selected_scale0 = lane < 16u ? scale00 : scale01;
+            float selected_scale1 = lane < 16u ? scale10 : scale11;
+            uint input_base0 = selected0 * 32u + local * 2u;
+            uint input_base1 = selected1 * 32u + local * 2u;
+            float weight00 = float(int(packed0 & 0xfu) - 7) * selected_scale0;
+            float weight01 = float(int((packed0 >> 4u) & 0xfu) - 7) * selected_scale0;
+            float weight10 = float(int(packed1 & 0xfu) - 7) * selected_scale1;
+            float weight11 = float(int((packed1 >> 4u) & 0xfu) - 7) * selected_scale1;
+            if (active > 0) {
+                sums.x += weight00 * cached_input[input_base0]
+                    + weight01 * cached_input[input_base0 + 1u]
+                    + weight10 * cached_input[input_base1]
+                    + weight11 * cached_input[input_base1 + 1u];
+            }
+            if (active > 1) {
+                sums.y += weight00 * cached_input[hidden + input_base0]
+                    + weight01 * cached_input[hidden + input_base0 + 1u]
+                    + weight10 * cached_input[hidden + input_base1]
+                    + weight11 * cached_input[hidden + input_base1 + 1u];
+            }
+            if (active > 2) {
+                sums.z += weight00 * cached_input[2u * hidden + input_base0]
+                    + weight01 * cached_input[2u * hidden + input_base0 + 1u]
+                    + weight10 * cached_input[2u * hidden + input_base1]
+                    + weight11 * cached_input[2u * hidden + input_base1 + 1u];
+            }
+            if (active > 3) {
+                sums.w += weight00 * cached_input[3u * hidden + input_base0]
+                    + weight01 * cached_input[3u * hidden + input_base0 + 1u]
+                    + weight10 * cached_input[3u * hidden + input_base1]
+                    + weight11 * cached_input[3u * hidden + input_base1 + 1u];
+            }
+        }
+    }
+    if (active > 0) sums.x = simd_sum(sums.x);
+    if (active > 1) sums.y = simd_sum(sums.y);
+    if (active > 2) sums.z = simd_sum(sums.z);
+    if (active > 3) sums.w = simd_sum(sums.w);
+    if (lane == 0 && row < hidden) {
+        if (active > 0) output[bucket_pairs[bucket_base] * hidden + row] = sums.x;
+        if (active > 1) output[bucket_pairs[bucket_base + 1u] * hidden + row] = sums.y;
+        if (active > 2) output[bucket_pairs[bucket_base + 2u] * hidden + row] = sums.z;
+        if (active > 3) output[bucket_pairs[bucket_base + 3u] * hidden + row] = sums.w;
+    }
+}
+
 kernel void qx_verifier_q4_moe_silu_batch(
     device const float* gate_up [[buffer(0)]],
     device float* activated [[buffer(1)]],
@@ -553,6 +1100,176 @@ kernel void qx_verifier_q4_moe_down_batch(
     }
     sum = simd_sum(sum);
     if (lane == 0 && row < hidden) output[pair * hidden + row] = sum;
+}
+
+// K-wide packet-stationary Down consumer. The route compactor groups pairs
+// by expert; this kernel decodes each Down packet once and applies it to all
+// activated rows routed to that expert before discarding the packet.
+kernel void qx_verifier_q4_moe_down_compact_unique_packet(
+    device const uchar* stream [[buffer(0)]],
+    device const uint* bucket_counts [[buffer(1)]],
+    device const uint* bucket_pairs [[buffer(2)]],
+    device const float* activated [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& pair_count [[buffer(5)]],
+    device const uint* active_experts [[buffer(6)]],
+    constant uint& active_mode [[buffer(7)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint intermediate = 512;
+    constexpr uint groups = 16;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint max_tokens = 4;
+    constexpr uint threadgroups_per_bucket = hidden / rows_per_threadgroup;
+    threadgroup float cached_activated[max_tokens * intermediate];
+    uint active_bucket = threadgroup_id / threadgroups_per_bucket;
+    uint row_group = threadgroup_id % threadgroups_per_bucket;
+    if (active_bucket >= 32) return;
+    uint bucket = active_mode != 0 ? active_experts[active_bucket] : active_bucket;
+    uint active = min(bucket_counts[bucket], max_tokens);
+    uint bucket_base = bucket * pair_count;
+    for (uint token_slot = 0; token_slot < max_tokens; ++token_slot) {
+        if (token_slot < active) {
+            uint pair = bucket_pairs[bucket_base + token_slot];
+            for (uint column = thread_index; column < intermediate; column += 256) {
+                cached_activated[token_slot * intermediate + column] =
+                    activated[pair * intermediate + column];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint row = row_group * rows_per_threadgroup + simdgroup;
+    float sums[max_tokens] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (active > 0 && row < hidden) {
+        uint row_base = bucket * expert_stride + row * row_stride;
+        for (uint group = 0; group < groups; group += 2) {
+            uint local = lane & 15u;
+            uint selected_group = group + (lane >= 16u ? 1u : 0u);
+            uint group_base = row_base + selected_group * group_stride;
+            uint packed = uint(stream[group_base + local]);
+            float scale = 0.0f;
+            if (local == 0u) scale = qx_q4_inline_scale(stream, group_base + 16u);
+            float scale0 = simd_broadcast(lane == 0u ? scale : 0.0f, 0);
+            float scale1 = simd_broadcast(lane == 16u ? scale : 0.0f, 16);
+            float selected_scale = lane < 16u ? scale0 : scale1;
+            uint input_base = selected_group * 32u + local * 2u;
+            float weight0 = float(int(packed & 0xfu) - 7) * selected_scale;
+            float weight1 = float(int((packed >> 4u) & 0xfu) - 7) * selected_scale;
+            for (uint token_slot = 0; token_slot < active; ++token_slot) {
+                uint token_base = token_slot * intermediate;
+                sums[token_slot] += weight0 * cached_activated[token_base + input_base]
+                    + weight1 * cached_activated[token_base + input_base + 1u];
+            }
+        }
+    }
+    for (uint token_slot = 0; token_slot < active; ++token_slot) {
+        sums[token_slot] = simd_sum(sums[token_slot]);
+        if (lane == 0) {
+            uint pair = bucket_pairs[bucket_base + token_slot];
+            output[pair * hidden + row] = sums[token_slot];
+        }
+    }
+}
+
+// K4 packet-stationary Down consumer with two packet pairs in flight.  Down
+// has half as many input groups as Gate/Up, so this variant keeps the same
+// four-token activation reuse while increasing independent packed-weight
+// loads.  It is deliberately separate from the Gate/Up unroll4 consumer:
+// the matrix shape and activation footprint are different.
+kernel void qx_verifier_q4_moe_down_compact_unique_packet_k4_unroll4(
+    device const uchar* stream [[buffer(0)]],
+    device const uint* bucket_counts [[buffer(1)]],
+    device const uint* bucket_pairs [[buffer(2)]],
+    device const float* activated [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& pair_count [[buffer(5)]],
+    device const uint* active_experts [[buffer(6)]],
+    constant uint& active_mode [[buffer(7)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint intermediate = 512;
+    constexpr uint groups = 16;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_threadgroup = 8;
+    constexpr uint max_tokens = 4;
+    constexpr uint threadgroups_per_bucket = hidden / rows_per_threadgroup;
+    threadgroup float cached_activated[max_tokens * intermediate];
+
+    uint active_bucket = threadgroup_id / threadgroups_per_bucket;
+    uint row_group = threadgroup_id % threadgroups_per_bucket;
+    if (active_bucket >= 32) return;
+    uint bucket = active_mode != 0 ? active_experts[active_bucket] : active_bucket;
+    uint active = min(bucket_counts[bucket], max_tokens);
+    uint bucket_base = bucket * pair_count;
+    for (uint token_slot = 0; token_slot < max_tokens; ++token_slot) {
+        if (token_slot < active) {
+            uint pair = bucket_pairs[bucket_base + token_slot];
+            for (uint column = thread_index; column < intermediate; column += 256) {
+                cached_activated[token_slot * intermediate + column] =
+                    activated[pair * intermediate + column];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row = row_group * rows_per_threadgroup + simdgroup;
+    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (active > 0 && row < hidden) {
+        uint row_base = bucket * expert_stride + row * row_stride;
+        for (uint group = 0; group < groups; group += 4) {
+            uint local = lane & 15u;
+            uint half_group = lane >= 16u ? 1u : 0u;
+            uint selected0 = group + half_group;
+            uint selected1 = group + 2u + half_group;
+            uint base0 = row_base + selected0 * group_stride;
+            uint base1 = row_base + selected1 * group_stride;
+            uint packed0 = uint(stream[base0 + local]);
+            uint packed1 = uint(stream[base1 + local]);
+            float scale0 = 0.0f;
+            float scale1 = 0.0f;
+            if (local == 0u) {
+                scale0 = qx_q4_inline_scale(stream, base0 + 16u);
+                scale1 = qx_q4_inline_scale(stream, base1 + 16u);
+            }
+            float scale00 = simd_broadcast(lane == 0u ? scale0 : 0.0f, 0);
+            float scale01 = simd_broadcast(lane == 16u ? scale0 : 0.0f, 16);
+            float scale10 = simd_broadcast(lane == 0u ? scale1 : 0.0f, 0);
+            float scale11 = simd_broadcast(lane == 16u ? scale1 : 0.0f, 16);
+            float selected_scale0 = lane < 16u ? scale00 : scale01;
+            float selected_scale1 = lane < 16u ? scale10 : scale11;
+            uint input_base0 = selected0 * 32u + local * 2u;
+            uint input_base1 = selected1 * 32u + local * 2u;
+            float weight00 = float(int(packed0 & 0xfu) - 7) * selected_scale0;
+            float weight01 = float(int((packed0 >> 4u) & 0xfu) - 7) * selected_scale0;
+            float weight10 = float(int(packed1 & 0xfu) - 7) * selected_scale1;
+            float weight11 = float(int((packed1 >> 4u) & 0xfu) - 7) * selected_scale1;
+            for (uint token_slot = 0; token_slot < active; ++token_slot) {
+                uint token_base = token_slot * intermediate;
+                sums[token_slot] += weight00 * cached_activated[token_base + input_base0]
+                    + weight01 * cached_activated[token_base + input_base0 + 1u]
+                    + weight10 * cached_activated[token_base + input_base1]
+                    + weight11 * cached_activated[token_base + input_base1 + 1u];
+            }
+        }
+    }
+    for (uint token_slot = 0; token_slot < active; ++token_slot) {
+        sums[token_slot] = simd_sum(sums[token_slot]);
+        if (lane == 0) {
+            uint pair = bucket_pairs[bucket_base + token_slot];
+            output[pair * hidden + row] = sums[token_slot];
+        }
+    }
 }
 
 kernel void qx_verifier_q4_moe_accumulate_batch(
@@ -808,6 +1525,102 @@ kernel void qx_dynamic_q4_moe_gate_up_inline_unique_packet_norm_simd(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     qx_dynamic_q4_gate_up_inline_unique_packet_body(stream, expert_ids, output, cached_input,
+        lane, simdgroup, threadgroup_id);
+}
+
+// Llama-derived exact-Q4 dataflow control. This keeps QX row-inline storage
+// but makes the execution unit two output rows per SIMD group, with two SIMD
+// groups per threadgroup. Within each 32-weight group, each half of the SIMD
+// group owns one row's packed bytes; only the half leader loads the scale and
+// broadcasts it. This isolates the interaction between llama's N_R0=2 /
+// N_SG=2 mapping and QX's proven packet load ownership.
+inline void qx_dynamic_q4_gate_up_two_row_unique_packet_body(
+    device const uchar* stream,
+    device const float* input,
+    device const float* norm_weights,
+    float inverse_rms,
+    uint normalized,
+    device const uint* expert_ids,
+    device float* output,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id) {
+    constexpr uint hidden = 1024;
+    constexpr uint groups = 32;
+    constexpr uint group_stride = 18;
+    constexpr uint row_stride = groups * group_stride;
+    constexpr uint expert_stride = hidden * row_stride;
+    constexpr uint rows_per_simdgroup = 2;
+    constexpr uint simdgroups_per_threadgroup = 2;
+    constexpr uint rows_per_threadgroup = rows_per_simdgroup * simdgroups_per_threadgroup;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint tile = threadgroup_id % threadgroups_per_expert;
+    uint first_row = tile * rows_per_threadgroup + simdgroup * rows_per_simdgroup;
+    uint expert = expert_ids[slot];
+    uint row_offset = lane >= 16u ? 1u : 0u;
+    uint local = lane & 15u;
+    float sum = 0.0f;
+
+    if (expert < 32 && first_row + row_offset < hidden) {
+        uint row = first_row + row_offset;
+        uint expert_base = expert * expert_stride;
+        for (uint group = 0; group < groups; ++group) {
+            uint group_base = expert_base + row * row_stride + group * group_stride;
+            uint packed = uint(stream[group_base + local]);
+            float scale = 0.0f;
+            if (local == 0u) {
+                scale = qx_q4_inline_scale(stream, group_base + 16u);
+            }
+            float selected_scale = simd_broadcast(
+                lane < 16u ? scale : 0.0f, row_offset == 0u ? 0 : 16);
+            uint input_base = group * 32u + local * 2u;
+            float x0 = input[input_base];
+            float x1 = input[input_base + 1u];
+            if (normalized != 0) {
+                x0 *= inverse_rms * norm_weights[input_base];
+                x1 *= inverse_rms * norm_weights[input_base + 1u];
+            }
+            sum += float(int(packed & 0xfu) - 7) * selected_scale * x0;
+            sum += float(int((packed >> 4u) & 0xfu) - 7) * selected_scale * x1;
+        }
+    }
+
+    sum = simd_sum(sum);
+    if (lane == 0 && expert < 32 && first_row < hidden) {
+        output[slot * hidden + first_row] = sum;
+    }
+    if (lane == 16 && expert < 32 && first_row + 1u < hidden) {
+        output[slot * hidden + first_row + 1u] = sum;
+    }
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_two_row_unique_packet_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    qx_dynamic_q4_gate_up_two_row_unique_packet_body(
+        stream, input, input, 1.0f, 0, expert_ids, output,
+        lane, simdgroup, threadgroup_id);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_two_row_unique_packet_norm_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]],
+    device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]]) {
+    qx_dynamic_q4_gate_up_two_row_unique_packet_body(
+        stream, input, norm_weights, inverse_rms[0], 1, expert_ids, output,
         lane, simdgroup, threadgroup_id);
 }
 
@@ -1601,6 +2414,184 @@ kernel void qx_dynamic_q4_moe_gate_up_fused_block_llama_norm_simd(
     qx_dynamic_q4_gate_up_fused_block_body(
         stream, expert_ids, output, cached_input, lane, simdgroup,
         threadgroup_id, 2, 2, layout);
+}
+
+// Payload-contiguous exact-Q4 superblock consumer. Each 144-byte block is
+// [128 code bytes][8 FP16 scales] for 256 weights. A SIMD lane owns eight
+// adjacent weights (one uint payload load), four neighboring lanes share one
+// group scale, and each SIMD group accumulates two rows while reusing the same
+// activation registers. Four SIMD groups therefore produce eight rows from a
+// 256-thread threadgroup.
+inline float qx_dynamic_q4_superblock_dot8(
+    uint packed, float4 x0, float4 x1, float scale, float sum) {
+    uint q0 = packed & 0xffu;
+    uint q1 = (packed >> 8u) & 0xffu;
+    uint q2 = (packed >> 16u) & 0xffu;
+    uint q3 = (packed >> 24u) & 0xffu;
+    sum = fma(float(int(q0 & 0xfu) - 7) * scale, x0.x, sum);
+    sum = fma(float(int(q0 >> 4u) - 7) * scale, x0.y, sum);
+    sum = fma(float(int(q1 & 0xfu) - 7) * scale, x0.z, sum);
+    sum = fma(float(int(q1 >> 4u) - 7) * scale, x0.w, sum);
+    sum = fma(float(int(q2 & 0xfu) - 7) * scale, x1.x, sum);
+    sum = fma(float(int(q2 >> 4u) - 7) * scale, x1.y, sum);
+    sum = fma(float(int(q3 & 0xfu) - 7) * scale, x1.z, sum);
+    return fma(float(int(q3 >> 4u) - 7) * scale, x1.w, sum);
+}
+
+inline void qx_dynamic_q4_superblock_gate_up_body(
+    device const uchar* stream,
+    device const uint* expert_ids,
+    device float* output,
+    threadgroup const float* cached_input,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id) {
+    constexpr uint hidden = 1024;
+    constexpr uint blocks = 4;
+    constexpr uint block_bytes = 144;
+    constexpr uint row_bytes = blocks * block_bytes;
+    constexpr uint expert_bytes = hidden * row_bytes;
+    constexpr uint rows_per_threadgroup = 32;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint first_row = (threadgroup_id % threadgroups_per_expert) * rows_per_threadgroup
+        + simdgroup * 4u;
+    uint expert = expert_ids[slot];
+    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (expert < 32u) {
+        uint expert_base = expert * expert_bytes;
+        #pragma unroll
+        for (uint block = 0; block < blocks; ++block) {
+            uint column = block * 256u + lane * 8u;
+            threadgroup const float4* values =
+                reinterpret_cast<threadgroup const float4*>(cached_input + column);
+            float4 x0 = values[0];
+            float4 x1 = values[1];
+            #pragma unroll
+            for (uint row_offset = 0; row_offset < 4u; ++row_offset) {
+                uint base = expert_base + (first_row + row_offset) * row_bytes
+                    + block * block_bytes;
+                uint packed = reinterpret_cast<device const uint*>(stream + base)[lane];
+                float owned_scale = lane < 8u
+                    ? float(reinterpret_cast<device const half*>(stream + base + 128u)[lane])
+                    : 0.0f;
+                float scale = simd_shuffle(owned_scale, ushort(lane >> 2u));
+                sums[row_offset] = qx_dynamic_q4_superblock_dot8(
+                    packed, x0, x1, scale, sums[row_offset]);
+            }
+        }
+    }
+    #pragma unroll
+    for (uint row_offset = 0; row_offset < 4u; ++row_offset) {
+        sums[row_offset] = simd_sum(sums[row_offset]);
+    }
+    if (lane == 0u && expert < 32u) {
+        #pragma unroll
+        for (uint row_offset = 0; row_offset < 4u; ++row_offset) {
+            output[slot * hidden + first_row + row_offset] = sums[row_offset];
+        }
+    }
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_superblock144_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    for (uint column = thread_index; column < 1024u; column += 256u) {
+        cached_input[column] = input[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_superblock_gate_up_body(
+        stream, expert_ids, output, cached_input, lane, simdgroup, threadgroup_id);
+}
+
+kernel void qx_dynamic_q4_moe_gate_up_superblock144_norm_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]],
+    device const float* inverse_rms [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    float inverse = inverse_rms[0];
+    for (uint column = thread_index; column < 1024u; column += 256u) {
+        cached_input[column] = input[column] * inverse * norm_weights[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_q4_superblock_gate_up_body(
+        stream, expert_ids, output, cached_input, lane, simdgroup, threadgroup_id);
+}
+
+kernel void qx_dynamic_q4_moe_down_superblock144_simd(
+    device const uchar* stream [[buffer(0)]],
+    device const float* activated [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint intermediate = 512;
+    constexpr uint blocks = 2;
+    constexpr uint block_bytes = 144;
+    constexpr uint row_bytes = blocks * block_bytes;
+    constexpr uint expert_bytes = hidden * row_bytes;
+    constexpr uint rows_per_threadgroup = 32;
+    constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
+    uint slot = threadgroup_id / threadgroups_per_expert;
+    uint first_row = (threadgroup_id % threadgroups_per_expert) * rows_per_threadgroup
+        + simdgroup * 4u;
+    uint expert = expert_ids[slot];
+    threadgroup float cached_input[intermediate];
+    for (uint column = thread_index; column < intermediate; column += 256u) {
+        cached_input[column] = activated[slot * intermediate + column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (expert < 32u) {
+        uint expert_base = expert * expert_bytes;
+        #pragma unroll
+        for (uint block = 0; block < blocks; ++block) {
+            uint column = block * 256u + lane * 8u;
+            threadgroup const float4* values =
+                reinterpret_cast<threadgroup const float4*>(cached_input + column);
+            float4 x0 = values[0];
+            float4 x1 = values[1];
+            #pragma unroll
+            for (uint row_offset = 0; row_offset < 4u; ++row_offset) {
+                uint base = expert_base + (first_row + row_offset) * row_bytes
+                    + block * block_bytes;
+                uint packed = reinterpret_cast<device const uint*>(stream + base)[lane];
+                float owned_scale = lane < 8u
+                    ? float(reinterpret_cast<device const half*>(stream + base + 128u)[lane])
+                    : 0.0f;
+                float scale = simd_shuffle(owned_scale, ushort(lane >> 2u));
+                sums[row_offset] = qx_dynamic_q4_superblock_dot8(
+                    packed, x0, x1, scale, sums[row_offset]);
+            }
+        }
+    }
+    #pragma unroll
+    for (uint row_offset = 0; row_offset < 4u; ++row_offset) {
+        sums[row_offset] = simd_sum(sums[row_offset]);
+    }
+    if (lane == 0u && expert < 32u) {
+        #pragma unroll
+        for (uint row_offset = 0; row_offset < 4u; ++row_offset) {
+            output[slot * hidden + first_row + row_offset] = sums[row_offset];
+        }
+    }
 }
 
 // Cross-expert activation-chunk candidate. A threadgroup owns one eight-row

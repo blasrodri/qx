@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-24",
+  "implementation": "qx-v2",
+  "target": "apple-m5-pro",
+  "artifact_hash": "8011bf406bff98f3",
+  "plan_id": "granite-m5-top8-all-superblock144-cb2",
+  "fixture": "general-systems",
+  "context": 512,
+  "prefill_tokens": 384,
+  "measured_tokens": 128,
+  "runs": [
+    {
+      "wall_ms_per_token": 2.8602109375,
+      "gpu_ms_per_token": 2.5895026064972626,
+      "tokens_per_second": 349.6245633107261
+    },
+    {
+      "wall_ms_per_token": 2.8393505859375,
+      "gpu_ms_per_token": 2.578267251010402,
+      "tokens_per_second": 352.19321099434393
+    },
+    {
+      "wall_ms_per_token": 2.8521503906250003,
+      "gpu_ms_per_token": 2.5801451779443596,
+      "tokens_per_second": 350.61264766647423
+    }
+  ],
+  "mean": {
+    "wall_ms_per_token": 2.8505706380208338,
+    "gpu_ms_per_token": 2.582638345150675,
+    "tokens_per_second": 350.8101406571814
+  },
+  "graph": {
+    "command_buffers_per_token": 2,
+    "encoders_per_token": 2,
+    "dispatches_per_token": 390,
+    "internal_cpu_waits": 0
+  },
+  "parity": {
+    "positions": [0, 1, 7, 31, 63, 127, 255, 511],
+    "max_kv_key_error": 0.009857,
+    "max_kv_value_error": 0.001049,
+    "max_attention_error": 0.000127,
+    "max_absolute_logit_error": 0.009906,
+    "minimum_logit_cosine": 1.0,
+    "argmax_agreement": "8/8"
+  },
+  "context_sweep": [
+    {
+      "context": 128,
+      "command_buffers_per_token": 1,
+      "tokens_per_second": 349.46,
+      "wall_ms_per_token": 2.862,
+      "gpu_ms_per_token": 2.383
+    },
+    {
+      "context": 128,
+      "command_buffers_per_token": 2,
+      "tokens_per_second": 364.32,
+      "wall_ms_per_token": 2.745,
+      "gpu_ms_per_token": 2.444
+    },
+    {
+      "context": 256,
+      "command_buffers_per_token": 1,
+      "tokens_per_second": 346.89,
+      "wall_ms_per_token": 2.883,
+      "gpu_ms_per_token": 2.420
+    },
+    {
+      "context": 256,
+      "command_buffers_per_token": 2,
+      "tokens_per_second": 365.73,
+      "wall_ms_per_token": 2.734,
+      "gpu_ms_per_token": 2.433
+    }
+  ],
+  "notes": [
+    "A prior five-run sample of the same payload and graph measured 356.18-376.42 tok/s (367.51 mean); the committed headline uses the later conservative three-run mean.",
+    "The one-command-buffer control measured 341.48-344.75 tok/s at context 512.",
+    "The context-512 fixture measures sequential positions 384 through 511."
+  ]
+}

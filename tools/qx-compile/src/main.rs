@@ -6,7 +6,7 @@ use qx_compiler::{
 };
 use qx_format::{
     CompiledTensor, ExecutionPlanManifest, ExpertRepresentation, RawTensor, TensorKind,
-    WeightStorage, write_artifact_with_raw_and_plan,
+    VerifierMoeConsumerTopology, WeightStorage, write_artifact_with_raw_and_plan,
 };
 use qx_model::{EXPERTS, Granite3A400M, GraniteConfig, LAYERS, MAX_CONTEXT, TOP_K};
 use qx_quant::{PackingLayout, QuantType, QuantizedTensor};
@@ -66,6 +66,10 @@ struct Args {
     /// row-major the Granite/M5 control even though Tile32 wins in isolation.
     #[arg(long, value_enum, default_value_t = ExpertLayout::RowMajor)]
     expert_layout: ExpertLayout,
+    /// Physical layout for attention, router, and tied embedding/LM-head Q4
+    /// projections.
+    #[arg(long, value_enum, default_value_t = DenseLayout::RowMajor)]
+    dense_layout: DenseLayout,
     /// Four-stage MoE execution candidate. `wide-expert` changes only the
     /// threadgroup mapping; it is never selected without complete-model
     /// evidence by qx-autotune.
@@ -86,6 +90,36 @@ struct Args {
     /// need not be identical.
     #[arg(long, value_enum, default_value_t = MoeConsumerArg::Canonical)]
     moe_down_consumer: MoeConsumerArg,
+    /// Width-specific exact verifier gate/up consumer. K4 vector-packet
+    /// reuses decoded Q4 packets across token activations; K1/K2 retain the
+    /// normal unique-packet path.
+    #[arg(long, value_enum, default_value_t = VerifierMoeConsumerArg::UniquePacket)]
+    verifier_moe_consumer: VerifierMoeConsumerArg,
+    /// Diagnostic K4 consumer that keeps two token accumulators live at a
+    /// time. It trades packet reloads for lower accumulator/resource pressure.
+    #[arg(long, default_value_t = false)]
+    verifier_k4_split_accumulation: bool,
+    /// Diagnostic K4 consumer that bypasses threadgroup activation staging.
+    #[arg(long, default_value_t = false)]
+    verifier_k4_direct_activation: bool,
+    /// Diagnostic K4 mapping using sixteen output rows per threadgroup.
+    #[arg(long, default_value_t = false)]
+    verifier_k4_rows16: bool,
+    /// Diagnostic K4 packet consumer with two packed packet pairs in flight.
+    #[arg(long, default_value_t = false)]
+    verifier_k4_unroll4: bool,
+    /// Maximum decode context at which the unroll4 K4 consumer is eligible.
+    /// Omit to make it eligible at every context; the planner may retain the
+    /// baseline consumer above this bound.
+    #[arg(long)]
+    verifier_k4_unroll4_max_context: Option<u32>,
+    /// Enable the independent K4 Down packet consumer.
+    #[arg(long, default_value_t = false)]
+    verifier_k4_down_unroll4: bool,
+    /// Use active-expert indirect dispatch for the K-wide verifier gate/up
+    /// path. This is a target/workload-specific execution-plan choice.
+    #[arg(long, default_value_t = false)]
+    verifier_active_expert_dispatch: bool,
     #[arg(long, default_value_t = MAX_CONTEXT)]
     context: usize,
     /// Stable identifier embedded in artifact v2 for compiler/autotuner provenance.
@@ -144,8 +178,26 @@ enum ExpertLayout {
     Transaction144,
     #[value(name = "transaction-160", alias = "transaction160")]
     Transaction160,
+    #[value(name = "superblock-144", alias = "superblock144")]
+    Superblock144,
     #[value(name = "cross-expert-tile8", alias = "cross-expert")]
     CrossExpertTile8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DenseLayout {
+    RowMajor,
+    #[value(name = "superblock-144", alias = "superblock144")]
+    Superblock144,
+}
+
+impl From<DenseLayout> for PackingLayout {
+    fn from(value: DenseLayout) -> Self {
+        match value {
+            DenseLayout::RowMajor => Self::RowMajor,
+            DenseLayout::Superblock144 => Self::Q4Superblock144,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -169,6 +221,14 @@ enum MoeConsumerArg {
     UniquePacket,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum VerifierMoeConsumerArg {
+    #[value(name = "unique-packet", alias = "unique_packet")]
+    UniquePacket,
+    #[value(name = "k4-vector-packet", alias = "k4_vector_packet")]
+    K4VectorPacket,
+}
+
 impl From<ExpertLayout> for PackingLayout {
     fn from(value: ExpertLayout) -> Self {
         match value {
@@ -181,6 +241,7 @@ impl From<ExpertLayout> for PackingLayout {
             ExpertLayout::Transaction144 => Self::Q4Transaction144,
             ExpertLayout::Transaction160 => Self::Q4Transaction160,
             ExpertLayout::CrossExpertTile8 => Self::Q4CrossExpertTile8,
+            ExpertLayout::Superblock144 => Self::Q4Superblock144,
         }
     }
 }
@@ -339,7 +400,7 @@ fn main() -> Result<()> {
     }
     if matches!(
         args.expert_layout,
-        ExpertLayout::Transaction144 | ExpertLayout::Transaction160
+        ExpertLayout::Transaction144 | ExpertLayout::Transaction160 | ExpertLayout::Superblock144
     ) && (args.expert_format != ExpertFormat::QxQ4
         || args.uniform_expert_bits.is_some()
         || args.layerwise_q3
@@ -348,7 +409,7 @@ fn main() -> Result<()> {
         || args.group_size != 32)
     {
         bail!(
-            "transaction-block candidates require uniform exact group-32 Q4 experts and --group-size 32"
+            "block-layout candidates require uniform exact group-32 Q4 experts and --group-size 32"
         );
     }
     if matches!(args.expert_layout, ExpertLayout::CrossExpertTile8)
@@ -917,13 +978,15 @@ fn main() -> Result<()> {
                 if shape != [rows, columns] {
                     bail!("tensor {name} has shape {shape:?}, expected [{rows}, {columns}]");
                 }
-                let tensor = QuantizedTensor::quantize(
+                let tensor = QuantizedTensor::quantize_for_layout(
                     &values,
                     rows,
                     columns,
                     QuantType::Q4,
                     args.group_size,
-                );
+                    args.dense_layout.into(),
+                )
+                .map_err(anyhow::Error::msg)?;
                 actual_weight_bytes += tensor.bytes();
                 compiled.push(CompiledTensor {
                     layer: layer as u16,
@@ -943,13 +1006,15 @@ fn main() -> Result<()> {
                 qx_model::HIDDEN
             );
         }
-        let tensor = QuantizedTensor::quantize(
+        let tensor = QuantizedTensor::quantize_for_layout(
             &values,
             qx_model::VOCAB,
             qx_model::HIDDEN,
             QuantType::Q4,
             args.group_size,
-        );
+            args.dense_layout.into(),
+        )
+        .map_err(anyhow::Error::msg)?;
         actual_weight_bytes += tensor.bytes();
         compiled.push(CompiledTensor {
             layer: u16::MAX,
@@ -998,6 +1063,7 @@ fn main() -> Result<()> {
     execution_plan.memory.weight_storage = args.weight_storage.into();
     execution_plan.schedule.command_buffers_per_token = args.command_buffers_per_token;
     execution_plan.schedule.encoders_per_token = args.command_buffers_per_token;
+    execution_plan.schedule.expected_dispatches_per_token = 390;
     let last_dispatch = execution_plan
         .schedule
         .expected_dispatches_per_token
@@ -1068,7 +1134,10 @@ fn main() -> Result<()> {
     execution_plan.representations.dense = if args.experts_only {
         ExpertRepresentation::MixedQ2Q3Q4
     } else {
-        ExpertRepresentation::Group32Q4RowMajor
+        match args.dense_layout {
+            DenseLayout::RowMajor => ExpertRepresentation::Group32Q4RowMajor,
+            DenseLayout::Superblock144 => ExpertRepresentation::Group32Q4Superblock144,
+        }
     };
     execution_plan.topology.moe = match args.moe_variant {
         MoeVariant::FourStage => qx_format::MoeTopology::FourStage,
@@ -1087,6 +1156,17 @@ fn main() -> Result<()> {
         MoeConsumerArg::Canonical => "canonical".to_owned(),
         MoeConsumerArg::UniquePacket => "unique-packet".to_owned(),
     });
+    execution_plan.verifier_moe_consumer = Some(match args.verifier_moe_consumer {
+        VerifierMoeConsumerArg::UniquePacket => VerifierMoeConsumerTopology::UniquePacket,
+        VerifierMoeConsumerArg::K4VectorPacket => VerifierMoeConsumerTopology::K4VectorPacket,
+    });
+    execution_plan.verifier_k4_split_accumulation = Some(args.verifier_k4_split_accumulation);
+    execution_plan.verifier_k4_direct_activation = Some(args.verifier_k4_direct_activation);
+    execution_plan.verifier_k4_rows16 = Some(args.verifier_k4_rows16);
+    execution_plan.verifier_k4_unroll4 = Some(args.verifier_k4_unroll4);
+    execution_plan.verifier_k4_unroll4_max_context = args.verifier_k4_unroll4_max_context;
+    execution_plan.verifier_k4_down_unroll4 = Some(args.verifier_k4_down_unroll4);
+    execution_plan.verifier_active_expert_dispatch = Some(args.verifier_active_expert_dispatch);
     execution_plan.expert_traversal = if args.expert_layout == ExpertLayout::CrossExpertTile8 {
         Some(qx_format::ExpertTraversalPlan {
             kind: qx_format::ExpertTraversalKind::CrossExpertTile,
@@ -1201,6 +1281,11 @@ fn representation_for(tensors: &[CompiledTensor], kind: TensorKind) -> ExpertRep
             && tensor.tensor.layout == PackingLayout::Q4Transaction160
     }) {
         ExpertRepresentation::Group32Q4Transaction160
+    } else if matching.iter().all(|tensor| {
+        tensor.tensor.quant_type == QuantType::Q4
+            && tensor.tensor.layout == PackingLayout::Q4Superblock144
+    }) {
+        ExpertRepresentation::Group32Q4Superblock144
     } else if matching.iter().all(|tensor| {
         tensor.tensor.quant_type == QuantType::Q4
             && tensor.tensor.layout == PackingLayout::Q4CrossExpertTile8
