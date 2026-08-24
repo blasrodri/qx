@@ -755,6 +755,8 @@ struct KWideVerifierBuffers {
     route_tokens: qx_metal::platform::RuntimeBuffer,
     bucket_counts: qx_metal::platform::RuntimeBuffer,
     bucket_pairs: qx_metal::platform::RuntimeBuffer,
+    active_experts: qx_metal::platform::RuntimeBuffer,
+    gate_up_dispatch_args: qx_metal::platform::RuntimeBuffer,
     gate_up: qx_metal::platform::RuntimeBuffer,
     activated: qx_metal::platform::RuntimeBuffer,
     expert_output: qx_metal::platform::RuntimeBuffer,
@@ -786,6 +788,8 @@ impl KWideVerifierBuffers {
         let route_tokens = alloc(pair_count * u32_bytes)?;
         let bucket_counts = alloc(EXPERTS * u32_bytes)?;
         let bucket_pairs = alloc(EXPERTS * pair_count * u32_bytes)?;
+        let active_experts = alloc(EXPERTS * u32_bytes)?;
+        let gate_up_dispatch_args = alloc(3 * u32_bytes)?;
         let gate_up = alloc(pair_count * HIDDEN * f32_bytes)?;
         let activated = alloc(pair_count * INTERMEDIATE * f32_bytes)?;
         let expert_output = alloc(pair_count * HIDDEN * f32_bytes)?;
@@ -827,6 +831,8 @@ impl KWideVerifierBuffers {
             route_tokens,
             bucket_counts,
             bucket_pairs,
+            active_experts,
+            gate_up_dispatch_args,
             gate_up,
             activated,
             expert_output,
@@ -863,6 +869,8 @@ impl PreparedMoeStack {
         route_weights: &qx_metal::platform::RuntimeBuffer,
         bucket_counts: &qx_metal::platform::RuntimeBuffer,
         bucket_pairs: &qx_metal::platform::RuntimeBuffer,
+        active_experts: &qx_metal::platform::RuntimeBuffer,
+        gate_up_dispatch_args: &qx_metal::platform::RuntimeBuffer,
         gate_up: &qx_metal::platform::RuntimeBuffer,
         activated: &qx_metal::platform::RuntimeBuffer,
         expert_output: &qx_metal::platform::RuntimeBuffer,
@@ -880,6 +888,8 @@ impl PreparedMoeStack {
             bucket_counts,
             bucket_pairs,
             pair_count,
+            active_experts,
+            gate_up_dispatch_args,
         )?;
         graph.encode_verifier_q4_gate_up_compact_unique_packet(
             prepared,
@@ -889,6 +899,8 @@ impl PreparedMoeStack {
             route_tokens,
             gate_up,
             pair_count,
+            active_experts,
+            gate_up_dispatch_args,
         )?;
         graph.encode_verifier_q4_silu_batch(prepared, gate_up, activated, pair_count)?;
         graph.encode_verifier_q4_down_batch(
@@ -1467,17 +1479,18 @@ impl GraniteV2Generator {
                 graph.stage_boundary(self.context.as_ref())?;
             }
             if self.verifier_moe_replay {
-                let prepared = self
-                    .moe
-                    .layers
-                    .get(layer)
-                    .ok_or_else(|| format!("verifier MoE layer {layer} is outside the stack"))?;
+                let prepared =
+                    self.moe.layers.get(layer).ok_or_else(|| {
+                        format!("verifier MoE layer {layer} is outside the stack")
+                    })?;
                 graph.encode_verifier_compact_routes_fixed(
                     prepared,
                     &verifier.topk_ids,
                     &verifier.bucket_counts,
                     &verifier.bucket_pairs,
                     verifier.pair_count,
+                    &verifier.active_experts,
+                    &verifier.gate_up_dispatch_args,
                 )?;
                 graph.encode_verifier_moe_replay(
                     self.context.as_ref(),
@@ -1486,17 +1499,18 @@ impl GraniteV2Generator {
                     width * HIDDEN,
                 )?;
             } else {
-                let prepared = self
-                    .moe
-                    .layers
-                    .get(layer)
-                    .ok_or_else(|| format!("verifier MoE layer {layer} is outside the stack"))?;
+                let prepared =
+                    self.moe.layers.get(layer).ok_or_else(|| {
+                        format!("verifier MoE layer {layer} is outside the stack")
+                    })?;
                 graph.encode_verifier_compact_routes_fixed(
                     prepared,
                     &verifier.topk_ids,
                     &verifier.bucket_counts,
                     &verifier.bucket_pairs,
                     verifier.pair_count,
+                    &verifier.active_experts,
+                    &verifier.gate_up_dispatch_args,
                 )?;
                 if self.verifier_gate_up_replay {
                     graph.encode_copy_f32(
@@ -1514,6 +1528,8 @@ impl GraniteV2Generator {
                         &verifier.route_tokens,
                         &verifier.gate_up,
                         verifier.pair_count,
+                        &verifier.active_experts,
+                        &verifier.gate_up_dispatch_args,
                     )?;
                 }
                 if self.verifier_gate_up_capture {

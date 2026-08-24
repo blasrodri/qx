@@ -30,11 +30,7 @@ mod llama_draft {
         fn qx_llama_draft_vocab(draft: *const c_void) -> c_int;
         fn qx_llama_draft_position(draft: *const c_void) -> u32;
         fn qx_llama_draft_error(draft: *const c_void) -> *const c_char;
-        fn qx_llama_draft_step(
-            draft: *mut c_void,
-            input: c_int,
-            output: *mut c_int,
-        ) -> c_int;
+        fn qx_llama_draft_step(draft: *mut c_void, input: c_int, output: *mut c_int) -> c_int;
         fn qx_llama_draft_rewind(draft: *mut c_void, position: u32) -> c_int;
     }
 
@@ -70,9 +66,7 @@ mod llama_draft {
 
         pub fn step(&mut self, input: u32) -> Result<u32, String> {
             let mut output = 0_i32;
-            let status = unsafe {
-                qx_llama_draft_step(self.raw, input as c_int, &mut output)
-            };
+            let status = unsafe { qx_llama_draft_step(self.raw, input as c_int, &mut output) };
             if status != 0 {
                 return Err(self.error());
             }
@@ -1187,6 +1181,12 @@ fn benchmark_v2_batch_moe_gateup(artifact_path: &std::path::Path, iterations: us
         let compact_bucket_pairs = context
             .allocate_runtime_buffer(32 * pair_count * std::mem::size_of::<u32>())
             .map_err(anyhow::Error::msg)?;
+        let active_experts = context
+            .allocate_runtime_buffer(32 * std::mem::size_of::<u32>())
+            .map_err(anyhow::Error::msg)?;
+        let gate_up_dispatch_args = context
+            .allocate_runtime_buffer(3 * std::mem::size_of::<u32>())
+            .map_err(anyhow::Error::msg)?;
         let output = context
             .allocate_runtime_buffer(pair_count * HIDDEN * 4)
             .map_err(anyhow::Error::msg)?;
@@ -1693,6 +1693,8 @@ fn benchmark_v2_batch_moe_gateup(artifact_path: &std::path::Path, iterations: us
                 &route_weights,
                 &bucket_counts,
                 &compact_bucket_pairs,
+                &active_experts,
+                &gate_up_dispatch_args,
                 &output,
                 &activated,
                 &expert_output,
@@ -1733,6 +1735,8 @@ fn benchmark_v2_batch_moe_gateup(artifact_path: &std::path::Path, iterations: us
                 &route_weights,
                 &bucket_counts,
                 &compact_bucket_pairs,
+                &active_experts,
+                &gate_up_dispatch_args,
                 &output,
                 &activated,
                 &expert_output,
@@ -2476,7 +2480,9 @@ fn benchmark_v2_gpu_verifier(
                 "whole" => generator.set_moe_capture(true),
                 "gateup" | "gate_up" => generator.set_gate_up_capture(true),
                 "down" => generator.set_down_capture(true),
-                other => bail!("unsupported QX_V2_VERIFIER_MOE_PROBE={other}; use whole, gateup, or down"),
+                other => bail!(
+                    "unsupported QX_V2_VERIFIER_MOE_PROBE={other}; use whole, gateup, or down"
+                ),
             }
             let result = generator
                 .verify_tokens_gpu(&inputs, &expected)
@@ -2569,19 +2575,25 @@ fn benchmark_v2_gpu_verifier(
             } else {
                 let expected_segments = EXPECTED_MARKERS + 1;
                 if timeline.segment_gpu_seconds.len() >= expected_segments {
-                    let mut totals = [timeline.segment_gpu_seconds[1] * 1e6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+                    let mut totals = [
+                        timeline.segment_gpu_seconds[1] * 1e6,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ];
                     for layer in 0..LAYERS {
                         let base = 2 + layer * STAGES_PER_LAYER;
                         totals[1] += timeline.segment_gpu_seconds[base] * 1e6;
                         for stage in 1..STAGES_PER_LAYER {
-                            totals[stage + 1] +=
-                                timeline.segment_gpu_seconds[base + stage] * 1e6;
+                            totals[stage + 1] += timeline.segment_gpu_seconds[base + stage] * 1e6;
                         }
                     }
                     totals[7] = timeline.segment_gpu_seconds[EXPECTED_MARKERS - 1] * 1e6;
-                    println!(
-                        "    stage GPU us (diagnostic CB fallback; scheduling changed):"
-                    );
+                    println!("    stage GPU us (diagnostic CB fallback; scheduling changed):");
                     for (name, value) in [
                         ("embedding", totals[0]),
                         ("qkv", totals[1]),
@@ -2637,13 +2649,9 @@ fn benchmark_v2_speculative(
 
     let mut target = qx_runtime_v2::GraniteV2Generator::load(artifact_path, context_length)
         .map_err(anyhow::Error::msg)?;
-    let mut draft = llama_draft::Draft::open(
-        draft_path,
-        context_length,
-        draft_gpu_layers,
-        draft_threads,
-    )
-    .map_err(anyhow::Error::msg)?;
+    let mut draft =
+        llama_draft::Draft::open(draft_path, context_length, draft_gpu_layers, draft_threads)
+            .map_err(anyhow::Error::msg)?;
     if draft.vocab() < VOCAB {
         bail!(
             "draft vocabulary {} is smaller than QX vocabulary {}",
@@ -2678,9 +2686,7 @@ fn benchmark_v2_speculative(
         let mut proposals = Vec::with_capacity(width + 1);
         proposals.push(draft_pending);
         for index in 0..width {
-            let next = draft
-                .step(proposals[index])
-                .map_err(anyhow::Error::msg)?;
+            let next = draft.step(proposals[index]).map_err(anyhow::Error::msg)?;
             proposals.push(next);
         }
         total_draft_wall += draft_start.elapsed().as_secs_f64() * 1_000_000.0;
@@ -2723,7 +2729,9 @@ fn benchmark_v2_speculative(
             accepted += accepted_here;
             mismatches += 1;
             delivered += accepted_here + 1;
-            draft.rewind(target.position()).map_err(anyhow::Error::msg)?;
+            draft
+                .rewind(target.position())
+                .map_err(anyhow::Error::msg)?;
             let correction = result.next_token;
             target_pending = target.step(correction).map_err(anyhow::Error::msg)?;
             draft_pending = draft.step(correction).map_err(anyhow::Error::msg)?;
@@ -2750,17 +2758,39 @@ fn benchmark_v2_speculative(
     println!("prompt tokens:        {}", prompt.len());
     println!("width / rounds:       K={width} / {rounds}");
     println!("draft vocab:          {}", draft.vocab());
-    println!("draft/target final position: {}/{}", draft.position(), target.position());
+    println!(
+        "draft/target final position: {}/{}",
+        draft.position(),
+        target.position()
+    );
     println!("proposed tokens:      {proposed}");
     println!("accepted proposals:   {accepted}");
-    println!("accepted proposal %:   {:.2}%", 100.0 * accepted as f64 / proposed_f.max(1.0));
+    println!(
+        "accepted proposal %:   {:.2}%",
+        100.0 * accepted as f64 / proposed_f.max(1.0)
+    );
     println!("mismatch rounds:      {mismatches}");
     println!("delivered tokens:     {delivered}");
-    println!("draft wall / round:    {:.2} us", total_draft_wall / rounds_f);
-    println!("verify GPU / round:    {:.2} us", total_verify_gpu / rounds_f);
-    println!("round wall / token:    {:.2} us", total_wall / delivered_f.max(1.0));
-    println!("delivered tok/s:       {:.2}", delivered_f / (total_wall / 1_000_000.0).max(f64::MIN_POSITIVE));
-    println!("proposed tok/s:        {:.2}", proposed_f / (total_wall / 1_000_000.0).max(f64::MIN_POSITIVE));
+    println!(
+        "draft wall / round:    {:.2} us",
+        total_draft_wall / rounds_f
+    );
+    println!(
+        "verify GPU / round:    {:.2} us",
+        total_verify_gpu / rounds_f
+    );
+    println!(
+        "round wall / token:    {:.2} us",
+        total_wall / delivered_f.max(1.0)
+    );
+    println!(
+        "delivered tok/s:       {:.2}",
+        delivered_f / (total_wall / 1_000_000.0).max(f64::MIN_POSITIVE)
+    );
+    println!(
+        "proposed tok/s:        {:.2}",
+        proposed_f / (total_wall / 1_000_000.0).max(f64::MIN_POSITIVE)
+    );
     Ok(())
 }
 

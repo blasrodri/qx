@@ -390,6 +390,18 @@ pub mod platform {
         })
     }
 
+    /// Opt-in K-wide gate/up dispatch that uses the GPU-produced active expert
+    /// list and indirect threadgroup count to skip empty expert buckets.
+    pub fn verifier_active_expert_dispatch_enabled() -> bool {
+        matches!(
+            std::env::var("QX_V2_VERIFIER_ACTIVE_EXPERT_DISPATCH")
+                .ok()
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    }
+
     /// Experimental Down-side neuron-cluster pre-screen. Accepted values are
     /// `16` and `32`; the switch is intentionally independent from the sealed
     /// artifact plan until a complete clustered path exists.
@@ -2954,6 +2966,8 @@ pub mod platform {
             bucket_counts: &RuntimeBuffer,
             bucket_pairs: &RuntimeBuffer,
             pair_count: usize,
+            active_experts: &RuntimeBuffer,
+            dispatch_args: &RuntimeBuffer,
         ) -> Result<(), String> {
             if pair_count == 0 || pair_count > 32 {
                 return Err("K-wide route compaction supports pair counts 1..=32".to_owned());
@@ -2961,6 +2975,8 @@ pub mod platform {
             if route_experts.length < pair_count * std::mem::size_of::<u32>()
                 || bucket_counts.length < 32 * std::mem::size_of::<u32>()
                 || bucket_pairs.length < 32 * pair_count * std::mem::size_of::<u32>()
+                || active_experts.length < 32 * std::mem::size_of::<u32>()
+                || dispatch_args.length < 3 * std::mem::size_of::<u32>()
             {
                 return Err("K-wide route-compaction buffers are too small".to_owned());
             }
@@ -2987,6 +3003,16 @@ pub mod platform {
                     NonNull::from(&pair_count).cast(),
                     std::mem::size_of_val(&pair_count),
                     3,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&active_experts.buffer),
+                    active_experts.offset,
+                    4,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&dispatch_args.buffer),
+                    dispatch_args.offset,
+                    5,
                 );
             }
             self.encoder.dispatchThreads_threadsPerThreadgroup(
@@ -3110,6 +3136,8 @@ pub mod platform {
             route_tokens: &RuntimeBuffer,
             output: &RuntimeBuffer,
             pair_count: usize,
+            active_experts: &RuntimeBuffer,
+            dispatch_args: &RuntimeBuffer,
         ) -> Result<(), String> {
             if prepared.gate_up_layout != PackingLayout::Q4RowInline {
                 return Err("K-wide compact gate/up requires Q4 row-inline".to_owned());
@@ -3122,10 +3150,17 @@ pub mod platform {
                 || bucket_pairs.length < 32 * pair_count * std::mem::size_of::<u32>()
                 || route_tokens.length < pair_count * std::mem::size_of::<u32>()
                 || output.length < pair_count * 1024 * std::mem::size_of::<f32>()
+                || active_experts.length < 32 * std::mem::size_of::<u32>()
+                || dispatch_args.length < 3 * std::mem::size_of::<u32>()
             {
                 return Err("K-wide compact gate/up buffers are too small".to_owned());
             }
             let pair_count = pair_count as u32;
+            let active_mode = if verifier_active_expert_dispatch_enabled() {
+                1_u32
+            } else {
+                0_u32
+            };
             self.encoder
                 .setComputePipelineState(&prepared.verifier_gate_up_compact_unique_packet_pipeline);
             unsafe {
@@ -3158,19 +3193,44 @@ pub mod platform {
                     std::mem::size_of_val(&pair_count),
                     6,
                 );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&active_experts.buffer),
+                    active_experts.offset,
+                    7,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&active_mode).cast(),
+                    std::mem::size_of_val(&active_mode),
+                    8,
+                );
             }
-            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: 32 * (1024 / 8),
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 256,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            if verifier_active_expert_dispatch_enabled() {
+                unsafe {
+                    self.encoder
+                        .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                            &dispatch_args.buffer,
+                            dispatch_args.offset,
+                            MTLSize {
+                                width: 256,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                }
+            } else {
+                self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: 32 * (1024 / 8),
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            }
             self.dispatches += 1;
             Ok(())
         }
@@ -7063,10 +7123,7 @@ pub mod platform {
         /// Preserve the five-dispatch MoE slot in a verifier probe without
         /// performing expert work. This is intentionally diagnostic-only:
         /// downstream values are not expected to preserve model semantics.
-        pub fn encode_verifier_moe_noop(
-            &mut self,
-            context: &MetalContext,
-        ) -> Result<(), String> {
+        pub fn encode_verifier_moe_noop(&mut self, context: &MetalContext) -> Result<(), String> {
             for _ in 0..5 {
                 self.encode_noop(
                     context,
@@ -7305,8 +7362,7 @@ pub mod platform {
                 v2_pipelines: Mutex::new([
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
-                    None, None, None, None, None, None, None, None, None, None, None, None,
-                    None,
+                    None, None, None, None, None, None, None, None, None, None, None, None, None,
                 ]),
                 scratch: Mutex::new(MetalScratch {
                     input_f32: None,

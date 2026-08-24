@@ -381,6 +381,8 @@ kernel void qx_verifier_compact_routes_fixed(
     device uint* bucket_counts [[buffer(1)]],
     device uint* bucket_pairs [[buffer(2)]],
     constant uint& pair_count [[buffer(3)]],
+    device uint* active_experts [[buffer(4)]],
+    device uint* dispatch_args [[buffer(5)]],
     uint expert [[thread_position_in_grid]]) {
     if (expert >= 32) return;
     uint count = 0;
@@ -391,6 +393,25 @@ kernel void qx_verifier_compact_routes_fixed(
         }
     }
     bucket_counts[expert] = count;
+    threadgroup_barrier(mem_flags::mem_device);
+    if (count > 0) {
+        uint rank = 0;
+        for (uint prior = 0; prior < expert; ++prior) {
+            if (bucket_counts[prior] > 0) ++rank;
+        }
+        active_experts[rank] = expert;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (expert == 0) {
+        uint active = 0;
+        for (uint e = 0; e < 32; ++e) {
+            if (bucket_counts[e] > 0) ++active;
+        }
+        // MTLDispatchThreadgroupsIndirectArguments: three uint32 values.
+        dispatch_args[0] = active * (1024 / 8);
+        dispatch_args[1] = 1;
+        dispatch_args[2] = 1;
+    }
 }
 
 // Packet-stationary consumer for the fixed-stride route buckets emitted by
@@ -404,6 +425,8 @@ kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet(
     device const float* input [[buffer(4)]],
     device float* output [[buffer(5)]],
     constant uint& pair_count [[buffer(6)]],
+    device const uint* active_experts [[buffer(7)]],
+    constant uint& active_mode [[buffer(8)]],
     uint lane [[thread_index_in_simdgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint threadgroup_id [[threadgroup_position_in_grid]],
@@ -418,9 +441,10 @@ kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet(
     constexpr uint threadgroups_per_bucket = hidden / rows_per_threadgroup;
     threadgroup float cached_input[max_tokens * hidden];
 
-    uint bucket = threadgroup_id / threadgroups_per_bucket;
+    uint active_bucket = threadgroup_id / threadgroups_per_bucket;
     uint row_group = threadgroup_id % threadgroups_per_bucket;
-    if (bucket >= 32) return;
+    if (active_bucket >= 32) return;
+    uint bucket = active_mode != 0 ? active_experts[active_bucket] : active_bucket;
     uint active = min(bucket_counts[bucket], max_tokens);
     uint bucket_base = bucket * pair_count;
     for (uint token_slot = 0; token_slot < max_tokens; ++token_slot) {
