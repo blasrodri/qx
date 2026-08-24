@@ -897,6 +897,7 @@ pub mod platform {
         verifier_gate_up_pipeline: Pipeline,
         verifier_gate_up_expert_major_pipeline: Pipeline,
         verifier_gate_up_expert_major_direct_pipeline: Pipeline,
+        verifier_gate_up_expert_major_unique_packet_pipeline: Pipeline,
         verifier_silu_pipeline: Pipeline,
         verifier_down_pipeline: Pipeline,
         verifier_accumulate_pipeline: Pipeline,
@@ -2883,6 +2884,99 @@ pub mod platform {
             let bucket_count = bucket_count as u32;
             self.encoder
                 .setComputePipelineState(&prepared.verifier_gate_up_expert_major_direct_pipeline);
+            unsafe {
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.gate_up_packed.buffer),
+                    prepared.gate_up_packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&bucket_experts.buffer),
+                    bucket_experts.offset,
+                    1,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&bucket_offsets.buffer),
+                    bucket_offsets.offset,
+                    2,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&bucket_pairs.buffer),
+                    bucket_pairs.offset,
+                    3,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&route_tokens.buffer),
+                    route_tokens.offset,
+                    4,
+                );
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 5);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&output.buffer), output.offset, 6);
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&bucket_count).cast(),
+                    std::mem::size_of_val(&bucket_count),
+                    7,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: (bucket_count as usize) * (1024 / 8),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        /// Encode the packet-stationary expert-major candidate. It has the
+        /// same route/bucket ABI as the cached expert-major control, but the
+        /// Metal kernel assigns one packed code byte and scale to each lane
+        /// half so both nibbles are reused across all active token pairs.
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_verifier_q4_gate_up_expert_major_unique_packet(
+            &mut self,
+            prepared: &PreparedDynamicQ4Moe,
+            input: &RuntimeBuffer,
+            bucket_experts: &RuntimeBuffer,
+            bucket_offsets: &RuntimeBuffer,
+            bucket_pairs: &RuntimeBuffer,
+            route_tokens: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            bucket_count: usize,
+        ) -> Result<(), String> {
+            if prepared.gate_up_layout != PackingLayout::Q4RowInline {
+                return Err(
+                    "K-wide expert-major gate/up requires the exact Q4 row-inline layout"
+                        .to_owned(),
+                );
+            }
+            if bucket_count == 0 {
+                return Ok(());
+            }
+            if bucket_count > 32 {
+                return Err("K-wide expert-major bucket count exceeds 32".to_owned());
+            }
+            if input.length < 1024 * std::mem::size_of::<f32>()
+                || bucket_experts.length < bucket_count * std::mem::size_of::<u32>()
+                || bucket_offsets.length < (bucket_count + 1) * std::mem::size_of::<u32>()
+                || bucket_pairs.length < std::mem::size_of::<u32>()
+                || route_tokens.length < std::mem::size_of::<u32>()
+                || output.length < 1024 * std::mem::size_of::<f32>()
+            {
+                return Err("K-wide expert-major gate/up buffers are too small".to_owned());
+            }
+            let bucket_count = bucket_count as u32;
+            self.encoder.setComputePipelineState(
+                &prepared.verifier_gate_up_expert_major_unique_packet_pipeline,
+            );
             unsafe {
                 self.encoder.setBuffer_offset_atIndex(
                     Some(&prepared.gate_up_packed.buffer),
@@ -8576,6 +8670,10 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_expert_major")?,
                 verifier_gate_up_expert_major_direct_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_expert_major_direct")?,
+                verifier_gate_up_expert_major_unique_packet_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_expert_major_unique_packet",
+                    )?,
                 verifier_silu_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_silu_batch")?,
                 verifier_down_pipeline: self
@@ -8933,6 +9031,10 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_expert_major")?,
                 verifier_gate_up_expert_major_direct_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_expert_major_direct")?,
+                verifier_gate_up_expert_major_unique_packet_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_expert_major_unique_packet",
+                    )?,
                 verifier_silu_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_silu_batch")?,
                 verifier_down_pipeline: self
@@ -9246,6 +9348,10 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_expert_major")?,
                 verifier_gate_up_expert_major_direct_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_expert_major_direct")?,
+                verifier_gate_up_expert_major_unique_packet_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_expert_major_unique_packet",
+                    )?,
                 verifier_silu_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_silu_batch")?,
                 verifier_down_pipeline: self
@@ -9639,6 +9745,10 @@ pub mod platform {
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_expert_major")?,
                 verifier_gate_up_expert_major_direct_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_gate_up_expert_major_direct")?,
+                verifier_gate_up_expert_major_unique_packet_pipeline: self
+                    .dynamic_moe_named_pipeline(
+                        "qx_verifier_q4_moe_gate_up_expert_major_unique_packet",
+                    )?,
                 verifier_silu_pipeline: self
                     .dynamic_moe_named_pipeline("qx_verifier_q4_moe_silu_batch")?,
                 verifier_down_pipeline: self
