@@ -751,6 +751,21 @@ pub struct GraniteV2Generator {
     position: usize,
 }
 
+/// Logical KV cursor state used by speculative verification.  The KV arena is
+/// not copied: speculative positions are written into future slots and a
+/// rollback only rewinds this cursor.  The next committed decode overwrites
+/// any discarded slots before attention can observe them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvCheckpoint {
+    pub sequence_len: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReferenceVerification {
+    pub accepted_prefix: usize,
+    pub next_token: u32,
+}
+
 #[cfg(target_os = "macos")]
 impl GraniteV2Generator {
     pub fn load(
@@ -794,6 +809,53 @@ impl GraniteV2Generator {
         self.position
     }
 
+    pub fn checkpoint_kv(&self) -> KvCheckpoint {
+        KvCheckpoint {
+            sequence_len: self.position,
+        }
+    }
+
+    /// Discard speculative suffix state without copying the KV arena.
+    pub fn rollback_kv(&mut self, checkpoint: KvCheckpoint) -> Result<(), String> {
+        if checkpoint.sequence_len > self.position
+            || checkpoint.sequence_len > self.context_length()
+        {
+            return Err(format!(
+                "KV rollback checkpoint {} is outside current position {} / context {}",
+                checkpoint.sequence_len,
+                self.position,
+                self.context_length()
+            ));
+        }
+        self.position = checkpoint.sequence_len;
+        Ok(())
+    }
+
+    /// Commit an accepted prefix of a speculative transaction.  This method
+    /// only advances/rewinds the logical cursor; the accepted KV slots are
+    /// already resident in the GPU arena.
+    pub fn commit_kv(
+        &mut self,
+        checkpoint: KvCheckpoint,
+        accepted_prefix: usize,
+    ) -> Result<(), String> {
+        let end = checkpoint
+            .sequence_len
+            .checked_add(accepted_prefix)
+            .ok_or_else(|| "KV commit position overflow".to_owned())?;
+        if checkpoint.sequence_len > self.position
+            || end > self.position
+            || end > self.context_length()
+        {
+            return Err(format!(
+                "KV commit [{}, {}) is outside current speculative range ending at {}",
+                checkpoint.sequence_len, end, self.position
+            ));
+        }
+        self.position = end;
+        Ok(())
+    }
+
     pub fn context_length(&self) -> usize {
         self.buffers.plan.context
     }
@@ -816,6 +878,41 @@ impl GraniteV2Generator {
         self.evaluate_token(token)?;
         self.context
             .read_runtime_f32(self.buffers.buffer(BufferId::Logits), VOCAB)
+    }
+
+    /// Correctness-only verifier for the future multi-position verifier.
+    /// `inputs[i]` is evaluated at the current cursor and its target output is
+    /// compared with `expected_next[i]`.  It intentionally uses the existing
+    /// one-token graph, so it is not a performance feature and must not be
+    /// used as a speculative-throughput claim.
+    pub fn verify_tokens_reference(
+        &mut self,
+        inputs: &[u32],
+        expected_next: &[u32],
+    ) -> Result<ReferenceVerification, String> {
+        if inputs.is_empty() || inputs.len() != expected_next.len() {
+            return Err("reference verification requires equal non-empty token slices".to_owned());
+        }
+        let checkpoint = self.checkpoint_kv();
+        let mut next_token = 0_u32;
+        for (index, (&input, &expected)) in inputs.iter().zip(expected_next).enumerate() {
+            let predicted = self.step(input)?;
+            next_token = predicted;
+            if predicted != expected {
+                self.rollback_kv(checkpoint)?;
+                for &accepted_input in &inputs[..index] {
+                    self.step(accepted_input)?;
+                }
+                return Ok(ReferenceVerification {
+                    accepted_prefix: index,
+                    next_token: predicted,
+                });
+            }
+        }
+        Ok(ReferenceVerification {
+            accepted_prefix: inputs.len(),
+            next_token,
+        })
     }
 
     fn evaluate_token(&mut self, token: u32) -> Result<(), String> {

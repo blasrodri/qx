@@ -29,6 +29,22 @@ verify(candidates[K], state)
     -> committed KV state
 ```
 
+The first state-management slice now exists in `GraniteV2Generator`:
+`checkpoint_kv()`, `commit_kv()`, `rollback_kv()`, and the explicitly named
+`verify_tokens_reference()` correctness path. It uses the existing one-token
+graph and is therefore **not** a performance result. Its purpose is to prove
+that accepted-prefix state, rejected-suffix rollback, and cursor bounds are
+well-defined before a batched verifier is introduced.
+
+The implementation relies on the current KV layout's important invariant:
+future slots are safe scratch space, and the next committed token overwrites
+the slot at the rewound cursor before attention reads it. No KV copy is made.
+
+The remaining blocker is execution, not state semantics: `verify_tokens()` must
+become a true multi-position graph that consumes `[K, hidden]` activations and
+commits only the accepted prefix. Repeated calls to `step()` are retained only
+as a reference oracle.
+
 The verifier must keep target weights and intermediate state GPU-resident,
 handle causal attention for K candidate positions, and commit only the
 accepted prefix. Rejected suffix state must not contaminate the next decode.
