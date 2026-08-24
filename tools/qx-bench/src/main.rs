@@ -165,6 +165,13 @@ struct Args {
     /// Run a complete V2 token graph including embedding, LM head, and argmax.
     #[arg(long)]
     v2_token: bool,
+    /// Keep this many complete token graphs in flight. Values greater than one
+    /// use GPU-resident argmax-to-embedding rollout without a per-token wait.
+    #[arg(long, default_value_t = 1)]
+    v2_rollout_window: usize,
+    /// Hash the final GPU KV arena after timing to verify rollout equivalence.
+    #[arg(long, requires = "v2_token")]
+    v2_rollout_verify: bool,
     /// Prefill a prompt through V2, then continue with artifact-only greedy decode.
     #[arg(long)]
     v2_generate: bool,
@@ -406,6 +413,8 @@ fn main() -> Result<()> {
             context,
             args.warmup,
             iterations,
+            args.v2_rollout_window,
+            args.v2_rollout_verify,
             fixture.as_ref(),
             args.result_json.as_deref(),
         );
@@ -425,6 +434,7 @@ fn main() -> Result<()> {
             args.prompt.as_str(),
             args.max_new_tokens,
             args.context,
+            args.v2_rollout_window,
         );
     }
     if args.v2_parity {
@@ -9429,6 +9439,9 @@ struct V2TokenBenchmarkRecord {
     measured_position_start: usize,
     measured_tokens: usize,
     warmup: usize,
+    rollout_window: usize,
+    kv_hash: Option<String>,
+    token_history_hash: Option<String>,
     wall_ms_per_token: f64,
     gpu_ms_per_token: f64,
     tokens_per_second: f64,
@@ -9741,6 +9754,8 @@ fn benchmark_v2_token(
     context_length: usize,
     warmup: usize,
     iterations: usize,
+    rollout_window: usize,
+    rollout_verify: bool,
     fixture: Option<&BenchmarkFixture>,
     result_json: Option<&std::path::Path>,
 ) -> Result<()> {
@@ -9763,6 +9778,9 @@ fn benchmark_v2_token(
     };
     if prefill_tokens.saturating_add(iterations) > context_length {
         bail!("prefill plus measured positions must fit within the V2 context");
+    }
+    if rollout_window == 0 {
+        bail!("--v2-rollout-window must be at least one");
     }
     let initial_token = tokens[0];
     let sealed_plan = qx_runtime_v2::activate_artifact_execution_plan(artifact_path)
@@ -9832,23 +9850,108 @@ fn benchmark_v2_token(
             )
             .map_err(anyhow::Error::msg)?;
     }
+    let rollout_history = metal
+        .allocate_runtime_buffer((iterations + 1) * std::mem::size_of::<u32>())
+        .map_err(anyhow::Error::msg)?;
+    let rollout_seed = metal
+        .read_runtime_u32(buffers.buffer(qx_runtime_v2::BufferId::TokenOutput))
+        .map_err(anyhow::Error::msg)?;
+    metal
+        .write_runtime_buffer(&rollout_history, &rollout_seed.to_le_bytes())
+        .map_err(anyhow::Error::msg)?;
     let before = metal.metrics().map_err(anyhow::Error::msg)?;
     let start = Instant::now();
     let measured_position_start = prefill_tokens;
-    for position in measured_position_start..measured_position_start + iterations {
-        let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
-        stack
-            .encode_token(&mut graph, &buffers, &moe, position)
-            .map_err(anyhow::Error::msg)?;
-        buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+    if rollout_window == 1 {
+        for (index, position) in
+            (measured_position_start..measured_position_start + iterations).enumerate()
+        {
+            let token_input = rollout_history
+                .subregion(
+                    index * std::mem::size_of::<u32>(),
+                    std::mem::size_of::<u32>(),
+                )
+                .map_err(anyhow::Error::msg)?;
+            let token_output = rollout_history
+                .subregion(
+                    (index + 1) * std::mem::size_of::<u32>(),
+                    std::mem::size_of::<u32>(),
+                )
+                .map_err(anyhow::Error::msg)?;
+            let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+            stack
+                .encode_token_from_to(
+                    &mut graph,
+                    &buffers,
+                    &moe,
+                    &token_input,
+                    &token_output,
+                    position,
+                )
+                .map_err(anyhow::Error::msg)?;
+            buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+        }
+    } else {
+        let mut in_flight = std::collections::VecDeque::with_capacity(rollout_window);
+        for (index, position) in
+            (measured_position_start..measured_position_start + iterations).enumerate()
+        {
+            let token_input = rollout_history
+                .subregion(
+                    index * std::mem::size_of::<u32>(),
+                    std::mem::size_of::<u32>(),
+                )
+                .map_err(anyhow::Error::msg)?;
+            let token_output = rollout_history
+                .subregion(
+                    (index + 1) * std::mem::size_of::<u32>(),
+                    std::mem::size_of::<u32>(),
+                )
+                .map_err(anyhow::Error::msg)?;
+            let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
+            stack
+                .encode_token_from_to(
+                    &mut graph,
+                    &buffers,
+                    &moe,
+                    &token_input,
+                    &token_output,
+                    position,
+                )
+                .map_err(anyhow::Error::msg)?;
+            in_flight.push_back(buffers.submit_token(graph));
+            if in_flight.len() >= rollout_window {
+                buffers
+                    .wait_token(in_flight.pop_front().expect("non-empty rollout window"))
+                    .map_err(anyhow::Error::msg)?;
+            }
+        }
+        while let Some(submitted) = in_flight.pop_front() {
+            buffers.wait_token(submitted).map_err(anyhow::Error::msg)?;
+        }
     }
     let wall = start.elapsed();
     let after = metal.metrics().map_err(anyhow::Error::msg)?;
     let count = iterations.max(1) as f64;
     let gpu_seconds = after.gpu_time_seconds - before.gpu_time_seconds;
-    let token = metal
-        .read_runtime_u32(buffers.buffer(qx_runtime_v2::BufferId::TokenOutput))
+    let token_history = metal
+        .read_runtime_u32s(&rollout_history, iterations + 1)
         .map_err(anyhow::Error::msg)?;
+    let token = *token_history.last().expect("rollout history includes seed");
+    let token_history_hash = rollout_verify.then(|| {
+        let bytes = token_history
+            .iter()
+            .skip(1)
+            .flat_map(|token| token.to_le_bytes())
+            .collect::<Vec<_>>();
+        format!("{:016x}", fnv1a64_bytes(&bytes))
+    });
+    let kv_hash = rollout_verify.then(|| {
+        format!(
+            "{:016x}",
+            fnv1a64_bytes(&metal.read_runtime_bytes(buffers.kv_buffer()))
+        )
+    });
     let (artifact_bytes, artifact_hash) = artifact_fingerprint(artifact_path)?;
     let plan_id = sealed_plan
         .as_ref()
@@ -9884,6 +9987,9 @@ fn benchmark_v2_token(
         measured_position_start,
         measured_tokens: iterations,
         warmup,
+        rollout_window,
+        kv_hash: kv_hash.clone(),
+        token_history_hash: token_history_hash.clone(),
         wall_ms_per_token,
         gpu_ms_per_token,
         tokens_per_second: count / wall.as_secs_f64(),
@@ -9914,7 +10020,14 @@ fn benchmark_v2_token(
     println!("layers:                 {}", stack.layers.len());
     println!("warmup:                {warmup}");
     println!("iterations:             {iterations}");
+    println!("rollout window:         {rollout_window}");
     println!("last GPU token ID:      {token}");
+    if let Some(hash) = &kv_hash {
+        println!("final KV hash:          {hash}");
+    }
+    if let Some(hash) = &token_history_hash {
+        println!("token history hash:     {hash}");
+    }
     println!("process peak RSS bytes:  {}", record.peak_rss_bytes);
     println!("process current RSS bytes: {}", record.current_rss_bytes);
     println!(
@@ -9945,6 +10058,7 @@ fn benchmark_v2_generate(
     prompt: &str,
     max_new_tokens: usize,
     context_length: usize,
+    rollout_window: usize,
 ) -> Result<()> {
     use std::rc::Rc;
     let tokenizer = qx_tokenizer::Tokenizer::from_dir(model_path)?;
@@ -9952,8 +10066,24 @@ fn benchmark_v2_generate(
     if prompt_tokens.is_empty() {
         bail!("V2 prompt must produce at least one token");
     }
+    if max_new_tokens == 0 {
+        bail!("--max-new-tokens must be at least one");
+    }
     if prompt_tokens.len().saturating_add(max_new_tokens) > context_length {
         bail!("prompt plus requested generation exceeds the V2 context");
+    }
+    if rollout_window == 0 {
+        bail!("--v2-rollout-window must be at least one");
+    }
+    let sealed_plan = qx_runtime_v2::activate_artifact_execution_plan(artifact_path)
+        .map_err(anyhow::Error::msg)?;
+    if let Some(plan) = sealed_plan {
+        if plan.workload.context_limit as usize != context_length {
+            bail!(
+                "requested context {context_length} does not match sealed plan context {}",
+                plan.workload.context_limit
+            );
+        }
     }
     let metal = Rc::new(
         qx_metal::platform::MetalContext::system_default()
@@ -9982,29 +10112,65 @@ fn benchmark_v2_generate(
     }
     let prefill_wall = start.elapsed();
     let decode_start = Instant::now();
-    let mut generated = Vec::with_capacity(max_new_tokens);
-    generated.push(
-        metal
-            .read_runtime_u32(buffers.buffer(qx_runtime_v2::BufferId::TokenOutput))
-            .map_err(anyhow::Error::msg)?,
-    );
-    for position in prompt_tokens.len()..prompt_tokens.len() + max_new_tokens.saturating_sub(1) {
+    let history = metal
+        .allocate_runtime_buffer(max_new_tokens * std::mem::size_of::<u32>())
+        .map_err(anyhow::Error::msg)?;
+    let first_generated = metal
+        .read_runtime_u32(buffers.buffer(qx_runtime_v2::BufferId::TokenOutput))
+        .map_err(anyhow::Error::msg)?;
+    metal
+        .write_runtime_buffer(&history, &first_generated.to_le_bytes())
+        .map_err(anyhow::Error::msg)?;
+    let mut in_flight = std::collections::VecDeque::with_capacity(rollout_window);
+    for (index, position) in
+        (prompt_tokens.len()..prompt_tokens.len() + max_new_tokens.saturating_sub(1)).enumerate()
+    {
+        let token_input = history
+            .subregion(
+                index * std::mem::size_of::<u32>(),
+                std::mem::size_of::<u32>(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        let token_output = history
+            .subregion(
+                (index + 1) * std::mem::size_of::<u32>(),
+                std::mem::size_of::<u32>(),
+            )
+            .map_err(anyhow::Error::msg)?;
         let mut graph = buffers.begin_token().map_err(anyhow::Error::msg)?;
         stack
-            .encode_token(&mut graph, &buffers, &moe, position)
+            .encode_token_from_to(
+                &mut graph,
+                &buffers,
+                &moe,
+                &token_input,
+                &token_output,
+                position,
+            )
             .map_err(anyhow::Error::msg)?;
-        buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
-        generated.push(
-            metal
-                .read_runtime_u32(buffers.buffer(qx_runtime_v2::BufferId::TokenOutput))
-                .map_err(anyhow::Error::msg)?,
-        );
+        if rollout_window == 1 {
+            buffers.finish_token(graph).map_err(anyhow::Error::msg)?;
+        } else {
+            in_flight.push_back(buffers.submit_token(graph));
+            if in_flight.len() >= rollout_window {
+                buffers
+                    .wait_token(in_flight.pop_front().expect("non-empty rollout window"))
+                    .map_err(anyhow::Error::msg)?;
+            }
+        }
     }
+    while let Some(submitted) = in_flight.pop_front() {
+        buffers.wait_token(submitted).map_err(anyhow::Error::msg)?;
+    }
+    let generated = metal
+        .read_runtime_u32s(&history, max_new_tokens)
+        .map_err(anyhow::Error::msg)?;
     let decode_wall = decode_start.elapsed();
     let token = *generated.last().expect("positive generation length");
     println!("QX V2 artifact-only generation");
     println!("prompt tokens:           {}", prompt_tokens.len());
     println!("generated tokens:        {max_new_tokens}");
+    println!("rollout window:          {rollout_window}");
     println!("last GPU token ID:       {token}");
     println!("decoded tail:            {}", tokenizer.decode(&generated)?);
     println!(
@@ -10423,6 +10589,7 @@ fn benchmark_v2_generate(
     _prompt: &str,
     _max_new_tokens: usize,
     _context_length: usize,
+    _rollout_window: usize,
 ) -> Result<()> {
     bail!("--v2-generate requires macOS Metal")
 }
@@ -10433,6 +10600,8 @@ fn benchmark_v2_token(
     _context_length: usize,
     _warmup: usize,
     _iterations: usize,
+    _rollout_window: usize,
+    _rollout_verify: bool,
     _fixture: Option<&BenchmarkFixture>,
     _result_json: Option<&std::path::Path>,
 ) -> Result<()> {
@@ -10984,6 +11153,15 @@ fn command_output(program: &str, arguments: &[&str]) -> String {
 fn token_fixture_hash(tokens: &[u32]) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in tokens.iter().flat_map(|token| token.to_le_bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn fnv1a64_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for &byte in bytes {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }

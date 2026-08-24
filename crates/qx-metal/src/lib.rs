@@ -1384,8 +1384,8 @@ pub mod platform {
     }
 
     /// Token-level command stream for Runtime V2. Operators may encode fixed
-    /// shape work through this object; lifecycle operations occur only in
-    /// `finish`, which is the single permitted synchronization point.
+    /// shape work through this object. `submit` commits the graph without a
+    /// CPU wait; `finish` is the synchronous convenience path.
     pub struct DecodeGraph {
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
@@ -1394,6 +1394,17 @@ pub mod platform {
         committed: Vec<(Retained<ProtocolObject<dyn MTLCommandBuffer>>, u64, u64)>,
         encoders: u64,
         encode_started_at: Instant,
+    }
+
+    /// A committed decode graph whose GPU work may still be in flight. Metal
+    /// queue order makes it safe to submit the next token before waiting on
+    /// this one; callers must eventually call `wait` to surface GPU errors and
+    /// account the completed work in runtime metrics.
+    pub struct SubmittedDecode {
+        committed: Vec<(Retained<ProtocolObject<dyn MTLCommandBuffer>>, u64, u64)>,
+        counter_timeline: Option<CounterTimeline>,
+        encode_started_at: Instant,
+        submitted_at: Instant,
     }
 
     impl DecodeGraph {
@@ -7614,13 +7625,33 @@ pub mod platform {
             Ok(())
         }
 
-        pub fn finish(mut self, context: &MetalContext) -> Result<(), String> {
+        pub fn submit(mut self) -> SubmittedDecode {
             self.encoder.endEncoding();
             self.command_buffer.commit();
-            let wait_start = Instant::now();
-            self.command_buffer.waitUntilCompleted();
             self.committed
                 .push((self.command_buffer, self.dispatches, self.encoders));
+            SubmittedDecode {
+                committed: self.committed,
+                counter_timeline: self.counter_timeline.take(),
+                encode_started_at: self.encode_started_at,
+                submitted_at: Instant::now(),
+            }
+        }
+
+        pub fn finish(self, context: &MetalContext) -> Result<(), String> {
+            self.submit().wait(context)
+        }
+    }
+
+    impl SubmittedDecode {
+        pub fn wait(mut self, context: &MetalContext) -> Result<(), String> {
+            let final_command_buffer = self
+                .committed
+                .last()
+                .ok_or_else(|| "submitted decode graph has no command buffers".to_owned())?;
+            let wait_started_at = Instant::now();
+            final_command_buffer.0.waitUntilCompleted();
+            let cpu_wait = wait_started_at.elapsed();
             for (command_buffer, _, _) in &self.committed {
                 if command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
                     return Err("Runtime V2 command buffer execution failed".to_owned());
@@ -7684,11 +7715,11 @@ pub mod platform {
                     (command_buffer.GPUEndTime() - command_buffer.GPUStartTime()).max(0.0)
                 })
                 .sum::<f64>();
-            metrics.cpu_encode_seconds += wait_start
+            metrics.cpu_encode_seconds += self
+                .submitted_at
                 .duration_since(self.encode_started_at)
                 .as_secs_f64();
-            // There is exactly one CPU wait, on the final command buffer.
-            metrics.cpu_wait_seconds += wait_start.elapsed().as_secs_f64();
+            metrics.cpu_wait_seconds += cpu_wait.as_secs_f64();
             Ok(())
         }
     }
@@ -7924,6 +7955,12 @@ pub mod platform {
                 return Err("V2 token buffer is smaller than u32".to_owned());
             }
             Ok(unsafe { *(buffer.buffer.contents().as_ptr().add(buffer.offset) as *const u32) })
+        }
+
+        pub fn read_runtime_bytes(&self, buffer: &RuntimeBuffer) -> Vec<u8> {
+            let pointer =
+                unsafe { buffer.buffer.contents().as_ptr().add(buffer.offset) as *const u8 };
+            unsafe { std::slice::from_raw_parts(pointer, buffer.length).to_vec() }
         }
 
         pub fn read_runtime_u32s(
@@ -12456,6 +12493,38 @@ mod tests {
         let after = context.metrics().unwrap();
         assert_eq!(after.command_buffers - before.command_buffers, 2);
         assert_eq!(after.encoders - before.encoders, 2);
+        assert_eq!(after.dispatches - before.dispatches, 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn separately_submitted_graphs_preserve_gpu_queue_order() {
+        let context = platform::MetalContext::system_default().expect("Metal device");
+        let source = context.allocate_runtime_buffer(4).unwrap();
+        let intermediate = context.allocate_runtime_buffer(4).unwrap();
+        let output = context.allocate_runtime_buffer(4).unwrap();
+        context
+            .write_runtime_buffer(&source, &13.25_f32.to_ne_bytes())
+            .unwrap();
+
+        let before = context.metrics().unwrap();
+        let mut producer = context.begin_decode().unwrap();
+        producer
+            .encode_copy_f32(&context, &source, &intermediate, 1)
+            .unwrap();
+        let producer = producer.submit();
+
+        let mut consumer = context.begin_decode().unwrap();
+        consumer
+            .encode_copy_f32(&context, &intermediate, &output, 1)
+            .unwrap();
+        let consumer = consumer.submit();
+
+        producer.wait(&context).unwrap();
+        consumer.wait(&context).unwrap();
+        let after = context.metrics().unwrap();
+        assert_eq!(context.read_runtime_f32(&output, 1).unwrap(), [13.25]);
+        assert_eq!(after.command_buffers - before.command_buffers, 2);
         assert_eq!(after.dispatches - before.dispatches, 2);
     }
 
