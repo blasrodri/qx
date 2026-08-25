@@ -539,6 +539,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "qx-route-cache"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "qx-runtime"
 version = "0.1.0"
 dependencies = [

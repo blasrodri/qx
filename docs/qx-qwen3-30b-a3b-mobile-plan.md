@@ -399,6 +399,55 @@ This answers the central iPhone question before paying for Qwen Metal kernels:
 whether explicit MoE locality is strong enough to make a sub-model-sized
 resident working set predictable.
 
+### Implemented route-capture harness
+
+`qx-route-cache` implements the first executable slice of this experiment. On
+macOS it links to the pinned llama.cpp control and observes the selected-expert
+tensor for every MoE layer. It emits a streaming JSONL trace, so the corpus does
+not have to reside in memory. Its simulator likewise streams the trace for each
+policy/budget cell and measures real `(layer, expert)` packets rather than VM
+pages.
+
+Build it against the pinned llama checkout:
+
+```sh
+QX_LLAMA_ROOT=/Users/blas/projects/qx/external/llama.cpp \
+  cargo build --release -p qx-route-cache
+```
+
+Capture a small correctness trace from the pinned GGUF:
+
+```sh
+target/release/qx-route-cache capture \
+  --model /Users/blas/projects/qx/external/models/qwen3-30b-a3b/Qwen3-30B-A3B-Q4_K_M.gguf \
+  --model-sha256 0d003f6662faee78606d5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5 \
+  --prompt "Explain why expert routing locality matters." \
+  --request-id smoke-001 \
+  --max-new-tokens 32 \
+  --context 512 \
+  --output /Users/blas/projects/qx/external/results/qwen3-route-smoke.jsonl
+```
+
+Replay Q3-112 full-expert packets through bounded LRU caches:
+
+```sh
+target/release/qx-route-cache simulate \
+  --trace /Users/blas/projects/qx/external/results/qwen3-route-smoke.jsonl \
+  --policies lru \
+  --budgets 3GiB,4GiB,6GiB,8GiB,10GiB,12GiB \
+  --output /Users/blas/projects/qx/external/results/qwen3-route-smoke-lru.json
+```
+
+`static-hot` requires a separate `--calibration` trace. It is deliberately not
+permitted to learn frequencies from the held-out trace. The default
+`2,064,384` bytes per expert is the exact group-32 Q3 payload for Qwen's three
+2,048 by 768 expert matrices; Q2 and packetized studies must override
+`--expert-bytes` or extend the trace schema before their results are compared.
+
+The current capture path records route IDs, which are sufficient for residency
+simulation. Router weights and activation magnitudes remain part of the later
+neuron-cluster study and must not be inferred from this trace.
+
 ## Evidence layout
 
 Keep generated model files and raw traces under ignored `external/` paths.

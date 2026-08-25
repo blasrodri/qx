@@ -22,6 +22,7 @@ members = [
     "tools/qx-quality",
     "tools/qx-quality-corpus",
     "tools/qx-task-eval",
+    "tools/qx-route-cache",
 ]
 resolver = "2"
 
