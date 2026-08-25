@@ -53,9 +53,15 @@ enum Command {
         /// Capture post-SwiGLU energy summaries for these neuron packet sizes.
         #[arg(long, value_delimiter = ',')]
         activation_packet_neurons: Vec<usize>,
+        /// Capture exact down-output contribution summaries for these packet sizes.
+        #[arg(long, value_delimiter = ',')]
+        contribution_packet_neurons: Vec<usize>,
         /// Expert intermediate width used by activation capture.
         #[arg(long, default_value_t = DEFAULT_EXPERT_NEURONS)]
         expert_neurons: usize,
+        /// Model hidden width used by down-output contribution capture.
+        #[arg(long, default_value_t = 2048)]
+        hidden_size: usize,
         /// Trusted model SHA-256. If omitted, the complete GGUF is hashed.
         #[arg(long)]
         model_sha256: Option<String>,
@@ -102,6 +108,21 @@ enum Command {
         trace: PathBuf,
         #[arg(long, value_delimiter = ',', default_value = "0.9,0.95,0.99,0.999")]
         thresholds: Vec<f64>,
+        #[arg(long, default_value_t = DEFAULT_Q3_EXPERT_BYTES)]
+        expert_bytes: u64,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Analyze perfect-knowledge greedy packet selection by down-output error.
+    ContributionOracle {
+        #[arg(long)]
+        trace: PathBuf,
+        /// Per-expert relative L2 error targets after the down projection.
+        #[arg(long, value_delimiter = ',', default_value = "0.1,0.05,0.01,0.001")]
+        relative_errors: Vec<f64>,
+        /// Fixed packet fractions whose resulting down-output error is reported.
+        #[arg(long, value_delimiter = ',', default_value = "0.25,0.5,0.75,0.9")]
+        selected_fractions: Vec<f64>,
         #[arg(long, default_value_t = DEFAULT_Q3_EXPERT_BYTES)]
         expert_bytes: u64,
         #[arg(long)]
@@ -191,6 +212,8 @@ struct TokenRoutes {
     routes: Vec<Vec<u16>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     packet_activation_energy: Option<Vec<PacketActivationEnergy>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    packet_down_contribution: Option<PacketDownContribution>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -198,6 +221,20 @@ struct PacketActivationEnergy {
     packet_neurons: usize,
     l1: Vec<Vec<Vec<f32>>>,
     squared_l2: Vec<Vec<Vec<f32>>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PacketDownContribution {
+    reconstruction_relative_squared_error: Vec<Vec<f32>>,
+    packets: Vec<PacketContributionMetrics>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PacketContributionMetrics {
+    packet_neurons: usize,
+    squared_l2: Vec<Vec<Vec<f32>>>,
+    /// Relative squared error after each greedy selection, from one packet through all packets.
+    greedy_relative_squared_error: Vec<Vec<Vec<f32>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -321,6 +358,65 @@ struct OracleAccumulator {
     active_bytes_per_token: Vec<u64>,
 }
 
+#[derive(Debug, Serialize)]
+struct ContributionOracleReport {
+    schema_version: u32,
+    classification: &'static str,
+    selection_semantics: &'static str,
+    quality_semantics: &'static str,
+    trace: String,
+    trace_header: TraceHeader,
+    expert_bytes: u64,
+    token_records: usize,
+    reconstruction_relative_l2_error_p95: f64,
+    reconstruction_relative_l2_error_p99: f64,
+    reconstruction_relative_l2_error_max: f64,
+    results: Vec<ContributionOracleResult>,
+    fixed_budget_results: Vec<FixedBudgetContributionResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContributionOracleResult {
+    packet_neurons: usize,
+    packets_per_expert: usize,
+    relative_l2_error_target: f64,
+    expert_observations: usize,
+    unmet_target_observations: usize,
+    mean_selected_packets_per_expert: f64,
+    p50_selected_packets_per_expert: u64,
+    p95_selected_packets_per_expert: u64,
+    p99_selected_packets_per_expert: u64,
+    mean_selected_fraction: f64,
+    mean_achieved_relative_l2_error: f64,
+    mean_active_packet_bytes_per_token: f64,
+    p50_active_packet_bytes_per_token: u64,
+    p95_active_packet_bytes_per_token: u64,
+    p99_active_packet_bytes_per_token: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct FixedBudgetContributionResult {
+    packet_neurons: usize,
+    packets_per_expert: usize,
+    requested_selected_fraction: f64,
+    selected_packets_per_expert: usize,
+    actual_selected_fraction: f64,
+    expert_observations: usize,
+    mean_relative_l2_error: f64,
+    p50_relative_l2_error: f64,
+    p95_relative_l2_error: f64,
+    p99_relative_l2_error: f64,
+    active_packet_bytes_per_token: u64,
+}
+
+#[derive(Default)]
+struct ContributionOracleAccumulator {
+    selected_packets: Vec<u64>,
+    achieved_relative_l2_error: Vec<f64>,
+    active_bytes_per_token: Vec<u64>,
+    unmet_target_observations: usize,
+}
+
 fn main() -> Result<()> {
     match Args::parse().command {
         Command::Capture {
@@ -336,7 +432,9 @@ fn main() -> Result<()> {
             gpu_layers,
             threads,
             activation_packet_neurons,
+            contribution_packet_neurons,
             expert_neurons,
+            hidden_size,
             model_sha256,
         } => capture(CaptureArgs {
             model,
@@ -351,7 +449,9 @@ fn main() -> Result<()> {
             gpu_layers,
             threads,
             activation_packet_neurons,
+            contribution_packet_neurons,
             expert_neurons,
+            hidden_size,
             model_sha256,
         }),
         Command::Simulate {
@@ -389,6 +489,19 @@ fn main() -> Result<()> {
             expert_bytes,
             output,
         } => oracle(&trace, &thresholds, expert_bytes, &output),
+        Command::ContributionOracle {
+            trace,
+            relative_errors,
+            selected_fractions,
+            expert_bytes,
+            output,
+        } => contribution_oracle(
+            &trace,
+            &relative_errors,
+            &selected_fractions,
+            expert_bytes,
+            &output,
+        ),
     }
 }
 
@@ -405,7 +518,9 @@ struct CaptureArgs {
     gpu_layers: i32,
     threads: i32,
     activation_packet_neurons: Vec<usize>,
+    contribution_packet_neurons: Vec<usize>,
     expert_neurons: usize,
+    hidden_size: usize,
     model_sha256: Option<String>,
 }
 
@@ -436,13 +551,38 @@ fn capture(args: CaptureArgs) -> Result<()> {
     if args.max_new_tokens == 0 {
         bail!("max-new-tokens must be positive");
     }
-    for &packet_neurons in &args.activation_packet_neurons {
+    for &packet_neurons in args
+        .activation_packet_neurons
+        .iter()
+        .chain(&args.contribution_packet_neurons)
+    {
         if packet_neurons == 0 || !args.expert_neurons.is_multiple_of(packet_neurons) {
             bail!(
-                "activation packet size {packet_neurons} must divide expert-neurons {}",
+                "capture packet size {packet_neurons} must divide expert-neurons {}",
                 args.expert_neurons
             );
         }
+    }
+    if args.hidden_size == 0 {
+        bail!("hidden-size must be positive");
+    }
+    if let Some(&finest) = args.contribution_packet_neurons.iter().min()
+        && args
+            .contribution_packet_neurons
+            .iter()
+            .any(|size| !size.is_multiple_of(finest))
+    {
+        bail!("every contribution packet size must be a multiple of the finest size");
+    }
+    if args
+        .contribution_packet_neurons
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>()
+        .len()
+        != args.contribution_packet_neurons.len()
+    {
+        bail!("contribution packet sizes must be unique");
     }
     let model_hash = match args.model_sha256.as_ref() {
         Some(value) => {
@@ -453,12 +593,18 @@ fn capture(args: CaptureArgs) -> Result<()> {
     };
     let mut llama = llama_capture::Capture::open(
         &args.model,
-        args.context,
-        args.layers,
-        args.top_k,
-        args.gpu_layers,
-        args.threads,
-        (!args.activation_packet_neurons.is_empty()).then_some(args.expert_neurons),
+        llama_capture::OpenConfig {
+            context: args.context,
+            layers: args.layers,
+            top_k: args.top_k,
+            gpu_layers: args.gpu_layers,
+            threads: args.threads,
+            intermediate: (!args.activation_packet_neurons.is_empty()
+                || !args.contribution_packet_neurons.is_empty())
+            .then_some(args.expert_neurons),
+            hidden: args.hidden_size,
+            contribution_packet_neurons: &args.contribution_packet_neurons,
+        },
     )?;
     let prompt_tokens = llama.tokenize(&args.prompt)?;
     if prompt_tokens.is_empty() {
@@ -493,6 +639,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
             predicted,
             routes,
             activations,
+            down_contribution,
         } = llama.step(token)?;
         validate_routes(&routes, args.layers, args.top_k, args.experts)?;
         write_trace_line(
@@ -504,9 +651,15 @@ fn capture(args: CaptureArgs) -> Result<()> {
                 input_token: token,
                 predicted_token: predicted,
                 routes,
-                packet_activation_energy: activations
-                    .as_deref()
-                    .map(|values| summarize_activations(values, &args)),
+                packet_activation_energy: (!args.activation_packet_neurons.is_empty()).then(|| {
+                    summarize_activations(
+                        activations
+                            .as_deref()
+                            .expect("activation buffer exists when energy capture is enabled"),
+                        &args,
+                    )
+                }),
+                packet_down_contribution: down_contribution,
             }),
         )?;
         position += 1;
@@ -521,6 +674,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
             predicted,
             routes,
             activations,
+            down_contribution,
         } = llama.step(next)?;
         validate_routes(&routes, args.layers, args.top_k, args.experts)?;
         write_trace_line(
@@ -532,9 +686,15 @@ fn capture(args: CaptureArgs) -> Result<()> {
                 input_token: next,
                 predicted_token: predicted,
                 routes,
-                packet_activation_energy: activations
-                    .as_deref()
-                    .map(|values| summarize_activations(values, &args)),
+                packet_activation_energy: (!args.activation_packet_neurons.is_empty()).then(|| {
+                    summarize_activations(
+                        activations
+                            .as_deref()
+                            .expect("activation buffer exists when energy capture is enabled"),
+                        &args,
+                    )
+                }),
+                packet_down_contribution: down_contribution,
             }),
         )?;
         position += 1;
@@ -758,6 +918,306 @@ fn select_activation_packets(energy: &[f32], threshold: f64) -> Result<(usize, f
         }
     }
     Ok((energy.len(), 1.0))
+}
+
+fn contribution_oracle(
+    trace: &Path,
+    relative_errors: &[f64],
+    selected_fractions: &[f64],
+    expert_bytes: u64,
+    output: &Path,
+) -> Result<()> {
+    if relative_errors.is_empty()
+        || relative_errors
+            .iter()
+            .any(|error| !error.is_finite() || *error <= 0.0 || *error >= 1.0)
+    {
+        bail!("relative error targets must be finite values in (0, 1)");
+    }
+    if selected_fractions.is_empty()
+        || selected_fractions
+            .iter()
+            .any(|fraction| !fraction.is_finite() || *fraction <= 0.0 || *fraction > 1.0)
+    {
+        bail!("selected fractions must be finite values in (0, 1]");
+    }
+    let header = read_trace_header(trace)?;
+    let mut accumulators = HashMap::<(usize, usize), ContributionOracleAccumulator>::new();
+    let mut packet_counts = HashMap::<usize, usize>::new();
+    let mut fixed_budget_errors = HashMap::<(usize, usize), Vec<f64>>::new();
+    let mut reconstruction_errors = Vec::<f64>::new();
+    let mut token_records = 0usize;
+    visit_trace(trace, &header, |token| {
+        let contribution = token
+            .packet_down_contribution
+            .ok_or_else(|| anyhow::anyhow!("trace token lacks packet down contribution"))?;
+        validate_matrix_shape(
+            "down reconstruction error",
+            &contribution.reconstruction_relative_squared_error,
+            header.layers,
+            header.top_k,
+        )?;
+        for layer in &contribution.reconstruction_relative_squared_error {
+            for &error in layer {
+                if !error.is_finite() || error < 0.0 {
+                    bail!("down reconstruction error is non-finite or negative");
+                }
+                reconstruction_errors.push((error as f64).sqrt());
+            }
+        }
+        for packet_metrics in contribution.packets {
+            validate_contribution_metrics(&packet_metrics, &header)?;
+            let packets_per_expert = packet_metrics.greedy_relative_squared_error[0][0].len();
+            if !expert_bytes.is_multiple_of(packets_per_expert as u64) {
+                bail!(
+                    "expert bytes {expert_bytes} are not divisible by {packets_per_expert} packets"
+                );
+            }
+            if packet_counts
+                .insert(packet_metrics.packet_neurons, packets_per_expert)
+                .is_some_and(|previous| previous != packets_per_expert)
+            {
+                bail!(
+                    "inconsistent packet count for {} neurons",
+                    packet_metrics.packet_neurons
+                );
+            }
+            let packet_bytes = expert_bytes / packets_per_expert as u64;
+            let mut token_selected = vec![0u64; relative_errors.len()];
+            for layer in &packet_metrics.greedy_relative_squared_error {
+                for curve in layer {
+                    for (target_index, &target) in relative_errors.iter().enumerate() {
+                        let (selected, achieved, met) = select_contribution_packets(curve, target)?;
+                        let accumulator = accumulators
+                            .entry((packet_metrics.packet_neurons, target_index))
+                            .or_default();
+                        accumulator.selected_packets.push(selected as u64);
+                        accumulator.achieved_relative_l2_error.push(achieved);
+                        accumulator.unmet_target_observations += usize::from(!met);
+                        token_selected[target_index] += selected as u64;
+                    }
+                    for (fraction_index, &fraction) in selected_fractions.iter().enumerate() {
+                        let selected = ((packets_per_expert as f64 * fraction).ceil() as usize)
+                            .clamp(1, packets_per_expert);
+                        fixed_budget_errors
+                            .entry((packet_metrics.packet_neurons, fraction_index))
+                            .or_default()
+                            .push((curve[selected - 1] as f64).sqrt());
+                    }
+                }
+            }
+            for (target_index, selected) in token_selected.into_iter().enumerate() {
+                accumulators
+                    .entry((packet_metrics.packet_neurons, target_index))
+                    .or_default()
+                    .active_bytes_per_token
+                    .push(selected.saturating_mul(packet_bytes));
+            }
+        }
+        token_records += 1;
+        Ok(())
+    })?;
+    if token_records == 0 || packet_counts.is_empty() || reconstruction_errors.is_empty() {
+        bail!("contribution trace contains no token records");
+    }
+
+    let mut packet_sizes = packet_counts.keys().copied().collect::<Vec<_>>();
+    packet_sizes.sort_unstable_by(|left, right| right.cmp(left));
+    let mut results = Vec::new();
+    let mut fixed_budget_results = Vec::new();
+    for packet_neurons in packet_sizes {
+        let packets_per_expert = packet_counts[&packet_neurons];
+        for (target_index, &target) in relative_errors.iter().enumerate() {
+            let accumulator = accumulators
+                .remove(&(packet_neurons, target_index))
+                .ok_or_else(|| anyhow::anyhow!("missing contribution oracle accumulator"))?;
+            let expert_observations = accumulator.selected_packets.len();
+            let selected_total = accumulator.selected_packets.iter().sum::<u64>();
+            results.push(ContributionOracleResult {
+                packet_neurons,
+                packets_per_expert,
+                relative_l2_error_target: target,
+                expert_observations,
+                unmet_target_observations: accumulator.unmet_target_observations,
+                mean_selected_packets_per_expert: selected_total as f64
+                    / expert_observations.max(1) as f64,
+                p50_selected_packets_per_expert: percentile(&accumulator.selected_packets, 0.50),
+                p95_selected_packets_per_expert: percentile(&accumulator.selected_packets, 0.95),
+                p99_selected_packets_per_expert: percentile(&accumulator.selected_packets, 0.99),
+                mean_selected_fraction: selected_total as f64
+                    / (expert_observations.max(1) * packets_per_expert) as f64,
+                mean_achieved_relative_l2_error: accumulator
+                    .achieved_relative_l2_error
+                    .iter()
+                    .sum::<f64>()
+                    / accumulator.achieved_relative_l2_error.len().max(1) as f64,
+                mean_active_packet_bytes_per_token: accumulator
+                    .active_bytes_per_token
+                    .iter()
+                    .sum::<u64>() as f64
+                    / accumulator.active_bytes_per_token.len().max(1) as f64,
+                p50_active_packet_bytes_per_token: percentile(
+                    &accumulator.active_bytes_per_token,
+                    0.50,
+                ),
+                p95_active_packet_bytes_per_token: percentile(
+                    &accumulator.active_bytes_per_token,
+                    0.95,
+                ),
+                p99_active_packet_bytes_per_token: percentile(
+                    &accumulator.active_bytes_per_token,
+                    0.99,
+                ),
+            });
+        }
+        for (fraction_index, &fraction) in selected_fractions.iter().enumerate() {
+            let errors = fixed_budget_errors
+                .remove(&(packet_neurons, fraction_index))
+                .ok_or_else(|| anyhow::anyhow!("missing fixed-budget contribution errors"))?;
+            let selected = ((packets_per_expert as f64 * fraction).ceil() as usize)
+                .clamp(1, packets_per_expert);
+            let packet_bytes = expert_bytes / packets_per_expert as u64;
+            fixed_budget_results.push(FixedBudgetContributionResult {
+                packet_neurons,
+                packets_per_expert,
+                requested_selected_fraction: fraction,
+                selected_packets_per_expert: selected,
+                actual_selected_fraction: selected as f64 / packets_per_expert as f64,
+                expert_observations: errors.len(),
+                mean_relative_l2_error: errors.iter().sum::<f64>() / errors.len().max(1) as f64,
+                p50_relative_l2_error: percentile_f64(&errors, 0.50).unwrap_or(0.0),
+                p95_relative_l2_error: percentile_f64(&errors, 0.95).unwrap_or(0.0),
+                p99_relative_l2_error: percentile_f64(&errors, 0.99).unwrap_or(0.0),
+                active_packet_bytes_per_token: (header.layers as u64)
+                    .saturating_mul(header.top_k as u64)
+                    .saturating_mul(selected as u64)
+                    .saturating_mul(packet_bytes),
+            });
+        }
+    }
+    let reconstruction_max = reconstruction_errors
+        .iter()
+        .copied()
+        .reduce(f64::max)
+        .unwrap_or(0.0);
+    let report = ContributionOracleReport {
+        schema_version: 1,
+        classification: "down-contribution-greedy-oracle-smoke",
+        selection_semantics: "perfect-knowledge-greedy-minimum-next-residual",
+        quality_semantics: "per-expert-quantized-down-output-relative-l2-not-logit-or-nll",
+        trace: trace.display().to_string(),
+        trace_header: header,
+        expert_bytes,
+        token_records,
+        reconstruction_relative_l2_error_p95: percentile_f64(&reconstruction_errors, 0.95)
+            .unwrap_or(0.0),
+        reconstruction_relative_l2_error_p99: percentile_f64(&reconstruction_errors, 0.99)
+            .unwrap_or(0.0),
+        reconstruction_relative_l2_error_max: reconstruction_max,
+        results,
+        fixed_budget_results,
+    };
+    let mut writer = BufWriter::new(
+        File::create(output).with_context(|| format!("create {}", output.display()))?,
+    );
+    serde_json::to_writer_pretty(&mut writer, &report)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    println!("contribution oracle report: {}", output.display());
+    println!(
+        "down reconstruction relative L2: p95 {:.6}, p99 {:.6}, max {:.6}",
+        report.reconstruction_relative_l2_error_p95,
+        report.reconstruction_relative_l2_error_p99,
+        report.reconstruction_relative_l2_error_max,
+    );
+    for result in &report.results {
+        println!(
+            "{} neurons {:.3}% relative L2: mean {:.2}/{}, p95 {}, {:.2} MiB/token, unmet {}",
+            result.packet_neurons,
+            result.relative_l2_error_target * 100.0,
+            result.mean_selected_packets_per_expert,
+            result.packets_per_expert,
+            result.p95_selected_packets_per_expert,
+            result.mean_active_packet_bytes_per_token / (1024.0 * 1024.0),
+            result.unmet_target_observations,
+        );
+    }
+    for result in &report.fixed_budget_results {
+        println!(
+            "{} neurons keep {:.1}% ({}/{}): mean error {:.2}%, p95 {:.2}%, {:.2} MiB/token",
+            result.packet_neurons,
+            result.actual_selected_fraction * 100.0,
+            result.selected_packets_per_expert,
+            result.packets_per_expert,
+            result.mean_relative_l2_error * 100.0,
+            result.p95_relative_l2_error * 100.0,
+            result.active_packet_bytes_per_token as f64 / (1024.0 * 1024.0),
+        );
+    }
+    Ok(())
+}
+
+fn validate_matrix_shape(
+    label: &str,
+    values: &[Vec<f32>],
+    layers: usize,
+    top_k: usize,
+) -> Result<()> {
+    if values.len() != layers || values.iter().any(|layer| layer.len() != top_k) {
+        bail!("{label} has an invalid layer or expert-slot shape");
+    }
+    Ok(())
+}
+
+fn validate_contribution_metrics(
+    metrics: &PacketContributionMetrics,
+    header: &TraceHeader,
+) -> Result<()> {
+    for (label, values) in [
+        ("down contribution squared-l2", &metrics.squared_l2),
+        (
+            "down contribution greedy residual",
+            &metrics.greedy_relative_squared_error,
+        ),
+    ] {
+        if values.len() != header.layers {
+            bail!("{label} has the wrong layer count");
+        }
+        for layer in values {
+            if layer.len() != header.top_k || layer.iter().any(Vec::is_empty) {
+                bail!("{label} has an invalid expert-slot shape");
+            }
+            let packets = layer[0].len();
+            if layer.iter().any(|expert| expert.len() != packets) {
+                bail!("{label} has inconsistent packet counts");
+            }
+            if layer
+                .iter()
+                .flatten()
+                .any(|value| !value.is_finite() || *value < 0.0)
+            {
+                bail!("{label} contains a non-finite or negative value");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn select_contribution_packets(curve: &[f32], target: f64) -> Result<(usize, f64, bool)> {
+    if curve.is_empty() || curve.iter().any(|value| !value.is_finite() || *value < 0.0) {
+        bail!("contribution residual curve is empty, non-finite, or negative");
+    }
+    for (index, &relative_squared_error) in curve.iter().enumerate() {
+        let relative_error = (relative_squared_error as f64).sqrt();
+        if relative_error <= target {
+            return Ok((index + 1, relative_error, true));
+        }
+    }
+    Ok((
+        curve.len(),
+        (*curve.last().expect("curve is non-empty") as f64).sqrt(),
+        false,
+    ))
 }
 
 fn simulate(args: SimulateArgs) -> Result<()> {
@@ -1502,6 +1962,9 @@ mod llama_capture {
             gpu_layers: c_int,
             threads: c_int,
             intermediate: c_int,
+            hidden: c_int,
+            contribution_packet_neurons: *const c_int,
+            contribution_size_count: c_int,
         ) -> *mut c_void;
         fn qx_llama_route_close(route: *mut c_void);
         fn qx_llama_route_error(route: *const c_void) -> *const c_char;
@@ -1521,6 +1984,11 @@ mod llama_capture {
             route_count: c_int,
             activations: *mut f32,
             activation_count: c_int,
+            contribution_norms: *mut f32,
+            contribution_residuals: *mut f32,
+            contribution_metric_count: c_int,
+            contribution_reconstruction: *mut f32,
+            contribution_reconstruction_count: c_int,
         ) -> c_int;
     }
 
@@ -1529,25 +1997,49 @@ mod llama_capture {
         layers: usize,
         top_k: usize,
         intermediate: Option<usize>,
+        contribution_packet_neurons: Vec<usize>,
+        contribution_total_packets: usize,
     }
 
     pub struct StepOutput {
         pub predicted: i32,
         pub routes: Vec<Vec<u16>>,
         pub activations: Option<Vec<f32>>,
+        pub down_contribution: Option<PacketDownContribution>,
+    }
+
+    pub struct OpenConfig<'a> {
+        pub context: usize,
+        pub layers: usize,
+        pub top_k: usize,
+        pub gpu_layers: i32,
+        pub threads: i32,
+        pub intermediate: Option<usize>,
+        pub hidden: usize,
+        pub contribution_packet_neurons: &'a [usize],
     }
 
     impl Capture {
-        pub fn open(
-            path: &Path,
-            context: usize,
-            layers: usize,
-            top_k: usize,
-            gpu_layers: i32,
-            threads: i32,
-            intermediate: Option<usize>,
-        ) -> Result<Self> {
+        pub fn open(path: &Path, config: OpenConfig<'_>) -> Result<Self> {
+            let OpenConfig {
+                context,
+                layers,
+                top_k,
+                gpu_layers,
+                threads,
+                intermediate,
+                hidden,
+                contribution_packet_neurons,
+            } = config;
             let path = CString::new(path.to_string_lossy().as_bytes())?;
+            let contribution_packet_neurons_i32 = contribution_packet_neurons
+                .iter()
+                .map(|&value| {
+                    value
+                        .try_into()
+                        .context("contribution packet size exceeds i32")
+                })
+                .collect::<Result<Vec<c_int>>>()?;
             let raw = unsafe {
                 qx_llama_route_open(
                     path.as_ptr(),
@@ -1557,6 +2049,9 @@ mod llama_capture {
                     gpu_layers,
                     threads,
                     intermediate.unwrap_or(0).try_into()?,
+                    hidden.try_into()?,
+                    contribution_packet_neurons_i32.as_ptr(),
+                    contribution_packet_neurons_i32.len().try_into()?,
                 )
             };
             if raw.is_null() {
@@ -1567,6 +2062,15 @@ mod llama_capture {
                 layers,
                 top_k,
                 intermediate,
+                contribution_total_packets: intermediate
+                    .map(|width| {
+                        contribution_packet_neurons
+                            .iter()
+                            .map(|packet| width / packet)
+                            .sum()
+                    })
+                    .unwrap_or(0),
+                contribution_packet_neurons: contribution_packet_neurons.to_vec(),
             })
         }
 
@@ -1619,6 +2123,18 @@ mod llama_capture {
                 })
                 .transpose()?
                 .unwrap_or((std::ptr::null_mut(), 0));
+            let metric_count = self.layers * self.top_k * self.contribution_total_packets;
+            let mut contribution_norms =
+                (!self.contribution_packet_neurons.is_empty()).then(|| vec![0.0f32; metric_count]);
+            let mut contribution_residuals =
+                (!self.contribution_packet_neurons.is_empty()).then(|| vec![0.0f32; metric_count]);
+            let mut contribution_reconstruction = (!self.contribution_packet_neurons.is_empty())
+                .then(|| vec![0.0f32; self.layers * self.top_k]);
+            let contribution_metric_count: c_int = metric_count.try_into()?;
+            let contribution_reconstruction_count: c_int = contribution_reconstruction
+                .as_ref()
+                .map_or(0, Vec::len)
+                .try_into()?;
             let status = unsafe {
                 qx_llama_route_step(
                     self.raw,
@@ -1628,6 +2144,17 @@ mod llama_capture {
                     flat.len().try_into()?,
                     activation_pointer,
                     activation_count,
+                    contribution_norms
+                        .as_mut()
+                        .map_or(std::ptr::null_mut(), Vec::as_mut_ptr),
+                    contribution_residuals
+                        .as_mut()
+                        .map_or(std::ptr::null_mut(), Vec::as_mut_ptr),
+                    contribution_metric_count,
+                    contribution_reconstruction
+                        .as_mut()
+                        .map_or(std::ptr::null_mut(), Vec::as_mut_ptr),
+                    contribution_reconstruction_count,
                 )
             };
             if status != 0 {
@@ -1642,10 +2169,67 @@ mod llama_capture {
                         .collect::<Result<Vec<_>>>()
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let down_contribution = contribution_norms
+                .zip(contribution_residuals)
+                .zip(contribution_reconstruction)
+                .map(|((norms, residuals), reconstruction)| {
+                    self.structure_contributions(norms, residuals, reconstruction)
+                })
+                .transpose()?;
             Ok(StepOutput {
                 predicted: output,
                 routes,
                 activations,
+                down_contribution,
+            })
+        }
+
+        fn structure_contributions(
+            &self,
+            norms: Vec<f32>,
+            residuals: Vec<f32>,
+            reconstruction: Vec<f32>,
+        ) -> Result<PacketDownContribution> {
+            let mut reconstruction_relative_squared_error =
+                vec![vec![0.0f32; self.top_k]; self.layers];
+            for (index, value) in reconstruction.into_iter().enumerate() {
+                reconstruction_relative_squared_error[index / self.top_k][index % self.top_k] =
+                    value;
+            }
+            let mut packets = self
+                .contribution_packet_neurons
+                .iter()
+                .map(|&packet_neurons| {
+                    let count =
+                        self.intermediate.expect("contribution capture has width") / packet_neurons;
+                    PacketContributionMetrics {
+                        packet_neurons,
+                        squared_l2: vec![vec![vec![0.0; count]; self.top_k]; self.layers],
+                        greedy_relative_squared_error: vec![
+                            vec![vec![0.0; count]; self.top_k];
+                            self.layers
+                        ],
+                    }
+                })
+                .collect::<Vec<_>>();
+            for layer in 0..self.layers {
+                for slot in 0..self.top_k {
+                    let expert_base = (layer * self.top_k + slot) * self.contribution_total_packets;
+                    let mut packet_offset = 0usize;
+                    for metrics in &mut packets {
+                        let count = metrics.squared_l2[layer][slot].len();
+                        let range =
+                            expert_base + packet_offset..expert_base + packet_offset + count;
+                        metrics.squared_l2[layer][slot].copy_from_slice(&norms[range.clone()]);
+                        metrics.greedy_relative_squared_error[layer][slot]
+                            .copy_from_slice(&residuals[range]);
+                        packet_offset += count;
+                    }
+                }
+            }
+            Ok(PacketDownContribution {
+                reconstruction_relative_squared_error,
+                packets,
             })
         }
 
@@ -1722,6 +2306,19 @@ mod tests {
     }
 
     #[test]
+    fn contribution_oracle_selects_the_first_greedy_prefix_below_error() {
+        let (selected, achieved, met) =
+            select_contribution_packets(&[0.25, 0.04, 0.0001], 0.05).unwrap();
+        assert_eq!(selected, 3);
+        assert!((achieved - 0.01).abs() < 1e-6);
+        assert!(met);
+        let (selected, achieved, met) = select_contribution_packets(&[0.25, 0.04], 0.1).unwrap();
+        assert_eq!(selected, 2);
+        assert!((achieved - 0.2).abs() < 1e-6);
+        assert!(!met);
+    }
+
+    #[test]
     fn synthetic_trace_reports_hits_misses_and_tail_bytes() {
         let path = std::env::temp_dir().join(format!(
             "qx-route-cache-{}-{}.jsonl",
@@ -1758,6 +2355,7 @@ mod tests {
                     predicted_token: position as i32 + 1,
                     routes,
                     packet_activation_energy: None,
+                    packet_down_contribution: None,
                 }),
             )
             .unwrap();

@@ -565,6 +565,57 @@ co-design problem, not a cache-policy problem.
 The committed oracle aggregate is
 `benchmarks/results/qwen3-30b-a3b-activation-energy-oracle-smoke-2026-08-25.json`.
 
+### Down-contribution oracle smoke
+
+The next control replaces activation magnitude with the packet's actual vector
+after the selected expert's quantized down projection. The llama callback reads
+the selected Q6_K down rows, dequantizes them with llama's own type traits, and
+computes one output vector per contiguous neuron packet. Their sum reconstructs
+llama's unweighted selected-expert output with a `2.64e-7` p95 and `5.10e-7`
+maximum relative L2 error on the current run.
+
+For each expert, a perfect-knowledge greedy selector repeatedly chooses the
+packet that minimizes the next exact residual. This is stronger than ranking
+post-SwiGLU energy, although it is not a globally optimal subset search. Router
+weighting is a scalar per expert and therefore does not change its relative
+error. Cross-expert cancellation, residual-stream effects, logits, NLL and task
+quality remain outside this control.
+
+The expanded smoke contains 22 routed positions from a disjoint code/math
+prompt, or 8,448 selected-expert observations:
+
+| Packet | 10% relative L2 | 5% relative L2 | 1% relative L2 | Full |
+|---:|---:|---:|---:|---:|
+| 128 neurons | 5.98 | 5.99 | 6.00 | 6 |
+| 64 neurons | 11.92 | 11.98 | 11.99 | 12 |
+| 32 neurons | 23.33 | 23.90 | 23.98 | 24 |
+
+For 32-neuron packets, even the 10% error target retains 97.20% of packets and
+approximately 734.8 MiB of the 756 MiB exact active payload per token. The
+p50, p95 and p99 expert all require 24 of 24 packets. At a 5% error target the
+mean retained fraction is 99.59%; at 1% it is 99.93%.
+
+The inverse budget curve is equally decisive:
+
+| 32-neuron packets retained | Active payload | Mean relative L2 error | p95 error |
+|---:|---:|---:|---:|
+| 25% | 189 MiB/token | 66.24% | 76.82% |
+| 50% | 378 MiB/token | 47.31% | 57.48% |
+| 75% | 567 MiB/token | 29.38% | 37.15% |
+| 91.7% | 693 MiB/token | 14.99% | 19.77% |
+
+This remains smoke evidence, not a quality study or promotion result. But the
+gap is too large to justify a learned predictor or masked-logit harness for the
+same contiguous packet definition: a predictor cannot manufacture the missing
+oracle sparsity, and the 2x capacity point already injects roughly 50% local
+output error. Reopen masked NLL only with a different structural hypothesis,
+such as learned non-contiguous neuron groups, structured pruning or a
+co-designed sparse checkpoint. The unmodified checkpoint's current mobile
+lane is model co-design, not cache-policy tuning.
+
+The committed aggregate is
+`benchmarks/results/qwen3-30b-a3b-down-contribution-oracle-smoke-2026-08-25.json`.
+
 ## Evidence layout
 
 Keep generated model files and raw traces under ignored `external/` paths.

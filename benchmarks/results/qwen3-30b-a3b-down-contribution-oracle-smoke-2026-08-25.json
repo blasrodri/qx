@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "classification": "down-contribution-greedy-oracle-smoke",
+  "promotion_evidence": false,
+  "selection_semantics": "perfect-knowledge-greedy-minimum-next-residual",
+  "quality_semantics": "per-expert-quantized-down-output-relative-l2-not-logit-or-nll",
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "llama_revision": "5cedcbfbc1713c9557af31ddcf5fb4b5287112f8",
+  "trace": {
+    "token_positions": 22,
+    "layers": 48,
+    "selected_experts_per_layer": 8,
+    "expert_observations": 8448,
+    "workload": "single-code-math-prompt-smoke"
+  },
+  "packet_definition": "matching contiguous intermediate-neuron range through gate, up, and down; contribution measured after the quantized Q6_K down projection",
+  "target_storage": {
+    "complete_q3_expert_bytes": 2064384,
+    "full_exact_active_mib_per_token": 756.0
+  },
+  "reconstruction_validation": {
+    "relative_l2_p95": 2.6356962340743696e-7,
+    "relative_l2_p99": 3.2141087629195724e-7,
+    "relative_l2_max": 5.093341823441007e-7
+  },
+  "error_target_results": [
+    {"packet_neurons":128,"packets_per_expert":6,"relative_l2_error_target":0.10,"mean_selected_fraction":0.997198547979798,"p95_selected_packets":6,"mean_active_mib_per_token":753.8821022727273},
+    {"packet_neurons":128,"packets_per_expert":6,"relative_l2_error_target":0.05,"mean_selected_fraction":0.9987965593434344,"p95_selected_packets":6,"mean_active_mib_per_token":755.0901988636364},
+    {"packet_neurons":128,"packets_per_expert":6,"relative_l2_error_target":0.01,"mean_selected_fraction":0.9996448863636364,"p95_selected_packets":6,"mean_active_mib_per_token":755.7315340909091},
+    {"packet_neurons":64,"packets_per_expert":12,"relative_l2_error_target":0.10,"mean_selected_fraction":0.9931147411616161,"p95_selected_packets":12,"mean_active_mib_per_token":750.7947443181819},
+    {"packet_neurons":64,"packets_per_expert":12,"relative_l2_error_target":0.05,"mean_selected_fraction":0.9980567392676768,"p95_selected_packets":12,"mean_active_mib_per_token":754.5308948863636},
+    {"packet_neurons":64,"packets_per_expert":12,"relative_l2_error_target":0.01,"mean_selected_fraction":0.9994771938131313,"p95_selected_packets":12,"mean_active_mib_per_token":755.6047585227273},
+    {"packet_neurons":32,"packets_per_expert":24,"relative_l2_error_target":0.10,"mean_selected_fraction":0.9719657512626263,"p50_selected_packets":24,"p95_selected_packets":24,"p99_selected_packets":24,"mean_active_mib_per_token":734.8061079545455},
+    {"packet_neurons":32,"packets_per_expert":24,"relative_l2_error_target":0.05,"mean_selected_fraction":0.9958668718434344,"p50_selected_packets":24,"p95_selected_packets":24,"p99_selected_packets":24,"mean_active_mib_per_token":752.8753551136364},
+    {"packet_neurons":32,"packets_per_expert":24,"relative_l2_error_target":0.01,"mean_selected_fraction":0.9992503156565656,"p50_selected_packets":24,"p95_selected_packets":24,"p99_selected_packets":24,"mean_active_mib_per_token":755.4332386363636}
+  ],
+  "fixed_budget_results_32_neurons": [
+    {"selected_fraction":0.25,"selected_packets":6,"mean_relative_l2_error":0.6624004779631238,"p95_relative_l2_error":0.7681620854115401,"active_mib_per_token":189.0},
+    {"selected_fraction":0.50,"selected_packets":12,"mean_relative_l2_error":0.4730990619303094,"p95_relative_l2_error":0.5748361654732603,"active_mib_per_token":378.0},
+    {"selected_fraction":0.75,"selected_packets":18,"mean_relative_l2_error":0.2938342110487813,"p95_relative_l2_error":0.37153224135279517,"active_mib_per_token":567.0},
+    {"selected_fraction":0.9166666666666666,"selected_packets":22,"mean_relative_l2_error":0.14990816281435748,"p95_relative_l2_error":0.1976792559597713,"active_mib_per_token":693.0}
+  ],
+  "conclusions": [
+    "Packet contributions reconstructed llama.cpp's selected-expert down output to below 5.1e-7 maximum relative L2 error.",
+    "The contribution-aware oracle is denser than the activation-energy proxy: 32-neuron packets retain 97.20% at a 10% per-expert relative L2 target and 99.59% at a 5% target.",
+    "A two-times payload reduction retains half of the 32-neuron packets but causes 47.31% mean and 57.48% p95 per-expert down-output error.",
+    "This perfect-knowledge greedy oracle does not prove downstream quality and is not a globally optimal subset search, but it leaves no credible contiguous-packet path to a two-times through ten-times capacity reduction.",
+    "Do not train a predictor or build a masked-logit harness for this packet definition without a new structural hypothesis; pursue learned neuron grouping or model co-design instead."
+  ]
+}
