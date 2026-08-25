@@ -97,11 +97,61 @@
       "pruned_student_top1_agreement": 0.9375
     }
   },
+  "routing_preselected_depth_screen": {
+    "selection_semantics": "most-frequent-training-route-expert-at-fixed-early-middle-late-layers-before-quality-evaluation",
+    "retained_fraction": 0.9375,
+    "results": [
+      {
+        "layer": 2,
+        "expert": 125,
+        "train_hits": 96,
+        "heldout_hits": 40,
+        "ridge": 1.0,
+        "masked_mean_relative_l2": 0.1778633897655574,
+        "distilled_mean_relative_l2": 0.1700693528538976,
+        "distilled_p95_relative_l2": 0.2827353519221827,
+        "nll_scored_tokens": 132,
+        "nll_expert_hits": 38,
+        "relative_perplexity_delta": -0.0009619362927848485,
+        "top1_agreement": 1.0
+      },
+      {
+        "layer": 24,
+        "expert": 2,
+        "train_hits": 161,
+        "heldout_hits": 59,
+        "ridge": 3.0,
+        "masked_mean_relative_l2": 0.20467914414301633,
+        "distilled_mean_relative_l2": 0.19887223229065137,
+        "distilled_p95_relative_l2": 0.2782747470330227,
+        "nll_scored_tokens": 132,
+        "nll_expert_hits": 55,
+        "relative_perplexity_delta": -0.0020555730125738636,
+        "top1_agreement": 0.9848484848484849
+      },
+      {
+        "layer": 44,
+        "expert": 6,
+        "train_hits": 179,
+        "heldout_hits": 92,
+        "ridge": 3.0,
+        "masked_mean_relative_l2": 0.20529297308221892,
+        "distilled_mean_relative_l2": 0.19269814575453498,
+        "distilled_p95_relative_l2": 0.3379125742134584,
+        "nll_scored_tokens": 132,
+        "nll_expert_hits": 81,
+        "relative_perplexity_delta": -0.002114993627763795,
+        "top1_agreement": 0.9924242424242424
+      }
+    ]
+  },
   "conclusions": [
     "Diverse real samples reverse the tiny-prompt result: the missing down-output residual has a learnable linear component across a disjoint corpus partition.",
     "The linear-kernel dual folds into the compact retained down matrix and matches dual predictions below 7.5e-7 relative L2, so no support bank is required at inference.",
     "Live replacement of the one folded expert passes the small held-out NLL regression gate: relative perplexity changes by -1.47% over 132 tokens, while a full-width injection control changes it by only +0.082% on the paired subset.",
     "The apparent NLL improvement is not a quality-improvement claim: the sample is small, single-domain, and covers only one of 6,144 experts.",
+    "Routing-preselected early, middle, and late experts also remain non-regressing when injected separately, but optimal ridge varies from 1.0 to 3.0 and local improvement varies from 2.8% to 6.1%.",
+    "Independent single-expert results do not establish safe composition; simultaneous multi-expert injection is the next quality gate.",
     "Promotion remains false. Scale the same sealed-corpus control across representative layers and experts before considering artifact or Metal-kernel work; joint gate/up/down training remains necessary for a hardware-tier capacity reduction."
   ]
 }

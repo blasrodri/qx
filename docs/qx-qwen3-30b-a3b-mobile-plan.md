@@ -837,6 +837,33 @@ than down-only post-hoc fitting.
 The committed aggregate is
 `benchmarks/results/qwen3-30b-a3b-expert-local-distillation-corpus-2026-08-25.json`.
 
+### Routing-preselected depth screen
+
+To test whether the layer-8 result was hand-picked, the next targets were fixed
+from training-route frequency before looking at quality: the most frequently
+routed experts at layers 2, 24, and 44. Each target used the same WikiText
+train/test partitions, 93.75% retained down width, and an independent ridge
+grid. The best ridge is therefore an expert specialization parameter rather
+than a transferred global constant.
+
+| Target | Train/test hits | Ridge | Masked/distilled mean L2 | PPL delta | Top-1 agreement |
+|---|---:|---:|---:|---:|---:|
+| L2 / E125 | 96 / 40 | 1.0 | 0.1779 / 0.1701 | -0.096% | 100.00% |
+| L24 / E2 | 161 / 59 | 3.0 | 0.2047 / 0.1989 | -0.206% | 98.48% |
+| L44 / E6 | 179 / 92 | 3.0 | 0.2053 / 0.1927 | -0.212% | 99.24% |
+
+All three separately injected students remain non-regressing over the same 132
+held-out target tokens, so the layer-8 pass is not isolated to one depth. The
+local benefit is much smaller, however: 2.8% to 6.1% relative improvement
+versus 22% for layer 8, and low regularization materially overfits the late
+expert. A compiler cannot assign one universal distillation policy.
+
+This screen still replaces only one expert per run. It does not prove that
+errors compose when multiple students are active in one forward pass. The next
+gate is simultaneous injection of these four preselected students on the same
+sealed corpus. Promotion and kernel work remain blocked until the combined
+relative-PPL delta stays inside 1%.
+
 ## Evidence layout
 
 Keep generated model files and raw traces under ignored `external/` paths.
