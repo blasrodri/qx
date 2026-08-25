@@ -10,6 +10,12 @@ and next work are summarized in
 [docs/qx-current-status.md](docs/qx-current-status.md). Iteration reports are
 retained as the chronological experiment log and contain historical numbers.
 
+The next model/device expansion is planned around sparse Qwen3-30B-A3B on the
+M5 Pro followed by a measured iPhone residency tier. The staged implementation,
+M5 cache emulation, quality gates, and physical-device acceptance criteria are
+defined in
+[docs/qx-qwen3-30b-a3b-mobile-plan.md](docs/qx-qwen3-30b-a3b-mobile-plan.md).
+
 The current PoC provides:
 
 - a hard-coded Granite V0 model description;
