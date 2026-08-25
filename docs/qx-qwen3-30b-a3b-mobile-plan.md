@@ -816,13 +816,23 @@ support bank is therefore a training representation, not an inference cost.
 At 93.75% width the resulting raw Q4 down payload is 737,280 bytes instead of
 786,432 bytes per expert.
 
-This is positive model-co-design evidence, but it is not promotion evidence.
-It proves one reduced down projection has a learnable residual on one corpus
-pair. It does not reduce gate/up storage, prove the other 6,143 experts, or
-establish end-to-end logits/NLL. Even the best p95 local error is 22.5%.
-Materialize the folded matrix in the execution callback and run disjoint
-teacher-forced NLL next. If that gate fails, skip the Metal kernel and move
-directly to joint gate/up/down group-aware training.
+The folded matrix was also injected into live llama.cpp execution for this one
+expert. On all 12 held-out sequences, 132 scored tokens included 106 target
+expert hits. Mean NLL changed from `3.791721` to `3.776882`, or -1.473% relative
+perplexity, with 97.73% top-1 agreement. A paired four-sequence full-width
+reconstruction control changed perplexity by only +0.0816% with 100% top-1;
+the 93.75%-width student changed it by -1.786% with 93.75% top-1 on the same
+48 tokens and 34 hits. Thus the single-expert regression gate passes and the
+callback is not merely a no-op or generic reconstruction improvement.
+
+This is positive model-co-design evidence, but it is not promotion evidence or
+a claim that pruning improves Qwen quality. The held-out corpus is small and
+single-domain, only one of 6,144 expert down projections is replaced, and
+gate/up storage is untouched. The next gate is representative coverage across
+layers and experts on a larger sealed multi-domain corpus. Do not build a Metal
+kernel until that aggregate stays within the 1% relative-PPL budget. A hardware
+tier reduction still requires joint gate/up/down group-aware training rather
+than down-only post-hoc fitting.
 
 The committed aggregate is
 `benchmarks/results/qwen3-30b-a3b-expert-local-distillation-corpus-2026-08-25.json`.

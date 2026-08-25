@@ -38,6 +38,7 @@ typedef struct qx_llama_route {
     float * sample_activation;
     float * sample_down_output;
     float * sample_down_weights;
+    float * sample_student_down_weights;
     bool sample_ready;
     bool sample_weights_ready;
     bool sample_weights_taken;
@@ -332,6 +333,22 @@ static bool qx_capture_expert_sample(
             route->sample_weights_ready = true;
         }
         route->sample_ready = true;
+        if (route->sample_student_down_weights) {
+            for (int32_t output = 0; output < route->hidden; ++output) {
+                float value = 0.0f;
+                const float * row = route->sample_student_down_weights +
+                    (size_t) output * route->intermediate;
+                for (int32_t neuron = 0; neuron < route->intermediate; ++neuron) {
+                    value += row[neuron] * route->sample_activation[neuron];
+                }
+                route->sample_down_output[output] = value;
+            }
+            ggml_backend_tensor_set(
+                tensor,
+                route->sample_down_output,
+                (size_t) slot * tensor->nb[1],
+                (size_t) route->hidden * sizeof(float));
+        }
         break;
     }
     return true;
@@ -594,6 +611,7 @@ void qx_llama_route_close(qx_llama_route * route) {
     free(route->sample_activation);
     free(route->sample_down_output);
     free(route->sample_down_weights);
+    free(route->sample_student_down_weights);
     free(route->contribution_packet_neurons);
     free(route->scratch_quantized);
     free(route->scratch_row);
@@ -664,6 +682,25 @@ int qx_llama_route_set_neuron_mask(
     }
     free(route->neuron_mask);
     route->neuron_mask = copied;
+    return 0;
+}
+
+int qx_llama_route_set_expert_student(
+        qx_llama_route * route,
+        const float * weights,
+        int32_t weight_count) {
+    const size_t expected = route && route->sample_layer >= 0 ?
+        (size_t) route->hidden * route->intermediate : 0;
+    if (!route || !weights || weight_count < 0 || (size_t) weight_count != expected) {
+        return -1;
+    }
+    float * copied = malloc(expected * sizeof(float));
+    if (!copied) {
+        return -2;
+    }
+    memcpy(copied, weights, expected * sizeof(float));
+    free(route->sample_student_down_weights);
+    route->sample_student_down_weights = copied;
     return 0;
 }
 

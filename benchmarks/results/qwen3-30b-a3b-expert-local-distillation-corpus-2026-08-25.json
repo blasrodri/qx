@@ -75,10 +75,33 @@
     "gate_and_up_payload_reduction_fraction": 0.0,
     "all_experts_generalization_proved": false
   },
+  "single_expert_end_to_end_nll": {
+    "semantics": "teacher-forced-heldout-corpus-with-only-layer-8-expert-38-down-output-replaced",
+    "folded_student_f32_sidecar_sha256": "309f72bdeec9c68722459a8d126cd972cdf0761e0a32a51c66d0d56e11368539",
+    "full_heldout": {
+      "sequences": 12,
+      "scored_tokens": 132,
+      "expert_hits": 106,
+      "exact_mean_nll": 3.7917213920803934,
+      "student_mean_nll": 3.7768822674907465,
+      "nll_delta": -0.014839124589646868,
+      "relative_perplexity_delta": -0.01472956736093567,
+      "top1_agreement": 0.9772727272727273
+    },
+    "paired_four_sequence_control": {
+      "scored_tokens": 48,
+      "expert_hits": 34,
+      "full_width_reconstruction_relative_perplexity_delta": 0.0008161509951929435,
+      "full_width_reconstruction_top1_agreement": 1.0,
+      "pruned_student_relative_perplexity_delta": -0.017856188560965602,
+      "pruned_student_top1_agreement": 0.9375
+    }
+  },
   "conclusions": [
     "Diverse real samples reverse the tiny-prompt result: the missing down-output residual has a learnable linear component across a disjoint corpus partition.",
     "The linear-kernel dual folds into the compact retained down matrix and matches dual predictions below 7.5e-7 relative L2, so no support bank is required at inference.",
-    "The absolute local error remains too high for promotion, and only one expert down projection is tested. This is not yet an end-to-end quality or whole-model capacity result.",
-    "The next experiment must materialize the folded matrix in execution and measure teacher-forced NLL, then move to joint gate/up/down structured training if the local-to-model gate passes."
+    "Live replacement of the one folded expert passes the small held-out NLL regression gate: relative perplexity changes by -1.47% over 132 tokens, while a full-width injection control changes it by only +0.082% on the paired subset.",
+    "The apparent NLL improvement is not a quality-improvement claim: the sample is small, single-domain, and covers only one of 6,144 experts.",
+    "Promotion remains false. Scale the same sealed-corpus control across representative layers and experts before considering artifact or Metal-kernel work; joint gate/up/down training remains necessary for a hardware-tier capacity reduction."
   ]
 }

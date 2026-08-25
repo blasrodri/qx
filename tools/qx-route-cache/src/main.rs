@@ -257,9 +257,50 @@ enum Command {
         /// Limit explicit-corpus training hits for learning-curve experiments.
         #[arg(long)]
         max_train_samples: Option<usize>,
+        /// Export the folded student as a dense-shape F32 sidecar with zeroed
+        /// pruned columns for direct execution-callback evaluation.
+        #[arg(long)]
+        student_down_weights_output: Option<PathBuf>,
         /// Ridge penalty relative to the mean train-kernel diagonal.
         #[arg(long, default_value_t = 1e-3)]
         ridge: f64,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Compare one folded expert student with the exact teacher on a corpus.
+    ExpertStudentNll {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long = "corpus", required = true)]
+        corpora: Vec<PathBuf>,
+        #[arg(long)]
+        student_down_weights: PathBuf,
+        #[arg(long)]
+        layer: usize,
+        #[arg(long)]
+        expert: u16,
+        #[arg(long, default_value_t = 64)]
+        max_sequences: usize,
+        #[arg(long, default_value_t = 96)]
+        max_tokens_per_sequence: usize,
+        #[arg(long, default_value_t = 128)]
+        context: usize,
+        #[arg(long, default_value_t = 48)]
+        layers: usize,
+        #[arg(long, default_value_t = 128)]
+        experts: usize,
+        #[arg(long, default_value_t = 8)]
+        top_k: usize,
+        #[arg(long, default_value_t = -1)]
+        gpu_layers: i32,
+        #[arg(long, default_value_t = 4)]
+        threads: i32,
+        #[arg(long, default_value_t = DEFAULT_EXPERT_NEURONS)]
+        expert_neurons: usize,
+        #[arg(long, default_value_t = 2048)]
+        hidden_size: usize,
+        #[arg(long)]
+        model_sha256: Option<String>,
         #[arg(long)]
         output: PathBuf,
     },
@@ -661,6 +702,27 @@ struct StructuredNllResult {
     top1_agreement_vs_exact: f64,
 }
 
+#[derive(Debug, Serialize)]
+struct ExpertStudentNllReport {
+    schema_version: u32,
+    classification: &'static str,
+    promotion_evidence: bool,
+    quality_semantics: &'static str,
+    model_sha256: String,
+    corpora: Vec<String>,
+    student_down_weights: String,
+    layer: usize,
+    expert: u16,
+    sequences: usize,
+    scored_tokens: usize,
+    expert_hits: usize,
+    exact_mean_nll: f64,
+    student_mean_nll: f64,
+    nll_delta: f64,
+    relative_perplexity_delta: f64,
+    top1_agreement: f64,
+}
+
 #[derive(Default)]
 struct StructuredCalibration {
     token_positions: usize,
@@ -683,6 +745,7 @@ struct ExpertDistillReport {
     traces: Vec<String>,
     heldout_traces: Vec<String>,
     teacher_down_weights: String,
+    student_down_weights: Option<String>,
     calibrations: Vec<String>,
     trace_header: TraceHeader,
     layer: usize,
@@ -912,6 +975,7 @@ fn main() -> Result<()> {
             relative_error,
             train_fraction,
             max_train_samples,
+            student_down_weights_output,
             ridge,
             output,
         } => distill_expert(
@@ -926,9 +990,47 @@ fn main() -> Result<()> {
             relative_error,
             train_fraction,
             max_train_samples,
+            student_down_weights_output.as_deref(),
             ridge,
             &output,
         ),
+        Command::ExpertStudentNll {
+            model,
+            corpora,
+            student_down_weights,
+            layer,
+            expert,
+            max_sequences,
+            max_tokens_per_sequence,
+            context,
+            layers,
+            experts,
+            top_k,
+            gpu_layers,
+            threads,
+            expert_neurons,
+            hidden_size,
+            model_sha256,
+            output,
+        } => expert_student_nll(ExpertStudentNllArgs {
+            model,
+            corpora,
+            student_down_weights,
+            layer,
+            expert,
+            max_sequences,
+            max_tokens_per_sequence,
+            context,
+            layers,
+            experts,
+            top_k,
+            gpu_layers,
+            threads,
+            expert_neurons,
+            hidden_size,
+            model_sha256,
+            output,
+        }),
     }
 }
 
@@ -990,6 +1092,26 @@ struct CaptureCorpusArgs {
     expert_neurons: usize,
     hidden_size: usize,
     model_sha256: Option<String>,
+}
+
+struct ExpertStudentNllArgs {
+    model: PathBuf,
+    corpora: Vec<PathBuf>,
+    student_down_weights: PathBuf,
+    layer: usize,
+    expert: u16,
+    max_sequences: usize,
+    max_tokens_per_sequence: usize,
+    context: usize,
+    layers: usize,
+    experts: usize,
+    top_k: usize,
+    gpu_layers: i32,
+    threads: i32,
+    expert_neurons: usize,
+    hidden_size: usize,
+    model_sha256: Option<String>,
+    output: PathBuf,
 }
 
 struct SimulateArgs {
@@ -1386,6 +1508,173 @@ fn split_corpus_paragraphs(contents: &str) -> Vec<String> {
         paragraphs.push(paragraph);
     }
     paragraphs
+}
+
+#[derive(Default)]
+struct CorpusNllMeasurement {
+    nll: f64,
+    scored_tokens: usize,
+    expert_hits: usize,
+    top1_tokens: Vec<i32>,
+}
+
+impl CorpusNllMeasurement {
+    fn mean_nll(&self) -> f64 {
+        self.nll / self.scored_tokens.max(1) as f64
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn expert_student_nll(args: ExpertStudentNllArgs) -> Result<()> {
+    if !args.model.is_file()
+        || args.corpora.is_empty()
+        || args.corpora.iter().any(|path| !path.is_file())
+        || !args.student_down_weights.is_file()
+    {
+        bail!("model, corpus, and student weight inputs must exist");
+    }
+    if args.max_sequences == 0
+        || args.max_tokens_per_sequence < 2
+        || args.max_tokens_per_sequence > args.context
+        || args.layer >= args.layers
+        || usize::from(args.expert) >= args.experts
+    {
+        bail!("expert student corpus or model shape arguments are invalid");
+    }
+    let model_hash = match args.model_sha256.as_ref() {
+        Some(value) => {
+            validate_sha256(value)?;
+            value.clone()
+        }
+        None => sha256_file(&args.model)?,
+    };
+    let (student_neurons, student_hidden, student_weights) =
+        read_expert_down_weights(&args.student_down_weights)?;
+    if (student_neurons, student_hidden) != (args.expert_neurons, args.hidden_size) {
+        bail!("student down weight dimensions do not match the requested model shape");
+    }
+    let mut capture = llama_capture::Capture::open(
+        &args.model,
+        llama_capture::OpenConfig {
+            context: args.context,
+            layers: args.layers,
+            experts: args.experts,
+            top_k: args.top_k,
+            gpu_layers: args.gpu_layers,
+            threads: args.threads,
+            intermediate: Some(args.expert_neurons),
+            hidden: args.hidden_size,
+            sample: Some((args.layer, args.expert)),
+            contribution_packet_neurons: &[],
+        },
+    )?;
+    let mut sequences = Vec::new();
+    for path in &args.corpora {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("read corpus {}", path.display()))?;
+        for paragraph in split_corpus_paragraphs(&contents) {
+            if sequences.len() >= args.max_sequences {
+                break;
+            }
+            let mut tokens = capture.tokenize(&paragraph)?;
+            tokens.truncate(args.max_tokens_per_sequence);
+            if tokens.len() >= 2 {
+                sequences.push(tokens);
+            }
+        }
+        if sequences.len() >= args.max_sequences {
+            break;
+        }
+    }
+    if sequences.is_empty() {
+        bail!("corpus produced no scoreable token sequences");
+    }
+    let exact = measure_corpus_nll(&mut capture, &sequences)?;
+    capture.set_expert_student(&student_weights)?;
+    let student = measure_corpus_nll(&mut capture, &sequences)?;
+    if exact.scored_tokens != student.scored_tokens
+        || exact.top1_tokens.len() != student.top1_tokens.len()
+    {
+        bail!("exact and student corpus passes produced different token counts");
+    }
+    let exact_mean_nll = exact.mean_nll();
+    let student_mean_nll = student.mean_nll();
+    let top1_matches = exact
+        .top1_tokens
+        .iter()
+        .zip(&student.top1_tokens)
+        .filter(|(exact, student)| exact == student)
+        .count();
+    let report = ExpertStudentNllReport {
+        schema_version: 1,
+        classification: "single-expert-folded-student-corpus-nll-control",
+        promotion_evidence: false,
+        quality_semantics: "teacher-forced-corpus-nll-with-one-expert-down-projection-replaced",
+        model_sha256: model_hash,
+        corpora: args
+            .corpora
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        student_down_weights: args.student_down_weights.display().to_string(),
+        layer: args.layer,
+        expert: args.expert,
+        sequences: sequences.len(),
+        scored_tokens: exact.scored_tokens,
+        expert_hits: exact.expert_hits,
+        exact_mean_nll,
+        student_mean_nll,
+        nll_delta: student_mean_nll - exact_mean_nll,
+        relative_perplexity_delta: (student_mean_nll - exact_mean_nll).exp() - 1.0,
+        top1_agreement: top1_matches as f64 / exact.top1_tokens.len().max(1) as f64,
+    };
+    let mut writer = BufWriter::new(
+        File::create(&args.output).with_context(|| format!("create {}", args.output.display()))?,
+    );
+    serde_json::to_writer_pretty(&mut writer, &report)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    println!("expert student NLL report: {}", args.output.display());
+    println!(
+        "layer {} expert {}: sequences {}, scored {}, hits {}, NLL {:.6} -> {:.6} ({:+.4}% PPL), top1 {:.2}%",
+        args.layer,
+        args.expert,
+        report.sequences,
+        report.scored_tokens,
+        report.expert_hits,
+        exact_mean_nll,
+        student_mean_nll,
+        report.relative_perplexity_delta * 100.0,
+        report.top1_agreement * 100.0,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn measure_corpus_nll(
+    capture: &mut llama_capture::Capture,
+    sequences: &[Vec<i32>],
+) -> Result<CorpusNllMeasurement> {
+    let mut measurement = CorpusNllMeasurement::default();
+    for tokens in sequences {
+        capture.reset()?;
+        for pair in tokens.windows(2) {
+            let output = capture.step_target(pair[0], pair[1])?;
+            measurement.nll += output
+                .target_nll
+                .ok_or_else(|| anyhow::anyhow!("llama bridge omitted target NLL"))?
+                as f64;
+            measurement.scored_tokens += 1;
+            measurement.expert_hits += usize::from(output.expert_sample.is_some());
+            measurement.top1_tokens.push(output.predicted);
+        }
+    }
+    Ok(measurement)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn expert_student_nll(_args: ExpertStudentNllArgs) -> Result<()> {
+    bail!("expert student NLL currently requires the macOS llama.cpp bridge")
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2492,6 +2781,7 @@ fn distill_expert(
     relative_error: f64,
     train_fraction: f64,
     max_train_samples: Option<usize>,
+    student_down_weights_output: Option<&Path>,
     ridge: f64,
     output: &Path,
 ) -> Result<()> {
@@ -2656,6 +2946,16 @@ fn distill_expert(
                 teacher_weights[output_index * expert_neurons + teacher_neuron] + correction as f32;
         }
     }
+    if let Some(path) = student_down_weights_output {
+        let mut dense_student_weights = vec![0.0f32; hidden * expert_neurons];
+        for output_index in 0..hidden {
+            for (compact_neuron, &teacher_neuron) in retained_indices.iter().enumerate() {
+                dense_student_weights[output_index * expert_neurons + teacher_neuron] =
+                    student_weights[output_index * retained_neurons + compact_neuron];
+            }
+        }
+        write_expert_down_weights(path, expert_neurons, hidden, &dense_student_weights)?;
+    }
 
     let mut relative_l2 = Vec::with_capacity(heldout.len());
     let mut cosines = Vec::with_capacity(heldout.len());
@@ -2745,6 +3045,7 @@ fn distill_expert(
             .map(|trace| trace.display().to_string())
             .collect(),
         teacher_down_weights: teacher_down_weights.display().to_string(),
+        student_down_weights: student_down_weights_output.map(|path| path.display().to_string()),
         calibrations: calibration_paths
             .iter()
             .map(|path| path.display().to_string())
@@ -3823,6 +4124,11 @@ mod llama_capture {
             mask: *const u8,
             mask_count: c_int,
         ) -> c_int;
+        fn qx_llama_route_set_expert_student(
+            route: *mut c_void,
+            weights: *const f32,
+            weight_count: c_int,
+        ) -> c_int;
         fn qx_llama_route_take_expert_sample(
             route: *mut c_void,
             activation: *mut f32,
@@ -4011,6 +4317,17 @@ mod llama_capture {
             };
             if status != 0 {
                 bail!("llama route mask setup failed ({status}): {}", self.error());
+            }
+            Ok(())
+        }
+
+        pub fn set_expert_student(&mut self, weights: &[f32]) -> Result<()> {
+            let count =
+                c_int::try_from(weights.len()).context("student weight count exceeds C int")?;
+            let status =
+                unsafe { qx_llama_route_set_expert_student(self.raw, weights.as_ptr(), count) };
+            if status != 0 {
+                bail!("llama bridge rejected expert student weights with status {status}");
             }
             Ok(())
         }
