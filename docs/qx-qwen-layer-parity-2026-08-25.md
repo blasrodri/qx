@@ -113,3 +113,23 @@ iPhone rate and not yet a BF16-teacher parity claim.
 - the serial GPU argmax is a dependency-correct placeholder;
 - parity is against quantized QX component math, not the BF16 teacher or
   downstream quality evaluations.
+
+## First optimization from the complete baseline
+
+The K-wide score-reuse GQA mapping assigns one 128-thread group to each query
+head. It computes every Q.K score once into dynamic threadgroup memory and
+reuses those scores across all 128 value dimensions. Contexts through 4,096
+select this mapping; larger contexts retain the low-threadgroup-memory
+correctness fallback.
+
+At position 511 on the same M5 Pro and 512-token state allocation:
+
+| Mapping | Warm GPU ms/token | tok/s |
+|---|---:|---:|
+| Per-output score recomputation | 141.913 | 7.05 |
+| K-wide score reuse | 110.501 | 9.05 |
+
+This is a 22.1% latency reduction with unchanged selected token and exact GQA
+parity in the context-38 component replay. Position-0 time remained effectively
+flat (`85.701 ms` versus `85.868 ms`), so the score-reuse specialization removes
+context growth without taxing the short-context path.

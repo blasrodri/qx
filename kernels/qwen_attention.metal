@@ -226,6 +226,83 @@ kernel void qx_qwen_gqa_attention(
     output[index] = half(weighted / denominator);
 }
 
+// K-wide score reuse: one threadgroup owns one query head, computes every
+// Q.K score once, and reuses the normalized score across all 128 value
+// dimensions. Dynamic threadgroup memory holds `context + 128` floats.
+kernel void qx_qwen_gqa_score_reuse(
+    device const half* query [[buffer(0)]],
+    device const half* key_cache [[buffer(1)]],
+    device const half* value_cache [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    constant uint& context [[buffer(4)]],
+    threadgroup float* scratch [[threadgroup(0)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint query_head [[threadgroup_position_in_grid]]) {
+    constexpr uint query_heads = 32;
+    constexpr uint key_heads = 4;
+    constexpr uint head_dim = 128;
+    if (query_head >= query_heads || context == 0) {
+        return;
+    }
+    threadgroup float* scores = scratch;
+    threadgroup float* reductions = scratch + context;
+    uint key_head = query_head / (query_heads / key_heads);
+    uint query_offset = query_head * head_dim;
+    float scale = rsqrt(float(head_dim));
+
+    for (uint token = 0; token < context; ++token) {
+        uint key_offset = (token * key_heads + key_head) * head_dim;
+        reductions[tid] = float(query[query_offset + tid])
+            * float(key_cache[key_offset + tid]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = head_dim / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reductions[tid] += reductions[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) {
+            scores[token] = reductions[0] * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float local_maximum = -INFINITY;
+    for (uint token = tid; token < context; token += head_dim) {
+        local_maximum = max(local_maximum, scores[token]);
+    }
+    reductions[tid] = local_maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = head_dim / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reductions[tid] = max(reductions[tid], reductions[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float maximum = reductions[0];
+
+    float local_denominator = 0.0f;
+    for (uint token = tid; token < context; token += head_dim) {
+        local_denominator += exp(scores[token] - maximum);
+    }
+    reductions[tid] = local_denominator;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = head_dim / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reductions[tid] += reductions[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float denominator = reductions[0];
+
+    float weighted = 0.0f;
+    for (uint token = 0; token < context; ++token) {
+        uint value_offset = (token * key_heads + key_head) * head_dim;
+        weighted += exp(scores[token] - maximum) * float(value_cache[value_offset + tid]);
+    }
+    output[query_offset + tid] = half(weighted / denominator);
+}
+
 kernel void qx_qwen_top8(
     device const half* logits [[buffer(0)]],
     device uint* ids [[buffer(1)]],

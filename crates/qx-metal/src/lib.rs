@@ -1477,6 +1477,7 @@ pub mod platform {
         qwen_q2s4_expert_pipeline: Mutex<Option<Pipeline>>,
         qwen_qk_norm_rope_pipeline: Mutex<Option<Pipeline>>,
         qwen_gqa_attention_pipeline: Mutex<Option<Pipeline>>,
+        qwen_gqa_score_reuse_pipeline: Mutex<Option<Pipeline>>,
         qwen_top8_pipeline: Mutex<Option<Pipeline>>,
         qwen_rms_norm_pipeline: Mutex<Option<Pipeline>>,
         qwen_residual_rms_norm_pipeline: Mutex<Option<Pipeline>>,
@@ -1873,7 +1874,12 @@ pub mod platform {
             {
                 return Err("Qwen GQA buffers are smaller than the requested context".to_owned());
             }
-            let pipeline = context.qwen_gqa_attention_pipeline()?;
+            let score_reuse = context_len <= 4096;
+            let pipeline = if score_reuse {
+                context.qwen_gqa_score_reuse_pipeline()?
+            } else {
+                context.qwen_gqa_attention_pipeline()?
+            };
             self.encoder.setComputePipelineState(&pipeline);
             unsafe {
                 for (buffer, index) in [(query, 0), (key_cache, 1), (value_cache, 2), (output, 3)] {
@@ -1889,18 +1895,39 @@ pub mod platform {
                     4,
                 );
             }
-            self.encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: QUERY_ELEMENTS,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 256,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            if score_reuse {
+                unsafe {
+                    self.encoder.setThreadgroupMemoryLength_atIndex(
+                        (context_len as usize + 128) * std::mem::size_of::<f32>(),
+                        0,
+                    );
+                }
+                self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: 32,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else {
+                self.encoder.dispatchThreads_threadsPerThreadgroup(
+                    MTLSize {
+                        width: QUERY_ELEMENTS,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            }
             self.dispatches += 1;
             Ok(())
         }
@@ -8914,6 +8941,7 @@ pub mod platform {
                 qwen_q2s4_expert_pipeline: Mutex::new(None),
                 qwen_qk_norm_rope_pipeline: Mutex::new(None),
                 qwen_gqa_attention_pipeline: Mutex::new(None),
+                qwen_gqa_score_reuse_pipeline: Mutex::new(None),
                 qwen_top8_pipeline: Mutex::new(None),
                 qwen_rms_norm_pipeline: Mutex::new(None),
                 qwen_residual_rms_norm_pipeline: Mutex::new(None),
@@ -9116,6 +9144,7 @@ pub mod platform {
             let _ = self.qwen_argmax_pipeline()?;
             let _ = self.qwen_qk_norm_rope_pipeline()?;
             let _ = self.qwen_gqa_attention_pipeline()?;
+            let _ = self.qwen_gqa_score_reuse_pipeline()?;
             let _ = self.qwen_top8_pipeline()?;
             let _ = self.qwen_dynamic_moe_pipeline()?;
             let _ = self.qwen_dynamic_accumulate_pipeline()?;
@@ -9450,6 +9479,14 @@ pub mod platform {
                 .map_err(|_| "Metal Qwen GQA pipeline creation failed".to_owned())?;
             *pipeline = Some(value.clone());
             Ok(value)
+        }
+
+        fn qwen_gqa_score_reuse_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_gqa_score_reuse_pipeline,
+                QWEN_ATTENTION_KERNEL_SOURCE,
+                "qx_qwen_gqa_score_reuse",
+            )
         }
 
         fn qwen_named_pipeline(
@@ -13745,7 +13782,12 @@ pub mod platform {
             let encoder = command_buffer
                 .computeCommandEncoder()
                 .ok_or_else(|| "Metal Qwen GQA encoder allocation failed".to_owned())?;
-            let pipeline = self.qwen_gqa_attention_pipeline()?;
+            let score_reuse = context <= 4096;
+            let pipeline = if score_reuse {
+                self.qwen_gqa_score_reuse_pipeline()?
+            } else {
+                self.qwen_gqa_attention_pipeline()?
+            };
             encoder.setComputePipelineState(&pipeline);
             unsafe {
                 for (buffer, index) in [
@@ -13762,18 +13804,39 @@ pub mod platform {
                     4,
                 );
             }
-            encoder.dispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: QUERY_ELEMENTS,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 256,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            if score_reuse {
+                unsafe {
+                    encoder.setThreadgroupMemoryLength_atIndex(
+                        (context as usize + 128) * std::mem::size_of::<f32>(),
+                        0,
+                    );
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: 32,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else {
+                encoder.dispatchThreads_threadsPerThreadgroup(
+                    MTLSize {
+                        width: QUERY_ELEMENTS,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            }
             encoder.endEncoding();
             let encode_start = Instant::now();
             command_buffer.commit();
@@ -14594,6 +14657,7 @@ mod tests {
             "qx_qwen_argmax",
             "qx_qwen_qk_norm_rope",
             "qx_qwen_gqa_attention",
+            "qx_qwen_gqa_score_reuse",
             "qx_qwen_top8",
         ] {
             assert!(
