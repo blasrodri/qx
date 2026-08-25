@@ -904,6 +904,16 @@ pub mod platform {
         down_scales: RuntimeBuffer,
     }
 
+    pub struct PreparedQwenDynamicMoe {
+        expert_pipeline: Pipeline,
+        accumulate_pipeline: Pipeline,
+        slab: RuntimeBuffer,
+        gate_data_offsets: RuntimeBuffer,
+        gate_scale_offsets: RuntimeBuffer,
+        down_data_offsets: RuntimeBuffer,
+        down_scale_offsets: RuntimeBuffer,
+    }
+
     /// A single Q4 matrix stage used by the kernel microbenchmarks. It keeps
     /// the artifact's packing layout so expert gate/up and down projections
     /// can be measured independently.
@@ -1460,6 +1470,13 @@ pub mod platform {
         qwen_q2s4_expert_pipeline: Mutex<Option<Pipeline>>,
         qwen_qk_norm_rope_pipeline: Mutex<Option<Pipeline>>,
         qwen_gqa_attention_pipeline: Mutex<Option<Pipeline>>,
+        qwen_top8_pipeline: Mutex<Option<Pipeline>>,
+        qwen_rms_norm_pipeline: Mutex<Option<Pipeline>>,
+        qwen_residual_rms_norm_pipeline: Mutex<Option<Pipeline>>,
+        qwen_store_kv_pipeline: Mutex<Option<Pipeline>>,
+        qwen_residual_pipeline: Mutex<Option<Pipeline>>,
+        qwen_dynamic_moe_pipeline: Mutex<Option<Pipeline>>,
+        qwen_dynamic_accumulate_pipeline: Mutex<Option<Pipeline>>,
         logits_pipeline: Mutex<Option<Pipeline>>,
         dense_pipeline: Mutex<Option<Pipeline>>,
         f16_dense_pipeline: Mutex<Option<Pipeline>>,
@@ -1533,6 +1550,482 @@ pub mod platform {
     impl DecodeGraph {
         pub fn encoder(&self) -> &ProtocolObject<dyn MTLComputeCommandEncoder> {
             &self.encoder
+        }
+
+        pub fn encode_qwen_rms_norm(
+            &mut self,
+            context: &MetalContext,
+            input: &RuntimeBuffer,
+            norm: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+        ) -> Result<(), String> {
+            const HIDDEN: usize = 2048;
+            if input.len() < HIDDEN * std::mem::size_of::<u16>()
+                || norm.len() < HIDDEN * std::mem::size_of::<f32>()
+                || output.len() < HIDDEN * std::mem::size_of::<u16>()
+            {
+                return Err("Qwen RMSNorm buffers are smaller than their fixed shape".to_owned());
+            }
+            let pipeline = context.qwen_rms_norm_pipeline()?;
+            self.encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                for (buffer, index) in [(input, 0), (norm, 1), (output, 2)] {
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
+                }
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        pub fn encode_prepared_qwen_q4_stage(
+            &mut self,
+            prepared: &PreparedQ4Stage,
+            input: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+        ) -> Result<(), String> {
+            if input.len() < prepared.columns * std::mem::size_of::<u16>()
+                || output.len() < prepared.rows * std::mem::size_of::<u16>()
+            {
+                return Err("Qwen Q4 stage buffers are smaller than their fixed shape".to_owned());
+            }
+            self.encoder.setComputePipelineState(&prepared.pipeline);
+            let columns = prepared.columns as u32;
+            let layout = prepared.layout as u32;
+            unsafe {
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.packed.buffer),
+                    prepared.packed.offset,
+                    0,
+                );
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&prepared.scales.buffer),
+                    prepared.scales.offset,
+                    1,
+                );
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 2);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&output.buffer), output.offset, 3);
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&columns).cast(),
+                    std::mem::size_of_val(&columns),
+                    4,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&layout).cast(),
+                    std::mem::size_of_val(&layout),
+                    5,
+                );
+            }
+            self.encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: prepared.rows,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        pub fn encode_qwen_qk_norm_rope(
+            &mut self,
+            context: &MetalContext,
+            query: &RuntimeBuffer,
+            key: &RuntimeBuffer,
+            query_norm: &RuntimeBuffer,
+            key_norm: &RuntimeBuffer,
+            position: u32,
+        ) -> Result<(), String> {
+            if query.len() < 4096 * std::mem::size_of::<u16>()
+                || key.len() < 512 * std::mem::size_of::<u16>()
+                || query_norm.len() < 128 * std::mem::size_of::<f32>()
+                || key_norm.len() < 128 * std::mem::size_of::<f32>()
+            {
+                return Err(
+                    "Qwen Q/K norm+RoPE buffers are smaller than their fixed shape".to_owned(),
+                );
+            }
+            let pipeline = context.qwen_qk_norm_rope_pipeline()?;
+            self.encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                for (buffer, index) in [(query, 0), (key, 1), (query_norm, 2), (key_norm, 3)] {
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
+                }
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&position).cast(),
+                    std::mem::size_of_val(&position),
+                    4,
+                );
+            }
+            self.encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: 36,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 36,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        pub fn encode_qwen_store_kv(
+            &mut self,
+            context: &MetalContext,
+            key: &RuntimeBuffer,
+            value: &RuntimeBuffer,
+            key_cache: &RuntimeBuffer,
+            value_cache: &RuntimeBuffer,
+            position: u32,
+        ) -> Result<(), String> {
+            const KV_ELEMENTS: usize = 512;
+            let required_cache = (position as usize + 1)
+                .checked_mul(KV_ELEMENTS * std::mem::size_of::<u16>())
+                .ok_or_else(|| "Qwen KV cache size overflows".to_owned())?;
+            if key.len() < KV_ELEMENTS * std::mem::size_of::<u16>()
+                || value.len() < KV_ELEMENTS * std::mem::size_of::<u16>()
+                || key_cache.len() < required_cache
+                || value_cache.len() < required_cache
+            {
+                return Err("Qwen KV buffers are smaller than the requested position".to_owned());
+            }
+            let pipeline = context.qwen_store_kv_pipeline()?;
+            self.encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                for (buffer, index) in [(key, 0), (value, 1), (key_cache, 2), (value_cache, 3)] {
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
+                }
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&position).cast(),
+                    std::mem::size_of_val(&position),
+                    4,
+                );
+            }
+            self.encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: KV_ELEMENTS,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        pub fn encode_qwen_gqa_attention(
+            &mut self,
+            context: &MetalContext,
+            query: &RuntimeBuffer,
+            key_cache: &RuntimeBuffer,
+            value_cache: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            context_len: u32,
+        ) -> Result<(), String> {
+            const QUERY_ELEMENTS: usize = 4096;
+            const KV_ELEMENTS: usize = 512;
+            let required_cache = context_len as usize * KV_ELEMENTS * std::mem::size_of::<u16>();
+            if context_len == 0
+                || query.len() < QUERY_ELEMENTS * std::mem::size_of::<u16>()
+                || key_cache.len() < required_cache
+                || value_cache.len() < required_cache
+                || output.len() < QUERY_ELEMENTS * std::mem::size_of::<u16>()
+            {
+                return Err("Qwen GQA buffers are smaller than the requested context".to_owned());
+            }
+            let pipeline = context.qwen_gqa_attention_pipeline()?;
+            self.encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                for (buffer, index) in [(query, 0), (key_cache, 1), (value_cache, 2), (output, 3)] {
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
+                }
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&context_len).cast(),
+                    std::mem::size_of_val(&context_len),
+                    4,
+                );
+            }
+            self.encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: QUERY_ELEMENTS,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        pub fn encode_qwen_residual_rms_norm(
+            &mut self,
+            context: &MetalContext,
+            residual: &RuntimeBuffer,
+            update: &RuntimeBuffer,
+            norm: &RuntimeBuffer,
+            hidden_output: &RuntimeBuffer,
+            norm_output: &RuntimeBuffer,
+        ) -> Result<(), String> {
+            const HIDDEN: usize = 2048;
+            if [residual, update, hidden_output, norm_output]
+                .iter()
+                .any(|buffer| buffer.len() < HIDDEN * std::mem::size_of::<u16>())
+                || norm.len() < HIDDEN * std::mem::size_of::<f32>()
+            {
+                return Err(
+                    "Qwen residual/RMS buffers are smaller than their fixed shape".to_owned(),
+                );
+            }
+            let pipeline = context.qwen_residual_rms_norm_pipeline()?;
+            self.encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                for (buffer, index) in [
+                    (residual, 0),
+                    (update, 1),
+                    (norm, 2),
+                    (hidden_output, 3),
+                    (norm_output, 4),
+                ] {
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
+                }
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        pub fn encode_qwen_residual(
+            &mut self,
+            context: &MetalContext,
+            residual: &RuntimeBuffer,
+            update: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+        ) -> Result<(), String> {
+            const HIDDEN: usize = 2048;
+            if [residual, update, output]
+                .iter()
+                .any(|buffer| buffer.len() < HIDDEN * std::mem::size_of::<u16>())
+            {
+                return Err("Qwen residual buffers are smaller than their fixed shape".to_owned());
+            }
+            let pipeline = context.qwen_residual_pipeline()?;
+            self.encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                for (buffer, index) in [(residual, 0), (update, 1), (output, 2)] {
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
+                }
+            }
+            self.encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: HIDDEN,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        /// Select and normalize the eight highest router logits entirely on
+        /// the GPU. The resulting IDs and weights can feed the dynamic MoE
+        /// encoder below without an intervening command-buffer boundary.
+        pub fn encode_qwen_top8(
+            &mut self,
+            context: &MetalContext,
+            logits: &RuntimeBuffer,
+            ids: &RuntimeBuffer,
+            weights: &RuntimeBuffer,
+        ) -> Result<(), String> {
+            const EXPERTS: usize = 128;
+            const TOP_K: usize = 8;
+            if logits.len() < EXPERTS * std::mem::size_of::<u16>()
+                || ids.len() < TOP_K * std::mem::size_of::<u32>()
+                || weights.len() < TOP_K * std::mem::size_of::<f32>()
+            {
+                return Err("Qwen top-8 buffers are smaller than their fixed shape".to_owned());
+            }
+            let pipeline = context.qwen_top8_pipeline()?;
+            self.encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&logits.buffer), logits.offset, 0);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&ids.buffer), ids.offset, 1);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&weights.buffer), weights.offset, 2);
+            }
+            self.encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        /// Execute the GPU-selected Qwen experts directly from a no-copy
+        /// artifact slab, then combine their outputs with the router weights.
+        /// Both dispatches remain in this graph and require no host readback.
+        pub fn encode_qwen_dynamic_moe(
+            &mut self,
+            prepared: &PreparedQwenDynamicMoe,
+            input: &RuntimeBuffer,
+            ids: &RuntimeBuffer,
+            weights: &RuntimeBuffer,
+            expert_outputs: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+        ) -> Result<(), String> {
+            const HIDDEN: usize = 2048;
+            const INTERMEDIATE: usize = 768;
+            const TOP_K: usize = 8;
+            if input.len() < HIDDEN * std::mem::size_of::<u16>()
+                || ids.len() < TOP_K * std::mem::size_of::<u32>()
+                || weights.len() < TOP_K * std::mem::size_of::<f32>()
+                || expert_outputs.len() < TOP_K * HIDDEN * std::mem::size_of::<u16>()
+                || output.len() < HIDDEN * std::mem::size_of::<u16>()
+            {
+                return Err(
+                    "Qwen dynamic MoE buffers are smaller than their fixed shape".to_owned(),
+                );
+            }
+            self.encoder
+                .setComputePipelineState(&prepared.expert_pipeline);
+            unsafe {
+                for (buffer, index) in [
+                    (&prepared.slab, 0),
+                    (&prepared.gate_data_offsets, 1),
+                    (&prepared.gate_scale_offsets, 2),
+                    (&prepared.down_data_offsets, 3),
+                    (&prepared.down_scale_offsets, 4),
+                    (input, 5),
+                    (ids, 6),
+                    (expert_outputs, 7),
+                ] {
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
+                }
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: TOP_K,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: INTERMEDIATE,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+
+            self.encoder
+                .setComputePipelineState(&prepared.accumulate_pipeline);
+            unsafe {
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&expert_outputs.buffer),
+                    expert_outputs.offset,
+                    0,
+                );
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&weights.buffer), weights.offset, 1);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&output.buffer), output.offset, 2);
+            }
+            self.encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: HIDDEN,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
         }
 
         pub fn encode_prepared_dense(
@@ -8319,6 +8812,13 @@ pub mod platform {
                 qwen_q2s4_expert_pipeline: Mutex::new(None),
                 qwen_qk_norm_rope_pipeline: Mutex::new(None),
                 qwen_gqa_attention_pipeline: Mutex::new(None),
+                qwen_top8_pipeline: Mutex::new(None),
+                qwen_rms_norm_pipeline: Mutex::new(None),
+                qwen_residual_rms_norm_pipeline: Mutex::new(None),
+                qwen_store_kv_pipeline: Mutex::new(None),
+                qwen_residual_pipeline: Mutex::new(None),
+                qwen_dynamic_moe_pipeline: Mutex::new(None),
+                qwen_dynamic_accumulate_pipeline: Mutex::new(None),
                 logits_pipeline: Mutex::new(None),
                 dense_pipeline: Mutex::new(None),
                 f16_dense_pipeline: Mutex::new(None),
@@ -8498,6 +8998,22 @@ pub mod platform {
 
         pub fn recommended_working_set_bytes(&self) -> u64 {
             self.device.recommendedMaxWorkingSetSize()
+        }
+
+        /// Compile every pipeline used by the persistent Qwen layer graph.
+        /// Model loading calls this once so shader compilation cannot leak
+        /// into the first token's encode latency.
+        pub fn prepare_qwen_layer_graph(&self) -> Result<(), String> {
+            let _ = self.qwen_rms_norm_pipeline()?;
+            let _ = self.qwen_residual_rms_norm_pipeline()?;
+            let _ = self.qwen_store_kv_pipeline()?;
+            let _ = self.qwen_residual_pipeline()?;
+            let _ = self.qwen_qk_norm_rope_pipeline()?;
+            let _ = self.qwen_gqa_attention_pipeline()?;
+            let _ = self.qwen_top8_pipeline()?;
+            let _ = self.qwen_dynamic_moe_pipeline()?;
+            let _ = self.qwen_dynamic_accumulate_pipeline()?;
+            Ok(())
         }
 
         pub fn begin_decode(&self) -> Result<DecodeGraph, String> {
@@ -8828,6 +9344,89 @@ pub mod platform {
                 .map_err(|_| "Metal Qwen GQA pipeline creation failed".to_owned())?;
             *pipeline = Some(value.clone());
             Ok(value)
+        }
+
+        fn qwen_named_pipeline(
+            &self,
+            cache: &Mutex<Option<Pipeline>>,
+            source: &str,
+            name: &str,
+        ) -> Result<Pipeline, String> {
+            let mut pipeline = cache
+                .lock()
+                .map_err(|_| format!("Metal {name} pipeline cache is poisoned"))?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&NSString::from_str(source), None)
+                .map_err(|_| format!("Metal {name} library compilation failed"))?;
+            let function = library
+                .newFunctionWithName(&NSString::from_str(name))
+                .ok_or_else(|| format!("Metal function {name} was not found"))?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| format!("Metal {name} pipeline creation failed"))?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn qwen_top8_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_top8_pipeline,
+                QWEN_ATTENTION_KERNEL_SOURCE,
+                "qx_qwen_top8",
+            )
+        }
+
+        fn qwen_rms_norm_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_rms_norm_pipeline,
+                QWEN_ATTENTION_KERNEL_SOURCE,
+                "qx_qwen_rms_norm",
+            )
+        }
+
+        fn qwen_residual_rms_norm_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_residual_rms_norm_pipeline,
+                QWEN_ATTENTION_KERNEL_SOURCE,
+                "qx_qwen_residual_rms_norm",
+            )
+        }
+
+        fn qwen_store_kv_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_store_kv_pipeline,
+                QWEN_ATTENTION_KERNEL_SOURCE,
+                "qx_qwen_store_kv",
+            )
+        }
+
+        fn qwen_residual_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_residual_pipeline,
+                QWEN_ATTENTION_KERNEL_SOURCE,
+                "qx_qwen_residual",
+            )
+        }
+
+        fn qwen_dynamic_moe_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_dynamic_moe_pipeline,
+                Q2_KERNEL_SOURCE,
+                "qx_q2s4_qwen_moe_dynamic",
+            )
+        }
+
+        fn qwen_dynamic_accumulate_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_dynamic_accumulate_pipeline,
+                Q2_KERNEL_SOURCE,
+                "qx_qwen_moe_accumulate_dynamic",
+            )
         }
 
         fn q4_gemv_pipeline(&self) -> Result<Pipeline, String> {
@@ -13120,6 +13719,53 @@ pub mod platform {
             })
         }
 
+        /// Bind all 128 Qwen experts through byte offsets into one mapped
+        /// artifact slab. Only the four compact offset tables are copied.
+        pub fn prepare_qwen_dynamic_moe(
+            &self,
+            slab: RuntimeBuffer,
+            gate_data_offsets: &[u64],
+            gate_scale_offsets: &[u64],
+            down_data_offsets: &[u64],
+            down_scale_offsets: &[u64],
+        ) -> Result<PreparedQwenDynamicMoe, String> {
+            const EXPERTS: usize = 128;
+            for (name, offsets) in [
+                ("gate data", gate_data_offsets),
+                ("gate scales", gate_scale_offsets),
+                ("down data", down_data_offsets),
+                ("down scales", down_scale_offsets),
+            ] {
+                if offsets.len() != EXPERTS {
+                    return Err(format!(
+                        "Qwen dynamic MoE {name} offset count {}, expected {EXPERTS}",
+                        offsets.len()
+                    ));
+                }
+                if offsets.iter().any(|offset| *offset as usize >= slab.len()) {
+                    return Err(format!("Qwen dynamic MoE {name} offset exceeds the slab"));
+                }
+            }
+            let offset_buffer = |offsets: &[u64]| {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        offsets.as_ptr().cast::<u8>(),
+                        std::mem::size_of_val(offsets),
+                    )
+                };
+                self.input_runtime_buffer(bytes)
+            };
+            Ok(PreparedQwenDynamicMoe {
+                expert_pipeline: self.qwen_dynamic_moe_pipeline()?,
+                accumulate_pipeline: self.qwen_dynamic_accumulate_pipeline()?,
+                slab,
+                gate_data_offsets: offset_buffer(gate_data_offsets)?,
+                gate_scale_offsets: offset_buffer(gate_scale_offsets)?,
+                down_data_offsets: offset_buffer(down_data_offsets)?,
+                down_scale_offsets: offset_buffer(down_scale_offsets)?,
+            })
+        }
+
         /// Execute one prepared Qwen Q2S4 expert with one command buffer and
         /// one dispatch. Input and output are FP16 bit patterns.
         pub fn run_prepared_qwen_q2s4_expert(
@@ -13793,8 +14439,20 @@ mod tests {
                 "missing Qwen MoE kernel {name}"
             );
         }
-        assert!(QWEN_ATTENTION_KERNEL_SOURCE.contains("qx_qwen_top8"));
-        assert!(QWEN_ATTENTION_KERNEL_SOURCE.contains("qx_qwen_gqa_attention"));
+        for name in [
+            "qx_qwen_rms_norm",
+            "qx_qwen_residual_rms_norm",
+            "qx_qwen_store_kv",
+            "qx_qwen_residual",
+            "qx_qwen_qk_norm_rope",
+            "qx_qwen_gqa_attention",
+            "qx_qwen_top8",
+        ] {
+            assert!(
+                QWEN_ATTENTION_KERNEL_SOURCE.contains(name),
+                "missing Qwen layer kernel {name}"
+            );
+        }
     }
 
     #[test]

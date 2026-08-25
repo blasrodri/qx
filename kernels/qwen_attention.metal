@@ -1,6 +1,89 @@
 #include <metal_stdlib>
 using namespace metal;
 
+kernel void qx_qwen_rms_norm(
+    device const half* input [[buffer(0)]],
+    device const float* norm [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 2048;
+    constexpr uint group = 256;
+    threadgroup float sums[group];
+    float local = 0.0f;
+    for (uint index = tid; index < hidden; index += group) {
+        float value = float(input[index]);
+        local += value * value;
+    }
+    sums[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sums[tid] += sums[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse_rms = rsqrt(sums[0] / float(hidden) + 1.0e-6f);
+    for (uint index = tid; index < hidden; index += group) {
+        output[index] = half(float(input[index]) * inverse_rms * norm[index]);
+    }
+}
+
+kernel void qx_qwen_residual_rms_norm(
+    device const half* residual [[buffer(0)]],
+    device const half* update [[buffer(1)]],
+    device const float* norm [[buffer(2)]],
+    device half* hidden_output [[buffer(3)]],
+    device half* norm_output [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint hidden = 2048;
+    constexpr uint group = 256;
+    threadgroup float sums[group];
+    float local = 0.0f;
+    for (uint index = tid; index < hidden; index += group) {
+        half value = half(float(residual[index]) + float(update[index]));
+        hidden_output[index] = value;
+        float quantized = float(value);
+        local += quantized * quantized;
+    }
+    sums[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sums[tid] += sums[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse_rms = rsqrt(sums[0] / float(hidden) + 1.0e-6f);
+    for (uint index = tid; index < hidden; index += group) {
+        norm_output[index] = half(float(hidden_output[index]) * inverse_rms * norm[index]);
+    }
+}
+
+kernel void qx_qwen_store_kv(
+    device const half* key [[buffer(0)]],
+    device const half* value [[buffer(1)]],
+    device half* key_cache [[buffer(2)]],
+    device half* value_cache [[buffer(3)]],
+    constant uint& position [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    constexpr uint kv_elements = 4 * 128;
+    if (index < kv_elements) {
+        uint destination = position * kv_elements + index;
+        key_cache[destination] = key[index];
+        value_cache[destination] = value[index];
+    }
+}
+
+kernel void qx_qwen_residual(
+    device const half* residual [[buffer(0)]],
+    device const half* update [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < 2048) {
+        output[index] = half(float(residual[index]) + float(update[index]));
+    }
+}
+
 // Qwen3 Q/K normalization and split-half RoPE. Query contains 32 x 128
 // elements and key contains 4 x 128 elements. One thread owns a complete head
 // so the reference mapping has deterministic reduction and write ordering.

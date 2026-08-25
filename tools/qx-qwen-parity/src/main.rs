@@ -24,6 +24,8 @@ struct Args {
     max_relative_l2: f32,
     #[arg(long, default_value_t = 37)]
     position: u32,
+    #[arg(long, default_value_t = 8)]
+    layer_replays: usize,
 }
 
 fn main() -> Result<()> {
@@ -282,6 +284,156 @@ fn run() -> Result<()> {
         .collect::<Vec<_>>();
     let moe_metrics = ErrorMetrics::between(&moe_expected, &moe_actual);
 
+    // Replay the same route through the production-shaped graph: router
+    // selection, slab-offset expert execution, and accumulation are one GPU
+    // dependency chain with no host-visible decision between dispatches.
+    let graph_input = context
+        .allocate_runtime_buffer(HIDDEN * std::mem::size_of::<u16>())
+        .map_err(anyhow::Error::msg)?;
+    let graph_logits = context
+        .allocate_runtime_buffer(128 * std::mem::size_of::<u16>())
+        .map_err(anyhow::Error::msg)?;
+    let graph_ids = context
+        .allocate_runtime_buffer(8 * std::mem::size_of::<u32>())
+        .map_err(anyhow::Error::msg)?;
+    let graph_weights = context
+        .allocate_runtime_buffer(8 * std::mem::size_of::<f32>())
+        .map_err(anyhow::Error::msg)?;
+    let graph_expert_outputs = context
+        .allocate_runtime_buffer(8 * HIDDEN * std::mem::size_of::<u16>())
+        .map_err(anyhow::Error::msg)?;
+    let graph_output = context
+        .allocate_runtime_buffer(HIDDEN * std::mem::size_of::<u16>())
+        .map_err(anyhow::Error::msg)?;
+    context
+        .write_runtime_buffer(&graph_input, u16_bytes(&moe_input_bits))
+        .map_err(anyhow::Error::msg)?;
+    context
+        .write_runtime_buffer(&graph_logits, u16_bytes(&post_router_actual_bits))
+        .map_err(anyhow::Error::msg)?;
+    let graph_metrics_before = context.metrics().map_err(anyhow::Error::msg)?;
+    let graph_started = Instant::now();
+    let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+    graph
+        .encode_qwen_top8(&context, &graph_logits, &graph_ids, &graph_weights)
+        .map_err(anyhow::Error::msg)?;
+    graph
+        .encode_qwen_dynamic_moe(
+            &persistent_layer.dynamic_moe,
+            &graph_input,
+            &graph_ids,
+            &graph_weights,
+            &graph_expert_outputs,
+            &graph_output,
+        )
+        .map_err(anyhow::Error::msg)?;
+    graph.finish(&context).map_err(anyhow::Error::msg)?;
+    let graph_wall = graph_started.elapsed();
+    let graph_metrics_after = context.metrics().map_err(anyhow::Error::msg)?;
+    let graph_route = context
+        .read_runtime_u32s(&graph_ids, 8)
+        .map_err(anyhow::Error::msg)?;
+    let graph_route_weights = context
+        .read_runtime_f32(&graph_weights, 8)
+        .map_err(anyhow::Error::msg)?;
+    let graph_output = context
+        .read_runtime_f16(&graph_output, HIDDEN)
+        .map_err(anyhow::Error::msg)?;
+    let expected_route_ids = post_actual_route
+        .iter()
+        .map(|item| item.0 as u32)
+        .collect::<Vec<_>>();
+    if graph_route != expected_route_ids {
+        bail!(
+            "GPU-selected route differs: graph={graph_route:?}, reference={expected_route_ids:?}"
+        );
+    }
+    let graph_weight_error = graph_route_weights
+        .iter()
+        .zip(route_weights)
+        .map(|(actual, expected)| (actual - expected).abs())
+        .fold(0.0_f32, f32::max);
+    let dynamic_moe_metrics = ErrorMetrics::between(&moe_expected, &graph_output);
+
+    let layer_hidden = context
+        .allocate_runtime_buffer(HIDDEN * std::mem::size_of::<u16>())
+        .map_err(anyhow::Error::msg)?;
+    let layer_key_cache = context
+        .allocate_runtime_buffer(key_cache.len() * std::mem::size_of::<u16>())
+        .map_err(anyhow::Error::msg)?;
+    let layer_value_cache = context
+        .allocate_runtime_buffer(value_cache.len() * std::mem::size_of::<u16>())
+        .map_err(anyhow::Error::msg)?;
+    let layer_output = context
+        .allocate_runtime_buffer(HIDDEN * std::mem::size_of::<u16>())
+        .map_err(anyhow::Error::msg)?;
+    let layer_workspace =
+        qx_runtime_v2::QwenLayerWorkspace::allocate(&context).map_err(anyhow::Error::msg)?;
+    context
+        .write_runtime_buffer(&layer_hidden, u16_bytes(&input_bits))
+        .map_err(anyhow::Error::msg)?;
+    context
+        .write_runtime_buffer(&layer_key_cache, u16_bytes(&key_cache))
+        .map_err(anyhow::Error::msg)?;
+    context
+        .write_runtime_buffer(&layer_value_cache, u16_bytes(&value_cache))
+        .map_err(anyhow::Error::msg)?;
+    let layer_metrics_before = context.metrics().map_err(anyhow::Error::msg)?;
+    let layer_started = Instant::now();
+    let mut layer_graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+    persistent_layer
+        .encode(
+            &mut layer_graph,
+            &context,
+            &layer_hidden,
+            &layer_key_cache,
+            &layer_value_cache,
+            &layer_output,
+            &layer_workspace,
+            args.position,
+        )
+        .map_err(anyhow::Error::msg)?;
+    layer_graph.finish(&context).map_err(anyhow::Error::msg)?;
+    let layer_wall = layer_started.elapsed();
+    let layer_metrics_after = context.metrics().map_err(anyhow::Error::msg)?;
+    let layer_actual = context
+        .read_runtime_f16(&layer_output, HIDDEN)
+        .map_err(anyhow::Error::msg)?;
+    let layer_expected = hidden_after_attention
+        .iter()
+        .zip(&moe_expected)
+        .map(|(residual, update)| f16::from_f32(residual + update).to_f32())
+        .collect::<Vec<_>>();
+    let layer_metrics = ErrorMetrics::between(&layer_expected, &layer_actual);
+    let layer_route = context
+        .read_runtime_u32s(&layer_workspace.expert_ids, 8)
+        .map_err(anyhow::Error::msg)?;
+    if layer_route != expected_route_ids {
+        bail!(
+            "complete GPU layer route differs: graph={layer_route:?}, reference={expected_route_ids:?}"
+        );
+    }
+    let replay_metrics_before = context.metrics().map_err(anyhow::Error::msg)?;
+    let replay_started = Instant::now();
+    for _ in 0..args.layer_replays {
+        let mut replay = context.begin_decode().map_err(anyhow::Error::msg)?;
+        persistent_layer
+            .encode(
+                &mut replay,
+                &context,
+                &layer_hidden,
+                &layer_key_cache,
+                &layer_value_cache,
+                &layer_output,
+                &layer_workspace,
+                args.position,
+            )
+            .map_err(anyhow::Error::msg)?;
+        replay.finish(&context).map_err(anyhow::Error::msg)?;
+    }
+    let replay_wall = replay_started.elapsed();
+    let replay_metrics_after = context.metrics().map_err(anyhow::Error::msg)?;
+
     println!("QX Qwen expert parity\n");
     println!("artifact:      {}", args.artifact.display());
     println!("layer/expert:  {}/{}", args.layer, args.expert);
@@ -379,13 +531,56 @@ fn run() -> Result<()> {
     );
     println!("weighted MoE L2:     {:.8}", moe_metrics.relative_l2);
     println!("weighted MoE cosine: {:.8}", moe_metrics.cosine);
+    println!("GPU graph top-8:      {graph_route:?}");
+    println!("GPU route weight Δ:   {graph_weight_error:.8}");
+    println!(
+        "dynamic MoE L2:      {:.8}",
+        dynamic_moe_metrics.relative_l2
+    );
+    println!("dynamic MoE cosine:  {:.8}", dynamic_moe_metrics.cosine);
+    println!(
+        "dynamic graph:       {:.3} ms wall, {:.3} ms GPU, {} CB / {} dispatches",
+        graph_wall.as_secs_f64() * 1000.0,
+        (graph_metrics_after.gpu_time_seconds - graph_metrics_before.gpu_time_seconds) * 1000.0,
+        graph_metrics_after.command_buffers - graph_metrics_before.command_buffers,
+        graph_metrics_after.dispatches - graph_metrics_before.dispatches,
+    );
+    println!("layer workspace:      {} bytes", layer_workspace.bytes());
+    println!("complete layer L2:    {:.8}", layer_metrics.relative_l2);
+    println!("complete layer cosine:{:.8}", layer_metrics.cosine);
+    println!(
+        "complete layer graph:{:.3} ms wall, {:.3} ms GPU, {} CB / {} dispatches",
+        layer_wall.as_secs_f64() * 1000.0,
+        (layer_metrics_after.gpu_time_seconds - layer_metrics_before.gpu_time_seconds) * 1000.0,
+        layer_metrics_after.command_buffers - layer_metrics_before.command_buffers,
+        layer_metrics_after.dispatches - layer_metrics_before.dispatches,
+    );
+    if args.layer_replays > 0 {
+        println!(
+            "warm layer mean:     {:.3} ms wall, {:.3} ms GPU ({} replays)",
+            replay_wall.as_secs_f64() * 1000.0 / args.layer_replays as f64,
+            (replay_metrics_after.gpu_time_seconds - replay_metrics_before.gpu_time_seconds)
+                * 1000.0
+                / args.layer_replays as f64,
+            args.layer_replays,
+        );
+    }
     if post_router_metrics.relative_l2 > args.max_relative_l2
         || moe_metrics.relative_l2 > args.max_relative_l2
+        || dynamic_moe_metrics.relative_l2 > args.max_relative_l2
+        || layer_metrics.relative_l2 > args.max_relative_l2
+        || graph_weight_error > 0.001
     {
         bail!("Qwen post-attention MoE parity failed");
     }
     println!("layer-{} components: pass", args.layer);
     Ok(())
+}
+
+fn u16_bytes(values: &[u16]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
 }
 
 fn validate_artifact(artifact: &MappedArtifact, args: &Args) -> Result<()> {

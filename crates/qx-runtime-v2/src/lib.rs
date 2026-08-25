@@ -620,8 +620,65 @@ pub struct PreparedQwenLayer {
     pub o_proj: qx_metal::platform::PreparedQ4Stage,
     pub router: qx_metal::platform::PreparedQ4Stage,
     pub experts: Vec<qx_metal::platform::PreparedQwenQ2S4Expert>,
+    pub dynamic_moe: qx_metal::platform::PreparedQwenDynamicMoe,
     artifact: Arc<qx_format::MappedArtifact>,
     slab: qx_metal::platform::RuntimeBuffer,
+}
+
+/// Reusable activation storage for one batch-1 Qwen3 MoE decoder layer.
+/// Its 72,000-byte footprint is independent of model size and token position;
+/// caller-owned KV caches remain separate so all layers can share the shape.
+#[cfg(target_os = "macos")]
+pub struct QwenLayerWorkspace {
+    pub attention_input: qx_metal::platform::RuntimeBuffer,
+    pub query: qx_metal::platform::RuntimeBuffer,
+    pub key: qx_metal::platform::RuntimeBuffer,
+    pub value: qx_metal::platform::RuntimeBuffer,
+    pub attention_output: qx_metal::platform::RuntimeBuffer,
+    pub attention_update: qx_metal::platform::RuntimeBuffer,
+    pub hidden_after_attention: qx_metal::platform::RuntimeBuffer,
+    pub moe_input: qx_metal::platform::RuntimeBuffer,
+    pub router_logits: qx_metal::platform::RuntimeBuffer,
+    pub expert_ids: qx_metal::platform::RuntimeBuffer,
+    pub expert_weights: qx_metal::platform::RuntimeBuffer,
+    pub expert_outputs: qx_metal::platform::RuntimeBuffer,
+    pub moe_output: qx_metal::platform::RuntimeBuffer,
+}
+
+#[cfg(target_os = "macos")]
+impl QwenLayerWorkspace {
+    pub fn allocate(context: &qx_metal::platform::MetalContext) -> Result<Self, String> {
+        const HALF: usize = std::mem::size_of::<u16>();
+        const FLOAT: usize = std::mem::size_of::<f32>();
+        let buffer =
+            |elements, element_size| context.allocate_runtime_buffer(elements * element_size);
+        Ok(Self {
+            attention_input: buffer(2048, HALF)?,
+            query: buffer(4096, HALF)?,
+            key: buffer(512, HALF)?,
+            value: buffer(512, HALF)?,
+            attention_output: buffer(4096, HALF)?,
+            attention_update: buffer(2048, HALF)?,
+            hidden_after_attention: buffer(2048, HALF)?,
+            moe_input: buffer(2048, HALF)?,
+            router_logits: buffer(128, HALF)?,
+            expert_ids: buffer(8, std::mem::size_of::<u32>())?,
+            expert_weights: buffer(8, FLOAT)?,
+            expert_outputs: buffer(8 * 2048, HALF)?,
+            moe_output: buffer(2048, HALF)?,
+        })
+    }
+
+    pub fn bytes(&self) -> usize {
+        2048 * 2
+            + 4096 * 2
+            + 512 * 2 * 2
+            + 4096 * 2
+            + 2048 * 2 * 4
+            + 128 * 2
+            + 8 * 4 * 2
+            + 8 * 2048 * 2
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -653,6 +710,7 @@ impl PreparedQwenLayer {
         {
             return Err("Qwen layer requires mmap/no-copy weight storage".to_owned());
         }
+        context.prepare_qwen_layer_graph()?;
         let weight_slab = artifact.weight_slab().map_err(|error| error.to_string())?;
         let pointer = NonNull::new(weight_slab.as_ptr() as *mut c_void)
             .ok_or_else(|| "Qwen artifact weight slab is empty".to_owned())?;
@@ -673,7 +731,18 @@ impl PreparedQwenLayer {
         let o_proj = matrix(qx_format::TensorKind::OProj, 2048, 4096)?;
         let router = matrix(qx_format::TensorKind::Router, 128, 2048)?;
         let mut experts = Vec::with_capacity(128);
+        let mut gate_data_offsets = Vec::with_capacity(128);
+        let mut gate_scale_offsets = Vec::with_capacity(128);
+        let mut down_data_offsets = Vec::with_capacity(128);
+        let mut down_scale_offsets = Vec::with_capacity(128);
         for expert in 0..128_u8 {
+            let gate_index =
+                qwen_entry_index(&artifact, layer, expert, qx_format::TensorKind::GateUp)?;
+            let (gate_scales_range, gate_data_range) = artifact
+                .tensor_slab_ranges(gate_index)
+                .map_err(|error| error.to_string())?;
+            gate_data_offsets.push(gate_data_range.start as u64);
+            gate_scale_offsets.push(gate_scales_range.start as u64);
             let (gate_scales, gate_data) = qwen_entry_buffers(
                 &artifact,
                 &slab,
@@ -684,6 +753,13 @@ impl PreparedQwenLayer {
                 1536,
                 2048,
             )?;
+            let down_index =
+                qwen_entry_index(&artifact, layer, expert, qx_format::TensorKind::Down)?;
+            let (down_scales_range, down_data_range) = artifact
+                .tensor_slab_ranges(down_index)
+                .map_err(|error| error.to_string())?;
+            down_data_offsets.push(down_data_range.start as u64);
+            down_scale_offsets.push(down_scales_range.start as u64);
             let (down_scales, down_data) = qwen_entry_buffers(
                 &artifact,
                 &slab,
@@ -701,6 +777,13 @@ impl PreparedQwenLayer {
                 down_scales,
             )?);
         }
+        let dynamic_moe = context.prepare_qwen_dynamic_moe(
+            slab.clone(),
+            &gate_data_offsets,
+            &gate_scale_offsets,
+            &down_data_offsets,
+            &down_scale_offsets,
+        )?;
         Ok(Self {
             layer,
             input_norm,
@@ -713,6 +796,7 @@ impl PreparedQwenLayer {
             o_proj,
             router,
             experts,
+            dynamic_moe,
             artifact,
             slab,
         })
@@ -724,6 +808,108 @@ impl PreparedQwenLayer {
 
     pub fn artifact(&self) -> &Arc<qx_format::MappedArtifact> {
         &self.artifact
+    }
+
+    /// Encode a complete batch-1 Qwen3 decoder layer into the caller's open
+    /// command graph. Routing, expert selection, and expert weights remain
+    /// GPU-resident; this method does not commit, wait, allocate, or read back.
+    pub fn encode(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        context: &qx_metal::platform::MetalContext,
+        hidden: &qx_metal::platform::RuntimeBuffer,
+        key_cache: &qx_metal::platform::RuntimeBuffer,
+        value_cache: &qx_metal::platform::RuntimeBuffer,
+        output: &qx_metal::platform::RuntimeBuffer,
+        workspace: &QwenLayerWorkspace,
+        position: u32,
+    ) -> Result<(), String> {
+        graph.encode_qwen_rms_norm(
+            context,
+            hidden,
+            &self.input_norm,
+            &workspace.attention_input,
+        )?;
+        graph.encode_prepared_qwen_q4_stage(
+            &self.q_proj,
+            &workspace.attention_input,
+            &workspace.query,
+        )?;
+        graph.encode_prepared_qwen_q4_stage(
+            &self.k_proj,
+            &workspace.attention_input,
+            &workspace.key,
+        )?;
+        graph.encode_prepared_qwen_q4_stage(
+            &self.v_proj,
+            &workspace.attention_input,
+            &workspace.value,
+        )?;
+        graph.encode_qwen_qk_norm_rope(
+            context,
+            &workspace.query,
+            &workspace.key,
+            &self.query_norm,
+            &self.key_norm,
+            position,
+        )?;
+        graph.encode_qwen_store_kv(
+            context,
+            &workspace.key,
+            &workspace.value,
+            key_cache,
+            value_cache,
+            position,
+        )?;
+        let context_len = position
+            .checked_add(1)
+            .ok_or_else(|| "Qwen position exceeds u32".to_owned())?;
+        graph.encode_qwen_gqa_attention(
+            context,
+            &workspace.query,
+            key_cache,
+            value_cache,
+            &workspace.attention_output,
+            context_len,
+        )?;
+        graph.encode_prepared_qwen_q4_stage(
+            &self.o_proj,
+            &workspace.attention_output,
+            &workspace.attention_update,
+        )?;
+        graph.encode_qwen_residual_rms_norm(
+            context,
+            hidden,
+            &workspace.attention_update,
+            &self.post_attention_norm,
+            &workspace.hidden_after_attention,
+            &workspace.moe_input,
+        )?;
+        graph.encode_prepared_qwen_q4_stage(
+            &self.router,
+            &workspace.moe_input,
+            &workspace.router_logits,
+        )?;
+        graph.encode_qwen_top8(
+            context,
+            &workspace.router_logits,
+            &workspace.expert_ids,
+            &workspace.expert_weights,
+        )?;
+        graph.encode_qwen_dynamic_moe(
+            &self.dynamic_moe,
+            &workspace.moe_input,
+            &workspace.expert_ids,
+            &workspace.expert_weights,
+            &workspace.expert_outputs,
+            &workspace.moe_output,
+        )?;
+        graph.encode_qwen_residual(
+            context,
+            &workspace.hidden_after_attention,
+            &workspace.moe_output,
+            output,
+        )
     }
 }
 

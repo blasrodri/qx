@@ -18,10 +18,14 @@ Qwen3-30B-A3B decoder layer on Metal from the sealed artifact:
 - eight Q2S4 gate/up-SwiGLU-down experts and GPU weighted accumulation.
 
 The Q2S4 expert kernel is Qwen-shaped rather than a renamed Granite kernel.
-One 768-thread group computes gate/up and retains the activated vector in
-threadgroup memory; each lane then strides over the 2,048 down rows. The eight
-selected experts and accumulation execute in one command buffer without
-expert-output readback.
+Eight 768-thread groups execute the GPU-selected experts directly from 64-bit
+offsets into the mapped weight slab, then one dispatch accumulates their
+outputs. Routing and expert weights never cross the host boundary.
+
+`PreparedQwenLayer::encode` now composes RMSNorm, Q/K/V, Q/K norm + RoPE, KV
+insertion, GQA, O projection, residual + RMSNorm, router, top-8, dynamic MoE,
+and the final residual into a caller-owned graph. It performs no allocation,
+commit, wait, or readback. One layer is 14 dispatches in one command buffer.
 
 ## Real-artifact parity
 
@@ -31,15 +35,16 @@ artifact. CPU is the dequantized-QX numerical oracle, including FP16 stage
 boundaries. These tests establish CPU/Metal artifact semantics, not BF16 model
 quality.
 
-| Layer / direct expert / position | Direct expert relative L2 | Q/K norm + RoPE relative L2 | Weighted top-8 MoE relative L2 | Result |
-|---|---:|---:|---:|---|
-| 0 / 0 / 37 | 0.00007621 | 0.00001500 | 0.00012655 | pass |
-| 24 / 64 / 63 | 0.00005271 | 0.00000419 | 0.00011630 | pass |
-| 47 / 127 / 7 | 0.00004916 | 0.00000028 | 0.00017482 | pass |
+| Layer / position | Direct expert L2 | Dynamic top-8 MoE L2 | Complete layer L2 | Warm layer GPU |
+|---|---:|---:|---:|---:|
+| 0 / 37 | 0.00007621 | 0.00012654 | 0.00009075 | 1.799 ms |
+| 24 / 37 | 0.00005610 | 0.00007323 | 0.00050762 | 2.216 ms |
+| 47 / 37 | 0.00002716 | 0.00016700 | 0.00077815 | 1.661 ms |
 
-All projection and GQA comparisons were bit-exact or below `2.1e-7` relative
-L2. Every router comparison selected identical expert IDs. Reported cosine was
-`1.0` for every component above.
+Every CPU, separately submitted Metal, dynamic-MoE, and complete-layer replay
+selected identical expert IDs. Complete-layer cosine was at least
+`0.9999997`. Timings are same-process warm means on the M5 Pro at context 38;
+they are correctness-kernel measurements, not a full-model token-rate claim.
 
 ## Persistent mapped bindings
 
@@ -51,8 +56,10 @@ mmap. On the M5 Pro:
 |---|---:|
 | Mapped weight-slab buffer | 9,927,294,976 bytes |
 | Experts bound | 128 |
-| Layer-0 binding time | 4.006 ms |
+| Layer-0 binding time after pipeline preparation | 2.9-5.0 ms |
 | Weight upload/repack | none |
+| Reusable layer activation workspace | 72,000 bytes |
+| Dynamic expert offset tables | 4,096 bytes per prepared layer |
 
 Metal's `currentAllocatedSize` increases by the logical buffer length because
 the complete mapping is exposed to Metal. That is not evidence of a second
@@ -70,19 +77,18 @@ cargo run --release -p qx-qwen-parity -- \
 
 ## What is not promoted yet
 
-This is a correctness graph, not the production token graph:
+The persistent single-layer graph is now real, but it is still a correctness
+baseline rather than a complete token runtime:
 
-- Q/K/V and output projections are separately submitted reference stages;
-- RMSNorm, residual composition, top-8 selection, and KV insertion are still
-  orchestrated by the harness;
-- the GQA kernel deliberately recomputes scores for each output dimension;
-- top-8 IDs and weights are still selected by the harness rather than a
-  Qwen-sized GPU top-k kernel;
-- embedding, persistent KV state, all-48-layer scheduling, final norm, untied
-  LM head, argmax, and GPU-resident rollout are not connected;
-- parity is against quantized QX math, not the BF16 teacher.
+- all 48 prepared layers are not yet chained in one command buffer;
+- per-layer persistent KV caches, embedding, final norm, untied LM head,
+  argmax, and GPU-resident rollout are not connected;
+- the GQA kernel deliberately recomputes scores for every output dimension;
+- the Q4 projections and Q2S4 expert kernel are shape-correct scalar consumers,
+  not the final SIMD/tiled performance mappings;
+- parity is against quantized QX math, not the BF16 teacher or downstream
+  quality evaluations.
 
-The next implementation milestone is a persistent `PreparedQwenLayer` which
-binds mapped artifact ranges once and encodes all stages into a caller-owned
-command graph. Only after 48 such layers produce a reference token should the
-correctness kernels be replaced with performance mappings.
+The next executable milestone is one reference token through all 48 layers.
+That will expose the actual working-set/page-residency behavior and establish
+the baseline from which attention and expert consumers should be optimized.
