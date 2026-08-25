@@ -10,7 +10,9 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const SCHEMA_VERSION: u32 = 1;
+const SIMULATION_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_Q3_EXPERT_BYTES: u64 = 2_064_384;
+const DEFAULT_EXPERT_NEURONS: usize = 768;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -65,6 +67,24 @@ enum Command {
         budgets: Vec<u64>,
         #[arg(long, default_value_t = DEFAULT_Q3_EXPERT_BYTES)]
         expert_bytes: u64,
+        /// Intermediate width of one complete expert.
+        #[arg(long, default_value_t = DEFAULT_EXPERT_NEURONS)]
+        expert_neurons: usize,
+        /// Neurons stored in one independently resident packet.
+        #[arg(long, value_delimiter = ',', default_value = "768")]
+        packet_neurons: Vec<usize>,
+        /// Physical packet order used to turn misses into contiguous fetches.
+        #[arg(long, value_delimiter = ',', default_value = "expert-major")]
+        layouts: Vec<PhysicalLayout>,
+        /// Synthetic sustained storage bandwidth used for I/O timing estimates.
+        #[arg(long)]
+        io_bandwidth_mib_s: Option<f64>,
+        /// Synthetic fixed latency for each contiguous missing-packet run.
+        #[arg(long, default_value_t = 0.0)]
+        io_fixed_us: f64,
+        /// Maximum concurrent contiguous fetches in the synthetic I/O shaper.
+        #[arg(long, default_value_t = 8)]
+        io_parallelism: usize,
         #[arg(long)]
         reset_between_requests: bool,
         #[arg(long)]
@@ -77,6 +97,44 @@ enum Command {
 enum CachePolicy {
     Lru,
     StaticHot,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum PhysicalLayout {
+    #[value(name = "expert-major")]
+    ExpertContiguous,
+    #[value(name = "neuron-major")]
+    NeuronInterleaved,
+    #[value(name = "co-selection-expert-major")]
+    CoSelectedExpertContiguous,
+    #[value(name = "co-selection-neuron-major")]
+    CoSelectedNeuronInterleaved,
+}
+
+impl PhysicalLayout {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ExpertContiguous => "expert-major",
+            Self::NeuronInterleaved => "neuron-major",
+            Self::CoSelectedExpertContiguous => "co-selection-expert-major",
+            Self::CoSelectedNeuronInterleaved => "co-selection-neuron-major",
+        }
+    }
+
+    fn uses_co_selection(self) -> bool {
+        matches!(
+            self,
+            Self::CoSelectedExpertContiguous | Self::CoSelectedNeuronInterleaved
+        )
+    }
+
+    fn is_neuron_major(self) -> bool {
+        matches!(
+            self,
+            Self::NeuronInterleaved | Self::CoSelectedNeuronInterleaved
+        )
+    }
 }
 
 impl CachePolicy {
@@ -123,15 +181,31 @@ struct SimulationReport {
     calibration: Option<String>,
     trace_header: TraceHeader,
     expert_bytes: u64,
+    expert_neurons: usize,
+    packet_neurons: Vec<usize>,
+    layouts: Vec<PhysicalLayout>,
+    io_shape: Option<IoShape>,
     results: Vec<SimulationResult>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct IoShape {
+    bandwidth_mib_s: f64,
+    fixed_latency_us: f64,
+    max_inflight_fetches: usize,
 }
 
 #[derive(Debug, Serialize)]
 struct SimulationResult {
     policy: String,
+    physical_layout: String,
     budget_bytes: u64,
-    resident_expert_capacity: usize,
+    packet_neurons: usize,
+    packets_per_expert: usize,
+    packet_bytes: u64,
+    resident_packet_capacity: usize,
     token_records: usize,
+    expert_route_lookups: u64,
     route_lookups: u64,
     hits: u64,
     misses: u64,
@@ -143,11 +217,45 @@ struct SimulationResult {
     p50_missing_bytes_per_token: u64,
     p95_missing_bytes_per_token: u64,
     p99_missing_bytes_per_token: u64,
+    p50_missing_bytes_per_layer: u64,
+    p95_missing_bytes_per_layer: u64,
+    p99_missing_bytes_per_layer: u64,
+    maximum_missing_bytes_per_layer: u64,
+    maximum_contiguous_burst_bytes: u64,
+    mean_transfer_runs_per_token: f64,
+    p95_transfer_runs_per_token: u64,
+    p99_transfer_runs_per_token: u64,
+    mean_contiguous_bytes_per_fetch: f64,
+    p50_contiguous_bytes_per_fetch: u64,
+    p95_contiguous_bytes_per_fetch: u64,
+    p99_contiguous_bytes_per_fetch: u64,
+    p50_reuse_distance_packet_lookups: u64,
+    p95_reuse_distance_packet_lookups: u64,
+    p99_reuse_distance_packet_lookups: u64,
     mean_layers_with_miss_per_token: f64,
     p95_layers_with_miss_per_token: u64,
     p99_layers_with_miss_per_token: u64,
     evictions: u64,
+    mean_evictions_per_token: f64,
     mean_adjacent_route_overlap: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mean_serial_io_ms_per_token: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p95_serial_io_ms_per_token: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p99_serial_io_ms_per_token: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mean_ideal_layer_parallel_io_ms_per_token: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p95_ideal_layer_parallel_io_ms_per_token: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p99_ideal_layer_parallel_io_ms_per_token: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mean_shaped_io_ms_per_token: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p95_shaped_io_ms_per_token: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p99_shaped_io_ms_per_token: Option<f64>,
 }
 
 fn main() -> Result<()> {
@@ -185,17 +293,29 @@ fn main() -> Result<()> {
             policies,
             budgets,
             expert_bytes,
+            expert_neurons,
+            packet_neurons,
+            layouts,
+            io_bandwidth_mib_s,
+            io_fixed_us,
+            io_parallelism,
             reset_between_requests,
             output,
-        } => simulate(
-            &trace,
-            calibration.as_deref(),
-            &policies,
-            &budgets,
+        } => simulate(SimulateArgs {
+            trace,
+            calibration,
+            policies,
+            budgets,
             expert_bytes,
+            expert_neurons,
+            packet_neurons,
+            layouts,
+            io_bandwidth_mib_s,
+            io_fixed_us,
+            io_parallelism,
             reset_between_requests,
-            &output,
-        ),
+            output,
+        }),
     }
 }
 
@@ -212,6 +332,22 @@ struct CaptureArgs {
     gpu_layers: i32,
     threads: i32,
     model_sha256: Option<String>,
+}
+
+struct SimulateArgs {
+    trace: PathBuf,
+    calibration: Option<PathBuf>,
+    policies: Vec<CachePolicy>,
+    budgets: Vec<u64>,
+    expert_bytes: u64,
+    expert_neurons: usize,
+    packet_neurons: Vec<usize>,
+    layouts: Vec<PhysicalLayout>,
+    io_bandwidth_mib_s: Option<f64>,
+    io_fixed_us: f64,
+    io_parallelism: usize,
+    reset_between_requests: bool,
+    output: PathBuf,
 }
 
 #[cfg(target_os = "macos")]
@@ -317,66 +453,123 @@ fn capture(_args: CaptureArgs) -> Result<()> {
     bail!("route capture currently requires the macOS llama.cpp bridge")
 }
 
-fn simulate(
-    trace: &Path,
-    calibration: Option<&Path>,
-    policies: &[CachePolicy],
-    budgets: &[u64],
-    expert_bytes: u64,
-    reset_between_requests: bool,
-    output: &Path,
-) -> Result<()> {
-    if policies.is_empty() || budgets.is_empty() {
-        bail!("provide at least one cache policy and budget");
+fn simulate(args: SimulateArgs) -> Result<()> {
+    let SimulateArgs {
+        trace,
+        calibration,
+        policies,
+        budgets,
+        expert_bytes,
+        expert_neurons,
+        packet_neurons,
+        layouts,
+        io_bandwidth_mib_s,
+        io_fixed_us,
+        io_parallelism,
+        reset_between_requests,
+        output,
+    } = args;
+    let calibration = calibration.as_deref();
+    if policies.is_empty() || budgets.is_empty() || packet_neurons.is_empty() || layouts.is_empty()
+    {
+        bail!("provide at least one cache policy, budget, packet size, and layout");
     }
-    if expert_bytes == 0 {
-        bail!("expert-bytes must be positive");
+    if expert_bytes == 0 || expert_neurons == 0 {
+        bail!("expert-bytes and expert-neurons must be positive");
     }
-    let trace_header = read_trace_header(trace)?;
+    if io_fixed_us < 0.0 || !io_fixed_us.is_finite() || io_parallelism == 0 {
+        bail!("io-fixed-us must be finite and non-negative and io-parallelism must be positive");
+    }
+    let io_shape = io_bandwidth_mib_s
+        .map(|bandwidth_mib_s| {
+            if bandwidth_mib_s <= 0.0 || !bandwidth_mib_s.is_finite() {
+                bail!("io-bandwidth-mib-s must be finite and positive");
+            }
+            Ok(IoShape {
+                bandwidth_mib_s,
+                fixed_latency_us: io_fixed_us,
+                max_inflight_fetches: io_parallelism,
+            })
+        })
+        .transpose()?;
+    if io_shape.is_none() && io_fixed_us != 0.0 {
+        bail!("io-fixed-us requires io-bandwidth-mib-s");
+    }
+    let trace_header = read_trace_header(&trace)?;
     let hot_frequency = calibration
         .map(|path| collect_frequency(path, &trace_header))
         .transpose()?;
+    let co_selection_ranks = calibration
+        .map(|path| collect_co_selection_ranks(path, &trace_header))
+        .transpose()?;
     let mut results = Vec::new();
-    for &policy in policies {
-        if matches!(policy, CachePolicy::StaticHot) && hot_frequency.is_none() {
-            bail!("static-hot requires a disjoint --calibration trace");
+    for &neurons in &packet_neurons {
+        if neurons == 0
+            || !expert_neurons.is_multiple_of(neurons)
+            || !expert_bytes.is_multiple_of((expert_neurons / neurons) as u64)
+        {
+            bail!(
+                "packet-neurons {neurons} must divide expert-neurons {expert_neurons} and expert-bytes {expert_bytes} exactly"
+            );
         }
-        for &budget in budgets {
-            let capacity = usize::try_from(budget / expert_bytes)
-                .context("resident expert capacity does not fit usize")?;
-            if capacity == 0 {
-                bail!("budget {budget} is smaller than one expert packet");
+        let packets_per_expert = expert_neurons / neurons;
+        let packet_bytes = expert_bytes / packets_per_expert as u64;
+        for &layout in &layouts {
+            if layout.uses_co_selection() && co_selection_ranks.is_none() {
+                bail!("co-selection layouts require a disjoint --calibration trace");
             }
-            let hot = hot_frequency.as_ref().map(|frequency| {
-                hottest_keys(
-                    frequency,
-                    capacity,
-                    trace_header.layers,
-                    trace_header.experts,
-                )
-            });
-            results.push(simulate_cell(SimulationCellConfig {
-                trace,
-                expected_header: &trace_header,
-                policy,
-                budget_bytes: budget,
-                capacity,
-                expert_bytes,
-                reset_between_requests,
-                static_hot: hot.as_ref(),
-            })?);
+            for &policy in &policies {
+                if matches!(policy, CachePolicy::StaticHot) && hot_frequency.is_none() {
+                    bail!("static-hot requires a disjoint --calibration trace");
+                }
+                for &budget in &budgets {
+                    let capacity = usize::try_from(budget / packet_bytes)
+                        .context("resident packet capacity does not fit usize")?;
+                    if capacity == 0 {
+                        bail!("budget {budget} is smaller than one neuron packet");
+                    }
+                    let hot = hot_frequency.as_ref().map(|frequency| {
+                        hottest_packet_keys(
+                            frequency,
+                            capacity,
+                            trace_header.layers,
+                            trace_header.experts,
+                            packets_per_expert,
+                        )
+                    });
+                    results.push(simulate_cell(SimulationCellConfig {
+                        trace: &trace,
+                        expected_header: &trace_header,
+                        policy,
+                        layout,
+                        co_selection_ranks: co_selection_ranks.as_deref(),
+                        budget_bytes: budget,
+                        capacity,
+                        packet_neurons: neurons,
+                        packets_per_expert,
+                        packet_bytes,
+                        io_shape,
+                        reset_between_requests,
+                        static_hot: hot.as_ref(),
+                    })?);
+                }
+            }
         }
     }
     let report = SimulationReport {
-        schema_version: SCHEMA_VERSION,
+        schema_version: SIMULATION_SCHEMA_VERSION,
         trace: trace.display().to_string(),
         calibration: calibration.map(|path| path.display().to_string()),
         trace_header,
         expert_bytes,
+        expert_neurons,
+        packet_neurons,
+        layouts,
+        io_shape,
         results,
     };
     let mut writer = BufWriter::new(
-        File::create(output).with_context(|| format!("create {}", output.display()))?,
+        File::create(&output).with_context(|| format!("create {}", output.display()))?,
     );
     serde_json::to_writer_pretty(&mut writer, &report).context("write simulation report")?;
     writer.write_all(b"\n")?;
@@ -384,8 +577,10 @@ fn simulate(
     println!("report: {}", output.display());
     for result in &report.results {
         println!(
-            "{} {} bytes: hit {:.3}% p95 miss {:.2} MiB p99 miss layers {}",
+            "{} {} {} neurons {} bytes: hit {:.3}% p95 miss {:.2} MiB p99 miss layers {}",
             result.policy,
+            result.physical_layout,
+            result.packet_neurons,
             result.budget_bytes,
             100.0 * result.byte_weighted_hit_rate,
             result.p95_missing_bytes_per_token as f64 / (1024.0 * 1024.0),
@@ -396,16 +591,22 @@ fn simulate(
 }
 
 type ExpertKey = (u16, u16);
+type PacketKey = (u16, u16, u16);
 
 struct SimulationCellConfig<'a> {
     trace: &'a Path,
     expected_header: &'a TraceHeader,
     policy: CachePolicy,
+    layout: PhysicalLayout,
+    co_selection_ranks: Option<&'a [Vec<u16>]>,
     budget_bytes: u64,
     capacity: usize,
-    expert_bytes: u64,
+    packet_neurons: usize,
+    packets_per_expert: usize,
+    packet_bytes: u64,
+    io_shape: Option<IoShape>,
     reset_between_requests: bool,
-    static_hot: Option<&'a HashSet<ExpertKey>>,
+    static_hot: Option<&'a HashSet<PacketKey>>,
 }
 
 fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
@@ -425,7 +626,17 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
     let mut compulsory_misses = 0u64;
     let mut evictions = 0u64;
     let mut missing_bytes = Vec::new();
+    let mut missing_bytes_per_layer = Vec::new();
+    let mut contiguous_bytes_per_fetch = Vec::new();
+    let mut maximum_contiguous_burst_bytes = 0u64;
+    let mut transfer_runs = Vec::new();
     let mut miss_layers = Vec::new();
+    let mut reuse_distances = Vec::new();
+    let mut last_access = HashMap::<PacketKey, u64>::new();
+    let mut access_clock = 0u64;
+    let mut serial_io_ms = Vec::new();
+    let mut ideal_layer_parallel_io_ms = Vec::new();
+    let mut shaped_io_ms = Vec::new();
     let mut overlap_sum = 0.0f64;
     let mut overlap_count = 0u64;
     let mut previous_request = None::<String>;
@@ -439,27 +650,70 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
         {
             state.clear();
             previous_keys.clear();
+            last_access.clear();
         }
         let mut current_keys =
             HashSet::with_capacity(config.expected_header.layers * config.expected_header.top_k);
         let mut token_misses = 0u64;
+        let mut token_transfer_runs = 0u64;
         let mut token_miss_layers = 0u64;
+        let mut token_serial_io_ms = 0.0f64;
+        let mut token_parallel_io_ms = 0.0f64;
+        let mut token_shaped_io_ms = 0.0f64;
         for (layer, experts) in token.routes.iter().enumerate() {
             let mut layer_missed = false;
+            let mut layer_missing_ordinals = Vec::new();
+            let mut layer_missing_packets = 0u64;
             for &expert in experts {
-                let key = (layer as u16, expert);
-                current_keys.insert(key);
-                let hit = state.access(key, &mut evictions);
-                if hit {
-                    hits += 1;
-                } else {
-                    misses += 1;
-                    token_misses += 1;
-                    layer_missed = true;
-                    if seen_ever.insert(key) {
-                        compulsory_misses += 1;
+                current_keys.insert((layer as u16, expert));
+                for packet in 0..config.packets_per_expert {
+                    let key = (layer as u16, expert, packet as u16);
+                    if let Some(previous) = last_access.insert(key, access_clock) {
+                        reuse_distances.push(access_clock.saturating_sub(previous + 1));
+                    }
+                    access_clock += 1;
+                    let hit = state.access(key, &mut evictions);
+                    if hit {
+                        hits += 1;
+                    } else {
+                        misses += 1;
+                        token_misses += 1;
+                        layer_missing_packets += 1;
+                        layer_missed = true;
+                        layer_missing_ordinals.push(physical_packet_ordinal(
+                            config.layout,
+                            layer,
+                            expert,
+                            packet,
+                            config.expected_header.experts,
+                            config.packets_per_expert,
+                            config.co_selection_ranks,
+                        ));
+                        if seen_ever.insert(key) {
+                            compulsory_misses += 1;
+                        }
                     }
                 }
+            }
+            let run_lengths = contiguous_run_lengths(&mut layer_missing_ordinals);
+            let layer_runs = run_lengths.len() as u64;
+            token_transfer_runs += layer_runs;
+            let layer_missing_bytes = layer_missing_packets.saturating_mul(config.packet_bytes);
+            missing_bytes_per_layer.push(layer_missing_bytes);
+            let layer_run_bytes = run_lengths
+                .into_iter()
+                .map(|run_packets| (run_packets as u64).saturating_mul(config.packet_bytes))
+                .collect::<Vec<_>>();
+            for &run_bytes in &layer_run_bytes {
+                maximum_contiguous_burst_bytes = maximum_contiguous_burst_bytes.max(run_bytes);
+                contiguous_bytes_per_fetch.push(run_bytes);
+            }
+            if let Some(io_shape) = config.io_shape {
+                token_serial_io_ms += transfer_time_ms(layer_missing_bytes, layer_runs, io_shape);
+                token_parallel_io_ms +=
+                    transfer_time_ms(layer_missing_bytes, u64::from(layer_runs > 0), io_shape);
+                token_shaped_io_ms +=
+                    shaped_transfer_time_ms(layer_missing_bytes, layer_runs, io_shape);
             }
             token_miss_layers += u64::from(layer_missed);
         }
@@ -472,8 +726,14 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
         }
         previous_request = Some(token.request_id.clone());
         previous_keys = current_keys;
-        missing_bytes.push(token_misses.saturating_mul(config.expert_bytes));
+        missing_bytes.push(token_misses.saturating_mul(config.packet_bytes));
+        transfer_runs.push(token_transfer_runs);
         miss_layers.push(token_miss_layers);
+        if config.io_shape.is_some() {
+            serial_io_ms.push(token_serial_io_ms);
+            ideal_layer_parallel_io_ms.push(token_parallel_io_ms);
+            shaped_io_ms.push(token_shaped_io_ms);
+        }
         token_records += 1;
         Ok(())
     })?;
@@ -481,12 +741,19 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
         bail!("trace contains no token records");
     }
     let route_lookups = hits + misses;
-    let total_missing_bytes = misses.saturating_mul(config.expert_bytes);
+    let total_missing_bytes = misses.saturating_mul(config.packet_bytes);
     Ok(SimulationResult {
         policy: config.policy.label().to_owned(),
+        physical_layout: config.layout.label().to_owned(),
         budget_bytes: config.budget_bytes,
-        resident_expert_capacity: config.capacity,
+        packet_neurons: config.packet_neurons,
+        packets_per_expert: config.packets_per_expert,
+        packet_bytes: config.packet_bytes,
+        resident_packet_capacity: config.capacity,
         token_records,
+        expert_route_lookups: token_records as u64
+            * config.expected_header.layers as u64
+            * config.expected_header.top_k as u64,
         route_lookups,
         hits,
         misses,
@@ -498,22 +765,49 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
         p50_missing_bytes_per_token: percentile(&missing_bytes, 0.50),
         p95_missing_bytes_per_token: percentile(&missing_bytes, 0.95),
         p99_missing_bytes_per_token: percentile(&missing_bytes, 0.99),
+        p50_missing_bytes_per_layer: percentile(&missing_bytes_per_layer, 0.50),
+        p95_missing_bytes_per_layer: percentile(&missing_bytes_per_layer, 0.95),
+        p99_missing_bytes_per_layer: percentile(&missing_bytes_per_layer, 0.99),
+        maximum_missing_bytes_per_layer: missing_bytes_per_layer.iter().copied().max().unwrap_or(0),
+        maximum_contiguous_burst_bytes,
+        mean_transfer_runs_per_token: transfer_runs.iter().sum::<u64>() as f64
+            / token_records as f64,
+        p95_transfer_runs_per_token: percentile(&transfer_runs, 0.95),
+        p99_transfer_runs_per_token: percentile(&transfer_runs, 0.99),
+        mean_contiguous_bytes_per_fetch: contiguous_bytes_per_fetch.iter().sum::<u64>() as f64
+            / contiguous_bytes_per_fetch.len().max(1) as f64,
+        p50_contiguous_bytes_per_fetch: percentile(&contiguous_bytes_per_fetch, 0.50),
+        p95_contiguous_bytes_per_fetch: percentile(&contiguous_bytes_per_fetch, 0.95),
+        p99_contiguous_bytes_per_fetch: percentile(&contiguous_bytes_per_fetch, 0.99),
+        p50_reuse_distance_packet_lookups: percentile(&reuse_distances, 0.50),
+        p95_reuse_distance_packet_lookups: percentile(&reuse_distances, 0.95),
+        p99_reuse_distance_packet_lookups: percentile(&reuse_distances, 0.99),
         mean_layers_with_miss_per_token: miss_layers.iter().sum::<u64>() as f64
             / token_records as f64,
         p95_layers_with_miss_per_token: percentile(&miss_layers, 0.95),
         p99_layers_with_miss_per_token: percentile(&miss_layers, 0.99),
         evictions,
+        mean_evictions_per_token: evictions as f64 / token_records as f64,
         mean_adjacent_route_overlap: overlap_sum / overlap_count.max(1) as f64,
+        mean_serial_io_ms_per_token: mean_f64(&serial_io_ms),
+        p95_serial_io_ms_per_token: percentile_f64(&serial_io_ms, 0.95),
+        p99_serial_io_ms_per_token: percentile_f64(&serial_io_ms, 0.99),
+        mean_ideal_layer_parallel_io_ms_per_token: mean_f64(&ideal_layer_parallel_io_ms),
+        p95_ideal_layer_parallel_io_ms_per_token: percentile_f64(&ideal_layer_parallel_io_ms, 0.95),
+        p99_ideal_layer_parallel_io_ms_per_token: percentile_f64(&ideal_layer_parallel_io_ms, 0.99),
+        mean_shaped_io_ms_per_token: mean_f64(&shaped_io_ms),
+        p95_shaped_io_ms_per_token: percentile_f64(&shaped_io_ms, 0.95),
+        p99_shaped_io_ms_per_token: percentile_f64(&shaped_io_ms, 0.99),
     })
 }
 
 enum CacheState {
     Lru(LruCache),
-    Static(HashSet<ExpertKey>),
+    Static(HashSet<PacketKey>),
 }
 
 impl CacheState {
-    fn access(&mut self, key: ExpertKey, evictions: &mut u64) -> bool {
+    fn access(&mut self, key: PacketKey, evictions: &mut u64) -> bool {
         match self {
             Self::Lru(cache) => cache.access(key, evictions),
             Self::Static(keys) => keys.contains(&key),
@@ -530,8 +824,8 @@ impl CacheState {
 struct LruCache {
     capacity: usize,
     clock: u64,
-    resident: HashMap<ExpertKey, u64>,
-    oldest: BinaryHeap<Reverse<(u64, ExpertKey)>>,
+    resident: HashMap<PacketKey, u64>,
+    oldest: BinaryHeap<Reverse<(u64, PacketKey)>>,
 }
 
 impl LruCache {
@@ -544,7 +838,7 @@ impl LruCache {
         }
     }
 
-    fn access(&mut self, key: ExpertKey, evictions: &mut u64) -> bool {
+    fn access(&mut self, key: PacketKey, evictions: &mut u64) -> bool {
         self.clock += 1;
         let hit = self.resident.contains_key(&key);
         if !hit && self.resident.len() >= self.capacity {
@@ -583,15 +877,120 @@ fn collect_frequency(
     Ok(frequency)
 }
 
-fn hottest_keys(
+fn collect_co_selection_ranks(path: &Path, expected_header: &TraceHeader) -> Result<Vec<Vec<u16>>> {
+    let experts = expected_header.experts;
+    let mut node_frequency = vec![vec![0u64; experts]; expected_header.layers];
+    let mut edge_frequency = vec![vec![0u64; experts * experts]; expected_header.layers];
+    visit_trace(path, expected_header, |token| {
+        for (layer, selected) in token.routes.iter().enumerate() {
+            for &expert in selected {
+                node_frequency[layer][expert as usize] += 1;
+            }
+            for (left_index, &left) in selected.iter().enumerate() {
+                for &right in &selected[left_index + 1..] {
+                    edge_frequency[layer][left as usize * experts + right as usize] += 1;
+                    edge_frequency[layer][right as usize * experts + left as usize] += 1;
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok((0..expected_header.layers)
+        .map(|layer| {
+            greedy_co_selection_ranks(&node_frequency[layer], &edge_frequency[layer], experts)
+        })
+        .collect())
+}
+
+fn greedy_co_selection_ranks(
+    node_frequency: &[u64],
+    edge_frequency: &[u64],
+    experts: usize,
+) -> Vec<u16> {
+    let mut order = Vec::with_capacity(experts);
+    let mut unused = vec![true; experts];
+    let first = (0..experts)
+        .max_by_key(|&expert| (node_frequency[expert], Reverse(expert)))
+        .unwrap_or(0);
+    order.push(first);
+    unused[first] = false;
+    while order.len() < experts {
+        let previous = *order.last().expect("co-selection order is non-empty");
+        let next = (0..experts)
+            .filter(|&expert| unused[expert])
+            .max_by_key(|&expert| {
+                (
+                    edge_frequency[previous * experts + expert],
+                    node_frequency[expert],
+                    Reverse(expert),
+                )
+            })
+            .expect("at least one expert remains");
+        unused[next] = false;
+        order.push(next);
+    }
+    let mut ranks = vec![0u16; experts];
+    for (rank, expert) in order.into_iter().enumerate() {
+        ranks[expert] = rank as u16;
+    }
+    ranks
+}
+
+fn physical_packet_ordinal(
+    layout: PhysicalLayout,
+    layer: usize,
+    expert: u16,
+    packet: usize,
+    experts: usize,
+    packets_per_expert: usize,
+    co_selection_ranks: Option<&[Vec<u16>]>,
+) -> usize {
+    let rank = if layout.uses_co_selection() {
+        co_selection_ranks.expect("co-selection ranks were validated")[layer][expert as usize]
+            as usize
+    } else {
+        expert as usize
+    };
+    if layout.is_neuron_major() {
+        packet * experts + rank
+    } else {
+        rank * packets_per_expert + packet
+    }
+}
+
+fn contiguous_run_lengths(ordinals: &mut Vec<usize>) -> Vec<usize> {
+    if ordinals.is_empty() {
+        return Vec::new();
+    }
+    ordinals.sort_unstable();
+    ordinals.dedup();
+    let mut runs = Vec::new();
+    let mut run_length = 1usize;
+    for pair in ordinals.windows(2) {
+        if pair[1] == pair[0] + 1 {
+            run_length += 1;
+        } else {
+            runs.push(run_length);
+            run_length = 1;
+        }
+    }
+    runs.push(run_length);
+    runs
+}
+
+fn hottest_packet_keys(
     frequency: &HashMap<ExpertKey, u64>,
     capacity: usize,
     layers: usize,
     experts: usize,
-) -> HashSet<ExpertKey> {
+    packets_per_expert: usize,
+) -> HashSet<PacketKey> {
     let mut ranked = frequency
         .iter()
-        .map(|(&key, &count)| (Reverse(count), key))
+        .flat_map(|(&(layer, expert), &count)| {
+            (0..packets_per_expert)
+                .map(move |packet| (Reverse(count), (layer, expert, packet as u16)))
+        })
         .collect::<Vec<_>>();
     ranked.sort_unstable();
     let mut selected = ranked
@@ -601,13 +1000,28 @@ fn hottest_keys(
         .collect::<HashSet<_>>();
     for layer in 0..layers {
         for expert in 0..experts {
-            if selected.len() >= capacity {
-                return selected;
+            for packet in 0..packets_per_expert {
+                if selected.len() >= capacity {
+                    return selected;
+                }
+                selected.insert((layer as u16, expert as u16, packet as u16));
             }
-            selected.insert((layer as u16, expert as u16));
         }
     }
     selected
+}
+
+fn transfer_time_ms(bytes: u64, runs: u64, shape: IoShape) -> f64 {
+    let bandwidth_bytes_s = shape.bandwidth_mib_s * 1024.0 * 1024.0;
+    bytes as f64 / bandwidth_bytes_s * 1000.0 + runs as f64 * shape.fixed_latency_us / 1000.0
+}
+
+fn shaped_transfer_time_ms(bytes: u64, runs: u64, shape: IoShape) -> f64 {
+    if runs == 0 {
+        return 0.0;
+    }
+    let latency_rounds = runs.div_ceil(shape.max_inflight_fetches as u64);
+    transfer_time_ms(bytes, latency_rounds, shape)
 }
 
 fn visit_trace(
@@ -707,6 +1121,20 @@ fn percentile(values: &[u64], quantile: f64) -> u64 {
     sorted.sort_unstable();
     let index = ((sorted.len() - 1) as f64 * quantile).ceil() as usize;
     sorted[index.min(sorted.len() - 1)]
+}
+
+fn mean_f64(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn percentile_f64(values: &[f64], quantile: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let index = ((sorted.len() - 1) as f64 * quantile).ceil() as usize;
+    Some(sorted[index.min(sorted.len() - 1)])
 }
 
 fn parse_bytes(value: &str) -> std::result::Result<u64, String> {
@@ -914,27 +1342,27 @@ mod tests {
     fn lru_evicts_the_oldest_expert() {
         let mut cache = LruCache::new(2);
         let mut evictions = 0;
-        assert!(!cache.access((0, 1), &mut evictions));
-        assert!(!cache.access((0, 2), &mut evictions));
-        assert!(cache.access((0, 1), &mut evictions));
-        assert!(!cache.access((0, 3), &mut evictions));
-        assert!(cache.access((0, 1), &mut evictions));
-        assert!(!cache.access((0, 2), &mut evictions));
+        assert!(!cache.access((0, 1, 0), &mut evictions));
+        assert!(!cache.access((0, 2, 0), &mut evictions));
+        assert!(cache.access((0, 1, 0), &mut evictions));
+        assert!(!cache.access((0, 3, 0), &mut evictions));
+        assert!(cache.access((0, 1, 0), &mut evictions));
+        assert!(!cache.access((0, 2, 0), &mut evictions));
         assert_eq!(evictions, 2);
     }
 
     #[test]
     fn hottest_keys_are_selected_by_frequency() {
         let frequency = HashMap::from([((0, 1), 4), ((0, 2), 9), ((1, 0), 6)]);
-        let hot = hottest_keys(&frequency, 2, 2, 3);
-        assert_eq!(hot, HashSet::from([(0, 2), (1, 0)]));
+        let hot = hottest_packet_keys(&frequency, 2, 2, 3, 1);
+        assert_eq!(hot, HashSet::from([(0, 2, 0), (1, 0, 0)]));
     }
 
     #[test]
     fn hottest_keys_fill_unused_capacity_with_cold_experts() {
-        let hot = hottest_keys(&HashMap::from([((1, 1), 9)]), 4, 2, 2);
+        let hot = hottest_packet_keys(&HashMap::from([((1, 1), 9)]), 4, 2, 2, 1);
         assert_eq!(hot.len(), 4);
-        assert!(hot.contains(&(1, 1)));
+        assert!(hot.contains(&(1, 1, 0)));
     }
 
     #[test]
@@ -988,9 +1416,14 @@ mod tests {
             trace: &path,
             expected_header: &header,
             policy: CachePolicy::Lru,
+            layout: PhysicalLayout::ExpertContiguous,
+            co_selection_ranks: None,
             budget_bytes: 200,
             capacity: 2,
-            expert_bytes: 100,
+            packet_neurons: 1,
+            packets_per_expert: 1,
+            packet_bytes: 100,
+            io_shape: None,
             reset_between_requests: false,
             static_hot: None,
         })
@@ -1000,6 +1433,68 @@ mod tests {
         assert_eq!(result.misses, 3);
         assert_eq!(result.p95_missing_bytes_per_token, 200);
         assert_eq!(result.p99_layers_with_miss_per_token, 2);
+        let packetized = simulate_cell(SimulationCellConfig {
+            trace: &path,
+            expected_header: &header,
+            policy: CachePolicy::Lru,
+            layout: PhysicalLayout::ExpertContiguous,
+            co_selection_ranks: None,
+            budget_bytes: 200,
+            capacity: 4,
+            packet_neurons: 1,
+            packets_per_expert: 2,
+            packet_bytes: 50,
+            io_shape: Some(IoShape {
+                bandwidth_mib_s: 1000.0,
+                fixed_latency_us: 100.0,
+                max_inflight_fetches: 2,
+            }),
+            reset_between_requests: false,
+            static_hot: None,
+        })
+        .unwrap();
+        assert_eq!(packetized.total_missing_bytes, result.total_missing_bytes);
+        assert_eq!(
+            packetized.p95_missing_bytes_per_token,
+            result.p95_missing_bytes_per_token
+        );
+        assert_eq!(
+            packetized.byte_weighted_hit_rate,
+            result.byte_weighted_hit_rate
+        );
+        assert_eq!(packetized.maximum_contiguous_burst_bytes, 100);
+        assert!(packetized.p95_serial_io_ms_per_token.is_some());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn physical_layout_changes_fetch_runs_without_changing_packets() {
+        let expert_major = [
+            physical_packet_ordinal(PhysicalLayout::ExpertContiguous, 0, 0, 0, 4, 2, None),
+            physical_packet_ordinal(PhysicalLayout::ExpertContiguous, 0, 0, 1, 4, 2, None),
+            physical_packet_ordinal(PhysicalLayout::ExpertContiguous, 0, 2, 0, 4, 2, None),
+            physical_packet_ordinal(PhysicalLayout::ExpertContiguous, 0, 2, 1, 4, 2, None),
+        ];
+        let neuron_major = [0, 1]
+            .into_iter()
+            .flat_map(|packet| {
+                [0, 2].map(|expert| {
+                    physical_packet_ordinal(
+                        PhysicalLayout::NeuronInterleaved,
+                        0,
+                        expert,
+                        packet,
+                        4,
+                        2,
+                        None,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contiguous_run_lengths(&mut expert_major.to_vec()), [2, 2]);
+        assert_eq!(
+            contiguous_run_lengths(&mut neuron_major.clone()),
+            [1, 1, 1, 1]
+        );
     }
 }

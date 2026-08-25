@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "classification": "trace-emulated-smoke",
+  "promotion_evidence": false,
+  "semantics": "exact-all-packets-touched",
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "trace": {
+    "held_out_token_positions": 78,
+    "calibration_token_positions": 80,
+    "held_out_expert_route_lookups": 29952
+  },
+  "packet": {
+    "expert_neurons": 768,
+    "packet_neurons_tested": [768, 128, 64, 32],
+    "definition": "matching neuron range across gate rows, up rows, down columns, and quantization metadata",
+    "q3_complete_expert_bytes": 2064384,
+    "packet_bytes": {"768":2064384,"128":344064,"64":172032,"32":86016}
+  },
+  "layouts": [
+    "expert-major",
+    "neuron-major",
+    "co-selection-expert-major",
+    "co-selection-neuron-major"
+  ],
+  "synthetic_io_shape": {
+    "shared_bandwidth_mib_s": 1000.0,
+    "fixed_latency_us_per_fetch": 100.0,
+    "max_inflight_fetches": 8,
+    "measured_device_profile": false
+  },
+  "capacity_results": [
+    {"policy":"lru","budget_gib":4,"packet_neurons":768,"hit_rate":0.7873263888888888,"p95_missing_mib_per_token":391.78125,"p99_missing_mib_per_token":756.0},
+    {"policy":"lru","budget_gib":4,"packet_neurons":32,"hit_rate":0.7873263888888888,"p95_missing_mib_per_token":391.78125,"p99_missing_mib_per_token":756.0},
+    {"policy":"static-hot","budget_gib":4,"packet_neurons":768,"hit_rate":0.5969885149572649,"p95_missing_mib_per_token":480.375,"p99_missing_mib_per_token":504.0},
+    {"policy":"static-hot","budget_gib":4,"packet_neurons":32,"hit_rate":0.5971888354700855,"p95_missing_mib_per_token":480.375,"p99_missing_mib_per_token":504.0},
+    {"policy":"static-hot","budget_gib":6,"packet_neurons":768,"hit_rate":0.7802483974358975,"p95_missing_mib_per_token":311.0625,"p99_missing_mib_per_token":356.34375},
+    {"policy":"static-hot","budget_gib":6,"packet_neurons":32,"hit_rate":0.7803485576923077,"p95_missing_mib_per_token":311.0625,"p99_missing_mib_per_token":356.34375},
+    {"policy":"static-hot","budget_gib":12,"packet_neurons":32,"hit_rate":1.0,"p95_missing_mib_per_token":0.0,"p99_missing_mib_per_token":0.0}
+  ],
+  "layout_results_static_hot_4gib": [
+    {"packet_neurons":768,"layout":"expert-major","p95_fetches_per_token":241,"maximum_burst_mib":5.90625,"p95_shaped_io_ms":485.175},
+    {"packet_neurons":128,"layout":"neuron-major","p95_fetches_per_token":1446,"maximum_burst_mib":0.984375,"p95_shaped_io_ms":500.175},
+    {"packet_neurons":128,"layout":"co-selection-neuron-major","p95_fetches_per_token":1326,"maximum_burst_mib":2.296875,"p95_shaped_io_ms":498.475},
+    {"packet_neurons":64,"layout":"co-selection-neuron-major","p95_fetches_per_token":2652,"maximum_burst_mib":1.1484375,"p95_shaped_io_ms":514.775},
+    {"packet_neurons":32,"layout":"co-selection-neuron-major","p95_fetches_per_token":5304,"maximum_burst_mib":0.57421875,"p95_shaped_io_ms":546.675}
+  ],
+  "conclusions": [
+    "Exact packetization preserves the missing-byte and capacity curve because every packet of every selected expert is still required.",
+    "Neuron-major layouts reduce maximum individual bursts but multiply fetch count and fixed-latency overhead.",
+    "The calibration-derived co-selection order reduces neuron-major fetch count by about eight percent in this smoke but cannot reduce transferred bytes.",
+    "At a shared 1000 MiB/s synthetic profile, the best p95 I/O lower bound remains about 397 ms for cold LRU at 4 GiB and 316 ms for static-hot at 6 GiB, before compute.",
+    "The systems-only exact packet lane does not meet the 100 ms token gate; activation-selected packet sparsity is now the decisive experiment."
+  ]
+}

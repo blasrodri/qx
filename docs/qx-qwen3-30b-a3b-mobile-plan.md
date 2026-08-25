@@ -483,6 +483,51 @@ The committed aggregate is
 `benchmarks/results/qwen3-30b-a3b-route-cache-smoke-2026-08-25.json`.
 Raw traces remain ignored under `external/results`.
 
+### Exact neuron-packet replay
+
+The second replay implements physical execution packets rather than arbitrary
+byte pages. A packet owns one matching intermediate-neuron range through the
+entire expert: gate rows, up rows, down columns, and their quantization
+metadata. The exact replay always touches every packet of every routed expert.
+It therefore tests transfer granularity, placement and scheduling—not
+approximate neuron skipping.
+
+The simulator now sweeps complete experts and 128/64/32-neuron packets across
+four layouts: expert-major, neuron-major, and calibration-derived co-selection
+orders for both traversals. It records missing bytes per layer and token,
+contiguous fetch runs, maximum bursts, reuse distance, churn, and serial,
+unlimited-latency-overlap, and finite-inflight I/O bounds. The shaped model
+uses one shared bandwidth budget; parallel requests never multiply storage
+bandwidth.
+
+On the current two-prompt smoke, exact packetization left capacity effectively
+unchanged. At 4 GiB, static-hot moved only from 59.699% for complete experts to
+59.719% for 32-neuron packets due to final-slot rounding. Both had a 480.375
+MiB p95 missing-byte tail. At 6 GiB, every exact packet size had a 311.063 MiB
+p95 tail. This is the expected invariant: all 768 neurons are still consumed.
+
+Neuron-major placement did change burst shape. At 4 GiB, the largest observed
+fetch fell from 5.906 MiB for expert-major to 0.984/0.492/0.246 MiB for
+128/64/32-neuron identity ordering. But p95 fetch count grew from 241 to
+1,446/2,892/5,784. Co-selection ordering reduced those neuron-major counts by
+about 8%, to 1,326/2,652/5,304, without changing missing bytes.
+
+Under a deliberately synthetic shared 1,000 MiB/s, 100 us/fetch, eight-inflight
+profile, the best 4 GiB p95 I/O estimate remained approximately 397 ms for
+cold LRU; the 6 GiB static-hot result remained approximately 316 ms. These are
+not device measurements, and both exclude compute. They demonstrate the
+structural limit: concurrency can amortize request latency, but hundreds of
+missing MiB divided by shared bandwidth remains hundreds of milliseconds.
+
+The exact packet lane therefore fails the 100 ms token gate on this smoke. Do
+not continue tuning exact packet sizes for capacity. The next experiment is
+activation-energy capture followed by a perfect-information packet oracle at
+90/95/99/99.9% retained contribution. Only if that oracle reaches a 3--4 GiB
+working set at negligible quality loss should a learned predictor be built.
+
+The committed exact-replay aggregate is
+`benchmarks/results/qwen3-30b-a3b-exact-packet-replay-smoke-2026-08-25.json`.
+
 ## Evidence layout
 
 Keep generated model files and raw traces under ignored `external/` paths.
