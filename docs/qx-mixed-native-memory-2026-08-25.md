@@ -67,10 +67,11 @@ this 751 MB model. It removes 5.6% of weight bytes and 5.3% of the context-512
 logical footprint. It establishes that consumer-native mixed precision can be
 both executable and quality-gated without dispatch inflation.
 
-The next performance target is the Q3 decoder inside the unified kernel. Q4
-retains its four-byte aligned load path; Q3 currently performs eight general
-3-bit extractions per lane. A Q3-112 payload-contiguous block with vectorized
-decode is the direct route to recovering the remaining roughly 0.29 ms/token.
+The Q3 decoder inside the unified kernel was the next performance target. That
+follow-up is implemented as Q3-112 plus a packed vector decoder and is recorded
+in `docs/qx-q3-superblock112-2026-08-25.md`. It recovers 0.187 ms/token of the
+retained pre-change mixed-tier GPU time and raises its measured throughput by
+7.1% without changing artifact size or the selected tensors.
 
 ## Reproduce the passing frontier
 
@@ -91,4 +92,3 @@ target/release/qx-bench \
   /tmp/qx-mixed-superblock-q3-s40m.qx \
   --v2-token --fixture benchmarks/fixtures/general.json --context 512
 ```
-

@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-25",
+  "device": "Apple M5 Pro",
+  "power": "battery",
+  "thermal_warning": false,
+  "model": "ibm-granite-3.0-1b-a400m-instruct",
+  "context": 512,
+  "fixture": "benchmarks/fixtures/general.json",
+  "prefill_tokens": 384,
+  "measured_tokens": 128,
+  "rollout_window": 2,
+  "canonical_q4": {
+    "artifact_bytes": 751009792,
+    "tokens_per_second": [402.720513, 414.480705, 412.147898],
+    "mean_tokens_per_second": 409.783039,
+    "gpu_ms_per_token": [2.479966, 2.409357, 2.423321],
+    "mean_gpu_ms_per_token": 2.437548,
+    "dispatches_per_token": 390
+  },
+  "legacy_split_q3_with_vector_decoder": {
+    "artifact_bytes": 709001216,
+    "tokens_per_second": [363.531926, 379.885413, 378.683380],
+    "mean_tokens_per_second": 374.033573,
+    "gpu_ms_per_token": [2.747644, 2.629614, 2.638036],
+    "mean_gpu_ms_per_token": 2.671765,
+    "dispatches_per_token": 390,
+    "note": "The first run is a low outlier; scale colocation is not assigned a material speedup."
+  },
+  "q3_superblock112": {
+    "artifact_bytes": 709001216,
+    "artifact_hash": "c32300e209e261e3",
+    "unique_weight_payload_bytes": 708892352,
+    "weight_bytes_saved_vs_q4": 42008576,
+    "q3_expert_tensors": 375,
+    "tokens_per_second": [379.816980, 377.538291, 381.610593],
+    "mean_tokens_per_second": 379.655288,
+    "gpu_ms_per_token": [2.630144, 2.645926, 2.617545],
+    "mean_gpu_ms_per_token": 2.631205,
+    "dispatches_per_token": 390,
+    "last_token_id": 26684,
+    "throughput_change_vs_q4_percent": -7.3521
+  },
+  "retained_prechange_mixed_baseline": {
+    "mean_tokens_per_second": 354.443333,
+    "mean_gpu_ms_per_token": 2.818,
+    "q3_superblock112_throughput_change_percent": 7.1131,
+    "q3_superblock112_gpu_ms_recovered": 0.186795
+  },
+  "quality": {
+    "corpus_note": "two disjoint 1023-position PTB windows; local frontier probe",
+    "control_nll": [3.102323, 3.384970],
+    "q3_superblock112_nll": [3.105383, 3.398301],
+    "window_ppl_change_percent": [0.306469, 1.342025],
+    "aggregate_ppl_change_percent": 0.822918,
+    "gate": "pass"
+  },
+  "notes": [
+    "Q3-112 has the same exact compact byte count as split Q3.",
+    "The packed vector decoder supplies the demonstrated performance gain.",
+    "Q3-112 and legacy split Q3 use compile-time-specialized Metal pipelines, not a hot representation branch."
+  ]
+}

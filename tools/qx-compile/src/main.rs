@@ -898,6 +898,11 @@ fn main() -> Result<()> {
         };
         let gate_layout = if gate_quant_type == QuantType::Q4K {
             PackingLayout::RowMajor
+        } else if args.expertwise_q3
+            && gate_quant_type == QuantType::Q3
+            && packing_layout == PackingLayout::Q4Superblock144
+        {
+            PackingLayout::Q3Superblock112
         } else if (args.layerwise_q3 || args.tensorwise_q3 || args.expertwise_q3)
             && gate_quant_type == QuantType::Q3
         {
@@ -909,6 +914,11 @@ fn main() -> Result<()> {
         };
         let down_layout = if down_quant_type == QuantType::Q4K {
             PackingLayout::RowMajor
+        } else if args.expertwise_q3
+            && down_quant_type == QuantType::Q3
+            && packing_layout == PackingLayout::Q4Superblock144
+        {
+            PackingLayout::Q3Superblock112
         } else if (args.layerwise_q3 || args.tensorwise_q3 || args.expertwise_q3)
             && down_quant_type == QuantType::Q3
         {

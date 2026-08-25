@@ -1107,6 +1107,8 @@ pub mod platform {
         expertwise_superblock_down_pipeline: Option<Pipeline>,
         expertwise_q4_gate_up_superblock: bool,
         expertwise_q4_down_superblock: bool,
+        expertwise_q3_gate_up_superblock: bool,
+        expertwise_q3_down_superblock: bool,
         expertwise_q4_gate_up_packed: Option<RuntimeBuffer>,
         expertwise_q4_gate_up_scales: Option<RuntimeBuffer>,
         expertwise_q3_gate_up_packed: Option<RuntimeBuffer>,
@@ -5190,11 +5192,13 @@ pub mod platform {
                         q3_gate.offset,
                         11,
                     );
-                    self.encoder.setBuffer_offset_atIndex(
-                        Some(&q3_gate_scales.buffer),
-                        q3_gate_scales.offset,
-                        12,
-                    );
+                    if !prepared.expertwise_q3_gate_up_superblock {
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&q3_gate_scales.buffer),
+                            q3_gate_scales.offset,
+                            12,
+                        );
+                    }
                     if let Some((weights, inverse)) = norm {
                         self.encoder.setBuffer_offset_atIndex(
                             Some(&weights.buffer),
@@ -5382,11 +5386,13 @@ pub mod platform {
                         q3_down.offset,
                         11,
                     );
-                    self.encoder.setBuffer_offset_atIndex(
-                        Some(&q3_down_scales.buffer),
-                        q3_down_scales.offset,
-                        12,
-                    );
+                    if !prepared.expertwise_q3_down_superblock {
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&q3_down_scales.buffer),
+                            q3_down_scales.offset,
+                            12,
+                        );
+                    }
                 }
                 self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
@@ -10781,6 +10787,8 @@ pub mod platform {
                 expertwise_superblock_down_pipeline: None,
                 expertwise_q4_gate_up_superblock: false,
                 expertwise_q4_down_superblock: false,
+                expertwise_q3_gate_up_superblock: false,
+                expertwise_q3_down_superblock: false,
                 expertwise_q4_gate_up_packed: None,
                 expertwise_q4_gate_up_scales: None,
                 expertwise_q3_gate_up_packed: None,
@@ -11218,6 +11226,8 @@ pub mod platform {
                 expertwise_superblock_down_pipeline: None,
                 expertwise_q4_gate_up_superblock: false,
                 expertwise_q4_down_superblock: false,
+                expertwise_q3_gate_up_superblock: false,
+                expertwise_q3_down_superblock: false,
                 expertwise_q4_gate_up_packed: None,
                 expertwise_q4_gate_up_scales: None,
                 expertwise_q3_gate_up_packed: None,
@@ -11337,6 +11347,8 @@ pub mod platform {
             q4_down_inline: bool,
             q4_gate_up_superblock: bool,
             q4_down_superblock: bool,
+            q3_gate_up_superblock: bool,
+            q3_down_superblock: bool,
         ) -> Result<PreparedDynamicQ4Moe, String> {
             if gate_up_map.length < 32 * std::mem::size_of::<u32>()
                 || down_map.length < 32 * std::mem::size_of::<u32>()
@@ -11585,25 +11597,35 @@ pub mod platform {
                 ),
                 expertwise_superblock_gate_up_pipeline: q4_gate_up_superblock
                     .then(|| {
-                        self.dynamic_moe_named_pipeline(
-                            "qx_dynamic_mixed_moe_gate_up_superblock_simd",
-                        )
+                        self.dynamic_moe_named_pipeline(if q3_gate_up_superblock {
+                            "qx_dynamic_mixed_moe_gate_up_q3_112_simd"
+                        } else {
+                            "qx_dynamic_mixed_moe_gate_up_superblock_simd"
+                        })
                     })
                     .transpose()?,
                 expertwise_superblock_gate_up_norm_pipeline: q4_gate_up_superblock
                     .then(|| {
-                        self.dynamic_moe_named_pipeline(
-                            "qx_dynamic_mixed_moe_gate_up_superblock_norm_simd",
-                        )
+                        self.dynamic_moe_named_pipeline(if q3_gate_up_superblock {
+                            "qx_dynamic_mixed_moe_gate_up_q3_112_norm_simd"
+                        } else {
+                            "qx_dynamic_mixed_moe_gate_up_superblock_norm_simd"
+                        })
                     })
                     .transpose()?,
                 expertwise_superblock_down_pipeline: q4_down_superblock
                     .then(|| {
-                        self.dynamic_moe_named_pipeline("qx_dynamic_mixed_moe_down_superblock_simd")
+                        self.dynamic_moe_named_pipeline(if q3_down_superblock {
+                            "qx_dynamic_mixed_moe_down_q3_112_simd"
+                        } else {
+                            "qx_dynamic_mixed_moe_down_superblock_simd"
+                        })
                     })
                     .transpose()?,
                 expertwise_q4_gate_up_superblock: q4_gate_up_superblock,
                 expertwise_q4_down_superblock: q4_down_superblock,
+                expertwise_q3_gate_up_superblock: q3_gate_up_superblock,
+                expertwise_q3_down_superblock: q3_down_superblock,
                 expertwise_q4_gate_up_packed: Some(q4_gate_up_packed.clone()),
                 expertwise_q4_gate_up_scales: Some(q4_gate_up_scales.clone()),
                 expertwise_q3_gate_up_packed: Some(q3_gate_up_packed.clone()),
@@ -11681,6 +11703,8 @@ pub mod platform {
             // layer; the map makes those dispatches no-ops.
             if prepared.expertwise_q3_gate_up_block_bytes.is_none()
                 && prepared.expertwise_q3_down_block_bytes.is_none()
+                && !prepared.expertwise_q4_gate_up_superblock
+                && !prepared.expertwise_q4_down_superblock
             {
                 return Err(
                     "expertwise preparation requires at least one Q3 tensor family".to_owned(),
@@ -12043,6 +12067,8 @@ pub mod platform {
                 expertwise_superblock_down_pipeline: None,
                 expertwise_q4_gate_up_superblock: false,
                 expertwise_q4_down_superblock: false,
+                expertwise_q3_gate_up_superblock: false,
+                expertwise_q3_down_superblock: false,
                 expertwise_q4_gate_up_packed: None,
                 expertwise_q4_gate_up_scales: None,
                 expertwise_q3_gate_up_packed: None,

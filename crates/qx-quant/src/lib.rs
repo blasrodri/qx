@@ -50,6 +50,10 @@ pub enum PackingLayout {
     /// followed by the eight FP16 group scales. This preserves the 144-byte
     /// size while making the payload contiguous and vector-load friendly.
     Q4Superblock144 = 10,
+    /// Exact-Q3 256-weight superblocks with 96 packed-code bytes followed by
+    /// eight FP16 group scales. The 112-byte block is byte-identical in size
+    /// to split compact Q3 while making each lane's 24-bit packet contiguous.
+    Q3Superblock112 = 11,
 }
 
 impl PackingLayout {
@@ -66,6 +70,7 @@ impl PackingLayout {
             8 => Some(Self::Q4Transaction160),
             9 => Some(Self::Q4CrossExpertTile8),
             10 => Some(Self::Q4Superblock144),
+            11 => Some(Self::Q3Superblock112),
             _ => None,
         }
     }
@@ -94,6 +99,10 @@ impl PackingLayout {
 
     pub const fn is_q4_superblock(self) -> bool {
         matches!(self, Self::Q4Superblock144)
+    }
+
+    pub const fn is_q3_superblock(self) -> bool {
+        matches!(self, Self::Q3Superblock112)
     }
 
     pub const fn cross_expert_tile_rows(self) -> Option<usize> {
@@ -313,6 +322,13 @@ impl QuantizedTensor {
                 self.layout = layout;
                 Ok(())
             }
+            PackingLayout::Q3Superblock112 => {
+                if self.quant_type != QuantType::Q3 || self.group_size != 32 {
+                    return Err("Q3 superblock transport requires group-32 Q3".to_owned());
+                }
+                self.layout = layout;
+                Ok(())
+            }
         }
     }
 
@@ -427,6 +443,39 @@ impl QuantizedTensor {
         Ok(output)
     }
 
+    /// Return exact-Q3 blocks as 96 contiguous code bytes followed by eight
+    /// FP16 scales. A block covers 256 logical weights and remains 112 bytes,
+    /// exactly matching the compact split representation's storage size.
+    pub fn q3_superblock_bytes(&self) -> Result<Vec<u8>, String> {
+        if self.quant_type != QuantType::Q3 || self.group_size != 32 {
+            return Err("Q3 superblock transport requires group-32 Q3".to_owned());
+        }
+        let groups = self.cols.div_ceil(self.group_size);
+        if !groups.is_multiple_of(8) {
+            return Err(format!(
+                "Q3 superblock transport requires a multiple of eight group-32 blocks, got {groups}"
+            ));
+        }
+        let blocks_per_row = groups / 8;
+        let mut output = Vec::with_capacity(self.rows * blocks_per_row * 112);
+        for row in 0..self.rows {
+            for block in 0..blocks_per_row {
+                let first_group = block * 8;
+                let data_offset = (row * groups + first_group) * 12;
+                output.extend_from_slice(&self.data[data_offset..data_offset + 96]);
+                for group_in_block in 0..8 {
+                    output.extend_from_slice(
+                        &self.scales[row * groups + first_group + group_in_block]
+                            .to_bits()
+                            .to_le_bytes(),
+                    );
+                }
+            }
+        }
+        debug_assert_eq!(output.len(), self.rows * blocks_per_row * 112);
+        Ok(output)
+    }
+
     /// Pack a set of same-shaped exact-Q4 expert tensors into a cross-expert
     /// row-tile stream. The stream order is
     /// `[row tile][group][row in tile][expert][codes][FP16 scale]`.
@@ -516,6 +565,9 @@ impl QuantizedTensor {
         } else if self.layout.is_q4_superblock() {
             let groups = self.cols.div_ceil(self.group_size);
             self.rows * groups.div_ceil(8) * 144
+        } else if self.layout.is_q3_superblock() {
+            let groups = self.cols.div_ceil(self.group_size);
+            self.rows * groups.div_ceil(8) * 112
         } else {
             self.bytes()
         }
@@ -591,7 +643,8 @@ impl QuantizedTensor {
             | PackingLayout::Q4Transaction144
             | PackingLayout::Q4Transaction160
             | PackingLayout::Q4CrossExpertTile8
-            | PackingLayout::Q4Superblock144 => {
+            | PackingLayout::Q4Superblock144
+            | PackingLayout::Q3Superblock112 => {
                 // QuantizedTensor keeps the split row-major backing vectors;
                 // packetization is materialized only by the artifact writer.
                 let row_bytes = groups * group_bytes;
@@ -1458,6 +1511,42 @@ mod tests {
 
         let mut superblock = split;
         superblock.layout = PackingLayout::Q4Superblock144;
+        assert_eq!(superblock.serialized_bytes(), stream.len());
+    }
+
+    #[test]
+    fn q3_superblocks_pack_one_lane_packet_without_padding() {
+        let rows = 3;
+        let cols = 512;
+        let values = (0..rows * cols)
+            .map(|index| (index as f32 - 100.0) / 17.0)
+            .collect::<Vec<_>>();
+        let split = QuantizedTensor::quantize(&values, rows, cols, QuantType::Q3, 32);
+        let stream = split.q3_superblock_bytes().unwrap();
+
+        assert_eq!(stream.len(), split.bytes());
+        assert_eq!(stream.len(), rows * 2 * 112);
+        for row in 0..rows {
+            for block in 0..2 {
+                let stream_start = (row * 2 + block) * 112;
+                let data_start = (row * 16 + block * 8) * 12;
+                assert_eq!(
+                    &stream[stream_start..stream_start + 96],
+                    &split.data[data_start..data_start + 96]
+                );
+                for group in 0..8 {
+                    assert_eq!(
+                        &stream[stream_start + 96 + group * 2..stream_start + 98 + group * 2],
+                        &split.scales[row * 16 + block * 8 + group]
+                            .to_bits()
+                            .to_le_bytes()
+                    );
+                }
+            }
+        }
+
+        let mut superblock = split;
+        superblock.layout = PackingLayout::Q3Superblock112;
         assert_eq!(superblock.serialized_bytes(), stream.len());
     }
 

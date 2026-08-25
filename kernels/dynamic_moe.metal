@@ -2603,42 +2603,32 @@ inline uint qx_expert_map_slot(uint encoded) {
 }
 
 // Consumer-native mixed precision. Q4 experts retain the promoted 144-byte
-// payload-contiguous stream while Q3 experts use their compact 12-byte
-// group-32 payload plus a separate FP16 scale slab. The map tag is uniform
-// for an expert threadgroup, so one dispatch selects a representation without
-// lane-level divergence or a second projection pass.
-inline uint qx_mixed_q3_code(device const uchar* packed, uint base, uint local) {
-    uint bit = local * 3u;
-    uint byte = bit / 8u;
-    uint shift = bit % 8u;
-    uint code = uint(packed[base + byte]) >> shift;
-    if (shift > 5u) {
-        code |= uint(packed[base + byte + 1u]) << (8u - shift);
-    }
-    return code & 0x7u;
-}
-
+// payload-contiguous stream. Q3 is compiled either as the legacy split stream
+// or as exact 112-byte blocks containing 96 code bytes and eight FP16 scales.
+// The representation is selected while building the Metal pipeline, while the
+// per-expert Q3/Q4 map tag remains uniform for an expert threadgroup.
 inline float qx_dynamic_q3_compact_dot8(
-    device const uchar* packed,
-    uint group_base,
-    uint first_local,
+    uint packet,
     float4 x0,
     float4 x1,
     float scale,
     float sum) {
-    sum = fma(float(int(qx_mixed_q3_code(packed, group_base, first_local + 0u)) - 3) * scale, x0.x, sum);
-    sum = fma(float(int(qx_mixed_q3_code(packed, group_base, first_local + 1u)) - 3) * scale, x0.y, sum);
-    sum = fma(float(int(qx_mixed_q3_code(packed, group_base, first_local + 2u)) - 3) * scale, x0.z, sum);
-    sum = fma(float(int(qx_mixed_q3_code(packed, group_base, first_local + 3u)) - 3) * scale, x0.w, sum);
-    sum = fma(float(int(qx_mixed_q3_code(packed, group_base, first_local + 4u)) - 3) * scale, x1.x, sum);
-    sum = fma(float(int(qx_mixed_q3_code(packed, group_base, first_local + 5u)) - 3) * scale, x1.y, sum);
-    sum = fma(float(int(qx_mixed_q3_code(packed, group_base, first_local + 6u)) - 3) * scale, x1.z, sum);
-    return fma(float(int(qx_mixed_q3_code(packed, group_base, first_local + 7u)) - 3) * scale, x1.w, sum);
+    uint4 lanes0 = (uint4(packet) >> uint4(0u, 3u, 6u, 9u)) & 0x7u;
+    uint4 lanes1 = (uint4(packet) >> uint4(12u, 15u, 18u, 21u)) & 0x7u;
+    float4 weights0 = float4(int4(lanes0) - 3) * scale;
+    float4 weights1 = float4(int4(lanes1) - 3) * scale;
+    return sum + dot(weights0, x0) + dot(weights1, x1);
 }
 
+inline uint qx_dynamic_q3_packet24(device const uchar* stream, uint offset) {
+    packed_uchar4 bytes = *reinterpret_cast<device const packed_uchar4*>(stream + offset);
+    return as_type<uint>(bytes) & 0x00ffffffu;
+}
+
+template <bool q3_superblock>
 inline void qx_dynamic_mixed_superblock_gate_up_body(
     device const uchar* q4_stream,
-    device const uchar* q3_packed,
+    device const uchar* q3_stream,
     device const half* q3_scales,
     device const uint* expert_ids,
     device const uint* expert_map,
@@ -2652,9 +2642,8 @@ inline void qx_dynamic_mixed_superblock_gate_up_body(
     constexpr uint q4_block_bytes = 144;
     constexpr uint q4_row_bytes = blocks * q4_block_bytes;
     constexpr uint q4_expert_bytes = hidden * q4_row_bytes;
-    constexpr uint q3_group_bytes = 12;
-    constexpr uint q3_groups = 32;
-    constexpr uint q3_row_bytes = q3_groups * q3_group_bytes;
+    constexpr uint q3_block_bytes = 112;
+    constexpr uint q3_row_bytes = blocks * q3_block_bytes;
     constexpr uint q3_expert_bytes = hidden * q3_row_bytes;
     constexpr uint rows_per_threadgroup = 32;
     constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
@@ -2680,13 +2669,27 @@ inline void qx_dynamic_mixed_superblock_gate_up_body(
                 uint row = first_row + row_offset;
                 if (q3) {
                     uint group = lane >> 2u;
-                    uint first_local = (lane & 3u) * 8u;
-                    uint group_base = physical * q3_expert_bytes + row * q3_row_bytes
-                        + (block * 8u + group) * q3_group_bytes;
-                    float scale = float(q3_scales[
-                        physical * hidden * q3_groups + row * q3_groups + block * 8u + group]);
+                    uint packet_base;
+                    float scale;
+                    if (q3_superblock) {
+                        uint block_base = physical * q3_expert_bytes + row * q3_row_bytes
+                            + block * q3_block_bytes;
+                        packet_base = block_base + group * 12u + (lane & 3u) * 3u;
+                        scale = float(reinterpret_cast<device const half*>(
+                            q3_stream + block_base + 96u)[group]);
+                    } else {
+                        constexpr uint split_groups = 32u;
+                        constexpr uint split_row_bytes = split_groups * 12u;
+                        packet_base = physical * hidden * split_row_bytes
+                            + row * split_row_bytes + (block * 8u + group) * 12u
+                            + (lane & 3u) * 3u;
+                        scale = float(q3_scales[
+                            physical * hidden * split_groups + row * split_groups
+                                + block * 8u + group]);
+                    }
+                    uint packet = qx_dynamic_q3_packet24(q3_stream, packet_base);
                     sums[row_offset] = qx_dynamic_q3_compact_dot8(
-                        q3_packed, group_base, first_local, x0, x1, scale, sums[row_offset]);
+                        packet, x0, x1, scale, sums[row_offset]);
                 } else {
                     uint base = physical * q4_expert_bytes + row * q4_row_bytes
                         + block * q4_block_bytes;
@@ -2719,7 +2722,7 @@ kernel void qx_dynamic_mixed_moe_gate_up_superblock_simd(
     device const uint* expert_ids [[buffer(5)]],
     device float* output [[buffer(6)]],
     device const uint* expert_map [[buffer(10)]],
-    device const uchar* q3_packed [[buffer(11)]],
+    device const uchar* q3_stream [[buffer(11)]],
     device const half* q3_scales [[buffer(12)]],
     uint lane [[thread_index_in_simdgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
@@ -2730,8 +2733,8 @@ kernel void qx_dynamic_mixed_moe_gate_up_superblock_simd(
         cached_input[column] = input[column];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    qx_dynamic_mixed_superblock_gate_up_body(
-        q4_stream, q3_packed, q3_scales, expert_ids, expert_map, output,
+    qx_dynamic_mixed_superblock_gate_up_body<false>(
+        q4_stream, q3_stream, q3_scales, expert_ids, expert_map, output,
         cached_input, lane, simdgroup, threadgroup_id);
 }
 
@@ -2743,7 +2746,7 @@ kernel void qx_dynamic_mixed_moe_gate_up_superblock_norm_simd(
     device const float* norm_weights [[buffer(8)]],
     device const float* inverse_rms [[buffer(9)]],
     device const uint* expert_map [[buffer(10)]],
-    device const uchar* q3_packed [[buffer(11)]],
+    device const uchar* q3_stream [[buffer(11)]],
     device const half* q3_scales [[buffer(12)]],
     uint lane [[thread_index_in_simdgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
@@ -2755,32 +2758,78 @@ kernel void qx_dynamic_mixed_moe_gate_up_superblock_norm_simd(
         cached_input[column] = input[column] * inverse * norm_weights[column];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    qx_dynamic_mixed_superblock_gate_up_body(
-        q4_stream, q3_packed, q3_scales, expert_ids, expert_map, output,
+    qx_dynamic_mixed_superblock_gate_up_body<false>(
+        q4_stream, q3_stream, q3_scales, expert_ids, expert_map, output,
         cached_input, lane, simdgroup, threadgroup_id);
 }
 
-kernel void qx_dynamic_mixed_moe_down_superblock_simd(
+kernel void qx_dynamic_mixed_moe_gate_up_q3_112_simd(
     device const uchar* q4_stream [[buffer(0)]],
-    device const float* activated [[buffer(4)]],
+    device const float* input [[buffer(4)]],
     device const uint* expert_ids [[buffer(5)]],
     device float* output [[buffer(6)]],
     device const uint* expert_map [[buffer(10)]],
-    device const uchar* q3_packed [[buffer(11)]],
-    device const half* q3_scales [[buffer(12)]],
+    device const uchar* q3_stream [[buffer(11)]],
     uint lane [[thread_index_in_simdgroup]],
     uint simdgroup [[simdgroup_index_in_threadgroup]],
     uint threadgroup_id [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    for (uint column = thread_index; column < 1024u; column += 256u) {
+        cached_input[column] = input[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_mixed_superblock_gate_up_body<true>(
+        q4_stream, q3_stream, reinterpret_cast<device const half*>(q3_stream),
+        expert_ids, expert_map, output, cached_input, lane, simdgroup, threadgroup_id);
+}
+
+kernel void qx_dynamic_mixed_moe_gate_up_q3_112_norm_simd(
+    device const uchar* q4_stream [[buffer(0)]],
+    device const float* input [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device const float* norm_weights [[buffer(8)]],
+    device const float* inverse_rms [[buffer(9)]],
+    device const uint* expert_map [[buffer(10)]],
+    device const uchar* q3_stream [[buffer(11)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[1024];
+    float inverse = inverse_rms[0];
+    for (uint column = thread_index; column < 1024u; column += 256u) {
+        cached_input[column] = input[column] * inverse * norm_weights[column];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    qx_dynamic_mixed_superblock_gate_up_body<true>(
+        q4_stream, q3_stream, reinterpret_cast<device const half*>(q3_stream),
+        expert_ids, expert_map, output, cached_input, lane, simdgroup, threadgroup_id);
+}
+
+template <bool q3_superblock>
+inline void qx_dynamic_mixed_superblock_down_body(
+    device const uchar* q4_stream,
+    device const float* activated,
+    device const uint* expert_ids,
+    device float* output,
+    device const uint* expert_map,
+    device const uchar* q3_stream,
+    device const half* q3_scales,
+    threadgroup float* cached_input,
+    uint lane,
+    uint simdgroup,
+    uint threadgroup_id,
+    uint thread_index) {
     constexpr uint hidden = 1024;
     constexpr uint intermediate = 512;
     constexpr uint blocks = 2;
     constexpr uint q4_block_bytes = 144;
     constexpr uint q4_row_bytes = blocks * q4_block_bytes;
     constexpr uint q4_expert_bytes = hidden * q4_row_bytes;
-    constexpr uint q3_group_bytes = 12;
-    constexpr uint q3_groups = 16;
-    constexpr uint q3_row_bytes = q3_groups * q3_group_bytes;
+    constexpr uint q3_block_bytes = 112;
+    constexpr uint q3_row_bytes = blocks * q3_block_bytes;
     constexpr uint q3_expert_bytes = hidden * q3_row_bytes;
     constexpr uint rows_per_threadgroup = 32;
     constexpr uint threadgroups_per_expert = hidden / rows_per_threadgroup;
@@ -2792,7 +2841,6 @@ kernel void qx_dynamic_mixed_moe_down_superblock_simd(
     bool valid = logical < 32u && encoded != 0xffffffffu;
     bool q3 = valid && qx_expert_map_is_q3(encoded);
     uint physical = qx_expert_map_slot(encoded);
-    threadgroup float cached_input[intermediate];
     for (uint column = thread_index; column < intermediate; column += 256u) {
         cached_input[column] = activated[slot * intermediate + column];
     }
@@ -2811,13 +2859,27 @@ kernel void qx_dynamic_mixed_moe_down_superblock_simd(
                 uint row = first_row + row_offset;
                 if (q3) {
                     uint group = lane >> 2u;
-                    uint first_local = (lane & 3u) * 8u;
-                    uint group_base = physical * q3_expert_bytes + row * q3_row_bytes
-                        + (block * 8u + group) * q3_group_bytes;
-                    float scale = float(q3_scales[
-                        physical * hidden * q3_groups + row * q3_groups + block * 8u + group]);
+                    uint packet_base;
+                    float scale;
+                    if (q3_superblock) {
+                        uint block_base = physical * q3_expert_bytes + row * q3_row_bytes
+                            + block * q3_block_bytes;
+                        packet_base = block_base + group * 12u + (lane & 3u) * 3u;
+                        scale = float(reinterpret_cast<device const half*>(
+                            q3_stream + block_base + 96u)[group]);
+                    } else {
+                        constexpr uint split_groups = 16u;
+                        constexpr uint split_row_bytes = split_groups * 12u;
+                        packet_base = physical * hidden * split_row_bytes
+                            + row * split_row_bytes + (block * 8u + group) * 12u
+                            + (lane & 3u) * 3u;
+                        scale = float(q3_scales[
+                            physical * hidden * split_groups + row * split_groups
+                                + block * 8u + group]);
+                    }
+                    uint packet = qx_dynamic_q3_packet24(q3_stream, packet_base);
                     sums[row_offset] = qx_dynamic_q3_compact_dot8(
-                        q3_packed, group_base, first_local, x0, x1, scale, sums[row_offset]);
+                        packet, x0, x1, scale, sums[row_offset]);
                 } else {
                     uint base = physical * q4_expert_bytes + row * q4_row_bytes
                         + block * q4_block_bytes;
@@ -2842,6 +2904,42 @@ kernel void qx_dynamic_mixed_moe_down_superblock_simd(
             output[slot * hidden + first_row + row_offset] = sums[row_offset];
         }
     }
+}
+
+kernel void qx_dynamic_mixed_moe_down_superblock_simd(
+    device const uchar* q4_stream [[buffer(0)]],
+    device const float* activated [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device const uint* expert_map [[buffer(10)]],
+    device const uchar* q3_stream [[buffer(11)]],
+    device const half* q3_scales [[buffer(12)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[512];
+    qx_dynamic_mixed_superblock_down_body<false>(
+        q4_stream, activated, expert_ids, output, expert_map, q3_stream, q3_scales,
+        cached_input, lane, simdgroup, threadgroup_id, thread_index);
+}
+
+kernel void qx_dynamic_mixed_moe_down_q3_112_simd(
+    device const uchar* q4_stream [[buffer(0)]],
+    device const float* activated [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device float* output [[buffer(6)]],
+    device const uint* expert_map [[buffer(10)]],
+    device const uchar* q3_stream [[buffer(11)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint threadgroup_id [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup float cached_input[512];
+    qx_dynamic_mixed_superblock_down_body<true>(
+        q4_stream, activated, expert_ids, output, expert_map, q3_stream,
+        reinterpret_cast<device const half*>(q3_stream), cached_input, lane, simdgroup,
+        threadgroup_id, thread_index);
 }
 
 // Cross-expert activation-chunk candidate. A threadgroup owns one eight-row

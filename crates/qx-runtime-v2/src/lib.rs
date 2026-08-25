@@ -3815,10 +3815,22 @@ fn load_no_copy_moe_stack_expertwise(
                 .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q4RowInline),
             gate_q4
                 .as_ref()
-                .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q4Superblock144),
+                .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q4Superblock144)
+                || gate_q3
+                    .as_ref()
+                    .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q3Superblock112),
             down_q4
                 .as_ref()
-                .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q4Superblock144),
+                .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q4Superblock144)
+                || down_q3
+                    .as_ref()
+                    .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q3Superblock112),
+            gate_q3
+                .as_ref()
+                .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q3Superblock112),
+            down_q3
+                .as_ref()
+                .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q3Superblock112),
         )?;
         layers.push(prepared);
     }
@@ -3916,7 +3928,10 @@ fn expertwise_typed_slab(
             ));
         }
         let valid_layout = if quant_type == qx_quant::QuantType::Q3 {
-            entry.layout == qx_quant::PackingLayout::RowMajor
+            matches!(
+                entry.layout,
+                qx_quant::PackingLayout::RowMajor | qx_quant::PackingLayout::Q3Superblock112
+            )
         } else {
             matches!(
                 entry.layout,
@@ -3927,7 +3942,7 @@ fn expertwise_typed_slab(
         };
         if !valid_layout {
             return Err(
-                "expertwise Q3 requires row-major and Q4 requires row-major, row-inline, or superblock-144"
+                "expertwise Q3 requires row-major or superblock-112 and Q4 requires row-major, row-inline, or superblock-144"
                     .to_owned(),
             );
         }
@@ -3947,7 +3962,9 @@ fn expertwise_typed_slab(
         } else {
             physical as u32
         };
-        if quant_type == qx_quant::QuantType::Q3 {
+        if quant_type == qx_quant::QuantType::Q3
+            && entry.layout == qx_quant::PackingLayout::RowMajor
+        {
             let blocks = rows * groups;
             let bytes = entry.data_length as usize / blocks;
             if !matches!(bytes, 12 | 16) {
