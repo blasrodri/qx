@@ -266,9 +266,11 @@ fn finish_gate_up(
     compiled: &mut Vec<CompiledTensor>,
     pending: &mut PendingGateUp,
 ) -> Result<()> {
-    let (Some(gate), Some(up)) = (pending.gate.remove(&key), pending.up.remove(&key)) else {
+    if !pending.gate.contains_key(&key) || !pending.up.contains_key(&key) {
         return Ok(());
-    };
+    }
+    let gate = pending.gate.remove(&key).unwrap();
+    let up = pending.up.remove(&key).unwrap();
     if gate.quant_type != up.quant_type
         || gate.layout != up.layout
         || gate.cols != up.cols
@@ -425,8 +427,11 @@ mod tests {
         let up = QuantizedTensor::quantize(&[2.0; 64], 2, 32, QuantType::Q2, 32);
         let mut pending = PendingGateUp::default();
         pending.gate.insert((0, 0), gate);
-        pending.up.insert((0, 0), up);
         let mut output = Vec::new();
+        finish_gate_up((0, 0), &mut output, &mut pending).unwrap();
+        assert!(output.is_empty());
+        assert_eq!(pending.gate.len(), 1);
+        pending.up.insert((0, 0), up);
         finish_gate_up((0, 0), &mut output, &mut pending).unwrap();
         assert_eq!(output[0].tensor.rows, 4);
         assert_eq!(output[0].tensor.cols, 32);

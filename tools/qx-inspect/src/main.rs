@@ -22,7 +22,10 @@ use std::{
 struct Args {
     /// Hugging Face model directory containing config.json and safetensors.
     #[arg(long)]
-    model: PathBuf,
+    model: Option<PathBuf>,
+    /// Inspect a compiled QX artifact instead of a source checkpoint.
+    #[arg(long)]
+    artifact: Option<PathBuf>,
     #[arg(long)]
     layer: Option<usize>,
     #[arg(long)]
@@ -121,16 +124,74 @@ struct ShardVerification {
     verified: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct ArtifactAudit {
+    schema_version: u32,
+    classification: &'static str,
+    capacity_baseline_complete: bool,
+    execution_promoted: bool,
+    artifact_sha256: String,
+    file_bytes: u64,
+    model_id: String,
+    target_id: String,
+    context_limit: u32,
+    tensor_entries: usize,
+    q2_entries: usize,
+    q4_entries: usize,
+    raw_entries: usize,
+    gate_up_entries: usize,
+    down_entries: usize,
+    memory_plan: ArtifactMemoryAudit,
+    model_shape: Option<ModelShape>,
+    plan_id: Option<String>,
+    limitations: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactMemoryAudit {
+    weights_bytes: u64,
+    kv_cache_bytes: u64,
+    runtime_bytes: u64,
+    total_bytes: u64,
+}
+
 fn parse_quant_type(value: &str) -> Result<QuantType, String> {
     QuantType::parse(value).ok_or_else(|| "expected q2, q3, or q4".to_owned())
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(artifact) = args.artifact.as_deref() {
+        if args.model.is_some()
+            || args.layer.is_some()
+            || args.expert.is_some()
+            || args.quantize.is_some()
+            || args.reference_manifest.is_some()
+            || args.model_revision.is_some()
+        {
+            bail!("--artifact cannot be combined with source-checkpoint options");
+        }
+        let audit = inspect_artifact(artifact)?;
+        print_artifact_audit(&audit);
+        if let Some(output) = args.audit_output {
+            let bytes = serde_json::to_vec_pretty(&audit)?;
+            fs::write(&output, [bytes.as_slice(), b"\n"].concat())
+                .with_context(|| format!("write {}", output.display()))?;
+            println!("artifact audit: {}", output.display());
+        }
+        if !audit.capacity_baseline_complete {
+            bail!("artifact failed the Qwen capacity-baseline contract");
+        }
+        return Ok(());
+    }
+    let model_root = args
+        .model
+        .as_deref()
+        .context("either --model or --artifact is required")?;
     if args.expert.is_some() != args.layer.is_some() {
         bail!("--layer and --expert must be supplied together");
     }
-    let model = inspect_config(&args.model)?;
+    let model = inspect_config(model_root)?;
     if args.layer.is_some_and(|layer| layer >= model.shape.layers) {
         bail!("layer must be in 0..{}", model.shape.layers);
     }
@@ -142,7 +203,7 @@ fn main() -> Result<()> {
     }
 
     print_model(&model);
-    let checkpoint = Checkpoint::open(&args.model)?;
+    let checkpoint = Checkpoint::open(model_root)?;
     if let (Some(layer), Some(expert)) = (args.layer, args.expert) {
         inspect_expert(&checkpoint, &model, layer, expert, args.quantize)?;
     } else if args.audit_output.is_none() {
@@ -153,7 +214,7 @@ fn main() -> Result<()> {
         let (revision, shard_verification) = match args.reference_manifest.as_deref() {
             Some(reference) => {
                 let (reference_revision, verification) =
-                    verify_source_reference(&args.model, reference)?;
+                    verify_source_reference(model_root, reference)?;
                 if args
                     .model_revision
                     .as_ref()
@@ -179,6 +240,106 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
+    let artifact = qx_format::MappedArtifact::open(path)
+        .with_context(|| format!("open QX artifact {}", path.display()))?;
+    let info = artifact.info();
+    let q2_entries = info
+        .entries
+        .iter()
+        .filter(|entry| entry.group_size != 0 && entry.quant_type == QuantType::Q2)
+        .count();
+    let q4_entries = info
+        .entries
+        .iter()
+        .filter(|entry| entry.group_size != 0 && entry.quant_type == QuantType::Q4)
+        .count();
+    let raw_entries = info
+        .entries
+        .iter()
+        .filter(|entry| entry.group_size == 0)
+        .count();
+    let gate_up_entries = info
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == qx_format::TensorKind::GateUp)
+        .count();
+    let down_entries = info
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == qx_format::TensorKind::Down)
+        .count();
+    let plan = info.execution_plan.as_ref();
+    let complete = info.header.model_id == QWEN3_30B_A3B_MODEL_ID
+        && info.header.target_id == "apple-a19-pro"
+        && info.header.context_limit == 4096
+        && info.entries.len() == 12_723
+        && q2_entries == 12_288
+        && q4_entries == 242
+        && raw_entries == 193
+        && gate_up_entries == 6_144
+        && down_entries == 6_144
+        && plan
+            .and_then(|plan| plan.model_shape.as_ref())
+            .is_some_and(|shape| {
+                shape.architecture == ModelArchitecture::Qwen3Moe
+                    && shape.expert_intermediate == 768
+            })
+        && plan.is_some_and(|plan| plan.schedule.expected_dispatches_per_token == 0);
+    let memory = info.memory_plan;
+    let runtime_bytes = memory.total_bytes - memory.weights_bytes - memory.kv_cache_bytes;
+    Ok(ArtifactAudit {
+        schema_version: 1,
+        classification: "qwen3-a19pro-q2-capacity-baseline-artifact",
+        capacity_baseline_complete: complete,
+        execution_promoted: false,
+        artifact_sha256: sha256_file(path)?,
+        file_bytes: fs::metadata(path)?.len(),
+        model_id: info.header.model_id.clone(),
+        target_id: info.header.target_id.clone(),
+        context_limit: info.header.context_limit,
+        tensor_entries: info.entries.len(),
+        q2_entries,
+        q4_entries,
+        raw_entries,
+        gate_up_entries,
+        down_entries,
+        memory_plan: ArtifactMemoryAudit {
+            weights_bytes: memory.weights_bytes,
+            kv_cache_bytes: memory.kv_cache_bytes,
+            runtime_bytes,
+            total_bytes: memory.total_bytes,
+        },
+        model_shape: plan.and_then(|plan| plan.model_shape.clone()),
+        plan_id: plan.map(|plan| plan.plan_id.clone()),
+        limitations: vec![
+            "uniform symmetric Q2 has not passed the QX quality gates",
+            "the Qwen Metal runtime and physical iPhone memory gate are not implemented",
+            "this artifact validates capacity and conversion only; it is not an app release model",
+        ],
+    })
+}
+
+fn print_artifact_audit(audit: &ArtifactAudit) {
+    println!("QX Artifact Inspector\n");
+    println!("model:              {}", audit.model_id);
+    println!("target:             {}", audit.target_id);
+    println!("file bytes:         {}", audit.file_bytes);
+    println!("tensor entries:     {}", audit.tensor_entries);
+    println!(
+        "Q2/Q4/raw entries:  {}/{}/{}",
+        audit.q2_entries, audit.q4_entries, audit.raw_entries
+    );
+    println!(
+        "gate-up/down:       {}/{}",
+        audit.gate_up_entries, audit.down_entries
+    );
+    println!("logical weights:    {}", audit.memory_plan.weights_bytes);
+    println!("logical total:      {}", audit.memory_plan.total_bytes);
+    println!("capacity complete:  {}", audit.capacity_baseline_complete);
+    println!("execution promoted: {}", audit.execution_promoted);
 }
 
 fn inspect_config(root: &std::path::Path) -> Result<InspectedModel> {

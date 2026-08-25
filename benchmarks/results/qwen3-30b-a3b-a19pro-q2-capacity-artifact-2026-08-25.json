@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-a19pro-q2-capacity-baseline-artifact",
+  "capacity_baseline_complete": true,
+  "execution_promoted": false,
+  "artifact_sha256": "a9ed2b8f13d9b3facead70207cdb735ab3519797e1807732a313b445528dd377",
+  "file_bytes": 9927917568,
+  "model_id": "Qwen/Qwen3-30B-A3B",
+  "target_id": "apple-a19-pro",
+  "context_limit": 4096,
+  "tensor_entries": 12723,
+  "q2_entries": 12288,
+  "q4_entries": 242,
+  "raw_entries": 193,
+  "gate_up_entries": 6144,
+  "down_entries": 6144,
+  "memory_plan": {
+    "weights_bytes": 9927286784,
+    "kv_cache_bytes": 402653184,
+    "runtime_bytes": 1238528,
+    "total_bytes": 10331178496
+  },
+  "model_shape": {
+    "architecture": "qwen3_moe",
+    "layers": 48,
+    "hidden_size": 2048,
+    "attention_heads": 32,
+    "key_value_heads": 4,
+    "head_dim": 128,
+    "experts": 128,
+    "active_experts": 8,
+    "expert_intermediate": 768,
+    "dense_intermediate": 6144,
+    "vocabulary": 151936,
+    "max_context": 40960,
+    "rms_epsilon": 0.000001,
+    "rope_theta": 1000000.0,
+    "normalize_router_weights": true,
+    "tied_word_embeddings": false,
+    "query_key_norm": true
+  },
+  "plan_id": "qwen3-30b-a3b-a19pro-q2-capacity-baseline",
+  "limitations": [
+    "uniform symmetric Q2 has not passed the QX quality gates",
+    "the Qwen Metal runtime and physical iPhone memory gate are not implemented",
+    "this artifact validates capacity and conversion only; it is not an app release model"
+  ]
+}

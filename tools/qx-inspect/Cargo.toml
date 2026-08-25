@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 qx-model.workspace = true
+qx-format.workspace = true
 qx-quant.workspace = true
 qx-safetensors = { path = "../../crates/qx-safetensors" }
 serde.workspace = true
