@@ -858,11 +858,19 @@ local benefit is much smaller, however: 2.8% to 6.1% relative improvement
 versus 22% for layer 8, and low regularization materially overfits the late
 expert. A compiler cannot assign one universal distillation policy.
 
-This screen still replaces only one expert per run. It does not prove that
-errors compose when multiple students are active in one forward pass. The next
-gate is simultaneous injection of these four preselected students on the same
-sealed corpus. Promotion and kernel work remain blocked until the combined
-relative-PPL delta stays inside 1%.
+The bridge now accepts multiple explicit `(layer, expert, folded matrix)`
+entries and applies them in one forward pass. With all four depth-screen
+students active simultaneously, held-out mean NLL changes from `3.791721` to
+`3.782732`, or -0.895% relative perplexity, with 97.73% top-1 agreement. Exact
+and student routing hits remain 38/38, 106/106, and 55/55 for the first three
+targets; the late target changes from 81 to 82 hits because earlier student
+outputs can legitimately perturb downstream routers.
+
+The four-student composition gate therefore passes the 1% regression budget on
+this corpus. It is still not promotion evidence: four down matrices remove only
+196,608 raw Q4 payload bytes, the corpus is small and single-domain, and the
+other 6,140 experts remain exact. The machinery is now sufficient for a larger
+fixed expert panel. That panel, not a Metal kernel, is the next experiment.
 
 ## Evidence layout
 

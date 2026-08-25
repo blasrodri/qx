@@ -145,13 +145,31 @@
       }
     ]
   },
+  "simultaneous_four_student_nll": {
+    "semantics": "four-folded-students-active-in-one-teacher-forced-forward-pass",
+    "sequences": 12,
+    "scored_tokens": 132,
+    "exact_mean_nll": 3.7917213920803934,
+    "student_mean_nll": 3.7827323588954695,
+    "nll_delta": -0.008989033184923834,
+    "relative_perplexity_delta": -0.008948752610952404,
+    "top1_agreement": 0.9772727272727273,
+    "route_hits": [
+      {"layer": 2, "expert": 125, "exact": 38, "student": 38},
+      {"layer": 8, "expert": 38, "exact": 106, "student": 106},
+      {"layer": 24, "expert": 2, "exact": 55, "student": 55},
+      {"layer": 44, "expert": 6, "exact": 81, "student": 82}
+    ],
+    "raw_q4_down_payload_bytes_removed_across_four_experts": 196608
+  },
   "conclusions": [
     "Diverse real samples reverse the tiny-prompt result: the missing down-output residual has a learnable linear component across a disjoint corpus partition.",
     "The linear-kernel dual folds into the compact retained down matrix and matches dual predictions below 7.5e-7 relative L2, so no support bank is required at inference.",
     "Live replacement of the one folded expert passes the small held-out NLL regression gate: relative perplexity changes by -1.47% over 132 tokens, while a full-width injection control changes it by only +0.082% on the paired subset.",
     "The apparent NLL improvement is not a quality-improvement claim: the sample is small, single-domain, and covers only one of 6,144 experts.",
     "Routing-preselected early, middle, and late experts also remain non-regressing when injected separately, but optimal ridge varies from 1.0 to 3.0 and local improvement varies from 2.8% to 6.1%.",
-    "Independent single-expert results do not establish safe composition; simultaneous multi-expert injection is the next quality gate.",
+    "Four simultaneously active depth-screen students compose within the 1% relative-PPL budget at -0.895%, while changing one downstream late-expert routing decision.",
+    "This validates the multi-student execution and quality machinery but removes only 196,608 raw Q4 down bytes across four experts, far below a capacity tier.",
     "Promotion remains false. Scale the same sealed-corpus control across representative layers and experts before considering artifact or Metal-kernel work; joint gate/up/down training remains necessary for a hardware-tier capacity reduction."
   ]
 }

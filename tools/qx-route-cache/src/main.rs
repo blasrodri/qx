@@ -304,6 +304,40 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Compare several simultaneously active folded students with the teacher.
+    MultiExpertStudentNll {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long = "corpus", required = true)]
+        corpora: Vec<PathBuf>,
+        /// Repeated `layer:expert:path` folded student specifications.
+        #[arg(long = "student", required = true)]
+        students: Vec<String>,
+        #[arg(long, default_value_t = 64)]
+        max_sequences: usize,
+        #[arg(long, default_value_t = 96)]
+        max_tokens_per_sequence: usize,
+        #[arg(long, default_value_t = 128)]
+        context: usize,
+        #[arg(long, default_value_t = 48)]
+        layers: usize,
+        #[arg(long, default_value_t = 128)]
+        experts: usize,
+        #[arg(long, default_value_t = 8)]
+        top_k: usize,
+        #[arg(long, default_value_t = -1)]
+        gpu_layers: i32,
+        #[arg(long, default_value_t = 4)]
+        threads: i32,
+        #[arg(long, default_value_t = DEFAULT_EXPERT_NEURONS)]
+        expert_neurons: usize,
+        #[arg(long, default_value_t = 2048)]
+        hidden_size: usize,
+        #[arg(long)]
+        model_sha256: Option<String>,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum)]
@@ -723,6 +757,33 @@ struct ExpertStudentNllReport {
     top1_agreement: f64,
 }
 
+#[derive(Debug, Serialize)]
+struct MultiExpertStudentNllReport {
+    schema_version: u32,
+    classification: &'static str,
+    promotion_evidence: bool,
+    quality_semantics: &'static str,
+    model_sha256: String,
+    corpora: Vec<String>,
+    students: Vec<MultiExpertStudentResult>,
+    sequences: usize,
+    scored_tokens: usize,
+    exact_mean_nll: f64,
+    student_mean_nll: f64,
+    nll_delta: f64,
+    relative_perplexity_delta: f64,
+    top1_agreement: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct MultiExpertStudentResult {
+    layer: usize,
+    expert: u16,
+    weights: String,
+    exact_route_hits: usize,
+    student_route_hits: usize,
+}
+
 #[derive(Default)]
 struct StructuredCalibration {
     token_positions: usize,
@@ -1031,6 +1092,39 @@ fn main() -> Result<()> {
             model_sha256,
             output,
         }),
+        Command::MultiExpertStudentNll {
+            model,
+            corpora,
+            students,
+            max_sequences,
+            max_tokens_per_sequence,
+            context,
+            layers,
+            experts,
+            top_k,
+            gpu_layers,
+            threads,
+            expert_neurons,
+            hidden_size,
+            model_sha256,
+            output,
+        } => multi_expert_student_nll(MultiExpertStudentNllArgs {
+            model,
+            corpora,
+            students,
+            max_sequences,
+            max_tokens_per_sequence,
+            context,
+            layers,
+            experts,
+            top_k,
+            gpu_layers,
+            threads,
+            expert_neurons,
+            hidden_size,
+            model_sha256,
+            output,
+        }),
     }
 }
 
@@ -1112,6 +1206,31 @@ struct ExpertStudentNllArgs {
     hidden_size: usize,
     model_sha256: Option<String>,
     output: PathBuf,
+}
+
+struct MultiExpertStudentNllArgs {
+    model: PathBuf,
+    corpora: Vec<PathBuf>,
+    students: Vec<String>,
+    max_sequences: usize,
+    max_tokens_per_sequence: usize,
+    context: usize,
+    layers: usize,
+    experts: usize,
+    top_k: usize,
+    gpu_layers: i32,
+    threads: i32,
+    expert_neurons: usize,
+    hidden_size: usize,
+    model_sha256: Option<String>,
+    output: PathBuf,
+}
+
+struct ExpertStudentSpec {
+    layer: usize,
+    expert: u16,
+    path: PathBuf,
+    weights: Vec<f32>,
 }
 
 struct SimulateArgs {
@@ -1515,6 +1634,7 @@ struct CorpusNllMeasurement {
     nll: f64,
     scored_tokens: usize,
     expert_hits: usize,
+    route_hits: Vec<usize>,
     top1_tokens: Vec<i32>,
 }
 
@@ -1670,6 +1790,209 @@ fn measure_corpus_nll(
         }
     }
     Ok(measurement)
+}
+
+#[cfg(target_os = "macos")]
+fn multi_expert_student_nll(args: MultiExpertStudentNllArgs) -> Result<()> {
+    if !args.model.is_file()
+        || args.corpora.is_empty()
+        || args.corpora.iter().any(|path| !path.is_file())
+        || args.students.is_empty()
+    {
+        bail!("model, corpus, and student inputs must exist");
+    }
+    if args.max_sequences == 0
+        || args.max_tokens_per_sequence < 2
+        || args.max_tokens_per_sequence > args.context
+    {
+        bail!("multi-student corpus arguments are invalid");
+    }
+    let model_hash = match args.model_sha256.as_ref() {
+        Some(value) => {
+            validate_sha256(value)?;
+            value.clone()
+        }
+        None => sha256_file(&args.model)?,
+    };
+    let mut targets = HashSet::new();
+    let mut specs = Vec::new();
+    for value in &args.students {
+        let mut fields = value.splitn(3, ':');
+        let layer = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("student lacks layer"))?
+            .parse::<usize>()
+            .with_context(|| format!("invalid student layer in {value}"))?;
+        let expert = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("student lacks expert"))?
+            .parse::<u16>()
+            .with_context(|| format!("invalid student expert in {value}"))?;
+        let path = PathBuf::from(
+            fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("student lacks weight path"))?,
+        );
+        if layer >= args.layers || usize::from(expert) >= args.experts || !path.is_file() {
+            bail!("student target or path is invalid: {value}");
+        }
+        if !targets.insert((layer, expert)) {
+            bail!("duplicate student target {layer}:{expert}");
+        }
+        let (neurons, hidden, weights) = read_expert_down_weights(&path)?;
+        if (neurons, hidden) != (args.expert_neurons, args.hidden_size) {
+            bail!("student {value} dimensions do not match the requested model shape");
+        }
+        specs.push(ExpertStudentSpec {
+            layer,
+            expert,
+            path,
+            weights,
+        });
+    }
+    let mut capture = llama_capture::Capture::open(
+        &args.model,
+        llama_capture::OpenConfig {
+            context: args.context,
+            layers: args.layers,
+            experts: args.experts,
+            top_k: args.top_k,
+            gpu_layers: args.gpu_layers,
+            threads: args.threads,
+            intermediate: Some(args.expert_neurons),
+            hidden: args.hidden_size,
+            sample: None,
+            contribution_packet_neurons: &[],
+        },
+    )?;
+    let mut sequences = Vec::new();
+    for path in &args.corpora {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("read corpus {}", path.display()))?;
+        for paragraph in split_corpus_paragraphs(&contents) {
+            if sequences.len() >= args.max_sequences {
+                break;
+            }
+            let mut tokens = capture.tokenize(&paragraph)?;
+            tokens.truncate(args.max_tokens_per_sequence);
+            if tokens.len() >= 2 {
+                sequences.push(tokens);
+            }
+        }
+        if sequences.len() >= args.max_sequences {
+            break;
+        }
+    }
+    if sequences.is_empty() {
+        bail!("corpus produced no scoreable token sequences");
+    }
+    let target_pairs = specs
+        .iter()
+        .map(|spec| (spec.layer, spec.expert))
+        .collect::<Vec<_>>();
+    let exact = measure_multi_corpus_nll(&mut capture, &sequences, &target_pairs)?;
+    for spec in &specs {
+        capture.add_expert_student(spec.layer, spec.expert, &spec.weights)?;
+    }
+    let student = measure_multi_corpus_nll(&mut capture, &sequences, &target_pairs)?;
+    if exact.scored_tokens != student.scored_tokens
+        || exact.top1_tokens.len() != student.top1_tokens.len()
+    {
+        bail!("exact and multi-student passes produced incompatible measurements");
+    }
+    let exact_mean_nll = exact.mean_nll();
+    let student_mean_nll = student.mean_nll();
+    let top1_matches = exact
+        .top1_tokens
+        .iter()
+        .zip(&student.top1_tokens)
+        .filter(|(exact, student)| exact == student)
+        .count();
+    let report = MultiExpertStudentNllReport {
+        schema_version: 1,
+        classification: "simultaneous-folded-expert-student-corpus-nll-control",
+        promotion_evidence: false,
+        quality_semantics: "teacher-forced-corpus-nll-with-multiple-expert-down-projections-replaced",
+        model_sha256: model_hash,
+        corpora: args
+            .corpora
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        students: specs
+            .iter()
+            .zip(exact.route_hits.iter().zip(&student.route_hits))
+            .map(
+                |(spec, (&exact_route_hits, &student_route_hits))| MultiExpertStudentResult {
+                    layer: spec.layer,
+                    expert: spec.expert,
+                    weights: spec.path.display().to_string(),
+                    exact_route_hits,
+                    student_route_hits,
+                },
+            )
+            .collect(),
+        sequences: sequences.len(),
+        scored_tokens: exact.scored_tokens,
+        exact_mean_nll,
+        student_mean_nll,
+        nll_delta: student_mean_nll - exact_mean_nll,
+        relative_perplexity_delta: (student_mean_nll - exact_mean_nll).exp() - 1.0,
+        top1_agreement: top1_matches as f64 / exact.top1_tokens.len().max(1) as f64,
+    };
+    let mut writer = BufWriter::new(
+        File::create(&args.output).with_context(|| format!("create {}", args.output.display()))?,
+    );
+    serde_json::to_writer_pretty(&mut writer, &report)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    println!("multi-expert student NLL report: {}", args.output.display());
+    println!(
+        "students {}, sequences {}, scored {}, NLL {:.6} -> {:.6} ({:+.4}% PPL), top1 {:.2}%",
+        report.students.len(),
+        report.sequences,
+        report.scored_tokens,
+        exact_mean_nll,
+        student_mean_nll,
+        report.relative_perplexity_delta * 100.0,
+        report.top1_agreement * 100.0,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn measure_multi_corpus_nll(
+    capture: &mut llama_capture::Capture,
+    sequences: &[Vec<i32>],
+    targets: &[(usize, u16)],
+) -> Result<CorpusNllMeasurement> {
+    let mut measurement = CorpusNllMeasurement {
+        route_hits: vec![0; targets.len()],
+        ..CorpusNllMeasurement::default()
+    };
+    for tokens in sequences {
+        capture.reset()?;
+        for pair in tokens.windows(2) {
+            let output = capture.step_target(pair[0], pair[1])?;
+            measurement.nll += output
+                .target_nll
+                .ok_or_else(|| anyhow::anyhow!("llama bridge omitted target NLL"))?
+                as f64;
+            measurement.scored_tokens += 1;
+            measurement.top1_tokens.push(output.predicted);
+            for (target_index, &(layer, expert)) in targets.iter().enumerate() {
+                if output.routes[layer].contains(&expert) {
+                    measurement.route_hits[target_index] += 1;
+                }
+            }
+        }
+    }
+    Ok(measurement)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn multi_expert_student_nll(_args: MultiExpertStudentNllArgs) -> Result<()> {
+    bail!("multi-expert student NLL currently requires the macOS llama.cpp bridge")
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -4129,6 +4452,13 @@ mod llama_capture {
             weights: *const f32,
             weight_count: c_int,
         ) -> c_int;
+        fn qx_llama_route_add_expert_student(
+            route: *mut c_void,
+            layer: c_int,
+            expert: c_int,
+            weights: *const f32,
+            weight_count: c_int,
+        ) -> c_int;
         fn qx_llama_route_take_expert_sample(
             route: *mut c_void,
             activation: *mut f32,
@@ -4328,6 +4658,30 @@ mod llama_capture {
                 unsafe { qx_llama_route_set_expert_student(self.raw, weights.as_ptr(), count) };
             if status != 0 {
                 bail!("llama bridge rejected expert student weights with status {status}");
+            }
+            Ok(())
+        }
+
+        pub fn add_expert_student(
+            &mut self,
+            layer: usize,
+            expert: u16,
+            weights: &[f32],
+        ) -> Result<()> {
+            let count =
+                c_int::try_from(weights.len()).context("student weight count exceeds C int")?;
+            let layer = c_int::try_from(layer).context("student layer exceeds C int")?;
+            let status = unsafe {
+                qx_llama_route_add_expert_student(
+                    self.raw,
+                    layer,
+                    c_int::from(expert),
+                    weights.as_ptr(),
+                    count,
+                )
+            };
+            if status != 0 {
+                bail!("llama bridge rejected expert student with status {status}");
             }
             Ok(())
         }

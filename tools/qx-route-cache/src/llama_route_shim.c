@@ -39,6 +39,11 @@ typedef struct qx_llama_route {
     float * sample_down_output;
     float * sample_down_weights;
     float * sample_student_down_weights;
+    int32_t student_count;
+    int32_t * student_layers;
+    int32_t * student_experts;
+    float ** student_down_weights;
+    float * student_output;
     bool sample_ready;
     bool sample_weights_ready;
     bool sample_weights_taken;
@@ -354,6 +359,57 @@ static bool qx_capture_expert_sample(
     return true;
 }
 
+static bool qx_has_student_layer(const qx_llama_route * route, int32_t layer) {
+    for (int32_t index = 0; index < route->student_count; ++index) {
+        if (route->student_layers[index] == layer) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool qx_apply_expert_students(
+        qx_llama_route * route,
+        struct ggml_tensor * tensor,
+        int32_t layer) {
+    if (!qx_has_student_layer(route, layer)) {
+        return true;
+    }
+    if (!route->active_activations || !route->seen_layers[layer] ||
+        tensor->type != GGML_TYPE_F32 || tensor->ne[0] != route->hidden ||
+        tensor->ne[1] != route->top_k) {
+        qx_set_error(route, "unexpected multi-student down tensor state");
+        return false;
+    }
+    for (int32_t slot = 0; slot < route->top_k; ++slot) {
+        const int32_t active_expert = route->active_routes[layer * route->top_k + slot];
+        for (int32_t student = 0; student < route->student_count; ++student) {
+            if (route->student_layers[student] != layer ||
+                route->student_experts[student] != active_expert) {
+                continue;
+            }
+            const float * activation = route->active_activations +
+                ((size_t) layer * route->top_k + slot) * route->intermediate;
+            const float * weights = route->student_down_weights[student];
+            for (int32_t output = 0; output < route->hidden; ++output) {
+                float value = 0.0f;
+                const float * row = weights + (size_t) output * route->intermediate;
+                for (int32_t neuron = 0; neuron < route->intermediate; ++neuron) {
+                    value += row[neuron] * activation[neuron];
+                }
+                route->student_output[output] = value;
+            }
+            ggml_backend_tensor_set(
+                tensor,
+                route->student_output,
+                (size_t) slot * tensor->nb[1],
+                (size_t) route->hidden * sizeof(float));
+            break;
+        }
+    }
+    return true;
+}
+
 static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user_data) {
     qx_llama_route * route = (qx_llama_route *) user_data;
     static const char route_prefix[] = "ffn_moe_topk-";
@@ -365,7 +421,8 @@ static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user
     const bool is_route = strncmp(tensor->name, route_prefix, sizeof(route_prefix) - 1) == 0;
     const bool is_activation = route->intermediate > 0 &&
         strncmp(tensor->name, activation_prefix, sizeof(activation_prefix) - 1) == 0;
-    const bool is_down = (route->contribution_size_count > 0 || route->sample_layer >= 0) &&
+    const bool is_down = (route->contribution_size_count > 0 || route->sample_layer >= 0 ||
+        route->student_count > 0) &&
         strncmp(tensor->name, contribution_prefix, sizeof(contribution_prefix) - 1) == 0;
     if (!is_route && !is_activation && !is_down) {
         return false;
@@ -376,7 +433,8 @@ static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user
     if (layer < 0 || layer >= route->layers) {
         return false;
     }
-    if (is_down && route->contribution_size_count == 0 && layer != route->sample_layer) {
+    if (is_down && route->contribution_size_count == 0 && layer != route->sample_layer &&
+        !qx_has_student_layer(route, layer)) {
         return false;
     }
     if (ask) {
@@ -401,6 +459,9 @@ static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user
         }
         if (route->sample_layer >= 0) {
             qx_capture_expert_sample(route, tensor, layer);
+        }
+        if (route->student_count > 0) {
+            qx_apply_expert_students(route, tensor, layer);
         }
         return true;
     }
@@ -612,6 +673,13 @@ void qx_llama_route_close(qx_llama_route * route) {
     free(route->sample_down_output);
     free(route->sample_down_weights);
     free(route->sample_student_down_weights);
+    for (int32_t index = 0; index < route->student_count; ++index) {
+        free(route->student_down_weights[index]);
+    }
+    free(route->student_layers);
+    free(route->student_experts);
+    free(route->student_down_weights);
+    free(route->student_output);
     free(route->contribution_packet_neurons);
     free(route->scratch_quantized);
     free(route->scratch_row);
@@ -701,6 +769,61 @@ int qx_llama_route_set_expert_student(
     memcpy(copied, weights, expected * sizeof(float));
     free(route->sample_student_down_weights);
     route->sample_student_down_weights = copied;
+    return 0;
+}
+
+int qx_llama_route_add_expert_student(
+        qx_llama_route * route,
+        int32_t layer,
+        int32_t expert,
+        const float * weights,
+        int32_t weight_count) {
+    const size_t expected = route ? (size_t) route->hidden * route->intermediate : 0;
+    if (!route || layer < 0 || layer >= route->layers || expert < 0 ||
+        expert >= route->experts || !weights || weight_count < 0 ||
+        (size_t) weight_count != expected) {
+        return -1;
+    }
+    for (int32_t index = 0; index < route->student_count; ++index) {
+        if (route->student_layers[index] == layer && route->student_experts[index] == expert) {
+            return -2;
+        }
+    }
+    const size_t count = (size_t) route->student_count + 1;
+    int32_t * layers = malloc(count * sizeof(int32_t));
+    int32_t * experts = malloc(count * sizeof(int32_t));
+    float ** matrices = malloc(count * sizeof(float *));
+    float * copied = malloc(expected * sizeof(float));
+    float * output = route->student_output ? route->student_output :
+        malloc((size_t) route->hidden * sizeof(float));
+    if (!layers || !experts || !matrices || !copied || !output) {
+        free(layers);
+        free(experts);
+        free(matrices);
+        free(copied);
+        if (!route->student_output) {
+            free(output);
+        }
+        return -3;
+    }
+    if (route->student_count > 0) {
+        memcpy(layers, route->student_layers, (size_t) route->student_count * sizeof(int32_t));
+        memcpy(experts, route->student_experts, (size_t) route->student_count * sizeof(int32_t));
+        memcpy(matrices, route->student_down_weights,
+            (size_t) route->student_count * sizeof(float *));
+    }
+    memcpy(copied, weights, expected * sizeof(float));
+    layers[route->student_count] = layer;
+    experts[route->student_count] = expert;
+    matrices[route->student_count] = copied;
+    free(route->student_layers);
+    free(route->student_experts);
+    free(route->student_down_weights);
+    route->student_layers = layers;
+    route->student_experts = experts;
+    route->student_down_weights = matrices;
+    route->student_output = output;
+    route->student_count += 1;
     return 0;
 }
 
