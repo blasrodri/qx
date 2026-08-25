@@ -148,3 +148,18 @@ weights. No artifact or quantization change is required.
 The position-511 result is 28.8% lower latency than the original complete
 token baseline (`141.913 ms`). Dynamic-MoE parity remains below `1.6e-4`
 relative L2 on the late-layer replay and selected tokens remain unchanged.
+
+Q4 projection packetization applies the same physical-consumer correction to
+Q/K/V/O/router and the untied LM head: one FP16 scale load per 32 weights and
+one packed-byte load per two weights, with division/modulo removed from the
+per-weight loop. Projection parity remains bit-exact or below `6.7e-7`
+relative L2.
+
+| Full-token case | Q2S4 packet baseline | + Q4 packet consumer | Gain |
+|---|---:|---:|---:|
+| Position 0 | 75.817 ms GPU / 13.19 tok/s | 54.714 ms / 18.28 tok/s | 27.8% latency |
+| Position 511 | 101.097 ms / 9.89 tok/s | 80.552 ms / 12.41 tok/s | 20.3% latency |
+
+Against the first complete graph, the combined consumer and attention changes
+reduce position-0 latency by 36.2% and position-511 latency by 43.2%, while
+preserving deterministic selected tokens (`58` and `106094`, respectively).

@@ -32,14 +32,19 @@ kernel void qx_q4_gemv(
     constexpr uint bytes_per_group = 16;
     uint groups = (cols + group_size - 1) / group_size;
     float sum = 0.0f;
-    for (uint column = 0; column < cols; ++column) {
-        uint group = column / group_size;
-        uint local = column % group_size;
-        uchar byte = packed[qx_group_offset(row, group, groups, bytes_per_group, layout) + local / 2];
-        uint code = (byte >> ((local % 2) * 4)) & 0xf;
-        float weight = (float(int(code) - int(qmax)))
-            * float(scales[qx_scale_offset(row, group, groups, layout)]);
-        sum += weight * float(input[column]);
+    for (uint group = 0; group < groups; ++group) {
+        uint base = qx_group_offset(row, group, groups, bytes_per_group, layout);
+        float scale = float(scales[qx_scale_offset(row, group, groups, layout)]);
+        uint group_column = group * group_size;
+        for (uint packet = 0; packet < bytes_per_group; ++packet) {
+            uint codes = uint(packed[base + packet]);
+            uint column = group_column + packet * 2;
+            sum += float(int(codes & 0xf) - int(qmax)) * scale * float(input[column]);
+            if (column + 1 < cols) {
+                sum += float(int((codes >> 4) & 0xf) - int(qmax))
+                    * scale * float(input[column + 1]);
+            }
+        }
     }
     output[row] = half(sum);
 }
