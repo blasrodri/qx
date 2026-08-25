@@ -14,6 +14,7 @@ typedef struct qx_llama_route {
     struct llama_context * context;
     int32_t n_vocab;
     int32_t layers;
+    int32_t experts;
     int32_t top_k;
     int32_t intermediate;
     int32_t hidden;
@@ -31,6 +32,7 @@ typedef struct qx_llama_route {
     uint8_t * seen_layers;
     uint8_t * seen_activations;
     uint8_t * seen_contributions;
+    uint8_t * neuron_mask;
     uint8_t * scratch_quantized;
     size_t scratch_quantized_bytes;
     float * scratch_row;
@@ -319,6 +321,30 @@ static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user
         route->active_activations + (size_t) layer * route->top_k * route->intermediate,
         0,
         (size_t) route->top_k * route->intermediate * sizeof(float));
+    if (route->neuron_mask) {
+        float * layer_activations = route->active_activations +
+            (size_t) layer * route->top_k * route->intermediate;
+        for (int32_t slot = 0; slot < route->top_k; ++slot) {
+            const int32_t expert = route->active_routes[layer * route->top_k + slot];
+            if (!route->seen_layers[layer] || expert < 0 || expert >= route->experts) {
+                qx_set_error(route, "cannot apply neuron mask before valid routes are available");
+                return true;
+            }
+            float * activation = layer_activations + (size_t) slot * route->intermediate;
+            const uint8_t * mask = route->neuron_mask +
+                ((size_t) layer * route->experts + expert) * route->intermediate;
+            for (int32_t neuron = 0; neuron < route->intermediate; ++neuron) {
+                if (!mask[neuron]) {
+                    activation[neuron] = 0.0f;
+                }
+            }
+        }
+        ggml_backend_tensor_set(
+            tensor,
+            layer_activations,
+            0,
+            (size_t) route->top_k * route->intermediate * sizeof(float));
+    }
     route->seen_activations[layer] = 1;
     return true;
 }
@@ -327,6 +353,7 @@ qx_llama_route * qx_llama_route_open(
         const char * path,
         uint32_t context_length,
         int32_t layers,
+        int32_t experts,
         int32_t top_k,
         int32_t gpu_layers,
         int32_t threads,
@@ -334,7 +361,7 @@ qx_llama_route * qx_llama_route_open(
         int32_t hidden,
         const int32_t * contribution_packet_neurons,
         int32_t contribution_size_count) {
-    if (!path || layers <= 0 || top_k <= 0 || intermediate < 0 || hidden < 0 ||
+    if (!path || layers <= 0 || experts <= 0 || top_k <= 0 || intermediate < 0 || hidden < 0 ||
         contribution_size_count < 0 ||
         (contribution_size_count > 0 &&
             (!contribution_packet_neurons || intermediate <= 0 || hidden <= 0))) {
@@ -345,6 +372,7 @@ qx_llama_route * qx_llama_route_open(
         return NULL;
     }
     route->layers = layers;
+    route->experts = experts;
     route->top_k = top_k;
     route->intermediate = intermediate;
     route->hidden = hidden;
@@ -459,6 +487,7 @@ void qx_llama_route_close(qx_llama_route * route) {
     free(route->seen_layers);
     free(route->seen_activations);
     free(route->seen_contributions);
+    free(route->neuron_mask);
     free(route->contribution_packet_neurons);
     free(route->scratch_quantized);
     free(route->scratch_row);
@@ -469,6 +498,31 @@ void qx_llama_route_close(qx_llama_route * route) {
     free(route->scratch_norms);
     free(route->scratch_selected);
     free(route);
+}
+
+int qx_llama_route_set_neuron_mask(
+        qx_llama_route * route,
+        const uint8_t * mask,
+        int32_t mask_count) {
+    const size_t expected = route && route->intermediate > 0 ?
+        (size_t) route->layers * route->experts * route->intermediate : 0;
+    if (!route || !mask || expected == 0 || mask_count < 0 || (size_t) mask_count != expected) {
+        return -1;
+    }
+    uint8_t * copied = malloc(expected);
+    if (!copied) {
+        return -2;
+    }
+    for (size_t index = 0; index < expected; ++index) {
+        if (mask[index] > 1) {
+            free(copied);
+            return -3;
+        }
+        copied[index] = mask[index];
+    }
+    free(route->neuron_mask);
+    route->neuron_mask = copied;
+    return 0;
 }
 
 const char * qx_llama_route_error(const qx_llama_route * route) {
@@ -505,6 +559,8 @@ int32_t qx_llama_route_eos(const qx_llama_route * route) {
 int qx_llama_route_step(
         qx_llama_route * route,
         int32_t input,
+        int32_t target,
+        float * target_nll,
         int32_t * output,
         int32_t * routes,
         int32_t route_count,
@@ -521,6 +577,7 @@ int qx_llama_route_step(
     const int32_t expected_reconstruction =
         route ? route->layers * route->top_k : 0;
     if (!route || !route->context || !output || !routes ||
+        ((target >= 0) != (target_nll != NULL)) || target >= route->n_vocab ||
         route_count != route->layers * route->top_k ||
         (route->intermediate > 0 && (!activations ||
             activation_count != route->layers * route->top_k * route->intermediate)) ||
@@ -605,6 +662,19 @@ int qx_llama_route_step(
         }
     }
     *output = best;
+    if (target >= 0) {
+        double maximum = logits[0];
+        for (int32_t index = 1; index < route->n_vocab; ++index) {
+            if (logits[index] > maximum) {
+                maximum = logits[index];
+            }
+        }
+        double exponential_sum = 0.0;
+        for (int32_t index = 0; index < route->n_vocab; ++index) {
+            exponential_sum += exp((double) logits[index] - maximum);
+        }
+        *target_nll = (float) (log(exponential_sum) + maximum - logits[target]);
+    }
     ++route->position;
     return 0;
 }

@@ -674,6 +674,62 @@ a grouped Metal kernel.
 The committed aggregate is
 `benchmarks/results/qwen3-30b-a3b-free-neuron-grouping-smoke-2026-08-25.json`.
 
+### Fixed eight-neuron mask quality control
+
+The next control applies a physically realizable fixed neuron mask to the real
+Qwen execution. Calibration ranks are packed into eight-neuron co-selection
+groups independently per observed `(layer, expert)`. Every expert then retains
+the same fixed number of groups; layer-pooled statistics provide a deterministic
+fallback for experts absent from calibration. The llama.cpp evaluation callback
+reads the post-SwiGLU tensor, zeros pruned neurons, writes it back before the down
+projection, and computes teacher-forced target NLL from the resulting logits.
+
+This is post-training structured pruning, not structured training: weights are
+not updated. Arbitrary learned groups are nevertheless physically realizable by
+permuting the corresponding gate/up rows and down columns together when an
+artifact is compiled.
+
+The all-one-mask control exactly reproduces the unmodified run over 17 scored
+held-out positions: mean NLL `4.7713409224`, zero NLL delta, and 100% top-1
+agreement. The callback mutation path is therefore semantically valid for this
+smoke.
+
+The fixed-group capacity curve is poor:
+
+| Retained expert neurons | NLL delta | Relative PPL delta | Top-1 agreement |
+|---:|---:|---:|---:|
+| 93.75% | +0.1081 | +11.42% | 88.24% |
+| 87.50% | +0.2264 | +25.40% | 70.59% |
+| 81.25% | +0.2292 | +25.76% | 64.71% |
+| 75.00% | +0.2837 | +32.80% | 47.06% |
+| 62.50% | +0.9703 | +163.87% | 35.29% |
+| 50.00% | +1.2657 | +254.55% | 41.18% |
+
+The two sweeps use four and six calibration positions respectively. The larger
+one observes 1,314 of 6,144 layer/expert pairs directly; all other masks use the
+layer fallback. The corpus is far too small for promotion, but the result is
+already sufficient to reject naive pruning as the capacity mechanism. It cannot
+remove even 6.25% of expert neurons without an order-of-magnitude miss against
+QX's 1% relative-PPL quality gate.
+
+The next credible capacity experiment requires an unquantized training
+checkpoint and a training stack. Distill or fine-tune with an explicit
+eight-neuron group penalty, freeze the chosen groups into gate/up-row and
+down-column permutations, quantize, and rerun this exact tensor-mask harness on
+the sealed quality corpus. Do not build the grouped storage kernel until a
+candidate reaches all of these gates:
+
+1. at least 50% expert-neuron removal;
+2. aggregate and worst-domain relative-PPL delta at or below 1%;
+3. no material HumanEval or GSM8K regression;
+4. stable group identities on held-out prompts rather than oracle-selected
+   groups;
+5. capacity accounting over the complete artifact, including dense weights and
+   KV state.
+
+The committed aggregate is
+`benchmarks/results/qwen3-30b-a3b-structured-nll-smoke-2026-08-25.json`.
+
 ## Evidence layout
 
 Keep generated model files and raw traces under ignored `external/` paths.

@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "classification": "post-training-fixed-group-mask-nll-smoke",
+  "promotion_evidence": false,
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "llama_revision": "5cedcbfbc1713c9557af31ddcf5fb4b5287112f8",
+  "group_neurons": 8,
+  "training_semantics": "calibration-contribution-frequency-and-co-selection-no-weight-updates",
+  "masking_semantics": "fixed-per-layer-expert-neuron-mask-applied-before-down-projection",
+  "quality_semantics": "teacher-forced-next-token-nll-on-one-disjoint-17-position-prompt",
+  "callback_control": {
+    "exact_mean_nll": 4.771340922397726,
+    "all_one_mask_mean_nll": 4.771340922397726,
+    "nll_delta": 0.0,
+    "top1_agreement": 1.0
+  },
+  "primary_sweep": {
+    "calibration_token_positions": 4,
+    "calibration_expert_observations": 1536,
+    "directly_calibrated_layer_experts": 1117,
+    "total_layer_experts": 6144,
+    "results": [
+      {"retained_fraction":0.75,"nll_delta":0.28369322419166565,"relative_perplexity_delta":0.3280254621705925,"top1_agreement":0.47058823529411764},
+      {"retained_fraction":0.625,"nll_delta":0.970302504213417,"relative_perplexity_delta":1.6387425693776034,"top1_agreement":0.35294117647058826},
+      {"retained_fraction":0.5,"nll_delta":1.2656709341441887,"relative_perplexity_delta":2.545470715646293,"top1_agreement":0.4117647058823529}
+    ]
+  },
+  "high_retention_knee_sweep": {
+    "calibration_token_positions": 6,
+    "calibration_expert_observations": 2304,
+    "directly_calibrated_layer_experts": 1314,
+    "total_layer_experts": 6144,
+    "results": [
+      {"retained_fraction":0.9375,"nll_delta":0.10814469263834159,"relative_perplexity_delta":0.11420895155637778,"top1_agreement":0.8823529411764706},
+      {"retained_fraction":0.875,"nll_delta":0.22637095696785892,"relative_perplexity_delta":0.2540407741683184,"top1_agreement":0.7058823529411765},
+      {"retained_fraction":0.8125,"nll_delta":0.22918754553093645,"relative_perplexity_delta":0.2575778700039473,"top1_agreement":0.6470588235294118}
+    ]
+  },
+  "conclusions": [
+    "The activation-tensor mutation path is semantically controlled: writing an all-one mask reproduces exact NLL and top-1 predictions on every scored position.",
+    "Naive post-training fixed-group pruning has no useful quality-capacity tier in this smoke. Removing only 6.25% of expert neurons increases relative perplexity by 11.42%; retaining 75% increases it by 32.80%.",
+    "This is not a rejection of structured co-training. Only 1314 of 6144 layer/expert pairs have direct calibration observations in the larger sweep, unseen experts use a layer-pooled fallback, no weights are updated, and only 17 held-out positions are scored.",
+    "A real co-design attempt must train or distill an unquantized checkpoint with an explicit eight-neuron group penalty, then require an all-domain held-out relative-perplexity delta at or below 1% before implementing a grouped storage kernel."
+  ]
+}

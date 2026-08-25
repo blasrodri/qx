@@ -144,6 +144,46 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Apply calibration-trained fixed neuron groups and measure teacher-forced NLL.
+    StructuredNll {
+        #[arg(long)]
+        model: PathBuf,
+        /// Exact individual-neuron contribution traces used only for mask training.
+        #[arg(long = "calibration", required = true)]
+        calibrations: Vec<PathBuf>,
+        /// Disjoint teacher-forced text used for the quality smoke.
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 8)]
+        group_neurons: usize,
+        /// Local per-expert contribution error used to label calibration neurons.
+        #[arg(long, default_value_t = 0.1)]
+        relative_error: f64,
+        /// Fixed group fractions retained in every expert. One is an all-one-mask control.
+        #[arg(long, value_delimiter = ',', default_value = "1,0.75,0.625,0.5")]
+        retained_fractions: Vec<f64>,
+        #[arg(long, default_value_t = 4096)]
+        context: usize,
+        #[arg(long, default_value_t = 48)]
+        layers: usize,
+        #[arg(long, default_value_t = 128)]
+        experts: usize,
+        #[arg(long, default_value_t = 8)]
+        top_k: usize,
+        #[arg(long, default_value_t = -1)]
+        gpu_layers: i32,
+        #[arg(long, default_value_t = 4)]
+        threads: i32,
+        #[arg(long, default_value_t = DEFAULT_EXPERT_NEURONS)]
+        expert_neurons: usize,
+        #[arg(long, default_value_t = 2048)]
+        hidden_size: usize,
+        /// Trusted model SHA-256. If omitted, the complete GGUF is hashed.
+        #[arg(long)]
+        model_sha256: Option<String>,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum)]
@@ -487,6 +527,61 @@ struct GroupOracleResult {
     p99_active_packet_bytes_per_token: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct StructuredNllReport {
+    schema_version: u32,
+    classification: &'static str,
+    promotion_evidence: bool,
+    training_semantics: &'static str,
+    masking_semantics: &'static str,
+    quality_semantics: &'static str,
+    model: String,
+    model_sha256: String,
+    llama_revision: String,
+    calibrations: Vec<String>,
+    calibration_token_positions: usize,
+    calibration_expert_observations: usize,
+    directly_calibrated_layer_experts: usize,
+    fallback_layer_experts: usize,
+    prompt_sha256: String,
+    prompt_tokens: usize,
+    scored_positions: usize,
+    group_neurons: usize,
+    groups_per_expert: usize,
+    relative_l2_training_target: f64,
+    exact: StructuredNllMeasurement,
+    results: Vec<StructuredNllResult>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StructuredNllMeasurement {
+    mean_nll: f64,
+    perplexity: f64,
+    top1_tokens: Vec<i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct StructuredNllResult {
+    requested_retained_fraction: f64,
+    retained_groups_per_expert: usize,
+    actual_retained_fraction: f64,
+    mean_nll: f64,
+    perplexity: f64,
+    nll_delta_vs_exact: f64,
+    relative_perplexity_vs_exact: f64,
+    top1_agreement_vs_exact: f64,
+}
+
+#[derive(Default)]
+struct StructuredCalibration {
+    token_positions: usize,
+    expert_observations: usize,
+    counts: HashMap<(usize, u16), Vec<u32>>,
+    observations: HashMap<(usize, u16), Vec<Vec<u16>>>,
+    layer_counts: HashMap<usize, Vec<u32>>,
+    layer_observations: HashMap<usize, Vec<Vec<u16>>>,
+}
+
 fn default_greedy_selection_semantics() -> String {
     "perfect-knowledge-greedy-minimum-next-residual".to_owned()
 }
@@ -599,7 +694,61 @@ fn main() -> Result<()> {
             expert_bytes,
             &output,
         ),
+        Command::StructuredNll {
+            model,
+            calibrations,
+            prompt,
+            group_neurons,
+            relative_error,
+            retained_fractions,
+            context,
+            layers,
+            experts,
+            top_k,
+            gpu_layers,
+            threads,
+            expert_neurons,
+            hidden_size,
+            model_sha256,
+            output,
+        } => structured_nll(StructuredNllArgs {
+            model,
+            calibrations,
+            prompt,
+            group_neurons,
+            relative_error,
+            retained_fractions,
+            context,
+            layers,
+            experts,
+            top_k,
+            gpu_layers,
+            threads,
+            expert_neurons,
+            hidden_size,
+            model_sha256,
+            output,
+        }),
     }
+}
+
+struct StructuredNllArgs {
+    model: PathBuf,
+    calibrations: Vec<PathBuf>,
+    prompt: String,
+    group_neurons: usize,
+    relative_error: f64,
+    retained_fractions: Vec<f64>,
+    context: usize,
+    layers: usize,
+    experts: usize,
+    top_k: usize,
+    gpu_layers: i32,
+    threads: i32,
+    expert_neurons: usize,
+    hidden_size: usize,
+    model_sha256: Option<String>,
+    output: PathBuf,
 }
 
 struct CaptureArgs {
@@ -693,6 +842,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
         llama_capture::OpenConfig {
             context: args.context,
             layers: args.layers,
+            experts: args.experts,
             top_k: args.top_k,
             gpu_layers: args.gpu_layers,
             threads: args.threads,
@@ -734,6 +884,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
     for token in prompt_tokens {
         let llama_capture::StepOutput {
             predicted,
+            target_nll: _,
             routes,
             activations,
             down_contribution,
@@ -769,6 +920,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
         }
         let llama_capture::StepOutput {
             predicted,
+            target_nll: _,
             routes,
             activations,
             down_contribution,
@@ -1579,6 +1731,318 @@ fn group_oracle(
         );
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn structured_nll(args: StructuredNllArgs) -> Result<()> {
+    if !args.model.is_file() {
+        bail!("model does not exist: {}", args.model.display());
+    }
+    if args.calibrations.is_empty() {
+        bail!("at least one calibration trace is required");
+    }
+    if args.layers == 0 || args.experts == 0 || args.top_k == 0 || args.expert_neurons == 0 {
+        bail!("layers, experts, top-k, and expert-neurons must be positive");
+    }
+    if args.group_neurons == 0 || !args.expert_neurons.is_multiple_of(args.group_neurons) {
+        bail!("group-neurons must divide expert-neurons exactly");
+    }
+    if !args.relative_error.is_finite() || args.relative_error <= 0.0 || args.relative_error >= 1.0
+    {
+        bail!("relative-error must be a finite value in (0, 1)");
+    }
+    if args.retained_fractions.is_empty()
+        || args
+            .retained_fractions
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0 || *value > 1.0)
+    {
+        bail!("retained-fractions must be finite values in (0, 1]");
+    }
+    let model_hash = match args.model_sha256.as_ref() {
+        Some(value) => {
+            validate_sha256(value)?;
+            value.clone()
+        }
+        None => sha256_file(&args.model)?,
+    };
+    let (header, calibration) =
+        train_structured_calibration(&args.calibrations, args.relative_error, args.expert_neurons)?;
+    if header.model_sha256 != model_hash {
+        bail!("calibration model SHA-256 does not match the requested model");
+    }
+    if (header.layers, header.experts, header.top_k) != (args.layers, args.experts, args.top_k) {
+        bail!("calibration shape does not match structured-NLL arguments");
+    }
+
+    let mut exact_capture = open_structured_capture(&args)?;
+    let tokens = exact_capture.tokenize(&args.prompt)?;
+    if tokens.len() < 2 {
+        bail!("structured-NLL prompt must tokenize to at least two tokens");
+    }
+    if tokens.len() > args.context {
+        bail!(
+            "structured-NLL prompt has {} tokens, exceeding context {}",
+            tokens.len(),
+            args.context
+        );
+    }
+    let exact = measure_teacher_forced_nll(&mut exact_capture, &tokens)?;
+    drop(exact_capture);
+
+    let groups_per_expert = args.expert_neurons / args.group_neurons;
+    let directly_calibrated_layer_experts = calibration.counts.len();
+    let total_layer_experts = args.layers * args.experts;
+    let mut results = Vec::new();
+    for &fraction in &args.retained_fractions {
+        let retained_groups =
+            ((groups_per_expert as f64 * fraction).ceil() as usize).clamp(1, groups_per_expert);
+        let mask = build_structured_mask(
+            &calibration,
+            args.layers,
+            args.experts,
+            args.expert_neurons,
+            args.group_neurons,
+            retained_groups,
+        )?;
+        let mut capture = open_structured_capture(&args)?;
+        capture.set_neuron_mask(&mask)?;
+        let measurement = measure_teacher_forced_nll(&mut capture, &tokens)?;
+        let agreements = measurement
+            .top1_tokens
+            .iter()
+            .zip(&exact.top1_tokens)
+            .filter(|(candidate, reference)| candidate == reference)
+            .count();
+        results.push(StructuredNllResult {
+            requested_retained_fraction: fraction,
+            retained_groups_per_expert: retained_groups,
+            actual_retained_fraction: retained_groups as f64 / groups_per_expert as f64,
+            mean_nll: measurement.mean_nll,
+            perplexity: measurement.perplexity,
+            nll_delta_vs_exact: measurement.mean_nll - exact.mean_nll,
+            relative_perplexity_vs_exact: (measurement.mean_nll - exact.mean_nll).exp() - 1.0,
+            top1_agreement_vs_exact: agreements as f64 / exact.top1_tokens.len() as f64,
+        });
+    }
+
+    let report = StructuredNllReport {
+        schema_version: 1,
+        classification: "post-training-fixed-group-mask-nll-smoke",
+        promotion_evidence: false,
+        training_semantics: "calibration-contribution-frequency-and-co-selection-no-weight-updates",
+        masking_semantics: "fixed-per-layer-expert-neuron-mask-applied-before-down-projection",
+        quality_semantics: "teacher-forced-next-token-nll-on-one-disjoint-prompt",
+        model: args.model.display().to_string(),
+        model_sha256: model_hash,
+        llama_revision: header.llama_revision,
+        calibrations: args
+            .calibrations
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        calibration_token_positions: calibration.token_positions,
+        calibration_expert_observations: calibration.expert_observations,
+        directly_calibrated_layer_experts,
+        fallback_layer_experts: total_layer_experts - directly_calibrated_layer_experts,
+        prompt_sha256: format!("{:x}", Sha256::digest(args.prompt.as_bytes())),
+        prompt_tokens: tokens.len(),
+        scored_positions: tokens.len() - 1,
+        group_neurons: args.group_neurons,
+        groups_per_expert,
+        relative_l2_training_target: args.relative_error,
+        exact,
+        results,
+    };
+    let mut writer = BufWriter::new(
+        File::create(&args.output).with_context(|| format!("create {}", args.output.display()))?,
+    );
+    serde_json::to_writer_pretty(&mut writer, &report)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    println!("structured NLL report: {}", args.output.display());
+    println!(
+        "exact: NLL {:.6}, PPL {:.4}, scored positions {}",
+        report.exact.mean_nll, report.exact.perplexity, report.scored_positions
+    );
+    for result in &report.results {
+        println!(
+            "retain {:.1}%: NLL {:.6} ({:+.6}), relative PPL {:+.2}%, top-1 {:.1}%",
+            result.actual_retained_fraction * 100.0,
+            result.mean_nll,
+            result.nll_delta_vs_exact,
+            result.relative_perplexity_vs_exact * 100.0,
+            result.top1_agreement_vs_exact * 100.0,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn structured_nll(_args: StructuredNllArgs) -> Result<()> {
+    bail!("structured NLL currently requires the macOS llama.cpp bridge")
+}
+
+fn train_structured_calibration(
+    paths: &[PathBuf],
+    relative_error: f64,
+    expert_neurons: usize,
+) -> Result<(TraceHeader, StructuredCalibration)> {
+    let header = read_trace_header(&paths[0])?;
+    let mut calibration = StructuredCalibration::default();
+    for path in paths {
+        let candidate_header = read_trace_header(path)?;
+        validate_compatible_headers(&header, &candidate_header)?;
+        visit_trace(path, &header, |token| {
+            let routes = token.routes;
+            let contribution = token.packet_down_contribution.ok_or_else(|| {
+                anyhow::anyhow!("calibration token lacks packet down contribution")
+            })?;
+            let metrics = contribution
+                .packets
+                .into_iter()
+                .find(|metrics| metrics.packet_neurons == 1)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("calibration trace lacks individual-neuron metrics")
+                })?;
+            validate_contribution_metrics(&metrics, &header)?;
+            let orders = metrics.ranked_packet_indices.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("calibration trace lacks ranked individual-neuron identities")
+            })?;
+            if metrics.ranked_relative_squared_error[0][0].len() != expert_neurons {
+                bail!("calibration expert width does not match expert-neurons");
+            }
+            calibration.token_positions += 1;
+            for layer in 0..header.layers {
+                for slot in 0..header.top_k {
+                    let expert = routes[layer][slot];
+                    let (selected, _, _) = select_contribution_packets(
+                        &metrics.ranked_relative_squared_error[layer][slot],
+                        relative_error,
+                    )?;
+                    let selected_neurons = orders[layer][slot][..selected].to_vec();
+                    let counts = calibration
+                        .counts
+                        .entry((layer, expert))
+                        .or_insert_with(|| vec![0u32; expert_neurons]);
+                    let layer_counts = calibration
+                        .layer_counts
+                        .entry(layer)
+                        .or_insert_with(|| vec![0u32; expert_neurons]);
+                    for &neuron in &selected_neurons {
+                        counts[neuron as usize] += 1;
+                        layer_counts[neuron as usize] += 1;
+                    }
+                    calibration
+                        .observations
+                        .entry((layer, expert))
+                        .or_default()
+                        .push(selected_neurons.clone());
+                    calibration
+                        .layer_observations
+                        .entry(layer)
+                        .or_default()
+                        .push(selected_neurons);
+                    calibration.expert_observations += 1;
+                }
+            }
+            Ok(())
+        })?;
+    }
+    if calibration.token_positions == 0 {
+        bail!("calibration traces contain no token positions");
+    }
+    Ok((header, calibration))
+}
+
+fn build_structured_mask(
+    calibration: &StructuredCalibration,
+    layers: usize,
+    experts: usize,
+    expert_neurons: usize,
+    group_neurons: usize,
+    retained_groups: usize,
+) -> Result<Vec<u8>> {
+    let groups_per_expert = expert_neurons / group_neurons;
+    if retained_groups == 0 || retained_groups > groups_per_expert {
+        bail!("retained group count is outside the valid range");
+    }
+    let mut mask = vec![0u8; layers * experts * expert_neurons];
+    for layer in 0..layers {
+        let fallback_counts = calibration
+            .layer_counts
+            .get(&layer)
+            .ok_or_else(|| anyhow::anyhow!("calibration has no observations for layer {layer}"))?;
+        let fallback_observations =
+            calibration.layer_observations.get(&layer).ok_or_else(|| {
+                anyhow::anyhow!("calibration has no selection signatures for layer {layer}")
+            })?;
+        for expert in 0..experts {
+            let key = (layer, expert as u16);
+            let counts = calibration.counts.get(&key).unwrap_or(fallback_counts);
+            let observations = calibration
+                .observations
+                .get(&key)
+                .unwrap_or(fallback_observations);
+            let layout = signature_packed_groups(observations, expert_neurons, group_neurons);
+            let mut scores = vec![0u64; groups_per_expert];
+            for neuron in 0..expert_neurons {
+                scores[layout[neuron]] += counts[neuron] as u64;
+            }
+            let mut group_order = (0..groups_per_expert).collect::<Vec<_>>();
+            group_order.sort_unstable_by_key(|&group| (Reverse(scores[group]), group));
+            let mut retained = vec![false; groups_per_expert];
+            for group in group_order.into_iter().take(retained_groups) {
+                retained[group] = true;
+            }
+            let base = (layer * experts + expert) * expert_neurons;
+            for neuron in 0..expert_neurons {
+                mask[base + neuron] = u8::from(retained[layout[neuron]]);
+            }
+        }
+    }
+    Ok(mask)
+}
+
+#[cfg(target_os = "macos")]
+fn open_structured_capture(args: &StructuredNllArgs) -> Result<llama_capture::Capture> {
+    llama_capture::Capture::open(
+        &args.model,
+        llama_capture::OpenConfig {
+            context: args.context,
+            layers: args.layers,
+            experts: args.experts,
+            top_k: args.top_k,
+            gpu_layers: args.gpu_layers,
+            threads: args.threads,
+            intermediate: Some(args.expert_neurons),
+            hidden: args.hidden_size,
+            contribution_packet_neurons: &[],
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn measure_teacher_forced_nll(
+    capture: &mut llama_capture::Capture,
+    tokens: &[i32],
+) -> Result<StructuredNllMeasurement> {
+    let mut nll = 0.0f64;
+    let mut top1_tokens = Vec::with_capacity(tokens.len() - 1);
+    for pair in tokens.windows(2) {
+        let output = capture.step_target(pair[0], pair[1])?;
+        nll += output
+            .target_nll
+            .ok_or_else(|| anyhow::anyhow!("llama bridge omitted target NLL"))?
+            as f64;
+        top1_tokens.push(output.predicted);
+    }
+    let mean_nll = nll / top1_tokens.len() as f64;
+    Ok(StructuredNllMeasurement {
+        mean_nll,
+        perplexity: mean_nll.exp(),
+        top1_tokens,
+    })
 }
 
 fn frequency_packed_groups(frequency: &[u32], group_neurons: usize) -> Vec<usize> {
@@ -2448,6 +2912,7 @@ mod llama_capture {
             path: *const c_char,
             context_length: u32,
             layers: c_int,
+            experts: c_int,
             top_k: c_int,
             gpu_layers: c_int,
             threads: c_int,
@@ -2456,6 +2921,11 @@ mod llama_capture {
             contribution_packet_neurons: *const c_int,
             contribution_size_count: c_int,
         ) -> *mut c_void;
+        fn qx_llama_route_set_neuron_mask(
+            route: *mut c_void,
+            mask: *const u8,
+            mask_count: c_int,
+        ) -> c_int;
         fn qx_llama_route_close(route: *mut c_void);
         fn qx_llama_route_error(route: *const c_void) -> *const c_char;
         fn qx_llama_route_tokenize(
@@ -2469,6 +2939,8 @@ mod llama_capture {
         fn qx_llama_route_step(
             route: *mut c_void,
             input: c_int,
+            target: c_int,
+            target_nll: *mut f32,
             output: *mut c_int,
             routes: *mut c_int,
             route_count: c_int,
@@ -2494,6 +2966,7 @@ mod llama_capture {
 
     pub struct StepOutput {
         pub predicted: i32,
+        pub target_nll: Option<f32>,
         pub routes: Vec<Vec<u16>>,
         pub activations: Option<Vec<f32>>,
         pub down_contribution: Option<PacketDownContribution>,
@@ -2502,6 +2975,7 @@ mod llama_capture {
     pub struct OpenConfig<'a> {
         pub context: usize,
         pub layers: usize,
+        pub experts: usize,
         pub top_k: usize,
         pub gpu_layers: i32,
         pub threads: i32,
@@ -2515,6 +2989,7 @@ mod llama_capture {
             let OpenConfig {
                 context,
                 layers,
+                experts,
                 top_k,
                 gpu_layers,
                 threads,
@@ -2536,6 +3011,7 @@ mod llama_capture {
                     path.as_ptr(),
                     context.try_into()?,
                     layers.try_into()?,
+                    experts.try_into()?,
                     top_k.try_into()?,
                     gpu_layers,
                     threads,
@@ -2601,8 +3077,27 @@ mod llama_capture {
             unsafe { qx_llama_route_eos(self.raw) }
         }
 
+        pub fn set_neuron_mask(&mut self, mask: &[u8]) -> Result<()> {
+            let status = unsafe {
+                qx_llama_route_set_neuron_mask(self.raw, mask.as_ptr(), mask.len().try_into()?)
+            };
+            if status != 0 {
+                bail!("llama route mask setup failed ({status}): {}", self.error());
+            }
+            Ok(())
+        }
+
         pub fn step(&mut self, input: i32) -> Result<StepOutput> {
+            self.step_optional_target(input, None)
+        }
+
+        pub fn step_target(&mut self, input: i32, target: i32) -> Result<StepOutput> {
+            self.step_optional_target(input, Some(target))
+        }
+
+        fn step_optional_target(&mut self, input: i32, target: Option<i32>) -> Result<StepOutput> {
             let mut output = 0i32;
+            let mut target_nll = 0.0f32;
             let mut flat = vec![-1i32; self.layers * self.top_k];
             let mut activations = self
                 .intermediate
@@ -2632,6 +3127,10 @@ mod llama_capture {
                 qx_llama_route_step(
                     self.raw,
                     input,
+                    target.unwrap_or(-1),
+                    target
+                        .map(|_| &mut target_nll as *mut f32)
+                        .unwrap_or(std::ptr::null_mut()),
                     &mut output,
                     flat.as_mut_ptr(),
                     flat.len().try_into()?,
@@ -2675,6 +3174,7 @@ mod llama_capture {
                 .transpose()?;
             Ok(StepOutput {
                 predicted: output,
+                target_nll: target.map(|_| target_nll),
                 routes,
                 activations,
                 down_contribution,
@@ -2836,6 +3336,43 @@ mod tests {
         assert_eq!(groups[0], groups[1]);
         assert_eq!(groups[2], groups[3]);
         assert_ne!(groups[0], groups[2]);
+    }
+
+    #[test]
+    fn structured_mask_enforces_the_same_group_budget_for_fallback_experts() {
+        let mut calibration = StructuredCalibration::default();
+        calibration
+            .counts
+            .insert((0, 0), vec![3, 3, 0, 0, 1, 1, 0, 0]);
+        calibration
+            .observations
+            .insert((0, 0), vec![vec![0, 1], vec![0, 1, 4, 5]]);
+        calibration
+            .layer_counts
+            .insert(0, vec![2, 2, 0, 0, 1, 1, 0, 0]);
+        calibration
+            .layer_observations
+            .insert(0, vec![vec![0, 1], vec![0, 1, 4, 5]]);
+
+        let mask = build_structured_mask(&calibration, 1, 2, 8, 2, 2).unwrap();
+        assert_eq!(mask.len(), 16);
+        assert_eq!(
+            mask[..8]
+                .iter()
+                .map(|&value| usize::from(value))
+                .sum::<usize>(),
+            4
+        );
+        assert_eq!(
+            mask[8..]
+                .iter()
+                .map(|&value| usize::from(value))
+                .sum::<usize>(),
+            4
+        );
+
+        let all = build_structured_mask(&calibration, 1, 2, 8, 2, 4).unwrap();
+        assert!(all.into_iter().all(|value| value == 1));
     }
 
     #[test]
