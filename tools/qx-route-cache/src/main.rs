@@ -13,6 +13,7 @@ const SCHEMA_VERSION: u32 = 1;
 const SIMULATION_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_Q3_EXPERT_BYTES: u64 = 2_064_384;
 const DEFAULT_EXPERT_NEURONS: usize = 768;
+const MAX_GREEDY_CONTRIBUTION_PACKETS: usize = 64;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -128,6 +129,21 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Learn fixed non-contiguous neuron groups and measure held-out packet coverage.
+    GroupOracle {
+        #[arg(long)]
+        calibration: PathBuf,
+        #[arg(long)]
+        trace: PathBuf,
+        #[arg(long, default_value_t = 32)]
+        group_neurons: usize,
+        #[arg(long, value_delimiter = ',', default_value = "0.25,0.1,0.05")]
+        relative_errors: Vec<f64>,
+        #[arg(long, default_value_t = DEFAULT_Q3_EXPERT_BYTES)]
+        expert_bytes: u64,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum)]
@@ -232,9 +248,15 @@ struct PacketDownContribution {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PacketContributionMetrics {
     packet_neurons: usize,
+    #[serde(default = "default_greedy_selection_semantics")]
+    selection_semantics: String,
     squared_l2: Vec<Vec<Vec<f32>>>,
-    /// Relative squared error after each greedy selection, from one packet through all packets.
-    greedy_relative_squared_error: Vec<Vec<Vec<f32>>>,
+    /// Relative squared error after each strategy-ranked selection, from one packet through all.
+    #[serde(alias = "greedy_relative_squared_error")]
+    ranked_relative_squared_error: Vec<Vec<Vec<f32>>>,
+    /// Packet IDs in selection order. Absent in traces captured before rank identity support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ranked_packet_indices: Option<Vec<Vec<Vec<u16>>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -379,6 +401,7 @@ struct ContributionOracleReport {
 struct ContributionOracleResult {
     packet_neurons: usize,
     packets_per_expert: usize,
+    selection_semantics: String,
     relative_l2_error_target: f64,
     expert_observations: usize,
     unmet_target_observations: usize,
@@ -415,6 +438,65 @@ struct ContributionOracleAccumulator {
     achieved_relative_l2_error: Vec<f64>,
     active_bytes_per_token: Vec<u64>,
     unmet_target_observations: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GroupOracleReport {
+    schema_version: u32,
+    classification: &'static str,
+    layout_semantics: &'static str,
+    quality_semantics: &'static str,
+    calibration: String,
+    trace: String,
+    trace_header: TraceHeader,
+    expert_bytes: u64,
+    expert_neurons: usize,
+    group_neurons: usize,
+    results: Vec<GroupOracleResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct GroupOracleResult {
+    relative_l2_error_target: f64,
+    heldout_expert_observations: usize,
+    fallback_identity_observations: usize,
+    mean_individual_neurons: f64,
+    mean_individual_fraction: f64,
+    mean_ideal_groups: f64,
+    mean_frequency_packed_groups: f64,
+    p50_frequency_packed_groups: u64,
+    p95_frequency_packed_groups: u64,
+    p99_frequency_packed_groups: u64,
+    mean_frequency_group_load_amplification: f64,
+    mean_frequency_resident_neuron_fraction: f64,
+    mean_signature_packed_groups: f64,
+    p50_signature_packed_groups: u64,
+    p95_signature_packed_groups: u64,
+    p99_signature_packed_groups: u64,
+    mean_signature_group_load_amplification: f64,
+    mean_signature_resident_neuron_fraction: f64,
+    calibrated_only_observations: usize,
+    calibrated_only_mean_frequency_group_load_amplification: f64,
+    calibrated_only_mean_frequency_resident_neuron_fraction: f64,
+    calibrated_only_p95_frequency_groups: u64,
+    calibrated_only_mean_signature_group_load_amplification: f64,
+    calibrated_only_mean_signature_resident_neuron_fraction: f64,
+    calibrated_only_p95_signature_groups: u64,
+    mean_active_packet_bytes_per_token: f64,
+    p95_active_packet_bytes_per_token: u64,
+    p99_active_packet_bytes_per_token: u64,
+}
+
+fn default_greedy_selection_semantics() -> String {
+    "perfect-knowledge-greedy-minimum-next-residual".to_owned()
+}
+
+fn contribution_selection_semantics(packets: usize) -> &'static str {
+    if packets <= MAX_GREEDY_CONTRIBUTION_PACKETS {
+        "perfect-knowledge-greedy-minimum-next-residual"
+    } else {
+        "perfect-knowledge-descending-packet-output-norm"
+    }
 }
 
 fn main() -> Result<()> {
@@ -499,6 +581,21 @@ fn main() -> Result<()> {
             &trace,
             &relative_errors,
             &selected_fractions,
+            expert_bytes,
+            &output,
+        ),
+        Command::GroupOracle {
+            calibration,
+            trace,
+            group_neurons,
+            relative_errors,
+            expert_bytes,
+            output,
+        } => group_oracle(
+            &calibration,
+            &trace,
+            group_neurons,
+            &relative_errors,
             expert_bytes,
             &output,
         ),
@@ -944,6 +1041,7 @@ fn contribution_oracle(
     let header = read_trace_header(trace)?;
     let mut accumulators = HashMap::<(usize, usize), ContributionOracleAccumulator>::new();
     let mut packet_counts = HashMap::<usize, usize>::new();
+    let mut packet_selection_semantics = HashMap::<usize, String>::new();
     let mut fixed_budget_errors = HashMap::<(usize, usize), Vec<f64>>::new();
     let mut reconstruction_errors = Vec::<f64>::new();
     let mut token_records = 0usize;
@@ -967,7 +1065,7 @@ fn contribution_oracle(
         }
         for packet_metrics in contribution.packets {
             validate_contribution_metrics(&packet_metrics, &header)?;
-            let packets_per_expert = packet_metrics.greedy_relative_squared_error[0][0].len();
+            let packets_per_expert = packet_metrics.ranked_relative_squared_error[0][0].len();
             if !expert_bytes.is_multiple_of(packets_per_expert as u64) {
                 bail!(
                     "expert bytes {expert_bytes} are not divisible by {packets_per_expert} packets"
@@ -982,9 +1080,21 @@ fn contribution_oracle(
                     packet_metrics.packet_neurons
                 );
             }
+            if packet_selection_semantics
+                .insert(
+                    packet_metrics.packet_neurons,
+                    packet_metrics.selection_semantics.clone(),
+                )
+                .is_some_and(|previous| previous != packet_metrics.selection_semantics)
+            {
+                bail!(
+                    "inconsistent selection semantics for {} neurons",
+                    packet_metrics.packet_neurons
+                );
+            }
             let packet_bytes = expert_bytes / packets_per_expert as u64;
             let mut token_selected = vec![0u64; relative_errors.len()];
-            for layer in &packet_metrics.greedy_relative_squared_error {
+            for layer in &packet_metrics.ranked_relative_squared_error {
                 for curve in layer {
                     for (target_index, &target) in relative_errors.iter().enumerate() {
                         let (selected, achieved, met) = select_contribution_packets(curve, target)?;
@@ -1036,6 +1146,7 @@ fn contribution_oracle(
             results.push(ContributionOracleResult {
                 packet_neurons,
                 packets_per_expert,
+                selection_semantics: packet_selection_semantics[&packet_neurons].clone(),
                 relative_l2_error_target: target,
                 expert_observations,
                 unmet_target_observations: accumulator.unmet_target_observations,
@@ -1102,8 +1213,8 @@ fn contribution_oracle(
         .unwrap_or(0.0);
     let report = ContributionOracleReport {
         schema_version: 1,
-        classification: "down-contribution-greedy-oracle-smoke",
-        selection_semantics: "perfect-knowledge-greedy-minimum-next-residual",
+        classification: "down-contribution-ranked-oracle-smoke",
+        selection_semantics: "per-packet-size-see-results",
         quality_semantics: "per-expert-quantized-down-output-relative-l2-not-logit-or-nll",
         trace: trace.display().to_string(),
         trace_header: header,
@@ -1132,7 +1243,7 @@ fn contribution_oracle(
     );
     for result in &report.results {
         println!(
-            "{} neurons {:.3}% relative L2: mean {:.2}/{}, p95 {}, {:.2} MiB/token, unmet {}",
+            "{} neurons {:.3}% relative L2: mean {:.2}/{}, p95 {}, {:.2} MiB/token, unmet {}, {}",
             result.packet_neurons,
             result.relative_l2_error_target * 100.0,
             result.mean_selected_packets_per_expert,
@@ -1140,6 +1251,7 @@ fn contribution_oracle(
             result.p95_selected_packets_per_expert,
             result.mean_active_packet_bytes_per_token / (1024.0 * 1024.0),
             result.unmet_target_observations,
+            result.selection_semantics,
         );
     }
     for result in &report.fixed_budget_results {
@@ -1155,6 +1267,353 @@ fn contribution_oracle(
         );
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct GroupOracleAccumulator {
+    individual_neurons: Vec<u64>,
+    ideal_groups: Vec<u64>,
+    learned_groups: Vec<u64>,
+    signature_groups: Vec<u64>,
+    calibrated_individual_neurons: Vec<u64>,
+    calibrated_learned_groups: Vec<u64>,
+    calibrated_signature_groups: Vec<u64>,
+    active_bytes_per_token: Vec<u64>,
+    fallback_identity_observations: usize,
+}
+
+fn group_oracle(
+    calibration: &Path,
+    trace: &Path,
+    group_neurons: usize,
+    relative_errors: &[f64],
+    expert_bytes: u64,
+    output: &Path,
+) -> Result<()> {
+    if group_neurons == 0 {
+        bail!("group-neurons must be positive");
+    }
+    if relative_errors.is_empty()
+        || relative_errors
+            .iter()
+            .any(|error| !error.is_finite() || *error <= 0.0 || *error >= 1.0)
+    {
+        bail!("relative error targets must be finite values in (0, 1)");
+    }
+    let trace_header = read_trace_header(trace)?;
+    let calibration_header = read_trace_header(calibration)?;
+    validate_compatible_headers(&trace_header, &calibration_header)?;
+
+    let mut expert_neurons = None::<usize>;
+    let mut frequencies = HashMap::<(usize, u16, usize), Vec<u32>>::new();
+    let mut selection_observations = HashMap::<(usize, u16, usize), Vec<Vec<u16>>>::new();
+    visit_trace(calibration, &trace_header, |token| {
+        let routes = token.routes;
+        let contribution = token
+            .packet_down_contribution
+            .ok_or_else(|| anyhow::anyhow!("calibration token lacks packet down contribution"))?;
+        let metrics = contribution
+            .packets
+            .into_iter()
+            .find(|metrics| metrics.packet_neurons == 1)
+            .ok_or_else(|| anyhow::anyhow!("calibration trace lacks individual-neuron metrics"))?;
+        validate_contribution_metrics(&metrics, &trace_header)?;
+        let orders = metrics.ranked_packet_indices.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("calibration trace lacks ranked individual-neuron identities")
+        })?;
+        let width = metrics.ranked_relative_squared_error[0][0].len();
+        if expert_neurons
+            .replace(width)
+            .is_some_and(|previous| previous != width)
+        {
+            bail!("calibration trace has inconsistent expert width");
+        }
+        for layer in 0..trace_header.layers {
+            for slot in 0..trace_header.top_k {
+                let expert = routes[layer][slot];
+                let curve = &metrics.ranked_relative_squared_error[layer][slot];
+                let order = &orders[layer][slot];
+                for (target_index, &target) in relative_errors.iter().enumerate() {
+                    let (selected, _, _) = select_contribution_packets(curve, target)?;
+                    let counts = frequencies
+                        .entry((layer, expert, target_index))
+                        .or_insert_with(|| vec![0u32; width]);
+                    for &neuron in &order[..selected] {
+                        counts[neuron as usize] += 1;
+                    }
+                    selection_observations
+                        .entry((layer, expert, target_index))
+                        .or_default()
+                        .push(order[..selected].to_vec());
+                }
+            }
+        }
+        Ok(())
+    })?;
+    let expert_neurons =
+        expert_neurons.ok_or_else(|| anyhow::anyhow!("empty calibration trace"))?;
+    if !expert_neurons.is_multiple_of(group_neurons) {
+        bail!("group-neurons must divide the expert neuron count exactly");
+    }
+    let groups_per_expert = expert_neurons / group_neurons;
+    if !expert_bytes.is_multiple_of(groups_per_expert as u64) {
+        bail!("expert-bytes must divide evenly across learned groups");
+    }
+    let packet_bytes = expert_bytes / groups_per_expert as u64;
+    let layouts = frequencies
+        .iter()
+        .map(|(&key, counts)| (key, frequency_packed_groups(counts, group_neurons)))
+        .collect::<HashMap<_, _>>();
+    let signature_layouts = selection_observations
+        .iter()
+        .map(|(&key, observations)| {
+            (
+                key,
+                signature_packed_groups(observations, expert_neurons, group_neurons),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut accumulators = (0..relative_errors.len())
+        .map(|_| GroupOracleAccumulator::default())
+        .collect::<Vec<_>>();
+    visit_trace(trace, &trace_header, |token| {
+        let routes = token.routes;
+        let contribution = token
+            .packet_down_contribution
+            .ok_or_else(|| anyhow::anyhow!("held-out token lacks packet down contribution"))?;
+        let metrics = contribution
+            .packets
+            .into_iter()
+            .find(|metrics| metrics.packet_neurons == 1)
+            .ok_or_else(|| anyhow::anyhow!("held-out trace lacks individual-neuron metrics"))?;
+        validate_contribution_metrics(&metrics, &trace_header)?;
+        let orders = metrics.ranked_packet_indices.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("held-out trace lacks ranked individual-neuron identities")
+        })?;
+        if metrics.ranked_relative_squared_error[0][0].len() != expert_neurons {
+            bail!("held-out trace expert width does not match calibration");
+        }
+        let mut token_groups = vec![0u64; relative_errors.len()];
+        for layer in 0..trace_header.layers {
+            for slot in 0..trace_header.top_k {
+                let expert = routes[layer][slot];
+                let curve = &metrics.ranked_relative_squared_error[layer][slot];
+                let order = &orders[layer][slot];
+                for (target_index, &target) in relative_errors.iter().enumerate() {
+                    let (selected, _, _) = select_contribution_packets(curve, target)?;
+                    let identity;
+                    let (groups, signature_groups, calibrated) =
+                        if let (Some(groups), Some(signature_groups)) = (
+                            layouts.get(&(layer, expert, target_index)),
+                            signature_layouts.get(&(layer, expert, target_index)),
+                        ) {
+                            (groups, signature_groups, true)
+                        } else {
+                            identity = (0..expert_neurons)
+                                .map(|neuron| neuron / group_neurons)
+                                .collect::<Vec<_>>();
+                            accumulators[target_index].fallback_identity_observations += 1;
+                            (&identity, &identity, false)
+                        };
+                    let mut touched = vec![false; groups_per_expert];
+                    let mut signature_touched = vec![false; groups_per_expert];
+                    for &neuron in &order[..selected] {
+                        touched[groups[neuron as usize]] = true;
+                        signature_touched[signature_groups[neuron as usize]] = true;
+                    }
+                    let learned = touched.into_iter().filter(|value| *value).count();
+                    let signature = signature_touched.into_iter().filter(|value| *value).count();
+                    accumulators[target_index]
+                        .individual_neurons
+                        .push(selected as u64);
+                    accumulators[target_index]
+                        .ideal_groups
+                        .push(selected.div_ceil(group_neurons) as u64);
+                    accumulators[target_index]
+                        .learned_groups
+                        .push(learned as u64);
+                    accumulators[target_index]
+                        .signature_groups
+                        .push(signature as u64);
+                    if calibrated {
+                        accumulators[target_index]
+                            .calibrated_individual_neurons
+                            .push(selected as u64);
+                        accumulators[target_index]
+                            .calibrated_learned_groups
+                            .push(learned as u64);
+                        accumulators[target_index]
+                            .calibrated_signature_groups
+                            .push(signature as u64);
+                    }
+                    token_groups[target_index] += signature as u64;
+                }
+            }
+        }
+        for (target_index, groups) in token_groups.into_iter().enumerate() {
+            accumulators[target_index]
+                .active_bytes_per_token
+                .push(groups.saturating_mul(packet_bytes));
+        }
+        Ok(())
+    })?;
+
+    let mut results = Vec::new();
+    for (target_index, &target) in relative_errors.iter().enumerate() {
+        let accumulator = &accumulators[target_index];
+        if accumulator.individual_neurons.is_empty() {
+            bail!("held-out trace contains no expert observations");
+        }
+        let observations = accumulator.individual_neurons.len();
+        let individual_total = accumulator.individual_neurons.iter().sum::<u64>();
+        let ideal_total = accumulator.ideal_groups.iter().sum::<u64>();
+        let learned_total = accumulator.learned_groups.iter().sum::<u64>();
+        let signature_total = accumulator.signature_groups.iter().sum::<u64>();
+        let calibrated_individual_total = accumulator
+            .calibrated_individual_neurons
+            .iter()
+            .sum::<u64>();
+        let calibrated_learned_total = accumulator.calibrated_learned_groups.iter().sum::<u64>();
+        let calibrated_signature_total =
+            accumulator.calibrated_signature_groups.iter().sum::<u64>();
+        let calibrated_observations = accumulator.calibrated_learned_groups.len();
+        results.push(GroupOracleResult {
+            relative_l2_error_target: target,
+            heldout_expert_observations: observations,
+            fallback_identity_observations: accumulator.fallback_identity_observations,
+            mean_individual_neurons: individual_total as f64 / observations as f64,
+            mean_individual_fraction: individual_total as f64
+                / (observations * expert_neurons) as f64,
+            mean_ideal_groups: ideal_total as f64 / observations as f64,
+            mean_frequency_packed_groups: learned_total as f64 / observations as f64,
+            p50_frequency_packed_groups: percentile(&accumulator.learned_groups, 0.50),
+            p95_frequency_packed_groups: percentile(&accumulator.learned_groups, 0.95),
+            p99_frequency_packed_groups: percentile(&accumulator.learned_groups, 0.99),
+            mean_frequency_group_load_amplification: learned_total as f64 * group_neurons as f64
+                / individual_total.max(1) as f64,
+            mean_frequency_resident_neuron_fraction: learned_total as f64
+                / (observations * groups_per_expert) as f64,
+            mean_signature_packed_groups: signature_total as f64 / observations as f64,
+            p50_signature_packed_groups: percentile(&accumulator.signature_groups, 0.50),
+            p95_signature_packed_groups: percentile(&accumulator.signature_groups, 0.95),
+            p99_signature_packed_groups: percentile(&accumulator.signature_groups, 0.99),
+            mean_signature_group_load_amplification: signature_total as f64 * group_neurons as f64
+                / individual_total.max(1) as f64,
+            mean_signature_resident_neuron_fraction: signature_total as f64
+                / (observations * groups_per_expert) as f64,
+            calibrated_only_observations: calibrated_observations,
+            calibrated_only_mean_frequency_group_load_amplification: calibrated_learned_total
+                as f64
+                * group_neurons as f64
+                / calibrated_individual_total.max(1) as f64,
+            calibrated_only_mean_frequency_resident_neuron_fraction: calibrated_learned_total
+                as f64
+                / (calibrated_observations.max(1) * groups_per_expert) as f64,
+            calibrated_only_p95_frequency_groups: percentile(
+                &accumulator.calibrated_learned_groups,
+                0.95,
+            ),
+            calibrated_only_mean_signature_group_load_amplification: calibrated_signature_total
+                as f64
+                * group_neurons as f64
+                / calibrated_individual_total.max(1) as f64,
+            calibrated_only_mean_signature_resident_neuron_fraction: calibrated_signature_total
+                as f64
+                / (calibrated_observations.max(1) * groups_per_expert) as f64,
+            calibrated_only_p95_signature_groups: percentile(
+                &accumulator.calibrated_signature_groups,
+                0.95,
+            ),
+            mean_active_packet_bytes_per_token: accumulator
+                .active_bytes_per_token
+                .iter()
+                .sum::<u64>() as f64
+                / accumulator.active_bytes_per_token.len().max(1) as f64,
+            p95_active_packet_bytes_per_token: percentile(
+                &accumulator.active_bytes_per_token,
+                0.95,
+            ),
+            p99_active_packet_bytes_per_token: percentile(
+                &accumulator.active_bytes_per_token,
+                0.99,
+            ),
+        });
+    }
+
+    let report = GroupOracleReport {
+        schema_version: 1,
+        classification: "learned-neuron-group-coverage-smoke",
+        layout_semantics: "per-layer-expert-target-frequency-and-co-selection-signature-fixed-groups",
+        quality_semantics: "group-coverage-of-individual-contribution-prefix-not-grouped-logit-or-nll",
+        calibration: calibration.display().to_string(),
+        trace: trace.display().to_string(),
+        trace_header,
+        expert_bytes,
+        expert_neurons,
+        group_neurons,
+        results,
+    };
+    let mut writer = BufWriter::new(
+        File::create(output).with_context(|| format!("create {}", output.display()))?,
+    );
+    serde_json::to_writer_pretty(&mut writer, &report)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    println!("group oracle report: {}", output.display());
+    for result in &report.results {
+        println!(
+            "{:.1}% error: individual {:.1}%, frequency {:.1}%/{:.1}% calibrated, signature {:.1}%/{:.1}% calibrated, signature amplification {:.2}x/{:.2}x calibrated, signature p95 {}/{}, {:.2} MiB/token, fallback {}",
+            result.relative_l2_error_target * 100.0,
+            result.mean_individual_fraction * 100.0,
+            result.mean_frequency_resident_neuron_fraction * 100.0,
+            result.calibrated_only_mean_frequency_resident_neuron_fraction * 100.0,
+            result.mean_signature_resident_neuron_fraction * 100.0,
+            result.calibrated_only_mean_signature_resident_neuron_fraction * 100.0,
+            result.mean_signature_group_load_amplification,
+            result.calibrated_only_mean_signature_group_load_amplification,
+            result.p95_signature_packed_groups,
+            result.calibrated_only_p95_signature_groups,
+            result.mean_active_packet_bytes_per_token / (1024.0 * 1024.0),
+            result.fallback_identity_observations,
+        );
+    }
+    Ok(())
+}
+
+fn frequency_packed_groups(frequency: &[u32], group_neurons: usize) -> Vec<usize> {
+    let mut neurons = (0..frequency.len()).collect::<Vec<_>>();
+    neurons.sort_unstable_by_key(|&neuron| (Reverse(frequency[neuron]), neuron));
+    let mut groups = vec![0usize; frequency.len()];
+    for (rank, neuron) in neurons.into_iter().enumerate() {
+        groups[neuron] = rank / group_neurons;
+    }
+    groups
+}
+
+fn signature_packed_groups(
+    observations: &[Vec<u16>],
+    neurons: usize,
+    group_neurons: usize,
+) -> Vec<usize> {
+    let words = observations.len().div_ceil(64);
+    let mut signatures = vec![vec![0u64; words]; neurons];
+    for (observation, selected) in observations.iter().enumerate() {
+        for &neuron in selected {
+            signatures[neuron as usize][observation / 64] |= 1u64 << (observation % 64);
+        }
+    }
+    let mut order = (0..neurons).collect::<Vec<_>>();
+    order.sort_unstable_by(|left, right| {
+        signatures[*right]
+            .cmp(&signatures[*left])
+            .then_with(|| left.cmp(right))
+    });
+    let mut groups = vec![0usize; neurons];
+    for (rank, neuron) in order.into_iter().enumerate() {
+        groups[neuron] = rank / group_neurons;
+    }
+    groups
 }
 
 fn validate_matrix_shape(
@@ -1173,11 +1632,19 @@ fn validate_contribution_metrics(
     metrics: &PacketContributionMetrics,
     header: &TraceHeader,
 ) -> Result<()> {
+    let packet_count = metrics
+        .ranked_relative_squared_error
+        .first()
+        .and_then(|layer| layer.first())
+        .map_or(0, Vec::len);
+    if metrics.selection_semantics != contribution_selection_semantics(packet_count) {
+        bail!("down contribution selection semantics do not match packet count");
+    }
     for (label, values) in [
         ("down contribution squared-l2", &metrics.squared_l2),
         (
-            "down contribution greedy residual",
-            &metrics.greedy_relative_squared_error,
+            "down contribution ranked residual",
+            &metrics.ranked_relative_squared_error,
         ),
     ] {
         if values.len() != header.layers {
@@ -1197,6 +1664,29 @@ fn validate_contribution_metrics(
                 .any(|value| !value.is_finite() || *value < 0.0)
             {
                 bail!("{label} contains a non-finite or negative value");
+            }
+        }
+    }
+    if let Some(orders) = &metrics.ranked_packet_indices {
+        if orders.len() != header.layers {
+            bail!("down contribution rank identities have the wrong layer count");
+        }
+        for layer in orders {
+            if layer.len() != header.top_k {
+                bail!("down contribution rank identities have the wrong expert-slot count");
+            }
+            for order in layer {
+                if order.len() != packet_count {
+                    bail!("down contribution rank identity length does not match packets");
+                }
+                let mut seen = vec![false; packet_count];
+                for &packet in order {
+                    let packet = packet as usize;
+                    if packet >= packet_count || seen[packet] {
+                        bail!("down contribution rank identities are not a permutation");
+                    }
+                    seen[packet] = true;
+                }
             }
         }
     }
@@ -1986,6 +2476,7 @@ mod llama_capture {
             activation_count: c_int,
             contribution_norms: *mut f32,
             contribution_residuals: *mut f32,
+            contribution_order: *mut u16,
             contribution_metric_count: c_int,
             contribution_reconstruction: *mut f32,
             contribution_reconstruction_count: c_int,
@@ -2128,6 +2619,8 @@ mod llama_capture {
                 (!self.contribution_packet_neurons.is_empty()).then(|| vec![0.0f32; metric_count]);
             let mut contribution_residuals =
                 (!self.contribution_packet_neurons.is_empty()).then(|| vec![0.0f32; metric_count]);
+            let mut contribution_order = (!self.contribution_packet_neurons.is_empty())
+                .then(|| vec![u16::MAX; metric_count]);
             let mut contribution_reconstruction = (!self.contribution_packet_neurons.is_empty())
                 .then(|| vec![0.0f32; self.layers * self.top_k]);
             let contribution_metric_count: c_int = metric_count.try_into()?;
@@ -2148,6 +2641,9 @@ mod llama_capture {
                         .as_mut()
                         .map_or(std::ptr::null_mut(), Vec::as_mut_ptr),
                     contribution_residuals
+                        .as_mut()
+                        .map_or(std::ptr::null_mut(), Vec::as_mut_ptr),
+                    contribution_order
                         .as_mut()
                         .map_or(std::ptr::null_mut(), Vec::as_mut_ptr),
                     contribution_metric_count,
@@ -2171,9 +2667,10 @@ mod llama_capture {
                 .collect::<Result<Vec<_>>>()?;
             let down_contribution = contribution_norms
                 .zip(contribution_residuals)
+                .zip(contribution_order)
                 .zip(contribution_reconstruction)
-                .map(|((norms, residuals), reconstruction)| {
-                    self.structure_contributions(norms, residuals, reconstruction)
+                .map(|(((norms, residuals), order), reconstruction)| {
+                    self.structure_contributions(norms, residuals, order, reconstruction)
                 })
                 .transpose()?;
             Ok(StepOutput {
@@ -2188,6 +2685,7 @@ mod llama_capture {
             &self,
             norms: Vec<f32>,
             residuals: Vec<f32>,
+            order: Vec<u16>,
             reconstruction: Vec<f32>,
         ) -> Result<PacketDownContribution> {
             let mut reconstruction_relative_squared_error =
@@ -2204,11 +2702,16 @@ mod llama_capture {
                         self.intermediate.expect("contribution capture has width") / packet_neurons;
                     PacketContributionMetrics {
                         packet_neurons,
+                        selection_semantics: contribution_selection_semantics(count).to_owned(),
                         squared_l2: vec![vec![vec![0.0; count]; self.top_k]; self.layers],
-                        greedy_relative_squared_error: vec![
+                        ranked_relative_squared_error: vec![
                             vec![vec![0.0; count]; self.top_k];
                             self.layers
                         ],
+                        ranked_packet_indices: Some(vec![
+                            vec![vec![u16::MAX; count]; self.top_k];
+                            self.layers
+                        ]),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -2221,8 +2724,17 @@ mod llama_capture {
                         let range =
                             expert_base + packet_offset..expert_base + packet_offset + count;
                         metrics.squared_l2[layer][slot].copy_from_slice(&norms[range.clone()]);
-                        metrics.greedy_relative_squared_error[layer][slot]
+                        metrics.ranked_relative_squared_error[layer][slot]
                             .copy_from_slice(&residuals[range]);
+                        metrics
+                            .ranked_packet_indices
+                            .as_mut()
+                            .expect("new contribution capture includes rank identities")[layer]
+                            [slot]
+                            .copy_from_slice(
+                                &order[expert_base + packet_offset
+                                    ..expert_base + packet_offset + count],
+                            );
                         packet_offset += count;
                     }
                 }
@@ -2316,6 +2828,14 @@ mod tests {
         assert_eq!(selected, 2);
         assert!((achieved - 0.2).abs() < 1e-6);
         assert!(!met);
+    }
+
+    #[test]
+    fn signature_packing_keeps_co_selected_neurons_together() {
+        let groups = signature_packed_groups(&[vec![0, 1], vec![0, 1], vec![2, 3]], 4, 2);
+        assert_eq!(groups[0], groups[1]);
+        assert_eq!(groups[2], groups[3]);
+        assert_ne!(groups[0], groups[2]);
     }
 
     #[test]

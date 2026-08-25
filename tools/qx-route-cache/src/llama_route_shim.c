@@ -26,6 +26,7 @@ typedef struct qx_llama_route {
     float * active_activations;
     float * active_contribution_norms;
     float * active_contribution_residuals;
+    uint16_t * active_contribution_order;
     float * active_contribution_reconstruction;
     uint8_t * seen_layers;
     uint8_t * seen_activations;
@@ -83,6 +84,7 @@ static bool qx_capture_down_contribution(
         struct ggml_tensor * tensor,
         int32_t layer) {
     if (!route->active_contribution_norms || !route->active_contribution_residuals ||
+        !route->active_contribution_order ||
         !route->active_contribution_reconstruction || !route->seen_layers[layer] ||
         !route->seen_activations[layer] || tensor->type != GGML_TYPE_F32 ||
         tensor->ne[0] != route->hidden || tensor->ne[1] != route->top_k ||
@@ -204,6 +206,9 @@ static bool qx_capture_down_contribution(
             float * residual_output = route->active_contribution_residuals +
                 ((size_t) layer * route->top_k + slot) * route->contribution_total_packets +
                 packet_offset;
+            uint16_t * order_output = route->active_contribution_order +
+                ((size_t) layer * route->top_k + slot) * route->contribution_total_packets +
+                packet_offset;
             memcpy(norm_output, route->scratch_norms, (size_t) packets * sizeof(float));
             memset(route->scratch_selected, 0, (size_t) packets);
             memcpy(
@@ -212,6 +217,7 @@ static bool qx_capture_down_contribution(
                 (size_t) route->hidden * sizeof(float));
             const double full_norm = qx_squared_norm(route->scratch_residual, route->hidden);
 
+            const bool use_greedy_residual = packets <= 64;
             for (int32_t step = 0; step < packets; ++step) {
                 int32_t best_packet = -1;
                 double best_error = DBL_MAX;
@@ -219,16 +225,21 @@ static bool qx_capture_down_contribution(
                     if (route->scratch_selected[packet]) {
                         continue;
                     }
-                    const float * candidate = route->scratch_packet_vectors +
-                        (size_t) packet * route->hidden;
-                    double error = 0.0;
-                    for (int32_t output = 0; output < route->hidden; ++output) {
-                        const double difference =
-                            (double) route->scratch_residual[output] - candidate[output];
-                        error += difference * difference;
-                    }
-                    if (error < best_error) {
-                        best_error = error;
+                    if (use_greedy_residual) {
+                        const float * candidate = route->scratch_packet_vectors +
+                            (size_t) packet * route->hidden;
+                        double error = 0.0;
+                        for (int32_t output = 0; output < route->hidden; ++output) {
+                            const double difference =
+                                (double) route->scratch_residual[output] - candidate[output];
+                            error += difference * difference;
+                        }
+                        if (error < best_error) {
+                            best_error = error;
+                            best_packet = packet;
+                        }
+                    } else if (best_packet < 0 ||
+                            route->scratch_norms[packet] > route->scratch_norms[best_packet]) {
                         best_packet = packet;
                     }
                 }
@@ -242,6 +253,10 @@ static bool qx_capture_down_contribution(
                     route->scratch_residual[output] -= selected[output];
                 }
                 route->scratch_selected[best_packet] = 1;
+                order_output[step] = (uint16_t) best_packet;
+                if (!use_greedy_residual) {
+                    best_error = qx_squared_norm(route->scratch_residual, route->hidden);
+                }
                 residual_output[step] =
                     (float) (best_error / fmax(full_norm, DBL_MIN));
             }
@@ -362,6 +377,11 @@ qx_llama_route * qx_llama_route_open(
                 free(route);
                 return NULL;
             }
+        }
+        if (intermediate / route->contribution_finest_neurons > UINT16_MAX) {
+            free(route->contribution_packet_neurons);
+            free(route);
+            return NULL;
         }
     }
     route->seen_layers = calloc((size_t) layers, 1);
@@ -492,6 +512,7 @@ int qx_llama_route_step(
         int32_t activation_count,
         float * contribution_norms,
         float * contribution_residuals,
+        uint16_t * contribution_order,
         int32_t contribution_metric_count,
         float * contribution_reconstruction,
         int32_t contribution_reconstruction_count) {
@@ -505,11 +526,13 @@ int qx_llama_route_step(
             activation_count != route->layers * route->top_k * route->intermediate)) ||
         (route->intermediate == 0 && (activations || activation_count != 0)) ||
         (route->contribution_size_count > 0 &&
-            (!contribution_norms || !contribution_residuals || !contribution_reconstruction ||
+            (!contribution_norms || !contribution_residuals || !contribution_order ||
+             !contribution_reconstruction ||
              contribution_metric_count != expected_contribution_metrics ||
              contribution_reconstruction_count != expected_reconstruction)) ||
         (route->contribution_size_count == 0 &&
-            (contribution_norms || contribution_residuals || contribution_reconstruction ||
+            (contribution_norms || contribution_residuals || contribution_order ||
+             contribution_reconstruction ||
              contribution_metric_count != 0 || contribution_reconstruction_count != 0))) {
         return -1;
     }
@@ -522,6 +545,7 @@ int qx_llama_route_step(
         memset(route->seen_contributions, 0, (size_t) route->layers);
         memset(contribution_norms, 0, (size_t) contribution_metric_count * sizeof(float));
         memset(contribution_residuals, 0, (size_t) contribution_metric_count * sizeof(float));
+        memset(contribution_order, 0xff, (size_t) contribution_metric_count * sizeof(uint16_t));
         memset(
             contribution_reconstruction,
             0,
@@ -532,6 +556,7 @@ int qx_llama_route_step(
     route->active_activations = activations;
     route->active_contribution_norms = contribution_norms;
     route->active_contribution_residuals = contribution_residuals;
+    route->active_contribution_order = contribution_order;
     route->active_contribution_reconstruction = contribution_reconstruction;
     route->error[0] = '\0';
 
@@ -543,6 +568,7 @@ int qx_llama_route_step(
     route->active_activations = NULL;
     route->active_contribution_norms = NULL;
     route->active_contribution_residuals = NULL;
+    route->active_contribution_order = NULL;
     route->active_contribution_reconstruction = NULL;
     if (decode_status != 0) {
         qx_set_error(route, "llama_decode failed");

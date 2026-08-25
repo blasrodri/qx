@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "classification": "free-neuron-and-fixed-grouping-smoke",
+  "promotion_evidence": false,
+  "quality_semantics": "per-expert-quantized-down-output-relative-l2-not-logit-or-nll",
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "llama_revision": "5cedcbfbc1713c9557af31ddcf5fb4b5287112f8",
+  "free_neuron_screen": {
+    "token_positions": 4,
+    "expert_observations": 1536,
+    "selection_semantics": "perfect-knowledge-descending-individual-output-norm",
+    "relative_l2_targets": [
+      {"target":0.50,"mean_selected_neurons":75.07161458333333,"mean_selected_fraction":0.09774949815538195,"p95_selected_neurons":138,"mean_active_mib_per_token":73.89862060546875},
+      {"target":0.25,"mean_selected_neurons":218.27278645833334,"mean_selected_fraction":0.28420935736762154,"p95_selected_neurons":309,"mean_active_mib_per_token":214.86227416992188},
+      {"target":0.10,"mean_selected_neurons":397.4329427083333,"mean_selected_fraction":0.5174908108181424,"p95_selected_neurons":482,"mean_active_mib_per_token":391.2230529785156},
+      {"target":0.05,"mean_selected_neurons":500.4752604166667,"mean_selected_fraction":0.6516604953342013,"p95_selected_neurons":573,"mean_active_mib_per_token":492.65533447265625},
+      {"target":0.01,"mean_selected_neurons":650.2330729166666,"mean_selected_fraction":0.8466576470269097,"p95_selected_neurons":693,"mean_active_mib_per_token":640.0731811523438}
+    ],
+    "fixed_half_neurons": {
+      "selected_neurons": 384,
+      "mean_relative_l2_error": 0.11812740879798296,
+      "p95_relative_l2_error": 0.1753239564416225,
+      "active_mib_per_token": 378.0
+    }
+  },
+  "fixed_group_screen": {
+    "calibration_token_positions": 4,
+    "heldout_token_positions": 2,
+    "heldout_expert_observations": 768,
+    "calibrated_heldout_observations": 570,
+    "fallback_identity_observations": 198,
+    "layout_semantics": "per-layer-expert-target-co-selection-signature-fixed-groups",
+    "relative_l2_target": 0.10,
+    "heldout_mean_individual_fraction": 0.5030890570746528,
+    "group_results": [
+      {"group_neurons":8,"mean_resident_fraction":0.79150390625,"calibrated_only_mean_resident_fraction":0.7222039473684211,"mean_load_amplification":1.5732878605080645,"calibrated_only_mean_load_amplification":1.468480017836241,"p95_groups":96,"groups_per_expert":96,"mean_active_mib_per_token":598.376953125},
+      {"group_neurons":16,"mean_resident_fraction":0.8151584201388888,"calibrated_only_mean_resident_fraction":0.7516447368421053,"mean_load_amplification":1.6203064023671032,"calibrated_only_mean_load_amplification":1.5283429017334598,"p95_groups":48,"groups_per_expert":48,"mean_active_mib_per_token":616.259765625},
+      {"group_neurons":32,"mean_resident_fraction":0.8450520833333334,"calibrated_only_mean_resident_fraction":0.7912280701754386,"mean_load_amplification":1.679726623844925,"calibrated_only_mean_load_amplification":1.6088289393010422,"p95_groups":24,"groups_per_expert":24,"mean_active_mib_per_token":638.859375}
+    ]
+  },
+  "conclusions": [
+    "Removing the contiguous-packet constraint exposes a real but idealized individual-neuron signal: a 10% per-expert relative L2 target retains 51.75% of neurons, while a fixed 50% budget produces 11.81% mean and 17.53% p95 error.",
+    "The useful neuron identities are not stable enough for simple fixed residency groups. At the 10% error target, co-selection-signature packing expands 50.31% individual coverage to 79.15%, 81.52%, or 84.51% residency for 8-, 16-, or 32-neuron groups.",
+    "Even when restricted to held-out observations whose layer/expert pair appeared in calibration, the resident fractions remain 72.22%, 75.16%, and 79.12%; missing calibration is not the entire failure.",
+    "The p95 held-out expert touches every fixed group at all three group sizes.",
+    "The free-neuron result is a model-co-design target, not a deployable runtime plan: structured training must make important neurons stable and group-aligned before consumer-native grouped storage can realize the theoretical capacity reduction."
+  ]
+}

@@ -616,6 +616,64 @@ lane is model co-design, not cache-policy tuning.
 The committed aggregate is
 `benchmarks/results/qwen3-30b-a3b-down-contribution-oracle-smoke-2026-08-25.json`.
 
+### Free-neuron and learned-group controls
+
+The contiguous-packet rejection does not imply that every individual neuron is
+equally important. The capture path now records the exact contribution rank
+identity for every neuron. For 768-way selection it uses perfect knowledge of
+each neuron's down-output norm, then measures the exact residual after adding
+neurons in that order. This norm-ranked screen is scalable, but unlike the
+32/64/128-packet control it is not greedy residual minimization and is not a
+globally optimal subset oracle.
+
+On four Qwen positions and 1,536 expert observations, individual-neuron
+selection is materially sparser than contiguous packets:
+
+| Relative L2 target | Mean neurons | Fraction | p95 neurons | Ideal Q3 payload |
+|---:|---:|---:|---:|---:|
+| 25% | 218.3 / 768 | 28.42% | 309 | 214.9 MiB/token |
+| 10% | 397.4 / 768 | 51.75% | 482 | 391.2 MiB/token |
+| 5% | 500.5 / 768 | 65.17% | 573 | 492.7 MiB/token |
+| 1% | 650.2 / 768 | 84.67% | 693 | 640.1 MiB/token |
+
+A fixed 50% neuron budget produces 11.81% mean and 17.53% p95 per-expert
+relative L2 error. This is not a quality result, but unlike contiguous packets
+it is close enough to a 2x theoretical payload tier to justify testing whether
+those neurons can be packed into fixed physical groups.
+
+The grouping control learns a target-specific permutation independently for
+each observed `(layer, expert)`. It packs neurons with matching calibration
+selection signatures together, then evaluates disjoint held-out positions. A
+group is resident if any desired individual neuron belongs to it; compute may
+still mask unwanted neurons. This is a capacity-coverage result, not grouped
+output error, logits or NLL.
+
+At a 10% individual-output error target, the two-position held-out smoke gives:
+
+| Fixed group | Individual fraction | Resident fraction | Calibrated-only | Load amplification | p95 groups |
+|---:|---:|---:|---:|---:|---:|
+| 8 neurons | 50.31% | 79.15% | 72.22% | 1.57x | 96 / 96 |
+| 16 neurons | 50.31% | 81.52% | 75.16% | 1.62x | 48 / 48 |
+| 32 neurons | 50.31% | 84.51% | 79.12% | 1.68x | 24 / 24 |
+
+Of 768 held-out expert observations, 570 had a calibration layout and 198 used
+identity fallback. The calibrated-only columns show that insufficient expert
+coverage is not the whole failure. Co-selection signatures improve simple
+frequency packing by only about one percentage point, and p95 still touches
+every fixed group even at eight-neuron granularity.
+
+Therefore the unmodified checkpoint exposes a dynamic individual-neuron signal
+but not a deployable fixed-group residency plan. Do not build an irregular
+single-neuron storage runtime from this smoke: metadata, fetch granularity and
+gathered matvec cost would erase much of the ideal payload win. Use the result
+as a model-co-design target—structured pruning, group-lasso/distillation or
+router-conditioned training must make importance stable and group-aligned.
+Only then rerun the same held-out coverage and masked-NLL gates before opening
+a grouped Metal kernel.
+
+The committed aggregate is
+`benchmarks/results/qwen3-30b-a3b-free-neuron-grouping-smoke-2026-08-25.json`.
+
 ## Evidence layout
 
 Keep generated model files and raw traces under ignored `external/` paths.
