@@ -698,6 +698,21 @@ int32_t qx_llama_route_eos(const qx_llama_route * route) {
     return llama_vocab_eos(llama_model_get_vocab(route->model));
 }
 
+int qx_llama_route_reset(qx_llama_route * route) {
+    if (!route || !route->context) {
+        return -1;
+    }
+    llama_memory_t memory = llama_get_memory(route->context);
+    if (!memory) {
+        return -2;
+    }
+    llama_synchronize(route->context);
+    llama_memory_clear(memory, false);
+    route->position = 0;
+    route->sample_ready = false;
+    return 0;
+}
+
 int qx_llama_route_step(
         qx_llama_route * route,
         int32_t input,

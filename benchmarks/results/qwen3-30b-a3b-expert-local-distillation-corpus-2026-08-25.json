@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "classification": "expert-local-fixed-group-corpus-distillation-control",
+  "promotion_evidence": false,
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "llama_revision": "5cedcbfbc1713c9557af31ddcf5fb4b5287112f8",
+  "machine": {
+    "chip": "Apple M5 Pro",
+    "unified_memory_gib": 24
+  },
+  "target": {
+    "layer": 8,
+    "expert": 38,
+    "hidden": 2048,
+    "expert_neurons": 768,
+    "group_neurons": 8
+  },
+  "capture": {
+    "semantics": "teacher-forced-independent-short-sequences-with-kv-reset",
+    "context": 128,
+    "max_tokens_per_sequence": 24,
+    "training": {
+      "corpus": "WikiText-2 train",
+      "corpus_sha256": "9e9fa1ad55b1c2c95b08e37dd8e653f638fac2c6de904b79e813611eefbc985f",
+      "trace_sha256": "c280b0111bd77a164f661897613aec2199ef36e82b45feed1f6214ebf0a30884",
+      "sequences": 16,
+      "token_positions": 238,
+      "expert_hits": 135
+    },
+    "heldout": {
+      "corpus": "WikiText-2 test",
+      "corpus_sha256": "d790b833ef8cf03a90db7bf1271b7520b83c45ce07ba3c1a9699df81e239eca0",
+      "trace_sha256": "be369d8547a0df4c8c49d8bff8f5c48fa47b4834460cb39d388d1835ec8d03b5",
+      "sequences": 12,
+      "token_positions": 144,
+      "expert_hits": 114
+    },
+    "independent_teacher_matrix_sha256": "923b284120dac781f9ac48db382be759f340ccbfe87697a960fd72c40c468360"
+  },
+  "learning_curve_at_93_75_percent_width_and_ridge_0_1": [
+    {"train_samples": 25, "masked_mean_relative_l2": 0.1491087147219772, "distilled_mean_relative_l2": 0.12770517278380805, "distilled_p95_relative_l2": 0.268448853900095},
+    {"train_samples": 50, "masked_mean_relative_l2": 0.1491087147219772, "distilled_mean_relative_l2": 0.12463985351707003, "distilled_p95_relative_l2": 0.25036364771694036},
+    {"train_samples": 100, "masked_mean_relative_l2": 0.1491087147219772, "distilled_mean_relative_l2": 0.11939050555049584, "distilled_p95_relative_l2": 0.24113554695479583},
+    {"train_samples": 135, "masked_mean_relative_l2": 0.1491087147219772, "distilled_mean_relative_l2": 0.11809876960233436, "distilled_p95_relative_l2": 0.22681555976164594}
+  ],
+  "ridge_curve_at_93_75_percent_width": [
+    {"ridge": 0.0001, "distilled_mean_relative_l2": 0.1227636075146924},
+    {"ridge": 0.001, "distilled_mean_relative_l2": 0.12270208098369136},
+    {"ridge": 0.01, "distilled_mean_relative_l2": 0.12186198165227459},
+    {"ridge": 0.1, "distilled_mean_relative_l2": 0.11809876960233436},
+    {"ridge": 0.3, "distilled_mean_relative_l2": 0.11636258570578932},
+    {"ridge": 1.0, "distilled_mean_relative_l2": 0.11729619870442341},
+    {"ridge": 3.0, "distilled_mean_relative_l2": 0.12244031389436207},
+    {"ridge": 10.0, "distilled_mean_relative_l2": 0.13151756900823858}
+  ],
+  "width_curve_at_ridge_0_1": [
+    {"retained_fraction": 0.9375, "masked_mean_relative_l2": 0.1491087147219772, "distilled_mean_relative_l2": 0.11809876960233436, "distilled_p95_relative_l2": 0.22681555976164594, "distilled_mean_cosine": 0.9902589303390321, "student_down_q4_payload_bytes": 737280},
+    {"retained_fraction": 0.875, "masked_mean_relative_l2": 0.2124395800921078, "distilled_mean_relative_l2": 0.17519383971832567, "distilled_p95_relative_l2": 0.3279014896035703, "distilled_mean_cosine": 0.978922286142248, "student_down_q4_payload_bytes": 688128},
+    {"retained_fraction": 0.75, "masked_mean_relative_l2": 0.33095332346908124, "distilled_mean_relative_l2": 0.25878300044963654, "distilled_p95_relative_l2": 0.5047915287494072, "distilled_mean_cosine": 0.9527016970556786, "student_down_q4_payload_bytes": 589824},
+    {"retained_fraction": 0.5, "masked_mean_relative_l2": 0.5308520272804075, "distilled_mean_relative_l2": 0.39730153711007044, "distilled_p95_relative_l2": 0.6941019503751871, "distilled_mean_cosine": 0.8844306185614518, "student_down_q4_payload_bytes": 393216}
+  ],
+  "best_93_75_percent_width_cell": {
+    "ridge": 0.3,
+    "masked_mean_relative_l2": 0.1491087147219772,
+    "distilled_mean_relative_l2": 0.11636258570578932,
+    "relative_mean_error_reduction": 0.21961244235285074,
+    "distilled_p95_relative_l2": 0.22533646894506176,
+    "student_down_q4_payload_bytes": 737280,
+    "dual_support_f32_bytes_avoided_by_primal_fold": 1494720,
+    "primal_dual_max_relative_l2": 7.409672675739462e-7
+  },
+  "capacity_scope": {
+    "full_down_q4_payload_bytes_per_expert": 786432,
+    "proved_down_payload_reduction_fraction_for_one_expert": 0.0625,
+    "gate_and_up_payload_reduction_fraction": 0.0,
+    "all_experts_generalization_proved": false
+  },
+  "conclusions": [
+    "Diverse real samples reverse the tiny-prompt result: the missing down-output residual has a learnable linear component across a disjoint corpus partition.",
+    "The linear-kernel dual folds into the compact retained down matrix and matches dual predictions below 7.5e-7 relative L2, so no support bank is required at inference.",
+    "The absolute local error remains too high for promotion, and only one expert down projection is tested. This is not yet an end-to-end quality or whole-model capacity result.",
+    "The next experiment must materialize the folded matrix in execution and measure teacher-forced NLL, then move to joint gate/up/down structured training if the local-to-model gate passes."
+  ]
+}

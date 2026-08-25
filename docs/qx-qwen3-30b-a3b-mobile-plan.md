@@ -777,6 +777,56 @@ therefore stream independent short sequences and reset KV state between them.
 The committed aggregate is
 `benchmarks/results/qwen3-30b-a3b-expert-local-distillation-smoke-2026-08-25.json`.
 
+### Corpus-scaled expert-local distillation
+
+The bounded-context capture now resets llama.cpp KV state in place and streams
+many independent sequences through one loaded model. WikiText-2 train and test
+were captured in separate model sessions. The training trace contains 135
+layer-8/expert-38 hits from 238 positions across 16 sequences; the held-out
+trace contains 114 hits from 144 positions across 12 sequences. Every sequence
+starts at position zero. Independently exported teacher matrices are
+byte-identical, which checks that reset and session boundaries do not alter the
+sampled expert.
+
+This larger, explicitly disjoint control reverses the 25-sample result. At
+93.75% down width and ridge 0.1, the learning curve is:
+
+| Training hits | Masked teacher mean L2 | Distilled mean L2 | Distilled p95 |
+|---:|---:|---:|---:|
+| 25 | 0.1491 | 0.1277 | 0.2684 |
+| 50 | 0.1491 | 0.1246 | 0.2504 |
+| 100 | 0.1491 | 0.1194 | 0.2411 |
+| 135 | 0.1491 | 0.1181 | 0.2268 |
+
+The best bracketed regularizer is 0.3, reaching 0.1164 mean relative L2: a
+21.9% relative reduction from the fixed masked teacher. The signal also
+survives larger reductions at ridge 0.1:
+
+| Retained down width | Masked teacher mean L2 | Distilled mean L2 | Distilled p95 |
+|---:|---:|---:|---:|
+| 93.75% | 0.1491 | 0.1181 | 0.2268 |
+| 87.50% | 0.2124 | 0.1752 | 0.3279 |
+| 75.00% | 0.3310 | 0.2588 | 0.5048 |
+| 50.00% | 0.5309 | 0.3973 | 0.6941 |
+
+The ridge evaluator uses a linear kernel. It now explicitly folds the dual
+solution into one compact primal down matrix and compares both paths on every
+held-out sample. The maximum relative disagreement is `7.41e-7`; the 1.49 MiB
+support bank is therefore a training representation, not an inference cost.
+At 93.75% width the resulting raw Q4 down payload is 737,280 bytes instead of
+786,432 bytes per expert.
+
+This is positive model-co-design evidence, but it is not promotion evidence.
+It proves one reduced down projection has a learnable residual on one corpus
+pair. It does not reduce gate/up storage, prove the other 6,143 experts, or
+establish end-to-end logits/NLL. Even the best p95 local error is 22.5%.
+Materialize the folded matrix in the execution callback and run disjoint
+teacher-forced NLL next. If that gate fails, skip the Metal kernel and move
+directly to joint gate/up/down group-aware training.
+
+The committed aggregate is
+`benchmarks/results/qwen3-30b-a3b-expert-local-distillation-corpus-2026-08-25.json`.
+
 ## Evidence layout
 
 Keep generated model files and raw traces under ignored `external/` paths.

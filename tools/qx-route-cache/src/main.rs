@@ -76,6 +76,43 @@ enum Command {
         #[arg(long)]
         model_sha256: Option<String>,
     },
+    /// Capture one expert across many independently reset corpus paragraphs.
+    CaptureCorpus {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long = "corpus", required = true)]
+        corpora: Vec<PathBuf>,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        sample_weights_output: PathBuf,
+        #[arg(long)]
+        sample_layer: usize,
+        #[arg(long)]
+        sample_expert: u16,
+        #[arg(long, default_value_t = 64)]
+        max_sequences: usize,
+        #[arg(long, default_value_t = 96)]
+        max_tokens_per_sequence: usize,
+        #[arg(long, default_value_t = 128)]
+        context: usize,
+        #[arg(long, default_value_t = 48)]
+        layers: usize,
+        #[arg(long, default_value_t = 128)]
+        experts: usize,
+        #[arg(long, default_value_t = 8)]
+        top_k: usize,
+        #[arg(long, default_value_t = -1)]
+        gpu_layers: i32,
+        #[arg(long, default_value_t = 4)]
+        threads: i32,
+        #[arg(long, default_value_t = DEFAULT_EXPERT_NEURONS)]
+        expert_neurons: usize,
+        #[arg(long, default_value_t = 2048)]
+        hidden_size: usize,
+        #[arg(long)]
+        model_sha256: Option<String>,
+    },
     /// Replay a route trace through one or more bounded expert caches.
     Simulate {
         #[arg(long)]
@@ -197,6 +234,10 @@ enum Command {
     DistillExpert {
         #[arg(long = "trace", required = true)]
         traces: Vec<PathBuf>,
+        /// Fully disjoint traces used only for evaluation. When omitted, the
+        /// training traces are split chronologically using --train-fraction.
+        #[arg(long = "heldout-trace")]
+        heldout_traces: Vec<PathBuf>,
         #[arg(long)]
         teacher_down_weights: PathBuf,
         #[arg(long = "calibration", required = true)]
@@ -213,6 +254,9 @@ enum Command {
         relative_error: f64,
         #[arg(long, default_value_t = 0.75)]
         train_fraction: f64,
+        /// Limit explicit-corpus training hits for learning-curve experiments.
+        #[arg(long)]
+        max_train_samples: Option<usize>,
         /// Ridge penalty relative to the mean train-kernel diagonal.
         #[arg(long, default_value_t = 1e-3)]
         ridge: f64,
@@ -633,8 +677,11 @@ struct ExpertDistillReport {
     classification: &'static str,
     promotion_evidence: bool,
     training_semantics: &'static str,
+    inference_semantics: &'static str,
     quality_semantics: &'static str,
+    split_semantics: &'static str,
     traces: Vec<String>,
+    heldout_traces: Vec<String>,
     teacher_down_weights: String,
     calibrations: Vec<String>,
     trace_header: TraceHeader,
@@ -644,6 +691,7 @@ struct ExpertDistillReport {
     retained_groups: usize,
     retained_neurons: usize,
     retained_fraction: f64,
+    available_train_samples: usize,
     train_samples: usize,
     heldout_samples: usize,
     ridge_relative_to_mean_kernel_diagonal: f64,
@@ -651,6 +699,8 @@ struct ExpertDistillReport {
     student_down_parameters: usize,
     student_down_f16_bytes: usize,
     student_down_q4_payload_bytes: usize,
+    dual_support_f32_bytes_avoided: usize,
+    primal_dual_max_relative_l2: f64,
     heldout_mean_relative_l2: f64,
     heldout_p50_relative_l2: f64,
     heldout_p95_relative_l2: f64,
@@ -713,6 +763,43 @@ fn main() -> Result<()> {
             hidden_size,
             sample: sample_layer.zip(sample_expert),
             sample_weights_output,
+            model_sha256,
+        }),
+        Command::CaptureCorpus {
+            model,
+            corpora,
+            output,
+            sample_weights_output,
+            sample_layer,
+            sample_expert,
+            max_sequences,
+            max_tokens_per_sequence,
+            context,
+            layers,
+            experts,
+            top_k,
+            gpu_layers,
+            threads,
+            expert_neurons,
+            hidden_size,
+            model_sha256,
+        } => capture_corpus(CaptureCorpusArgs {
+            model,
+            corpora,
+            output,
+            sample_weights_output,
+            sample_layer,
+            sample_expert,
+            max_sequences,
+            max_tokens_per_sequence,
+            context,
+            layers,
+            experts,
+            top_k,
+            gpu_layers,
+            threads,
+            expert_neurons,
+            hidden_size,
             model_sha256,
         }),
         Command::Simulate {
@@ -815,6 +902,7 @@ fn main() -> Result<()> {
         }),
         Command::DistillExpert {
             traces,
+            heldout_traces,
             teacher_down_weights,
             calibrations,
             layer,
@@ -823,10 +911,12 @@ fn main() -> Result<()> {
             retained_fraction,
             relative_error,
             train_fraction,
+            max_train_samples,
             ridge,
             output,
         } => distill_expert(
             &traces,
+            &heldout_traces,
             &teacher_down_weights,
             &calibrations,
             layer,
@@ -835,6 +925,7 @@ fn main() -> Result<()> {
             retained_fraction,
             relative_error,
             train_fraction,
+            max_train_samples,
             ridge,
             &output,
         ),
@@ -878,6 +969,26 @@ struct CaptureArgs {
     hidden_size: usize,
     sample: Option<(usize, u16)>,
     sample_weights_output: Option<PathBuf>,
+    model_sha256: Option<String>,
+}
+
+struct CaptureCorpusArgs {
+    model: PathBuf,
+    corpora: Vec<PathBuf>,
+    output: PathBuf,
+    sample_weights_output: PathBuf,
+    sample_layer: usize,
+    sample_expert: u16,
+    max_sequences: usize,
+    max_tokens_per_sequence: usize,
+    context: usize,
+    layers: usize,
+    experts: usize,
+    top_k: usize,
+    gpu_layers: i32,
+    threads: i32,
+    expert_neurons: usize,
+    hidden_size: usize,
     model_sha256: Option<String>,
 }
 
@@ -1110,6 +1221,176 @@ fn capture(args: CaptureArgs) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn capture(_args: CaptureArgs) -> Result<()> {
     bail!("route capture currently requires the macOS llama.cpp bridge")
+}
+
+#[cfg(target_os = "macos")]
+fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
+    if !args.model.is_file() {
+        bail!("model does not exist: {}", args.model.display());
+    }
+    if args.corpora.is_empty() || args.corpora.iter().any(|path| !path.is_file()) {
+        bail!("every corpus input must be an existing file");
+    }
+    if args.max_sequences == 0
+        || args.max_tokens_per_sequence < 2
+        || args.max_tokens_per_sequence > args.context
+    {
+        bail!("corpus capture requires positive sequences and 2..=context tokens per sequence");
+    }
+    if args.sample_layer >= args.layers || usize::from(args.sample_expert) >= args.experts {
+        bail!("expert sample target is outside the model shape");
+    }
+    let model_hash = match args.model_sha256.as_ref() {
+        Some(value) => {
+            validate_sha256(value)?;
+            value.clone()
+        }
+        None => sha256_file(&args.model)?,
+    };
+    let mut llama = llama_capture::Capture::open(
+        &args.model,
+        llama_capture::OpenConfig {
+            context: args.context,
+            layers: args.layers,
+            experts: args.experts,
+            top_k: args.top_k,
+            gpu_layers: args.gpu_layers,
+            threads: args.threads,
+            intermediate: Some(args.expert_neurons),
+            hidden: args.hidden_size,
+            sample: Some((args.sample_layer, args.sample_expert)),
+            contribution_packet_neurons: &[],
+        },
+    )?;
+    let mut paragraphs = Vec::new();
+    for path in &args.corpora {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("read corpus {}", path.display()))?;
+        paragraphs.extend(split_corpus_paragraphs(&contents));
+    }
+    if paragraphs.is_empty() {
+        bail!("corpus files contain no non-empty paragraphs");
+    }
+    let file =
+        File::create(&args.output).with_context(|| format!("create {}", args.output.display()))?;
+    let mut writer = BufWriter::new(file);
+    write_trace_line(
+        &mut writer,
+        &TraceLine::Header(TraceHeader {
+            schema_version: SCHEMA_VERSION,
+            model_sha256: model_hash,
+            llama_revision: option_env!("QX_LLAMA_REVISION")
+                .unwrap_or("unknown")
+                .to_owned(),
+            layers: args.layers,
+            experts: args.experts,
+            top_k: args.top_k,
+            source: "llama.cpp-eval-callback-corpus-reset".to_owned(),
+        }),
+    )?;
+
+    let mut sequences = 0usize;
+    let mut token_positions = 0usize;
+    let mut expert_hits = 0usize;
+    let mut wrote_weights = false;
+    for paragraph in paragraphs {
+        if sequences >= args.max_sequences {
+            break;
+        }
+        let mut tokens = llama.tokenize(&paragraph)?;
+        tokens.truncate(args.max_tokens_per_sequence);
+        if tokens.len() < 2 {
+            continue;
+        }
+        if sequences > 0 {
+            llama.reset()?;
+        }
+        let request_id = format!("corpus-{sequences:04}");
+        for (position, token) in tokens.into_iter().enumerate() {
+            let llama_capture::StepOutput {
+                predicted,
+                target_nll: _,
+                routes,
+                activations: _,
+                down_contribution: _,
+                expert_sample,
+                expert_down_weights,
+            } = llama.step(token)?;
+            validate_routes(&routes, args.layers, args.top_k, args.experts)?;
+            if let Some(weights) = expert_down_weights {
+                write_expert_down_weights(
+                    &args.sample_weights_output,
+                    args.expert_neurons,
+                    args.hidden_size,
+                    &weights,
+                )?;
+                wrote_weights = true;
+            }
+            if expert_sample.is_some() {
+                expert_hits += 1;
+            }
+            write_trace_line(
+                &mut writer,
+                &TraceLine::Token(TokenRoutes {
+                    request_id: request_id.clone(),
+                    token_position: position,
+                    phase: "corpus".to_owned(),
+                    input_token: token,
+                    predicted_token: predicted,
+                    routes,
+                    packet_activation_energy: None,
+                    packet_down_contribution: None,
+                    expert_distill_sample: expert_sample.map(
+                        |(activation, teacher_down_output)| ExpertDistillSample {
+                            layer: args.sample_layer,
+                            expert: args.sample_expert,
+                            activation,
+                            teacher_down_output,
+                        },
+                    ),
+                }),
+            )?;
+            token_positions += 1;
+        }
+        sequences += 1;
+    }
+    writer.flush()?;
+    if sequences == 0 || expert_hits == 0 || !wrote_weights {
+        bail!(
+            "corpus capture produced sequences {sequences}, expert hits {expert_hits}, weights {wrote_weights}"
+        );
+    }
+    println!("corpus trace: {}", args.output.display());
+    println!(
+        "sequences: {sequences}, routed token positions: {token_positions}, expert hits: {expert_hits}"
+    );
+    Ok(())
+}
+
+fn split_corpus_paragraphs(contents: &str) -> Vec<String> {
+    let mut paragraphs = Vec::new();
+    let mut paragraph = String::new();
+    for line in contents.lines() {
+        if line.trim().is_empty() {
+            if !paragraph.is_empty() {
+                paragraphs.push(std::mem::take(&mut paragraph));
+            }
+        } else {
+            if !paragraph.is_empty() {
+                paragraph.push('\n');
+            }
+            paragraph.push_str(line.trim());
+        }
+    }
+    if !paragraph.is_empty() {
+        paragraphs.push(paragraph);
+    }
+    paragraphs
+}
+
+#[cfg(not(target_os = "macos"))]
+fn capture_corpus(_args: CaptureCorpusArgs) -> Result<()> {
+    bail!("corpus capture currently requires the macOS llama.cpp bridge")
 }
 
 fn summarize_activations(values: &[f32], args: &CaptureArgs) -> Vec<PacketActivationEnergy> {
@@ -2201,6 +2482,7 @@ fn measure_teacher_forced_nll(
 #[allow(clippy::too_many_arguments)]
 fn distill_expert(
     traces: &[PathBuf],
+    heldout_traces: &[PathBuf],
     teacher_down_weights: &Path,
     calibration_paths: &[PathBuf],
     layer: usize,
@@ -2209,6 +2491,7 @@ fn distill_expert(
     retained_fraction: f64,
     relative_error: f64,
     train_fraction: f64,
+    max_train_samples: Option<usize>,
     ridge: f64,
     output: &Path,
 ) -> Result<()> {
@@ -2221,8 +2504,16 @@ fn distill_expert(
     if !retained_fraction.is_finite() || retained_fraction <= 0.0 || retained_fraction > 1.0 {
         bail!("retained-fraction must be a finite value in (0, 1]");
     }
-    if !train_fraction.is_finite() || train_fraction <= 0.0 || train_fraction >= 1.0 {
+    if heldout_traces.is_empty()
+        && (!train_fraction.is_finite() || train_fraction <= 0.0 || train_fraction >= 1.0)
+    {
         bail!("train-fraction must be a finite value in (0, 1)");
+    }
+    if heldout_traces.is_empty() && max_train_samples.is_some() {
+        bail!("max-train-samples requires explicit heldout traces");
+    }
+    if max_train_samples.is_some_and(|limit| limit < 2) {
+        bail!("max-train-samples must be at least two");
     }
     if !ridge.is_finite() || ridge <= 0.0 {
         bail!("ridge must be finite and positive");
@@ -2231,31 +2522,38 @@ fn distill_expert(
     if layer >= trace_header.layers || usize::from(expert) >= trace_header.experts {
         bail!("distillation target is outside the trace model shape");
     }
-    let mut samples = Vec::<ExpertDistillSample>::new();
-    for trace in traces {
-        let candidate_header = read_trace_header(trace)?;
-        validate_compatible_headers(&trace_header, &candidate_header)?;
-        visit_trace(trace, &trace_header, |token| {
-            if let Some(sample) = token.expert_distill_sample {
-                if sample.layer != layer || sample.expert != expert {
-                    bail!("trace contains an expert sample for a different target");
-                }
-                samples.push(sample);
-            }
-            Ok(())
-        })?;
+    let mut samples = read_expert_samples(traces, &trace_header, layer, expert)?;
+    let available_train_samples = samples.len();
+    if let Some(limit) = max_train_samples {
+        samples.truncate(limit);
     }
-    if samples.len() < 4 {
-        bail!(
-            "distillation requires at least four expert hits, found {}",
-            samples.len()
-        );
-    }
-    let expert_neurons = samples[0].activation.len();
-    let hidden = samples[0].teacher_down_output.len();
+    let (train, heldout, split_semantics) = if heldout_traces.is_empty() {
+        if samples.len() < 4 {
+            bail!(
+                "chronological distillation split requires at least four expert hits, found {}",
+                samples.len()
+            );
+        }
+        let train_samples =
+            ((samples.len() as f64 * train_fraction).floor() as usize).clamp(2, samples.len() - 1);
+        let heldout = samples.split_off(train_samples);
+        (samples, heldout, "chronological-within-training-traces")
+    } else {
+        let heldout = read_expert_samples(heldout_traces, &trace_header, layer, expert)?;
+        if samples.len() < 2 || heldout.is_empty() {
+            bail!(
+                "explicit corpus split requires at least two train hits and one held-out hit; found {}/{}",
+                samples.len(),
+                heldout.len()
+            );
+        }
+        (samples, heldout, "explicit-disjoint-corpus-traces")
+    };
+    let expert_neurons = train[0].activation.len();
+    let hidden = train[0].teacher_down_output.len();
     if expert_neurons == 0
         || hidden == 0
-        || samples.iter().any(|sample| {
+        || train.iter().chain(&heldout).any(|sample| {
             sample.activation.len() != expert_neurons
                 || sample.teacher_down_output.len() != hidden
                 || sample
@@ -2295,10 +2593,7 @@ fn distill_expert(
     if (weight_neurons, weight_hidden) != (expert_neurons, hidden) {
         bail!("teacher down weight dimensions do not match captured samples");
     }
-    let train_samples =
-        ((samples.len() as f64 * train_fraction).floor() as usize).clamp(2, samples.len() - 1);
-    let train = &samples[..train_samples];
-    let heldout = &samples[train_samples..];
+    let train_samples = train.len();
     let train_residuals = train
         .iter()
         .map(|sample| {
@@ -2340,11 +2635,34 @@ fn distill_expert(
     }
     cholesky_in_place(&mut kernel, train_samples)?;
 
+    // The linear-kernel dual is exactly a reduced primal projection. Fold the
+    // learned residual into the retained teacher columns so runtime needs one
+    // compact down matrix, not a support-vector bank.
+    let retained_neurons = retained_indices.len();
+    let mut student_weights = vec![0.0f32; hidden * retained_neurons];
+    for output_index in 0..hidden {
+        let mut coefficients = train_residuals
+            .iter()
+            .map(|residual| residual[output_index] as f64)
+            .collect::<Vec<_>>();
+        cholesky_solve(&kernel, train_samples, &mut coefficients);
+        for (compact_neuron, &teacher_neuron) in retained_indices.iter().enumerate() {
+            let correction = train
+                .iter()
+                .zip(&coefficients)
+                .map(|(sample, coefficient)| sample.activation[teacher_neuron] as f64 * coefficient)
+                .sum::<f64>();
+            student_weights[output_index * retained_neurons + compact_neuron] =
+                teacher_weights[output_index * expert_neurons + teacher_neuron] + correction as f32;
+        }
+    }
+
     let mut relative_l2 = Vec::with_capacity(heldout.len());
     let mut cosines = Vec::with_capacity(heldout.len());
     let mut masked_relative_l2 = Vec::with_capacity(heldout.len());
     let mut masked_cosines = Vec::with_capacity(heldout.len());
-    for sample in heldout {
+    let mut primal_dual_relative_l2 = Vec::with_capacity(heldout.len());
+    for sample in &heldout {
         let mut coefficients = train
             .iter()
             .map(|training| {
@@ -2371,6 +2689,8 @@ fn distill_expert(
         let mut masked_squared_error = 0.0f64;
         let mut masked_norm = 0.0f64;
         let mut masked_dot = 0.0f64;
+        let mut primal_dual_squared_error = 0.0f64;
+        let mut dual_norm = 0.0f64;
         for output_index in 0..hidden {
             let residual = train_residuals
                 .iter()
@@ -2381,6 +2701,14 @@ fn distill_expert(
                 .sum::<f64>();
             let masked = base[output_index] as f64;
             let predicted = masked + residual;
+            let primal = retained_indices
+                .iter()
+                .enumerate()
+                .map(|(compact_neuron, &teacher_neuron)| {
+                    student_weights[output_index * retained_neurons + compact_neuron]
+                        * sample.activation[teacher_neuron]
+                })
+                .sum::<f32>() as f64;
             let target = sample.teacher_down_output[output_index] as f64;
             squared_error += (predicted - target).powi(2);
             masked_squared_error += (masked - target).powi(2);
@@ -2389,21 +2717,30 @@ fn distill_expert(
             masked_norm += masked * masked;
             dot += predicted * target;
             masked_dot += masked * target;
+            primal_dual_squared_error += (primal - predicted).powi(2);
+            dual_norm += predicted * predicted;
         }
         relative_l2.push((squared_error / target_norm.max(f64::MIN_POSITIVE)).sqrt());
         cosines.push(dot / (predicted_norm * target_norm).sqrt().max(f64::MIN_POSITIVE));
         masked_relative_l2.push((masked_squared_error / target_norm.max(f64::MIN_POSITIVE)).sqrt());
         masked_cosines.push(masked_dot / (masked_norm * target_norm).sqrt().max(f64::MIN_POSITIVE));
+        primal_dual_relative_l2
+            .push((primal_dual_squared_error / dual_norm.max(f64::MIN_POSITIVE)).sqrt());
     }
-    let retained_neurons = retained_indices.len();
     let student_down_parameters = retained_neurons * hidden;
     let report = ExpertDistillReport {
-        schema_version: 1,
+        schema_version: 2,
         classification: "expert-local-fixed-group-ridge-distillation-smoke",
         promotion_evidence: false,
         training_semantics: "kernel-ridge-fit-of-reduced-down-projection-from-real-teacher-activations",
+        inference_semantics: "linear-kernel-dual-folded-into-one-compact-primal-down-matrix",
         quality_semantics: "heldout-local-expert-down-output-not-logit-or-nll",
+        split_semantics,
         traces: traces
+            .iter()
+            .map(|trace| trace.display().to_string())
+            .collect(),
+        heldout_traces: heldout_traces
             .iter()
             .map(|trace| trace.display().to_string())
             .collect(),
@@ -2419,6 +2756,7 @@ fn distill_expert(
         retained_groups,
         retained_neurons,
         retained_fraction: retained_neurons as f64 / expert_neurons as f64,
+        available_train_samples,
         train_samples,
         heldout_samples: heldout.len(),
         ridge_relative_to_mean_kernel_diagonal: ridge,
@@ -2426,6 +2764,11 @@ fn distill_expert(
         student_down_parameters,
         student_down_f16_bytes: student_down_parameters * 2,
         student_down_q4_payload_bytes: student_down_parameters.div_ceil(2),
+        dual_support_f32_bytes_avoided: train_samples * (retained_neurons + hidden) * 4,
+        primal_dual_max_relative_l2: primal_dual_relative_l2
+            .into_iter()
+            .reduce(f64::max)
+            .unwrap_or(0.0),
         heldout_mean_relative_l2: relative_l2.iter().sum::<f64>() / relative_l2.len() as f64,
         heldout_p50_relative_l2: percentile_f64(&relative_l2, 0.50)
             .expect("heldout split is non-empty"),
@@ -2460,6 +2803,29 @@ fn distill_expert(
         report.heldout_mean_cosine,
     );
     Ok(())
+}
+
+fn read_expert_samples(
+    traces: &[PathBuf],
+    expected_header: &TraceHeader,
+    layer: usize,
+    expert: u16,
+) -> Result<Vec<ExpertDistillSample>> {
+    let mut samples = Vec::new();
+    for trace in traces {
+        let candidate_header = read_trace_header(trace)?;
+        validate_compatible_headers(expected_header, &candidate_header)?;
+        visit_trace(trace, expected_header, |token| {
+            if let Some(sample) = token.expert_distill_sample {
+                if sample.layer != layer || sample.expert != expert {
+                    bail!("trace contains an expert sample for a different target");
+                }
+                samples.push(sample);
+            }
+            Ok(())
+        })?;
+    }
+    Ok(samples)
 }
 
 fn project_down_subset(
@@ -3479,6 +3845,7 @@ mod llama_capture {
             capacity: c_int,
         ) -> c_int;
         fn qx_llama_route_eos(route: *const c_void) -> c_int;
+        fn qx_llama_route_reset(route: *mut c_void) -> c_int;
         fn qx_llama_route_step(
             route: *mut c_void,
             input: c_int,
@@ -3628,6 +3995,14 @@ mod llama_capture {
 
         pub fn eos(&self) -> i32 {
             unsafe { qx_llama_route_eos(self.raw) }
+        }
+
+        pub fn reset(&mut self) -> Result<()> {
+            let status = unsafe { qx_llama_route_reset(self.raw) };
+            if status != 0 {
+                bail!("llama route reset failed ({status}): {}", self.error());
+            }
+            Ok(())
         }
 
         pub fn set_neuron_mask(&mut self, mask: &[u8]) -> Result<()> {
@@ -3870,6 +4245,14 @@ mod llama_capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corpus_split_treats_whitespace_only_lines_as_boundaries() {
+        assert_eq!(
+            split_corpus_paragraphs(" first line\nsecond line\n \t\n third \n\n"),
+            vec!["first line\nsecond line", "third"]
+        );
+    }
 
     #[test]
     fn byte_parser_distinguishes_decimal_and_binary_units() {
