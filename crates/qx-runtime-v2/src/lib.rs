@@ -604,6 +604,227 @@ pub struct PreparedAttentionStack {
     pub embedding_lookup: qx_metal::platform::PreparedQ4Embedding,
 }
 
+/// Persistent no-copy bindings for one Qwen3-30B-A3B decoder layer. Every
+/// matrix and expert is a subregion of one Metal buffer backed by the mapped
+/// artifact; constructing this object does not upload or repack weights.
+#[cfg(target_os = "macos")]
+pub struct PreparedQwenLayer {
+    pub layer: u16,
+    pub input_norm: qx_metal::platform::RuntimeBuffer,
+    pub post_attention_norm: qx_metal::platform::RuntimeBuffer,
+    pub query_norm: qx_metal::platform::RuntimeBuffer,
+    pub key_norm: qx_metal::platform::RuntimeBuffer,
+    pub q_proj: qx_metal::platform::PreparedQ4Stage,
+    pub k_proj: qx_metal::platform::PreparedQ4Stage,
+    pub v_proj: qx_metal::platform::PreparedQ4Stage,
+    pub o_proj: qx_metal::platform::PreparedQ4Stage,
+    pub router: qx_metal::platform::PreparedQ4Stage,
+    pub experts: Vec<qx_metal::platform::PreparedQwenQ2S4Expert>,
+    artifact: Arc<qx_format::MappedArtifact>,
+    slab: qx_metal::platform::RuntimeBuffer,
+}
+
+#[cfg(target_os = "macos")]
+impl PreparedQwenLayer {
+    pub fn load(
+        context: &qx_metal::platform::MetalContext,
+        artifact: Arc<qx_format::MappedArtifact>,
+        layer: u16,
+    ) -> Result<Self, String> {
+        let shape = artifact
+            .info()
+            .execution_plan
+            .as_ref()
+            .and_then(|plan| plan.model_shape.as_ref())
+            .ok_or_else(|| "Qwen artifact does not seal a model shape".to_owned())?;
+        if shape.architecture != qx_model::ModelArchitecture::Qwen3Moe
+            || shape.hidden_size != 2048
+            || shape.expert_intermediate != 768
+            || shape.experts != 128
+            || usize::from(layer) >= shape.layers
+        {
+            return Err(format!("unsupported Qwen layer shape {shape:?}"));
+        }
+        if artifact
+            .info()
+            .execution_plan
+            .as_ref()
+            .is_none_or(|plan| plan.memory.weight_storage != qx_format::WeightStorage::MmapNoCopy)
+        {
+            return Err("Qwen layer requires mmap/no-copy weight storage".to_owned());
+        }
+        let weight_slab = artifact.weight_slab().map_err(|error| error.to_string())?;
+        let pointer = NonNull::new(weight_slab.as_ptr() as *mut c_void)
+            .ok_or_else(|| "Qwen artifact weight slab is empty".to_owned())?;
+        let slab =
+            unsafe { context.input_buffer_no_copy(pointer, weight_slab.len(), artifact.clone())? };
+
+        let raw = |kind| qwen_raw_buffer(&artifact, &slab, layer, kind);
+        let matrix = |kind, rows, columns| {
+            qwen_q4_stage(context, &artifact, &slab, layer, kind, rows, columns)
+        };
+        let input_norm = raw(qx_format::TensorKind::InputNorm)?;
+        let post_attention_norm = raw(qx_format::TensorKind::PostAttentionNorm)?;
+        let query_norm = raw(qx_format::TensorKind::QueryNorm)?;
+        let key_norm = raw(qx_format::TensorKind::KeyNorm)?;
+        let q_proj = matrix(qx_format::TensorKind::QProj, 4096, 2048)?;
+        let k_proj = matrix(qx_format::TensorKind::KProj, 512, 2048)?;
+        let v_proj = matrix(qx_format::TensorKind::VProj, 512, 2048)?;
+        let o_proj = matrix(qx_format::TensorKind::OProj, 2048, 4096)?;
+        let router = matrix(qx_format::TensorKind::Router, 128, 2048)?;
+        let mut experts = Vec::with_capacity(128);
+        for expert in 0..128_u8 {
+            let (gate_scales, gate_data) = qwen_entry_buffers(
+                &artifact,
+                &slab,
+                layer,
+                expert,
+                qx_format::TensorKind::GateUp,
+                qx_quant::QuantType::Q2S4,
+                1536,
+                2048,
+            )?;
+            let (down_scales, down_data) = qwen_entry_buffers(
+                &artifact,
+                &slab,
+                layer,
+                expert,
+                qx_format::TensorKind::Down,
+                qx_quant::QuantType::Q2S4,
+                2048,
+                768,
+            )?;
+            experts.push(context.prepare_qwen_q2s4_expert_buffers(
+                gate_data,
+                gate_scales,
+                down_data,
+                down_scales,
+            )?);
+        }
+        Ok(Self {
+            layer,
+            input_norm,
+            post_attention_norm,
+            query_norm,
+            key_norm,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            router,
+            experts,
+            artifact,
+            slab,
+        })
+    }
+
+    pub fn mapped_slab_bytes(&self) -> usize {
+        self.slab.len()
+    }
+
+    pub fn artifact(&self) -> &Arc<qx_format::MappedArtifact> {
+        &self.artifact
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn qwen_entry_index(
+    artifact: &qx_format::MappedArtifact,
+    layer: u16,
+    expert: u8,
+    kind: qx_format::TensorKind,
+) -> Result<usize, String> {
+    artifact
+        .info()
+        .entries
+        .iter()
+        .position(|entry| entry.layer == layer && entry.expert == expert && entry.kind == kind)
+        .ok_or_else(|| format!("missing Qwen {kind:?} layer {layer} expert {expert}"))
+}
+
+#[cfg(target_os = "macos")]
+fn qwen_entry_buffers(
+    artifact: &qx_format::MappedArtifact,
+    slab: &qx_metal::platform::RuntimeBuffer,
+    layer: u16,
+    expert: u8,
+    kind: qx_format::TensorKind,
+    quant_type: qx_quant::QuantType,
+    rows: usize,
+    columns: usize,
+) -> Result<
+    (
+        qx_metal::platform::RuntimeBuffer,
+        qx_metal::platform::RuntimeBuffer,
+    ),
+    String,
+> {
+    let index = qwen_entry_index(artifact, layer, expert, kind)?;
+    let entry = &artifact.info().entries[index];
+    if entry.quant_type != quant_type
+        || entry.layout != qx_quant::PackingLayout::RowMajor
+        || entry.group_size != 32
+        || entry.rows as usize != rows
+        || entry.cols as usize != columns
+    {
+        return Err(format!("unsupported mapped Qwen entry {entry:?}"));
+    }
+    let (scales, data) = artifact
+        .tensor_slab_ranges(index)
+        .map_err(|error| error.to_string())?;
+    Ok((
+        slab.subregion(scales.start, scales.len())?,
+        slab.subregion(data.start, data.len())?,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn qwen_raw_buffer(
+    artifact: &qx_format::MappedArtifact,
+    slab: &qx_metal::platform::RuntimeBuffer,
+    layer: u16,
+    kind: qx_format::TensorKind,
+) -> Result<qx_metal::platform::RuntimeBuffer, String> {
+    let index = qwen_entry_index(artifact, layer, u8::MAX, kind)?;
+    let entry = &artifact.info().entries[index];
+    if entry.group_size != 0 || entry.scale_length != 0 {
+        return Err(format!("Qwen {kind:?} is not a raw vector"));
+    }
+    let (_, data) = artifact
+        .tensor_slab_ranges(index)
+        .map_err(|error| error.to_string())?;
+    slab.subregion(data.start, data.len())
+}
+
+#[cfg(target_os = "macos")]
+fn qwen_q4_stage(
+    context: &qx_metal::platform::MetalContext,
+    artifact: &qx_format::MappedArtifact,
+    slab: &qx_metal::platform::RuntimeBuffer,
+    layer: u16,
+    kind: qx_format::TensorKind,
+    rows: usize,
+    columns: usize,
+) -> Result<qx_metal::platform::PreparedQ4Stage, String> {
+    let (scales, data) = qwen_entry_buffers(
+        artifact,
+        slab,
+        layer,
+        u8::MAX,
+        kind,
+        qx_quant::QuantType::Q4,
+        rows,
+        columns,
+    )?;
+    context.prepare_q4_stage_buffers(
+        data,
+        scales,
+        rows,
+        columns,
+        qx_quant::PackingLayout::RowMajor,
+    )
+}
+
 #[cfg(target_os = "macos")]
 impl PreparedAttentionStack {
     pub fn load(

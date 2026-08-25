@@ -41,6 +41,25 @@ All projection and GQA comparisons were bit-exact or below `2.1e-7` relative
 L2. Every router comparison selected identical expert IDs. Reported cosine was
 `1.0` for every component above.
 
+## Persistent mapped bindings
+
+`PreparedQwenLayer` now binds Q/K/V/O/router, four norm vectors, and all 128
+Q2S4 experts as subregions of one no-copy Metal buffer backed by the artifact
+mmap. On the M5 Pro:
+
+| Measurement | Result |
+|---|---:|
+| Mapped weight-slab buffer | 9,927,294,976 bytes |
+| Experts bound | 128 |
+| Layer-0 binding time | 4.006 ms |
+| Weight upload/repack | none |
+
+Metal's `currentAllocatedSize` increases by the logical buffer length because
+the complete mapping is exposed to Metal. That is not evidence of a second
+resident copy: `newBufferWithBytesNoCopy` owns the mmap lifetime and every
+prepared tensor is only a range of that same buffer. The complete parity replay
+above passes while executing directly from those mapped ranges.
+
 ## Reproduce
 
 ```bash
@@ -57,8 +76,8 @@ This is a correctness graph, not the production token graph:
 - RMSNorm, residual composition, top-8 selection, and KV insertion are still
   orchestrated by the harness;
 - the GQA kernel deliberately recomputes scores for each output dimension;
-- selected expert weights are uploaded instead of bound as persistent mapped
-  no-copy slab ranges;
+- top-8 IDs and weights are still selected by the harness rather than a
+  Qwen-sized GPU top-k kernel;
 - embedding, persistent KV state, all-48-layer scheduling, final norm, untied
   LM head, argmax, and GPU-resident rollout are not connected;
 - parity is against quantized QX math, not the BF16 teacher.

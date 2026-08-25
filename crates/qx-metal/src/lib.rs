@@ -1199,6 +1199,14 @@ pub mod platform {
     }
 
     impl RuntimeBuffer {
+        pub fn len(&self) -> usize {
+            self.length
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.length == 0
+        }
+
         pub fn subregion(&self, offset: usize, length: usize) -> Result<Self, String> {
             let end = offset
                 .checked_add(length)
@@ -12612,6 +12620,35 @@ pub mod platform {
             })
         }
 
+        /// Bind a Q4 matrix from existing runtime-buffer ranges. This is the
+        /// no-copy constructor used by mapped Qwen artifacts.
+        pub fn prepare_q4_stage_buffers(
+            &self,
+            packed: RuntimeBuffer,
+            scales: RuntimeBuffer,
+            rows: usize,
+            columns: usize,
+            layout: PackingLayout,
+        ) -> Result<PreparedQ4Stage, String> {
+            let expected_packed = buffer_len(rows, columns, QuantType::Q4);
+            let expected_scales = scale_len(rows, columns);
+            if packed.len() != expected_packed || scales.len() != expected_scales {
+                return Err(format!(
+                    "Q4 mapped stage bytes packed/scales={}/{}, expected {expected_packed}/{expected_scales}",
+                    packed.len(),
+                    scales.len()
+                ));
+            }
+            Ok(PreparedQ4Stage {
+                pipeline: self.q4_gemv_pipeline()?,
+                packed,
+                scales,
+                rows,
+                columns,
+                layout,
+            })
+        }
+
         pub fn prepare_q4_simd_stage(
             &self,
             weights: &qx_quant::QuantizedTensor,
@@ -13042,6 +13079,44 @@ pub mod platform {
                 gate_up_scales: self.input_runtime_buffer(gate_up_scales)?,
                 down_packed: self.input_runtime_buffer(down_packed)?,
                 down_scales: self.input_runtime_buffer(down_scales)?,
+            })
+        }
+
+        /// Bind one Qwen expert from subregions of a shared mapped weight
+        /// slab. No weight bytes are copied or re-packed.
+        pub fn prepare_qwen_q2s4_expert_buffers(
+            &self,
+            gate_up_packed: RuntimeBuffer,
+            gate_up_scales: RuntimeBuffer,
+            down_packed: RuntimeBuffer,
+            down_scales: RuntimeBuffer,
+        ) -> Result<PreparedQwenQ2S4Expert, String> {
+            const QWEN_HIDDEN: usize = 2048;
+            const QWEN_INTERMEDIATE: usize = 768;
+            const QWEN_GATE_UP_ROWS: usize = QWEN_INTERMEDIATE * 2;
+            let expected = [
+                buffer_len(QWEN_GATE_UP_ROWS, QWEN_HIDDEN, QuantType::Q2S4),
+                scale_len(QWEN_GATE_UP_ROWS, QWEN_HIDDEN),
+                buffer_len(QWEN_HIDDEN, QWEN_INTERMEDIATE, QuantType::Q2S4),
+                scale_len(QWEN_HIDDEN, QWEN_INTERMEDIATE),
+            ];
+            let actual = [
+                gate_up_packed.len(),
+                gate_up_scales.len(),
+                down_packed.len(),
+                down_scales.len(),
+            ];
+            if actual != expected {
+                return Err(format!(
+                    "invalid mapped Qwen expert byte lengths {actual:?}, expected {expected:?}"
+                ));
+            }
+            Ok(PreparedQwenQ2S4Expert {
+                pipeline: self.qwen_q2s4_expert_pipeline()?,
+                gate_up_packed,
+                gate_up_scales,
+                down_packed,
+                down_scales,
             })
         }
 

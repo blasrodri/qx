@@ -568,6 +568,7 @@ dependencies = [
  "qx-metal",
  "qx-model",
  "qx-quant",
+ "qx-runtime-v2",
 ]
 
 [[package]]

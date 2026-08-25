@@ -4,7 +4,7 @@ use half::f16;
 use qx_format::{MappedArtifact, TensorKind};
 use qx_model::{ModelArchitecture, QWEN3_30B_A3B_MODEL_ID};
 use qx_quant::QuantType;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 const HIDDEN: usize = 2048;
 const INTERMEDIATE: usize = 768;
@@ -36,8 +36,10 @@ fn main() -> Result<()> {
 #[cfg(target_os = "macos")]
 fn run() -> Result<()> {
     let args = Args::parse();
-    let artifact = MappedArtifact::open(&args.artifact)
-        .with_context(|| format!("open {}", args.artifact.display()))?;
+    let artifact = Arc::new(
+        MappedArtifact::open(&args.artifact)
+            .with_context(|| format!("open {}", args.artifact.display()))?,
+    );
     validate_artifact(&artifact, &args)?;
     let gate_index = find_expert(&artifact, args.layer, args.expert, TensorKind::GateUp)?;
     let down_index = find_expert(&artifact, args.layer, args.expert, TensorKind::Down)?;
@@ -56,15 +58,17 @@ fn run() -> Result<()> {
         .collect::<Vec<_>>();
     let expected = cpu_expert(&gate, &down, &input);
 
-    let (gate_scales, gate_data) = artifact.tensor_bytes(gate_index)?;
-    let (down_scales, down_data) = artifact.tensor_bytes(down_index)?;
     let context = qx_metal::platform::MetalContext::system_default()
         .context("no Metal device is available")?;
-    let prepared = context
-        .prepare_qwen_q2s4_expert_bytes(gate_data, gate_scales, down_data, down_scales)
-        .map_err(anyhow::Error::msg)?;
+    let allocated_before_bind = context.current_allocated_bytes();
+    let bind_started = Instant::now();
+    let persistent_layer =
+        qx_runtime_v2::PreparedQwenLayer::load(&context, artifact.clone(), args.layer)
+            .map_err(anyhow::Error::msg)?;
+    let bind_elapsed = bind_started.elapsed();
+    let allocated_after_bind = context.current_allocated_bytes();
     let actual_bits = context
-        .run_prepared_qwen_q2s4_expert(&prepared, &input_bits)
+        .run_prepared_qwen_q2s4_expert(&persistent_layer.experts[args.expert as usize], &input_bits)
         .map_err(anyhow::Error::msg)?;
     let actual = actual_bits
         .iter()
@@ -79,11 +83,8 @@ fn run() -> Result<()> {
         .into_iter()
         .map(|value| f16::from_f32(value).to_f32())
         .collect::<Vec<_>>();
-    let router_prepared = context
-        .prepare_q4_stage(&router)
-        .map_err(anyhow::Error::msg)?;
     let router_actual = context
-        .run_prepared_q4_stage(&router_prepared, &input_bits)
+        .run_prepared_q4_stage(&persistent_layer.router, &input_bits)
         .map_err(anyhow::Error::msg)?
         .into_iter()
         .map(|bits| f16::from_bits(bits).to_f32())
@@ -105,6 +106,7 @@ fn run() -> Result<()> {
     let query = q4_projection(
         &artifact,
         &context,
+        &persistent_layer.q_proj,
         args.layer,
         TensorKind::QProj,
         4096,
@@ -115,6 +117,7 @@ fn run() -> Result<()> {
     let key = q4_projection(
         &artifact,
         &context,
+        &persistent_layer.k_proj,
         args.layer,
         TensorKind::KProj,
         512,
@@ -125,6 +128,7 @@ fn run() -> Result<()> {
     let value = q4_projection(
         &artifact,
         &context,
+        &persistent_layer.v_proj,
         args.layer,
         TensorKind::VProj,
         512,
@@ -183,6 +187,7 @@ fn run() -> Result<()> {
     let output_projection = q4_projection(
         &artifact,
         &context,
+        &persistent_layer.o_proj,
         args.layer,
         TensorKind::OProj,
         HIDDEN,
@@ -218,7 +223,7 @@ fn run() -> Result<()> {
         .map(|value| f16::from_f32(value).to_f32())
         .collect::<Vec<_>>();
     let post_router_actual_bits = context
-        .run_prepared_q4_stage(&router_prepared, &moe_input_bits)
+        .run_prepared_q4_stage(&persistent_layer.router, &moe_input_bits)
         .map_err(anyhow::Error::msg)?;
     let post_router_actual = post_router_actual_bits
         .iter()
@@ -239,7 +244,6 @@ fn run() -> Result<()> {
         bail!("post-attention router selected different CPU and Metal experts");
     }
 
-    let mut prepared_experts = Vec::with_capacity(8);
     let mut cpu_expert_outputs = Vec::with_capacity(8);
     for &(expert, _) in &post_actual_route {
         let expert = u8::try_from(expert).expect("Qwen expert ID fits u8");
@@ -248,13 +252,6 @@ fn run() -> Result<()> {
         let gate = artifact.quantized_tensor(gate_index)?;
         let down = artifact.quantized_tensor(down_index)?;
         cpu_expert_outputs.push(cpu_expert(&gate, &down, &moe_input));
-        let (gate_scales, gate_data) = artifact.tensor_bytes(gate_index)?;
-        let (down_scales, down_data) = artifact.tensor_bytes(down_index)?;
-        prepared_experts.push(
-            context
-                .prepare_qwen_q2s4_expert_bytes(gate_data, gate_scales, down_data, down_scales)
-                .map_err(anyhow::Error::msg)?,
-        );
     }
     let route_weights: [f32; 8] = post_actual_route
         .iter()
@@ -262,7 +259,10 @@ fn run() -> Result<()> {
         .collect::<Vec<_>>()
         .try_into()
         .expect("top-8 route has eight weights");
-    let prepared_refs = prepared_experts.iter().collect::<Vec<_>>();
+    let prepared_refs = post_actual_route
+        .iter()
+        .map(|&(expert, _)| &persistent_layer.experts[expert])
+        .collect::<Vec<_>>();
     let moe_actual_bits = context
         .run_prepared_qwen_q2s4_experts_weighted(&prepared_refs, &moe_input_bits, &route_weights)
         .map_err(anyhow::Error::msg)?;
@@ -285,6 +285,19 @@ fn run() -> Result<()> {
     println!("QX Qwen expert parity\n");
     println!("artifact:      {}", args.artifact.display());
     println!("layer/expert:  {}/{}", args.layer, args.expert);
+    println!(
+        "mapped slab:    {} bytes",
+        persistent_layer.mapped_slab_bytes()
+    );
+    println!("bound experts:  {}", persistent_layer.experts.len());
+    println!(
+        "binding time:   {:.3} ms",
+        bind_elapsed.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Metal logical Δ:{} bytes",
+        allocated_after_bind.saturating_sub(allocated_before_bind)
+    );
     println!("gate/up:       {} x {}", gate.rows, gate.cols);
     println!("down:          {} x {}", down.rows, down.cols);
     println!("max abs error: {:.8}", metrics.max_abs);
@@ -479,6 +492,7 @@ struct ProjectionParity {
 fn q4_projection(
     artifact: &MappedArtifact,
     context: &qx_metal::platform::MetalContext,
+    prepared: &qx_metal::platform::PreparedQ4Stage,
     layer: u16,
     kind: TensorKind,
     rows: usize,
@@ -493,11 +507,8 @@ fn q4_projection(
         .into_iter()
         .map(|value| f16::from_f32(value).to_f32())
         .collect::<Vec<_>>();
-    let prepared = context
-        .prepare_q4_stage(&weights)
-        .map_err(anyhow::Error::msg)?;
     let actual_bits = context
-        .run_prepared_q4_stage(&prepared, input_bits)
+        .run_prepared_q4_stage(prepared, input_bits)
         .map_err(anyhow::Error::msg)?;
     let actual = actual_bits
         .iter()

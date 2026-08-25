@@ -12,3 +12,4 @@ qx-format.workspace = true
 qx-metal.workspace = true
 qx-model.workspace = true
 qx-quant.workspace = true
+qx-runtime-v2.workspace = true
