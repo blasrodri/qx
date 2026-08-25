@@ -26,6 +26,16 @@ struct Args {
     position: u32,
     #[arg(long, default_value_t = 8)]
     layer_replays: usize,
+    #[arg(long)]
+    full_model: bool,
+    #[arg(long, default_value_t = 1)]
+    input_token: u32,
+    #[arg(long, default_value_t = 64)]
+    state_context: usize,
+    #[arg(long, default_value_t = 0)]
+    full_position: u32,
+    #[arg(long, default_value_t = 2)]
+    full_replays: usize,
 }
 
 fn main() -> Result<()> {
@@ -574,6 +584,114 @@ fn run() -> Result<()> {
         bail!("Qwen post-attention MoE parity failed");
     }
     println!("layer-{} components: pass", args.layer);
+    if args.full_model {
+        run_full_model(&context, artifact, &args)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_full_model(
+    context: &qx_metal::platform::MetalContext,
+    artifact: Arc<MappedArtifact>,
+    args: &Args,
+) -> Result<()> {
+    let allocated_before = context.current_allocated_bytes();
+    let prepare_started = Instant::now();
+    let model =
+        qx_runtime_v2::PreparedQwenModel::load(context, artifact).map_err(anyhow::Error::msg)?;
+    let prepare_wall = prepare_started.elapsed();
+    let state = model
+        .allocate_state(context, args.state_context)
+        .map_err(anyhow::Error::msg)?;
+    context
+        .write_runtime_buffer(&state.token, &args.input_token.to_ne_bytes())
+        .map_err(anyhow::Error::msg)?;
+    let allocated_after = context.current_allocated_bytes();
+
+    let metrics_before = context.metrics().map_err(anyhow::Error::msg)?;
+    let first_started = Instant::now();
+    let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+    model
+        .encode_token(
+            &mut graph,
+            context,
+            &state,
+            &state.token,
+            &state.next_token,
+            args.full_position,
+        )
+        .map_err(anyhow::Error::msg)?;
+    graph.finish(context).map_err(anyhow::Error::msg)?;
+    let first_wall = first_started.elapsed();
+    let metrics_after = context.metrics().map_err(anyhow::Error::msg)?;
+    let next_token = context
+        .read_runtime_u32(&state.next_token)
+        .map_err(anyhow::Error::msg)?;
+
+    let replay_metrics_before = context.metrics().map_err(anyhow::Error::msg)?;
+    let replay_started = Instant::now();
+    for _ in 0..args.full_replays {
+        let mut replay = context.begin_decode().map_err(anyhow::Error::msg)?;
+        model
+            .encode_token(
+                &mut replay,
+                context,
+                &state,
+                &state.token,
+                &state.next_token,
+                args.full_position,
+            )
+            .map_err(anyhow::Error::msg)?;
+        replay.finish(context).map_err(anyhow::Error::msg)?;
+    }
+    let replay_wall = replay_started.elapsed();
+    let replay_metrics_after = context.metrics().map_err(anyhow::Error::msg)?;
+    let replay_token = context
+        .read_runtime_u32(&state.next_token)
+        .map_err(anyhow::Error::msg)?;
+    if args.full_replays > 0 && replay_token != next_token {
+        bail!(
+            "complete Qwen replay was nondeterministic: first={next_token}, replay={replay_token}"
+        );
+    }
+
+    println!();
+    println!("QX complete Qwen token graph");
+    println!("prepared layers:      {}", model.layers.len());
+    println!(
+        "model preparation:   {:.3} ms",
+        prepare_wall.as_secs_f64() * 1000.0
+    );
+    println!("state context:        {}", state.max_context());
+    println!("decode position:      {}", args.full_position);
+    println!("runtime state:        {} bytes", state.bytes());
+    println!(
+        "Metal logical Δ:      {} bytes",
+        allocated_after.saturating_sub(allocated_before)
+    );
+    println!(
+        "input -> next token:  {} -> {}",
+        args.input_token, next_token
+    );
+    println!("replay deterministic: yes");
+    println!(
+        "first token graph:    {:.3} ms wall, {:.3} ms GPU, {} CB / {} dispatches",
+        first_wall.as_secs_f64() * 1000.0,
+        (metrics_after.gpu_time_seconds - metrics_before.gpu_time_seconds) * 1000.0,
+        metrics_after.command_buffers - metrics_before.command_buffers,
+        metrics_after.dispatches - metrics_before.dispatches,
+    );
+    if args.full_replays > 0 {
+        println!(
+            "warm token mean:     {:.3} ms wall, {:.3} ms GPU ({} replays)",
+            replay_wall.as_secs_f64() * 1000.0 / args.full_replays as f64,
+            (replay_metrics_after.gpu_time_seconds - replay_metrics_before.gpu_time_seconds)
+                * 1000.0
+                / args.full_replays as f64,
+            args.full_replays,
+        );
+    }
     Ok(())
 }
 

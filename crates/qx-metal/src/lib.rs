@@ -914,6 +914,13 @@ pub mod platform {
         down_scale_offsets: RuntimeBuffer,
     }
 
+    pub struct PreparedQwenQ4Embedding {
+        pipeline: Pipeline,
+        packed: RuntimeBuffer,
+        scales: RuntimeBuffer,
+        rows: usize,
+    }
+
     /// A single Q4 matrix stage used by the kernel microbenchmarks. It keeps
     /// the artifact's packing layout so expert gate/up and down projections
     /// can be measured independently.
@@ -1475,6 +1482,8 @@ pub mod platform {
         qwen_residual_rms_norm_pipeline: Mutex<Option<Pipeline>>,
         qwen_store_kv_pipeline: Mutex<Option<Pipeline>>,
         qwen_residual_pipeline: Mutex<Option<Pipeline>>,
+        qwen_embedding_pipeline: Mutex<Option<Pipeline>>,
+        qwen_argmax_pipeline: Mutex<Option<Pipeline>>,
         qwen_dynamic_moe_pipeline: Mutex<Option<Pipeline>>,
         qwen_dynamic_accumulate_pipeline: Mutex<Option<Pipeline>>,
         logits_pipeline: Mutex<Option<Pipeline>>,
@@ -1550,6 +1559,99 @@ pub mod platform {
     impl DecodeGraph {
         pub fn encoder(&self) -> &ProtocolObject<dyn MTLComputeCommandEncoder> {
             &self.encoder
+        }
+
+        pub fn encode_qwen_embedding_lookup(
+            &mut self,
+            prepared: &PreparedQwenQ4Embedding,
+            token: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+        ) -> Result<(), String> {
+            const HIDDEN: usize = 2048;
+            if token.len() < std::mem::size_of::<u32>()
+                || output.len() < HIDDEN * std::mem::size_of::<u16>()
+            {
+                return Err("Qwen embedding buffers are smaller than their fixed shape".to_owned());
+            }
+            self.encoder.setComputePipelineState(&prepared.pipeline);
+            let rows = prepared.rows as u32;
+            unsafe {
+                for (buffer, index) in [
+                    (&prepared.packed, 0),
+                    (&prepared.scales, 1),
+                    (token, 2),
+                    (output, 3),
+                ] {
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
+                }
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&rows).cast(),
+                    std::mem::size_of_val(&rows),
+                    4,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
+        pub fn encode_qwen_argmax(
+            &mut self,
+            context: &MetalContext,
+            logits: &RuntimeBuffer,
+            token: &RuntimeBuffer,
+            count: usize,
+        ) -> Result<(), String> {
+            if count == 0
+                || logits.len() < count * std::mem::size_of::<u16>()
+                || token.len() < std::mem::size_of::<u32>()
+            {
+                return Err("Qwen argmax buffers are smaller than the requested shape".to_owned());
+            }
+            let count =
+                u32::try_from(count).map_err(|_| "Qwen argmax count exceeds u32".to_owned())?;
+            let pipeline = context.qwen_argmax_pipeline()?;
+            self.encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&logits.buffer), logits.offset, 0);
+                self.encoder
+                    .setBuffer_offset_atIndex(Some(&token.buffer), token.offset, 1);
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&count).cast(),
+                    std::mem::size_of_val(&count),
+                    2,
+                );
+            }
+            self.encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
         }
 
         pub fn encode_qwen_rms_norm(
@@ -8817,6 +8919,8 @@ pub mod platform {
                 qwen_residual_rms_norm_pipeline: Mutex::new(None),
                 qwen_store_kv_pipeline: Mutex::new(None),
                 qwen_residual_pipeline: Mutex::new(None),
+                qwen_embedding_pipeline: Mutex::new(None),
+                qwen_argmax_pipeline: Mutex::new(None),
                 qwen_dynamic_moe_pipeline: Mutex::new(None),
                 qwen_dynamic_accumulate_pipeline: Mutex::new(None),
                 logits_pipeline: Mutex::new(None),
@@ -9008,6 +9112,8 @@ pub mod platform {
             let _ = self.qwen_residual_rms_norm_pipeline()?;
             let _ = self.qwen_store_kv_pipeline()?;
             let _ = self.qwen_residual_pipeline()?;
+            let _ = self.qwen_embedding_pipeline()?;
+            let _ = self.qwen_argmax_pipeline()?;
             let _ = self.qwen_qk_norm_rope_pipeline()?;
             let _ = self.qwen_gqa_attention_pipeline()?;
             let _ = self.qwen_top8_pipeline()?;
@@ -9410,6 +9516,22 @@ pub mod platform {
                 &self.qwen_residual_pipeline,
                 QWEN_ATTENTION_KERNEL_SOURCE,
                 "qx_qwen_residual",
+            )
+        }
+
+        fn qwen_embedding_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_embedding_pipeline,
+                QWEN_ATTENTION_KERNEL_SOURCE,
+                "qx_qwen_q4_embedding_lookup",
+            )
+        }
+
+        fn qwen_argmax_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_argmax_pipeline,
+                QWEN_ATTENTION_KERNEL_SOURCE,
+                "qx_qwen_argmax",
             )
         }
 
@@ -13248,6 +13370,30 @@ pub mod platform {
             })
         }
 
+        pub fn prepare_qwen_q4_embedding_buffers(
+            &self,
+            packed: RuntimeBuffer,
+            scales: RuntimeBuffer,
+            rows: usize,
+        ) -> Result<PreparedQwenQ4Embedding, String> {
+            const HIDDEN: usize = 2048;
+            let expected_packed = buffer_len(rows, HIDDEN, QuantType::Q4);
+            let expected_scales = scale_len(rows, HIDDEN);
+            if packed.len() != expected_packed || scales.len() != expected_scales {
+                return Err(format!(
+                    "Qwen embedding bytes packed/scales={}/{}, expected {expected_packed}/{expected_scales}",
+                    packed.len(),
+                    scales.len()
+                ));
+            }
+            Ok(PreparedQwenQ4Embedding {
+                pipeline: self.qwen_embedding_pipeline()?,
+                packed,
+                scales,
+                rows,
+            })
+        }
+
         pub fn prepare_q4_simd_stage(
             &self,
             weights: &qx_quant::QuantizedTensor,
@@ -14444,6 +14590,8 @@ mod tests {
             "qx_qwen_residual_rms_norm",
             "qx_qwen_store_kv",
             "qx_qwen_residual",
+            "qx_qwen_q4_embedding_lookup",
+            "qx_qwen_argmax",
             "qx_qwen_qk_norm_rope",
             "qx_qwen_gqa_attention",
             "qx_qwen_top8",

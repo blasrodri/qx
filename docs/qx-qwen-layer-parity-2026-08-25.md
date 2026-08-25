@@ -75,20 +75,41 @@ cargo run --release -p qx-qwen-parity -- \
   --layer 0 --expert 0 --position 37
 ```
 
+## Complete token graph baseline
+
+That milestone now executes. `PreparedQwenModel` binds the Q4 embedding, all
+48 layers, final norm, untied Q4 LM head, and GPU argmax. `QwenModelState`
+allocates context-bounded per-layer FP16 KV caches plus one shared layer
+workspace. One input token traverses the complete model in a single Metal
+command buffer without a host decision inside the graph.
+
+M5 Pro, input token `151643`:
+
+| Measurement | Result |
+|---|---:|
+| Prepared layers | 48 |
+| KV growth per allocated context token | 98,304 bytes |
+| Command buffers per token | 1 |
+| Dispatches per token | 676 |
+| Position 0 / capacity 64 | 6,675,528-byte state; 85.868 ms GPU; 11.65 tok/s |
+| Position 63 / capacity 64 | 6,675,528-byte state; 92.382 ms GPU; 10.82 tok/s |
+| Position 511 / capacity 512 | 50,715,720-byte state; 141.913 ms GPU; 7.05 tok/s |
+| Deterministic position-0 next token | `58` |
+
+This changes the optimization question. Host routing and token-boundary waits
+are no longer on the critical path inside a token. The remaining 85.7 ms is
+dominated by intentionally simple Q4 projection, GQA, and Q2S4 expert
+consumers. These figures are a structural baseline, not the expected final
+iPhone rate and not yet a BF16-teacher parity claim.
+
 ## What is not promoted yet
 
-The persistent single-layer graph is now real, but it is still a correctness
-baseline rather than a complete token runtime:
-
-- all 48 prepared layers are not yet chained in one command buffer;
-- per-layer persistent KV caches, embedding, final norm, untied LM head,
-  argmax, and GPU-resident rollout are not connected;
-- the GQA kernel deliberately recomputes scores for every output dimension;
-- the Q4 projections and Q2S4 expert kernel are shape-correct scalar consumers,
-  not the final SIMD/tiled performance mappings;
-- parity is against quantized QX math, not the BF16 teacher or downstream
-  quality evaluations.
-
-The next executable milestone is one reference token through all 48 layers.
-That will expose the actual working-set/page-residency behavior and establish
-the baseline from which attention and expert consumers should be optimized.
+- multi-token GPU-resident rollout is not connected to this Qwen model state;
+- GQA deliberately recomputes scores for every output dimension, which grows
+  from a small fraction of token time at position 0 to roughly 56 ms of added
+  GPU time at position 511;
+- Q4 projections and Q2S4 experts are shape-correct scalar consumers, not the
+  final SIMD/tiled performance mappings;
+- the serial GPU argmax is a dependency-correct placeholder;
+- parity is against quantized QX component math, not the BF16 teacher or
+  downstream quality evaluations.

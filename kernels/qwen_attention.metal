@@ -84,6 +84,54 @@ kernel void qx_qwen_residual(
     }
 }
 
+kernel void qx_qwen_q4_embedding_lookup(
+    device const uchar* packed [[buffer(0)]],
+    device const half* scales [[buffer(1)]],
+    device const uint* token [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint columns = 2048;
+    constexpr uint group_size = 32;
+    constexpr uint groups = columns / group_size;
+    constexpr uint bytes_per_group = 16;
+    uint row = token[0];
+    if (row >= rows) {
+        return;
+    }
+    for (uint column = tid; column < columns; column += 256) {
+        uint group = column / group_size;
+        uint local = column % group_size;
+        uchar byte = packed[row * groups * bytes_per_group
+            + group * bytes_per_group + local / 2];
+        uint code = (byte >> ((local & 1) * 4)) & 0xf;
+        output[column] = half(float(int(code) - 7) * float(scales[row * groups + group]));
+    }
+}
+
+// Correctness-first final selection. This intentionally favors an exact,
+// allocation-free GPU dependency over parallel reduction; the production
+// head can replace it without changing the token graph contract.
+kernel void qx_qwen_argmax(
+    device const half* logits [[buffer(0)]],
+    device uint* token [[buffer(1)]],
+    constant uint& count [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]) {
+    if (tid != 0 || count == 0) {
+        return;
+    }
+    float best = float(logits[0]);
+    uint best_index = 0;
+    for (uint index = 1; index < count; ++index) {
+        float value = float(logits[index]);
+        if (value > best) {
+            best = value;
+            best_index = index;
+        }
+    }
+    token[0] = best_index;
+}
+
 // Qwen3 Q/K normalization and split-half RoPE. Query contains 32 x 128
 // elements and key contains 4 x 128 elements. One thread owns a complete head
 // so the reference mapping has deterministic reduction and write ordering.

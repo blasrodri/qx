@@ -913,6 +913,215 @@ impl PreparedQwenLayer {
     }
 }
 
+/// Complete no-copy Qwen3-30B-A3B decode weights. Layer-local prepared views
+/// all alias the same mapped artifact slab.
+#[cfg(target_os = "macos")]
+pub struct PreparedQwenModel {
+    pub layers: Vec<PreparedQwenLayer>,
+    pub embedding: qx_metal::platform::PreparedQwenQ4Embedding,
+    pub final_norm: qx_metal::platform::RuntimeBuffer,
+    pub lm_head: qx_metal::platform::PreparedQ4Stage,
+    pub vocabulary: usize,
+    artifact: Arc<qx_format::MappedArtifact>,
+}
+
+/// Mutable GPU state for one Qwen decode stream. KV storage is bounded by the
+/// requested context rather than the artifact's maximum context.
+#[cfg(target_os = "macos")]
+pub struct QwenModelState {
+    pub token: qx_metal::platform::RuntimeBuffer,
+    pub next_token: qx_metal::platform::RuntimeBuffer,
+    pub hidden_a: qx_metal::platform::RuntimeBuffer,
+    pub hidden_b: qx_metal::platform::RuntimeBuffer,
+    pub logits: qx_metal::platform::RuntimeBuffer,
+    pub workspace: QwenLayerWorkspace,
+    pub key_caches: Vec<qx_metal::platform::RuntimeBuffer>,
+    pub value_caches: Vec<qx_metal::platform::RuntimeBuffer>,
+    max_context: usize,
+    bytes: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl QwenModelState {
+    pub fn allocate(
+        context: &qx_metal::platform::MetalContext,
+        layers: usize,
+        vocabulary: usize,
+        max_context: usize,
+    ) -> Result<Self, String> {
+        if layers == 0 || vocabulary == 0 || max_context == 0 {
+            return Err("Qwen model state dimensions must be nonzero".to_owned());
+        }
+        let half = std::mem::size_of::<u16>();
+        let cache_bytes = max_context
+            .checked_mul(512 * half)
+            .ok_or_else(|| "Qwen KV cache allocation overflows".to_owned())?;
+        let mut key_caches = Vec::with_capacity(layers);
+        let mut value_caches = Vec::with_capacity(layers);
+        for _ in 0..layers {
+            key_caches.push(context.allocate_runtime_buffer(cache_bytes)?);
+            value_caches.push(context.allocate_runtime_buffer(cache_bytes)?);
+        }
+        let workspace = QwenLayerWorkspace::allocate(context)?;
+        let bytes = layers * cache_bytes * 2
+            + workspace.bytes()
+            + 2 * std::mem::size_of::<u32>()
+            + 2 * 2048 * half
+            + vocabulary * half;
+        Ok(Self {
+            token: context.allocate_runtime_buffer(std::mem::size_of::<u32>())?,
+            next_token: context.allocate_runtime_buffer(std::mem::size_of::<u32>())?,
+            hidden_a: context.allocate_runtime_buffer(2048 * half)?,
+            hidden_b: context.allocate_runtime_buffer(2048 * half)?,
+            logits: context.allocate_runtime_buffer(vocabulary * half)?,
+            workspace,
+            key_caches,
+            value_caches,
+            max_context,
+            bytes,
+        })
+    }
+
+    pub fn max_context(&self) -> usize {
+        self.max_context
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl PreparedQwenModel {
+    pub fn load(
+        context: &qx_metal::platform::MetalContext,
+        artifact: Arc<qx_format::MappedArtifact>,
+    ) -> Result<Self, String> {
+        let shape = artifact
+            .info()
+            .execution_plan
+            .as_ref()
+            .and_then(|plan| plan.model_shape.as_ref())
+            .ok_or_else(|| "Qwen artifact does not seal a model shape".to_owned())?;
+        if shape.architecture != qx_model::ModelArchitecture::Qwen3Moe
+            || shape.layers != 48
+            || shape.hidden_size != 2048
+            || shape.vocabulary != 151_936
+        {
+            return Err(format!("unsupported complete Qwen shape {shape:?}"));
+        }
+        let weight_slab = artifact.weight_slab().map_err(|error| error.to_string())?;
+        let pointer = NonNull::new(weight_slab.as_ptr() as *mut c_void)
+            .ok_or_else(|| "Qwen artifact weight slab is empty".to_owned())?;
+        let slab =
+            unsafe { context.input_buffer_no_copy(pointer, weight_slab.len(), artifact.clone())? };
+        let (embedding_scales, embedding_data) = qwen_entry_buffers(
+            &artifact,
+            &slab,
+            u16::MAX,
+            u8::MAX,
+            qx_format::TensorKind::Embedding,
+            qx_quant::QuantType::Q4,
+            shape.vocabulary,
+            shape.hidden_size,
+        )?;
+        let embedding = context.prepare_qwen_q4_embedding_buffers(
+            embedding_data,
+            embedding_scales,
+            shape.vocabulary,
+        )?;
+        let final_norm =
+            qwen_raw_buffer(&artifact, &slab, u16::MAX, qx_format::TensorKind::FinalNorm)?;
+        let lm_head = qwen_q4_stage(
+            context,
+            &artifact,
+            &slab,
+            u16::MAX,
+            qx_format::TensorKind::LmHead,
+            shape.vocabulary,
+            shape.hidden_size,
+        )?;
+        let mut layers = Vec::with_capacity(shape.layers);
+        for layer in 0..shape.layers {
+            layers.push(PreparedQwenLayer::load(
+                context,
+                artifact.clone(),
+                layer as u16,
+            )?);
+        }
+        Ok(Self {
+            layers,
+            embedding,
+            final_norm,
+            lm_head,
+            vocabulary: shape.vocabulary,
+            artifact,
+        })
+    }
+
+    pub fn allocate_state(
+        &self,
+        context: &qx_metal::platform::MetalContext,
+        max_context: usize,
+    ) -> Result<QwenModelState, String> {
+        QwenModelState::allocate(context, self.layers.len(), self.vocabulary, max_context)
+    }
+
+    /// Encode one complete autoregressive token without committing or waiting.
+    /// Input and output token buffers may be chained across command buffers.
+    pub fn encode_token(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        context: &qx_metal::platform::MetalContext,
+        state: &QwenModelState,
+        input_token: &qx_metal::platform::RuntimeBuffer,
+        output_token: &qx_metal::platform::RuntimeBuffer,
+        position: u32,
+    ) -> Result<(), String> {
+        if position as usize >= state.max_context {
+            return Err(format!(
+                "Qwen position {position} exceeds allocated context {}",
+                state.max_context
+            ));
+        }
+        graph.encode_qwen_embedding_lookup(&self.embedding, input_token, &state.hidden_a)?;
+        for (index, layer) in self.layers.iter().enumerate() {
+            let (input, output) = if index.is_multiple_of(2) {
+                (&state.hidden_a, &state.hidden_b)
+            } else {
+                (&state.hidden_b, &state.hidden_a)
+            };
+            layer.encode(
+                graph,
+                context,
+                input,
+                &state.key_caches[index],
+                &state.value_caches[index],
+                output,
+                &state.workspace,
+                position,
+            )?;
+        }
+        let final_hidden = if self.layers.len().is_multiple_of(2) {
+            &state.hidden_a
+        } else {
+            &state.hidden_b
+        };
+        let normalized = if self.layers.len().is_multiple_of(2) {
+            &state.hidden_b
+        } else {
+            &state.hidden_a
+        };
+        graph.encode_qwen_rms_norm(context, final_hidden, &self.final_norm, normalized)?;
+        graph.encode_prepared_qwen_q4_stage(&self.lm_head, normalized, &state.logits)?;
+        graph.encode_qwen_argmax(context, &state.logits, output_token, self.vocabulary)
+    }
+
+    pub fn artifact(&self) -> &Arc<qx_format::MappedArtifact> {
+        &self.artifact
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn qwen_entry_index(
     artifact: &qx_format::MappedArtifact,
