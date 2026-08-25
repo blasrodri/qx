@@ -522,11 +522,48 @@ missing MiB divided by shared bandwidth remains hundreds of milliseconds.
 The exact packet lane therefore fails the 100 ms token gate on this smoke. Do
 not continue tuning exact packet sizes for capacity. The next experiment is
 activation-energy capture followed by a perfect-information packet oracle at
-90/95/99/99.9% retained contribution. Only if that oracle reaches a 3--4 GiB
+90/95/99/99.9% retained activation energy. Only if that oracle reaches a 3--4 GiB
 working set at negligible quality loss should a learned predictor be built.
 
 The committed exact-replay aggregate is
 `benchmarks/results/qwen3-30b-a3b-exact-packet-replay-smoke-2026-08-25.json`.
+
+### Activation-energy oracle smoke
+
+Because the exact lane failed, the llama bridge now optionally captures the
+post-SwiGLU intermediate for every selected expert. It reduces the raw tensor
+immediately into L1 and squared-L2 energy for 128/64/32-neuron packets. The
+`oracle` command sorts those packets with perfect knowledge and asks how many
+are required to cross 90/95/99/99.9% squared-L2 energy.
+
+This is deliberately a proxy. Post-SwiGLU energy is not the packet's weighted
+down-projection contribution, logit error, NLL, or task quality. It establishes
+whether obvious contiguous activation sparsity exists before paying for a
+masked down-projection and quality harness.
+
+For 29,952 selected-expert observations from the 78-position Qwen smoke:
+
+| Packet | 90% energy | 95% energy | 99% energy | Full |
+|---:|---:|---:|---:|---:|
+| 128 neurons | 5.47 | 5.93 | 5.99 | 6 |
+| 64 neurons | 9.86 | 10.94 | 11.96 | 12 |
+| 32 neurons | 18.09 | 20.69 | 23.53 | 24 |
+
+At 99% energy, the perfect selector retained 98.06% of 32-neuron packets and
+99.67% of 64-neuron packets. At the much looser 90% target, 32-neuron packets
+still retained 75.37%, corresponding to approximately 569.8 MiB of active Q3
+expert payload per token instead of 756 MiB. The p95 selected count was 20 of
+24 packets. This is not a 2x--10x sparsity opportunity.
+
+Therefore a learned predictor for the current contiguous packet definition is
+not justified: it cannot beat the perfect-information oracle. The remaining
+credible research step is contribution-aware measurement on a much larger,
+disjoint corpus—ideally packet-wise down-output norm and then masked-logit/NLL
+curves. If that remains dense, the unmodified-Qwen mobile lane is a model
+co-design problem, not a cache-policy problem.
+
+The committed oracle aggregate is
+`benchmarks/results/qwen3-30b-a3b-activation-energy-oracle-smoke-2026-08-25.json`.
 
 ## Evidence layout
 

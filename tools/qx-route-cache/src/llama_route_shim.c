@@ -13,9 +13,12 @@ typedef struct qx_llama_route {
     int32_t n_vocab;
     int32_t layers;
     int32_t top_k;
+    int32_t intermediate;
     uint32_t position;
     int32_t * active_routes;
+    float * active_activations;
     uint8_t * seen_layers;
+    uint8_t * seen_activations;
     char error[256];
 } qx_llama_route;
 
@@ -35,27 +38,50 @@ static void qx_route_log(enum ggml_log_level level, const char * text, void * us
 
 static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user_data) {
     qx_llama_route * route = (qx_llama_route *) user_data;
-    static const char prefix[] = "ffn_moe_topk-";
-    if (!route || strncmp(tensor->name, prefix, sizeof(prefix) - 1) != 0) {
+    static const char route_prefix[] = "ffn_moe_topk-";
+    static const char activation_prefix[] = "ffn_moe_swiglu-";
+    if (!route) {
         return false;
     }
-    int layer = atoi(tensor->name + sizeof(prefix) - 1);
+    const bool is_route = strncmp(tensor->name, route_prefix, sizeof(route_prefix) - 1) == 0;
+    const bool is_activation = route->intermediate > 0 &&
+        strncmp(tensor->name, activation_prefix, sizeof(activation_prefix) - 1) == 0;
+    if (!is_route && !is_activation) {
+        return false;
+    }
+    const char * suffix = tensor->name +
+        (is_route ? sizeof(route_prefix) - 1 : sizeof(activation_prefix) - 1);
+    int layer = atoi(suffix);
     if (layer < 0 || layer >= route->layers) {
         return false;
     }
     if (ask) {
         return true;
     }
-    if (!route->active_routes || tensor->type != GGML_TYPE_I32 || tensor->ne[0] != route->top_k) {
-        qx_set_error(route, "unexpected ffn_moe_topk tensor shape or type");
+    if (is_route) {
+        if (!route->active_routes || tensor->type != GGML_TYPE_I32 || tensor->ne[0] != route->top_k) {
+            qx_set_error(route, "unexpected ffn_moe_topk tensor shape or type");
+            return true;
+        }
+        ggml_backend_tensor_get(
+            tensor,
+            route->active_routes + layer * route->top_k,
+            0,
+            (size_t) route->top_k * sizeof(int32_t));
+        route->seen_layers[layer] = 1;
+        return true;
+    }
+    if (!route->active_activations || tensor->type != GGML_TYPE_F32 ||
+        tensor->ne[0] != route->intermediate || tensor->ne[1] != route->top_k) {
+        qx_set_error(route, "unexpected ffn_moe_swiglu tensor shape or type");
         return true;
     }
     ggml_backend_tensor_get(
         tensor,
-        route->active_routes + layer * route->top_k,
+        route->active_activations + (size_t) layer * route->top_k * route->intermediate,
         0,
-        (size_t) route->top_k * sizeof(int32_t));
-    route->seen_layers[layer] = 1;
+        (size_t) route->top_k * route->intermediate * sizeof(float));
+    route->seen_activations[layer] = 1;
     return true;
 }
 
@@ -65,8 +91,9 @@ qx_llama_route * qx_llama_route_open(
         int32_t layers,
         int32_t top_k,
         int32_t gpu_layers,
-        int32_t threads) {
-    if (!path || layers <= 0 || top_k <= 0) {
+        int32_t threads,
+        int32_t intermediate) {
+    if (!path || layers <= 0 || top_k <= 0 || intermediate < 0) {
         return NULL;
     }
     qx_llama_route * route = calloc(1, sizeof(*route));
@@ -75,8 +102,12 @@ qx_llama_route * qx_llama_route_open(
     }
     route->layers = layers;
     route->top_k = top_k;
+    route->intermediate = intermediate;
     route->seen_layers = calloc((size_t) layers, 1);
-    if (!route->seen_layers) {
+    route->seen_activations = intermediate > 0 ? calloc((size_t) layers, 1) : NULL;
+    if (!route->seen_layers || (intermediate > 0 && !route->seen_activations)) {
+        free(route->seen_layers);
+        free(route->seen_activations);
         free(route);
         return NULL;
     }
@@ -88,12 +119,14 @@ qx_llama_route * qx_llama_route_open(
     route->model = llama_model_load_from_file(path, model_params);
     if (!route->model) {
         free(route->seen_layers);
+        free(route->seen_activations);
         free(route);
         return NULL;
     }
     if (llama_model_n_layer(route->model) != layers) {
         llama_model_free(route->model);
         free(route->seen_layers);
+        free(route->seen_activations);
         free(route);
         return NULL;
     }
@@ -113,6 +146,7 @@ qx_llama_route * qx_llama_route_open(
     if (!route->context) {
         llama_model_free(route->model);
         free(route->seen_layers);
+        free(route->seen_activations);
         free(route);
         return NULL;
     }
@@ -132,6 +166,7 @@ void qx_llama_route_close(qx_llama_route * route) {
         llama_model_free(route->model);
     }
     free(route->seen_layers);
+    free(route->seen_activations);
     free(route);
 }
 
@@ -171,14 +206,24 @@ int qx_llama_route_step(
         int32_t input,
         int32_t * output,
         int32_t * routes,
-        int32_t route_count) {
+        int32_t route_count,
+        float * activations,
+        int32_t activation_count) {
     if (!route || !route->context || !output || !routes ||
-        route_count != route->layers * route->top_k) {
+        route_count != route->layers * route->top_k ||
+        (route->intermediate > 0 && (!activations ||
+            activation_count != route->layers * route->top_k * route->intermediate)) ||
+        (route->intermediate == 0 && (activations || activation_count != 0))) {
         return -1;
     }
     memset(route->seen_layers, 0, (size_t) route->layers);
+    if (route->intermediate > 0) {
+        memset(route->seen_activations, 0, (size_t) route->layers);
+        memset(activations, 0, (size_t) activation_count * sizeof(float));
+    }
     memset(routes, 0xff, (size_t) route_count * sizeof(int32_t));
     route->active_routes = routes;
+    route->active_activations = activations;
     route->error[0] = '\0';
 
     llama_token token = input;
@@ -186,6 +231,7 @@ int qx_llama_route_step(
     int decode_status = llama_decode(route->context, batch);
     llama_synchronize(route->context);
     route->active_routes = NULL;
+    route->active_activations = NULL;
     if (decode_status != 0) {
         qx_set_error(route, "llama_decode failed");
         return -2;
@@ -194,6 +240,10 @@ int qx_llama_route_step(
         if (!route->seen_layers[layer]) {
             qx_set_error(route, "route callback missed one or more layers");
             return -3;
+        }
+        if (route->intermediate > 0 && !route->seen_activations[layer]) {
+            qx_set_error(route, "activation callback missed one or more layers");
+            return -5;
         }
     }
     float * logits = llama_get_logits(route->context);

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "classification": "activation-energy-oracle-smoke",
+  "promotion_evidence": false,
+  "quality_semantics": "post-swiglu-squared-l2-proxy-not-down-output-or-quality",
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "trace": {
+    "token_positions": 78,
+    "layers": 48,
+    "selected_experts_per_layer": 8,
+    "expert_observations": 29952
+  },
+  "full_exact_active_q3_payload_mib_per_token": 756.0,
+  "results": [
+    {"packet_neurons":128,"packets_per_expert":6,"energy_threshold":0.90,"mean_selected_packets":5.472255608974359,"p95_selected_packets":6,"mean_selected_fraction":0.9120426014957265,"mean_retained_energy":0.9622048469312858,"mean_active_mib_per_token":689.5042067307693},
+    {"packet_neurons":128,"packets_per_expert":6,"energy_threshold":0.95,"mean_selected_packets":5.927784455128205,"p95_selected_packets":6,"mean_selected_fraction":0.9879640758547008,"mean_retained_energy":0.9979299982883697,"mean_active_mib_per_token":746.9008413461538},
+    {"packet_neurons":128,"packets_per_expert":6,"energy_threshold":0.99,"mean_selected_packets":5.992487980769231,"p95_selected_packets":6,"mean_selected_fraction":0.9987479967948718,"mean_retained_energy":0.9999708475963527,"mean_active_mib_per_token":755.0534855769231},
+    {"packet_neurons":128,"packets_per_expert":6,"energy_threshold":0.999,"mean_selected_packets":5.998731303418803,"p95_selected_packets":6,"mean_selected_fraction":0.9997885505698005,"mean_retained_energy":0.9999997924829931,"mean_active_mib_per_token":755.8401442307693},
+    {"packet_neurons":64,"packets_per_expert":12,"energy_threshold":0.90,"mean_selected_packets":9.862713675213675,"p95_selected_packets":11,"mean_selected_fraction":0.8218928062678063,"mean_retained_energy":0.9238993645908413,"mean_active_mib_per_token":621.3509615384615},
+    {"packet_neurons":64,"packets_per_expert":12,"energy_threshold":0.95,"mean_selected_packets":10.940037393162394,"p95_selected_packets":12,"mean_selected_fraction":0.9116697827635327,"mean_retained_energy":0.9678305944866098,"mean_active_mib_per_token":689.2223557692307},
+    {"packet_neurons":64,"packets_per_expert":12,"energy_threshold":0.99,"mean_selected_packets":11.960036057692308,"p95_selected_packets":12,"mean_selected_fraction":0.9966696714743589,"mean_retained_energy":0.9998328842006532,"mean_active_mib_per_token":753.4822716346154},
+    {"packet_neurons":64,"packets_per_expert":12,"energy_threshold":0.999,"mean_selected_packets":11.995626335470085,"p95_selected_packets":12,"mean_selected_fraction":0.9996355279558404,"mean_retained_energy":0.9999990697399967,"mean_active_mib_per_token":755.7244591346154},
+    {"packet_neurons":32,"packets_per_expert":24,"energy_threshold":0.90,"mean_selected_packets":18.088741987179485,"p95_selected_packets":20,"mean_selected_fraction":0.7536975827991453,"mean_retained_energy":0.9108677097188878,"mean_active_mib_per_token":569.7953725961538},
+    {"packet_neurons":32,"packets_per_expert":24,"energy_threshold":0.95,"mean_selected_packets":20.693309294871796,"p95_selected_packets":22,"mean_selected_fraction":0.8622212206196581,"mean_retained_energy":0.9588939176526871,"mean_active_mib_per_token":651.8392427884615},
+    {"packet_neurons":32,"packets_per_expert":24,"energy_threshold":0.99,"mean_selected_packets":23.534788995726494,"p95_selected_packets":24,"mean_selected_fraction":0.9806162081552706,"mean_retained_energy":0.9973487061276178,"mean_active_mib_per_token":741.3458533653846},
+    {"packet_neurons":32,"packets_per_expert":24,"energy_threshold":0.999,"mean_selected_packets":23.981336805555557,"p95_selected_packets":24,"mean_selected_fraction":0.9992223668981481,"mean_retained_energy":0.9999948943458474,"mean_active_mib_per_token":755.412109375}
+  ],
+  "conclusions": [
+    "Contiguous post-SwiGLU packet energy is broadly dense for this smoke trace.",
+    "At a 99% activation-energy target, even a perfect selector retains 98.06% of 32-neuron packets and 99.67% of 64-neuron packets.",
+    "At a much looser 90% target, the best 32-neuron result still retains 75.37% of packets and 569.8 MiB of active Q3 payload per token.",
+    "This oracle is already too weak to justify training a packet predictor for the current contiguous packet definition.",
+    "Activation energy is not down-output contribution or a quality measurement; a larger corpus and contribution-aware control are required before rejecting model-system co-design."
+  ]
+}

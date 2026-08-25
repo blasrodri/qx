@@ -50,6 +50,12 @@ enum Command {
         gpu_layers: i32,
         #[arg(long, default_value_t = 4)]
         threads: i32,
+        /// Capture post-SwiGLU energy summaries for these neuron packet sizes.
+        #[arg(long, value_delimiter = ',')]
+        activation_packet_neurons: Vec<usize>,
+        /// Expert intermediate width used by activation capture.
+        #[arg(long, default_value_t = DEFAULT_EXPERT_NEURONS)]
+        expert_neurons: usize,
         /// Trusted model SHA-256. If omitted, the complete GGUF is hashed.
         #[arg(long)]
         model_sha256: Option<String>,
@@ -87,6 +93,17 @@ enum Command {
         io_parallelism: usize,
         #[arg(long)]
         reset_between_requests: bool,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Analyze perfect-information packet selection from captured activations.
+    Oracle {
+        #[arg(long)]
+        trace: PathBuf,
+        #[arg(long, value_delimiter = ',', default_value = "0.9,0.95,0.99,0.999")]
+        thresholds: Vec<f64>,
+        #[arg(long, default_value_t = DEFAULT_Q3_EXPERT_BYTES)]
+        expert_bytes: u64,
         #[arg(long)]
         output: PathBuf,
     },
@@ -172,6 +189,15 @@ struct TokenRoutes {
     input_token: i32,
     predicted_token: i32,
     routes: Vec<Vec<u16>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    packet_activation_energy: Option<Vec<PacketActivationEnergy>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PacketActivationEnergy {
+    packet_neurons: usize,
+    l1: Vec<Vec<Vec<f32>>>,
+    squared_l2: Vec<Vec<Vec<f32>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -258,6 +284,43 @@ struct SimulationResult {
     p99_shaped_io_ms_per_token: Option<f64>,
 }
 
+#[derive(Debug, Serialize)]
+struct OracleReport {
+    schema_version: u32,
+    classification: &'static str,
+    quality_semantics: &'static str,
+    trace: String,
+    trace_header: TraceHeader,
+    expert_bytes: u64,
+    token_records: usize,
+    results: Vec<OracleResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct OracleResult {
+    packet_neurons: usize,
+    packets_per_expert: usize,
+    threshold: f64,
+    expert_observations: usize,
+    mean_selected_packets_per_expert: f64,
+    p50_selected_packets_per_expert: u64,
+    p95_selected_packets_per_expert: u64,
+    p99_selected_packets_per_expert: u64,
+    mean_selected_fraction: f64,
+    mean_retained_activation_energy: f64,
+    mean_active_packet_bytes_per_token: f64,
+    p50_active_packet_bytes_per_token: u64,
+    p95_active_packet_bytes_per_token: u64,
+    p99_active_packet_bytes_per_token: u64,
+}
+
+#[derive(Default)]
+struct OracleAccumulator {
+    selected_packets: Vec<u64>,
+    retained_energy: Vec<f64>,
+    active_bytes_per_token: Vec<u64>,
+}
+
 fn main() -> Result<()> {
     match Args::parse().command {
         Command::Capture {
@@ -272,6 +335,8 @@ fn main() -> Result<()> {
             top_k,
             gpu_layers,
             threads,
+            activation_packet_neurons,
+            expert_neurons,
             model_sha256,
         } => capture(CaptureArgs {
             model,
@@ -285,6 +350,8 @@ fn main() -> Result<()> {
             top_k,
             gpu_layers,
             threads,
+            activation_packet_neurons,
+            expert_neurons,
             model_sha256,
         }),
         Command::Simulate {
@@ -316,6 +383,12 @@ fn main() -> Result<()> {
             reset_between_requests,
             output,
         }),
+        Command::Oracle {
+            trace,
+            thresholds,
+            expert_bytes,
+            output,
+        } => oracle(&trace, &thresholds, expert_bytes, &output),
     }
 }
 
@@ -331,6 +404,8 @@ struct CaptureArgs {
     top_k: usize,
     gpu_layers: i32,
     threads: i32,
+    activation_packet_neurons: Vec<usize>,
+    expert_neurons: usize,
     model_sha256: Option<String>,
 }
 
@@ -361,10 +436,18 @@ fn capture(args: CaptureArgs) -> Result<()> {
     if args.max_new_tokens == 0 {
         bail!("max-new-tokens must be positive");
     }
-    let model_hash = match args.model_sha256 {
+    for &packet_neurons in &args.activation_packet_neurons {
+        if packet_neurons == 0 || !args.expert_neurons.is_multiple_of(packet_neurons) {
+            bail!(
+                "activation packet size {packet_neurons} must divide expert-neurons {}",
+                args.expert_neurons
+            );
+        }
+    }
+    let model_hash = match args.model_sha256.as_ref() {
         Some(value) => {
-            validate_sha256(&value)?;
-            value
+            validate_sha256(value)?;
+            value.clone()
         }
         None => sha256_file(&args.model)?,
     };
@@ -375,6 +458,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
         args.top_k,
         args.gpu_layers,
         args.threads,
+        (!args.activation_packet_neurons.is_empty()).then_some(args.expert_neurons),
     )?;
     let prompt_tokens = llama.tokenize(&args.prompt)?;
     if prompt_tokens.is_empty() {
@@ -405,7 +489,11 @@ fn capture(args: CaptureArgs) -> Result<()> {
     let mut position = 0usize;
     let mut next = 0i32;
     for token in prompt_tokens {
-        let (predicted, routes) = llama.step(token)?;
+        let llama_capture::StepOutput {
+            predicted,
+            routes,
+            activations,
+        } = llama.step(token)?;
         validate_routes(&routes, args.layers, args.top_k, args.experts)?;
         write_trace_line(
             &mut writer,
@@ -416,6 +504,9 @@ fn capture(args: CaptureArgs) -> Result<()> {
                 input_token: token,
                 predicted_token: predicted,
                 routes,
+                packet_activation_energy: activations
+                    .as_deref()
+                    .map(|values| summarize_activations(values, &args)),
             }),
         )?;
         position += 1;
@@ -426,7 +517,11 @@ fn capture(args: CaptureArgs) -> Result<()> {
         if next == eos {
             break;
         }
-        let (predicted, routes) = llama.step(next)?;
+        let llama_capture::StepOutput {
+            predicted,
+            routes,
+            activations,
+        } = llama.step(next)?;
         validate_routes(&routes, args.layers, args.top_k, args.experts)?;
         write_trace_line(
             &mut writer,
@@ -437,6 +532,9 @@ fn capture(args: CaptureArgs) -> Result<()> {
                 input_token: next,
                 predicted_token: predicted,
                 routes,
+                packet_activation_energy: activations
+                    .as_deref()
+                    .map(|values| summarize_activations(values, &args)),
             }),
         )?;
         position += 1;
@@ -451,6 +549,215 @@ fn capture(args: CaptureArgs) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn capture(_args: CaptureArgs) -> Result<()> {
     bail!("route capture currently requires the macOS llama.cpp bridge")
+}
+
+fn summarize_activations(values: &[f32], args: &CaptureArgs) -> Vec<PacketActivationEnergy> {
+    debug_assert_eq!(values.len(), args.layers * args.top_k * args.expert_neurons);
+    args.activation_packet_neurons
+        .iter()
+        .map(|&packet_neurons| {
+            let packets = args.expert_neurons / packet_neurons;
+            let mut l1 = vec![vec![vec![0.0f32; packets]; args.top_k]; args.layers];
+            let mut squared_l2 = vec![vec![vec![0.0f32; packets]; args.top_k]; args.layers];
+            for layer in 0..args.layers {
+                for slot in 0..args.top_k {
+                    let base = (layer * args.top_k + slot) * args.expert_neurons;
+                    for packet in 0..packets {
+                        let range =
+                            base + packet * packet_neurons..base + (packet + 1) * packet_neurons;
+                        for &value in &values[range] {
+                            l1[layer][slot][packet] += value.abs();
+                            squared_l2[layer][slot][packet] += value * value;
+                        }
+                    }
+                }
+            }
+            PacketActivationEnergy {
+                packet_neurons,
+                l1,
+                squared_l2,
+            }
+        })
+        .collect()
+}
+
+fn oracle(trace: &Path, thresholds: &[f64], expert_bytes: u64, output: &Path) -> Result<()> {
+    if thresholds.is_empty()
+        || thresholds
+            .iter()
+            .any(|threshold| !threshold.is_finite() || *threshold <= 0.0 || *threshold > 1.0)
+    {
+        bail!("oracle thresholds must be finite values in (0, 1]");
+    }
+    let header = read_trace_header(trace)?;
+    let mut accumulators = HashMap::<(usize, usize), OracleAccumulator>::new();
+    let mut packet_counts = HashMap::<usize, usize>::new();
+    let mut token_records = 0usize;
+    visit_trace(trace, &header, |token| {
+        let energy_sets = token
+            .packet_activation_energy
+            .ok_or_else(|| anyhow::anyhow!("trace token lacks packet activation energy"))?;
+        for energy in energy_sets {
+            validate_activation_energy(&energy, &header)?;
+            let packets_per_expert = energy.squared_l2[0][0].len();
+            if !expert_bytes.is_multiple_of(packets_per_expert as u64) {
+                bail!(
+                    "expert bytes {expert_bytes} are not divisible by {packets_per_expert} packets"
+                );
+            }
+            if packet_counts
+                .insert(energy.packet_neurons, packets_per_expert)
+                .is_some_and(|previous| previous != packets_per_expert)
+            {
+                bail!(
+                    "inconsistent packet count for {} neurons",
+                    energy.packet_neurons
+                );
+            }
+            let packet_bytes = expert_bytes / packets_per_expert as u64;
+            let mut token_selected = vec![0u64; thresholds.len()];
+            for layer in &energy.squared_l2 {
+                for expert in layer {
+                    for (threshold_index, &threshold) in thresholds.iter().enumerate() {
+                        let (selected, retained) = select_activation_packets(expert, threshold)?;
+                        let accumulator = accumulators
+                            .entry((energy.packet_neurons, threshold_index))
+                            .or_default();
+                        accumulator.selected_packets.push(selected as u64);
+                        accumulator.retained_energy.push(retained);
+                        token_selected[threshold_index] += selected as u64;
+                    }
+                }
+            }
+            for (threshold_index, selected) in token_selected.into_iter().enumerate() {
+                accumulators
+                    .entry((energy.packet_neurons, threshold_index))
+                    .or_default()
+                    .active_bytes_per_token
+                    .push(selected.saturating_mul(packet_bytes));
+            }
+        }
+        token_records += 1;
+        Ok(())
+    })?;
+    if token_records == 0 || packet_counts.is_empty() {
+        bail!("activation trace contains no token records");
+    }
+    let mut packet_sizes = packet_counts.keys().copied().collect::<Vec<_>>();
+    packet_sizes.sort_unstable_by(|left, right| right.cmp(left));
+    let mut results = Vec::new();
+    for packet_neurons in packet_sizes {
+        let packets_per_expert = packet_counts[&packet_neurons];
+        for (threshold_index, &threshold) in thresholds.iter().enumerate() {
+            let accumulator = accumulators
+                .remove(&(packet_neurons, threshold_index))
+                .ok_or_else(|| anyhow::anyhow!("missing oracle accumulator"))?;
+            let expert_observations = accumulator.selected_packets.len();
+            let selected_total = accumulator.selected_packets.iter().sum::<u64>();
+            results.push(OracleResult {
+                packet_neurons,
+                packets_per_expert,
+                threshold,
+                expert_observations,
+                mean_selected_packets_per_expert: selected_total as f64
+                    / expert_observations.max(1) as f64,
+                p50_selected_packets_per_expert: percentile(&accumulator.selected_packets, 0.50),
+                p95_selected_packets_per_expert: percentile(&accumulator.selected_packets, 0.95),
+                p99_selected_packets_per_expert: percentile(&accumulator.selected_packets, 0.99),
+                mean_selected_fraction: selected_total as f64
+                    / (expert_observations.max(1) * packets_per_expert) as f64,
+                mean_retained_activation_energy: accumulator.retained_energy.iter().sum::<f64>()
+                    / accumulator.retained_energy.len().max(1) as f64,
+                mean_active_packet_bytes_per_token: accumulator
+                    .active_bytes_per_token
+                    .iter()
+                    .sum::<u64>() as f64
+                    / accumulator.active_bytes_per_token.len().max(1) as f64,
+                p50_active_packet_bytes_per_token: percentile(
+                    &accumulator.active_bytes_per_token,
+                    0.50,
+                ),
+                p95_active_packet_bytes_per_token: percentile(
+                    &accumulator.active_bytes_per_token,
+                    0.95,
+                ),
+                p99_active_packet_bytes_per_token: percentile(
+                    &accumulator.active_bytes_per_token,
+                    0.99,
+                ),
+            });
+        }
+    }
+    let report = OracleReport {
+        schema_version: 1,
+        classification: "activation-energy-oracle-smoke",
+        quality_semantics: "post-swiglu-squared-l2-proxy-not-down-output-or-quality",
+        trace: trace.display().to_string(),
+        trace_header: header,
+        expert_bytes,
+        token_records,
+        results,
+    };
+    let mut writer = BufWriter::new(
+        File::create(output).with_context(|| format!("create {}", output.display()))?,
+    );
+    serde_json::to_writer_pretty(&mut writer, &report)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    println!("oracle report: {}", output.display());
+    for result in &report.results {
+        println!(
+            "{} neurons {:.3}% energy: mean {:.2}/{} packets, p95 {}, {:.2} MiB/token",
+            result.packet_neurons,
+            result.threshold * 100.0,
+            result.mean_selected_packets_per_expert,
+            result.packets_per_expert,
+            result.p95_selected_packets_per_expert,
+            result.mean_active_packet_bytes_per_token / (1024.0 * 1024.0),
+        );
+    }
+    Ok(())
+}
+
+fn validate_activation_energy(energy: &PacketActivationEnergy, header: &TraceHeader) -> Result<()> {
+    for (label, values) in [("l1", &energy.l1), ("squared-l2", &energy.squared_l2)] {
+        if values.len() != header.layers {
+            bail!("{label} activation energy has the wrong layer count");
+        }
+        for layer in values {
+            if layer.len() != header.top_k || layer.iter().any(Vec::is_empty) {
+                bail!("{label} activation energy has an invalid expert-slot shape");
+            }
+            let packets = layer[0].len();
+            if layer.iter().any(|expert| expert.len() != packets) {
+                bail!("{label} activation energy has inconsistent packet counts");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn select_activation_packets(energy: &[f32], threshold: f64) -> Result<(usize, f64)> {
+    if energy
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        bail!("activation energy contains a non-finite or negative value");
+    }
+    let total = energy.iter().map(|&value| value as f64).sum::<f64>();
+    if total == 0.0 {
+        return Ok((0, 1.0));
+    }
+    let mut ranked = energy.to_vec();
+    ranked.sort_by(|left, right| right.total_cmp(left));
+    let mut retained = 0.0f64;
+    for (index, value) in ranked.into_iter().enumerate() {
+        retained += value as f64;
+        if retained / total >= threshold {
+            return Ok((index + 1, retained / total));
+        }
+    }
+    Ok((energy.len(), 1.0))
 }
 
 fn simulate(args: SimulateArgs) -> Result<()> {
@@ -1194,6 +1501,7 @@ mod llama_capture {
             top_k: c_int,
             gpu_layers: c_int,
             threads: c_int,
+            intermediate: c_int,
         ) -> *mut c_void;
         fn qx_llama_route_close(route: *mut c_void);
         fn qx_llama_route_error(route: *const c_void) -> *const c_char;
@@ -1211,6 +1519,8 @@ mod llama_capture {
             output: *mut c_int,
             routes: *mut c_int,
             route_count: c_int,
+            activations: *mut f32,
+            activation_count: c_int,
         ) -> c_int;
     }
 
@@ -1218,6 +1528,13 @@ mod llama_capture {
         raw: *mut c_void,
         layers: usize,
         top_k: usize,
+        intermediate: Option<usize>,
+    }
+
+    pub struct StepOutput {
+        pub predicted: i32,
+        pub routes: Vec<Vec<u16>>,
+        pub activations: Option<Vec<f32>>,
     }
 
     impl Capture {
@@ -1228,6 +1545,7 @@ mod llama_capture {
             top_k: usize,
             gpu_layers: i32,
             threads: i32,
+            intermediate: Option<usize>,
         ) -> Result<Self> {
             let path = CString::new(path.to_string_lossy().as_bytes())?;
             let raw = unsafe {
@@ -1238,12 +1556,18 @@ mod llama_capture {
                     top_k.try_into()?,
                     gpu_layers,
                     threads,
+                    intermediate.unwrap_or(0).try_into()?,
                 )
             };
             if raw.is_null() {
                 bail!("failed to initialize llama.cpp route capture");
             }
-            Ok(Self { raw, layers, top_k })
+            Ok(Self {
+                raw,
+                layers,
+                top_k,
+                intermediate,
+            })
         }
 
         pub fn tokenize(&self, text: &str) -> Result<Vec<i32>> {
@@ -1282,9 +1606,19 @@ mod llama_capture {
             unsafe { qx_llama_route_eos(self.raw) }
         }
 
-        pub fn step(&mut self, input: i32) -> Result<(i32, Vec<Vec<u16>>)> {
+        pub fn step(&mut self, input: i32) -> Result<StepOutput> {
             let mut output = 0i32;
             let mut flat = vec![-1i32; self.layers * self.top_k];
+            let mut activations = self
+                .intermediate
+                .map(|width| vec![0.0f32; self.layers * self.top_k * width]);
+            let (activation_pointer, activation_count) = activations
+                .as_mut()
+                .map(|values| {
+                    Ok::<_, anyhow::Error>((values.as_mut_ptr(), values.len().try_into()?))
+                })
+                .transpose()?
+                .unwrap_or((std::ptr::null_mut(), 0));
             let status = unsafe {
                 qx_llama_route_step(
                     self.raw,
@@ -1292,6 +1626,8 @@ mod llama_capture {
                     &mut output,
                     flat.as_mut_ptr(),
                     flat.len().try_into()?,
+                    activation_pointer,
+                    activation_count,
                 )
             };
             if status != 0 {
@@ -1306,7 +1642,11 @@ mod llama_capture {
                         .collect::<Result<Vec<_>>>()
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok((output, routes))
+            Ok(StepOutput {
+                predicted: output,
+                routes,
+                activations,
+            })
         }
 
         fn error(&self) -> String {
@@ -1372,6 +1712,16 @@ mod tests {
     }
 
     #[test]
+    fn activation_oracle_selects_the_minimum_energy_prefix() {
+        let (selected, retained) = select_activation_packets(&[9.0, 0.5, 0.5], 0.90).unwrap();
+        assert_eq!(selected, 1);
+        assert!((retained - 0.9).abs() < 1e-6);
+        let (selected, retained) = select_activation_packets(&[0.0, 0.0], 0.99).unwrap();
+        assert_eq!(selected, 0);
+        assert_eq!(retained, 1.0);
+    }
+
+    #[test]
     fn synthetic_trace_reports_hits_misses_and_tail_bytes() {
         let path = std::env::temp_dir().join(format!(
             "qx-route-cache-{}-{}.jsonl",
@@ -1407,6 +1757,7 @@ mod tests {
                     input_token: position as i32,
                     predicted_token: position as i32 + 1,
                     routes,
+                    packet_activation_energy: None,
                 }),
             )
             .unwrap();
