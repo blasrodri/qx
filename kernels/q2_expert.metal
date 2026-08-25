@@ -229,6 +229,83 @@ kernel void qx_q2s4_qwen_expert(
     }
 }
 
+kernel void qx_q2s4_qwen_moe_dynamic(
+    device const uchar* slab [[buffer(0)]],
+    device const ulong* gate_data_offsets [[buffer(1)]],
+    device const ulong* gate_scale_offsets [[buffer(2)]],
+    device const ulong* down_data_offsets [[buffer(3)]],
+    device const ulong* down_scale_offsets [[buffer(4)]],
+    device const half* input [[buffer(5)]],
+    device const uint* expert_ids [[buffer(6)]],
+    device half* expert_outputs [[buffer(7)]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint slot [[threadgroup_position_in_grid]]) {
+    constexpr uint hidden = 2048;
+    constexpr uint intermediate = 768;
+    constexpr uint group_size = 32;
+    constexpr uint gate_groups = hidden / group_size;
+    constexpr uint down_groups = intermediate / group_size;
+    constexpr uint bytes_per_group = 8;
+    uint expert = expert_ids[slot];
+    device const uchar* gate_data = slab + gate_data_offsets[expert];
+    device const half* gate_scales =
+        reinterpret_cast<device const half*>(slab + gate_scale_offsets[expert]);
+    device const uchar* down_data = slab + down_data_offsets[expert];
+    device const half* down_scales =
+        reinterpret_cast<device const half*>(slab + down_scale_offsets[expert]);
+    threadgroup half activated[intermediate];
+
+    float gate = 0.0f;
+    float up = 0.0f;
+    uint up_row = intermediate + lane;
+    for (uint column = 0; column < hidden; ++column) {
+        uint group = column / group_size;
+        uint local = column % group_size;
+        uint shift = (local % 4) * 2;
+        uint gate_base = (lane * gate_groups + group) * bytes_per_group;
+        uint up_base = (up_row * gate_groups + group) * bytes_per_group;
+        uint gate_code = (gate_data[gate_base + local / 4] >> shift) & 0x3;
+        uint up_code = (gate_data[up_base + local / 4] >> shift) & 0x3;
+        gate += qx_q2s4_decode(gate_code, float(gate_scales[lane * gate_groups + group]))
+            * float(input[column]);
+        up += qx_q2s4_decode(up_code, float(gate_scales[up_row * gate_groups + group]))
+            * float(input[column]);
+    }
+    half gate_half = half(gate);
+    half up_half = half(up);
+    float gate_rounded = float(gate_half);
+    activated[lane] = half((gate_rounded / (1.0f + exp(-gate_rounded))) * float(up_half));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint row = lane; row < hidden; row += intermediate) {
+        float down = 0.0f;
+        for (uint column = 0; column < intermediate; ++column) {
+            uint group = column / group_size;
+            uint local = column % group_size;
+            uint base = (row * down_groups + group) * bytes_per_group;
+            uint code = (down_data[base + local / 4] >> ((local % 4) * 2)) & 0x3;
+            down += qx_q2s4_decode(code, float(down_scales[row * down_groups + group]))
+                * float(activated[column]);
+        }
+        expert_outputs[slot * hidden + row] = half(down);
+    }
+}
+
+kernel void qx_qwen_moe_accumulate_dynamic(
+    device const half* expert_outputs [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device half* output [[buffer(2)]],
+    uint row [[thread_position_in_grid]]) {
+    constexpr uint hidden = 2048;
+    if (row >= hidden) {
+        return;
+    }
+    float value = 0.0f;
+    for (uint slot = 0; slot < 8; ++slot) {
+        value += weights[slot] * float(expert_outputs[slot * hidden + row]);
+    }
+    output[row] = half(value);
+}
+
 kernel void qx_moe_accumulate(
     device const half* expert0 [[buffer(0)]],
     device const half* expert1 [[buffer(1)]],

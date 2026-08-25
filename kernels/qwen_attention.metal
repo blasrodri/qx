@@ -94,3 +94,44 @@ kernel void qx_qwen_gqa_attention(
     }
     output[index] = half(weighted / denominator);
 }
+
+kernel void qx_qwen_top8(
+    device const half* logits [[buffer(0)]],
+    device uint* ids [[buffer(1)]],
+    device float* weights [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) {
+        return;
+    }
+    float best_values[8];
+    uint best_ids[8];
+    for (uint slot = 0; slot < 8; ++slot) {
+        best_values[slot] = -INFINITY;
+        best_ids[slot] = 0;
+    }
+    for (uint expert = 0; expert < 128; ++expert) {
+        float value = float(logits[expert]);
+        for (uint slot = 0; slot < 8; ++slot) {
+            if (value > best_values[slot]
+                || (value == best_values[slot] && expert < best_ids[slot])) {
+                for (uint move = 7; move > slot; --move) {
+                    best_values[move] = best_values[move - 1];
+                    best_ids[move] = best_ids[move - 1];
+                }
+                best_values[slot] = value;
+                best_ids[slot] = expert;
+                break;
+            }
+        }
+    }
+    float maximum = best_values[0];
+    float denominator = 0.0f;
+    for (uint slot = 0; slot < 8; ++slot) {
+        weights[slot] = exp(best_values[slot] - maximum);
+        denominator += weights[slot];
+    }
+    for (uint slot = 0; slot < 8; ++slot) {
+        ids[slot] = best_ids[slot];
+        weights[slot] /= denominator;
+    }
+}

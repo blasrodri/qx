@@ -13787,6 +13787,14 @@ mod tests {
         for quant_type in [QuantType::Q2, QuantType::Q2S4, QuantType::Q3, QuantType::Q4] {
             assert!(kernel_source(quant_type).contains("kernel"));
         }
+        for name in ["qx_q2s4_qwen_moe_dynamic", "qx_qwen_moe_accumulate_dynamic"] {
+            assert!(
+                Q2_KERNEL_SOURCE.contains(name),
+                "missing Qwen MoE kernel {name}"
+            );
+        }
+        assert!(QWEN_ATTENTION_KERNEL_SOURCE.contains("qx_qwen_top8"));
+        assert!(QWEN_ATTENTION_KERNEL_SOURCE.contains("qx_qwen_gqa_attention"));
     }
 
     #[test]
