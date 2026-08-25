@@ -347,9 +347,14 @@ fn simulate(
             if capacity == 0 {
                 bail!("budget {budget} is smaller than one expert packet");
             }
-            let hot = hot_frequency
-                .as_ref()
-                .map(|frequency| hottest_keys(frequency, capacity));
+            let hot = hot_frequency.as_ref().map(|frequency| {
+                hottest_keys(
+                    frequency,
+                    capacity,
+                    trace_header.layers,
+                    trace_header.experts,
+                )
+            });
             results.push(simulate_cell(SimulationCellConfig {
                 trace,
                 expected_header: &trace_header,
@@ -578,17 +583,31 @@ fn collect_frequency(
     Ok(frequency)
 }
 
-fn hottest_keys(frequency: &HashMap<ExpertKey, u64>, capacity: usize) -> HashSet<ExpertKey> {
+fn hottest_keys(
+    frequency: &HashMap<ExpertKey, u64>,
+    capacity: usize,
+    layers: usize,
+    experts: usize,
+) -> HashSet<ExpertKey> {
     let mut ranked = frequency
         .iter()
         .map(|(&key, &count)| (Reverse(count), key))
         .collect::<Vec<_>>();
     ranked.sort_unstable();
-    ranked
+    let mut selected = ranked
         .into_iter()
         .take(capacity)
         .map(|(_, key)| key)
-        .collect()
+        .collect::<HashSet<_>>();
+    for layer in 0..layers {
+        for expert in 0..experts {
+            if selected.len() >= capacity {
+                return selected;
+            }
+            selected.insert((layer as u16, expert as u16));
+        }
+    }
+    selected
 }
 
 fn visit_trace(
@@ -907,8 +926,15 @@ mod tests {
     #[test]
     fn hottest_keys_are_selected_by_frequency() {
         let frequency = HashMap::from([((0, 1), 4), ((0, 2), 9), ((1, 0), 6)]);
-        let hot = hottest_keys(&frequency, 2);
+        let hot = hottest_keys(&frequency, 2, 2, 3);
         assert_eq!(hot, HashSet::from([(0, 2), (1, 0)]));
+    }
+
+    #[test]
+    fn hottest_keys_fill_unused_capacity_with_cold_experts() {
+        let hot = hottest_keys(&HashMap::from([((1, 1), 9)]), 4, 2, 2);
+        assert_eq!(hot.len(), 4);
+        assert!(hot.contains(&(1, 1)));
     }
 
     #[test]

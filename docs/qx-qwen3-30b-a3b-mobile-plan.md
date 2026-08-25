@@ -84,8 +84,9 @@ asymmetric result is not evidence that Qwen requires FP32 K.
 
 ## Work package 0: pin the reference and controls
 
-The Qwen checkpoint is not currently present under `external/models`, so no
-Qwen execution claim can yet be made from this workspace.
+The official Q4_K_M route-capture control is present under the ignored external
+model directory and pinned by the committed reference manifest. Original
+safetensors are still required before QX compilation and quality claims begin.
 
 Acquire and pin:
 
@@ -420,7 +421,7 @@ Capture a small correctness trace from the pinned GGUF:
 ```sh
 target/release/qx-route-cache capture \
   --model /Users/blas/projects/qx/external/models/qwen3-30b-a3b/Qwen3-30B-A3B-Q4_K_M.gguf \
-  --model-sha256 0d003f6662faee78606d5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5 \
+  --model-sha256 0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5 \
   --prompt "Explain why expert routing locality matters." \
   --request-id smoke-001 \
   --max-new-tokens 32 \
@@ -447,6 +448,40 @@ permitted to learn frequencies from the held-out trace. The default
 The current capture path records route IDs, which are sufficient for residency
 simulation. Router weights and activation magnitudes remain part of the later
 neuron-cluster study and must not be inferred from this trace.
+
+### First target-model smoke result
+
+The pinned 18,556,685,824-byte GGUF was verified at SHA-256
+`0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5`.
+It loaded on the 24 GiB M5 Pro and the harness captured valid top-8 routes from
+all 48 layers. The first disjoint-prompt smoke used 80 calibration positions
+and 78 held-out positions, or 29,952 held-out expert lookups.
+
+For complete Q3 expert packets, the held-out curve was:
+
+| Budget | LRU hit rate | Static-hot hit rate | LRU p95 miss bytes | Static p95 miss bytes |
+|---:|---:|---:|---:|---:|
+| 2 GiB | 57.42% | 36.57% | 594.6 MiB | 616.2 MiB |
+| 3 GiB | 68.40% | 49.06% | 504.0 MiB | 553.2 MiB |
+| 4 GiB | 78.73% | 59.70% | 391.8 MiB | 480.4 MiB |
+| 6 GiB | 88.38% | 78.02% | 391.8 MiB | 311.1 MiB |
+| 8 GiB | 88.46% | 87.77% | 391.8 MiB | 196.9 MiB |
+| 10 GiB | 88.46% | 94.47% | 391.8 MiB | 86.6 MiB |
+| 12 GiB | 88.46% | 100.00% | 391.8 MiB | 0 MiB |
+
+At 8 GiB and above, cold LRU had zero capacity misses but still recorded 3,457
+compulsory misses. Its p99 token had misses in all 48 layers. Static-hot needed
+the complete 12 GiB expert tier to cross the 98% gate; at 10 GiB it reached
+94.47% and its p99 token still missed in 18 layers. Thus naive full-expert
+paging below the complete-expert payload fails the gate in this smoke. The
+result does not yet reject partial residency: two prompts are far too small for
+a locality claim, the cache started cold, and neuron packets may have
+materially different locality. It does reject treating average MoE sparsity as
+evidence that whole-expert paging will work automatically.
+
+The committed aggregate is
+`benchmarks/results/qwen3-30b-a3b-route-cache-smoke-2026-08-25.json`.
+Raw traces remain ignored under `external/results`.
 
 ## Evidence layout
 

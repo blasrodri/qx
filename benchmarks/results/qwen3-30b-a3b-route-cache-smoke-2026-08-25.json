@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "classification": "trace-emulated-smoke",
+  "promotion_evidence": false,
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "llama_revision": "5cedcbfbc1713c9557af31ddcf5fb4b5287112f8",
+  "machine": "Apple M5 Pro, 24 GiB unified memory",
+  "trace": {
+    "held_out_token_positions": 78,
+    "calibration_token_positions": 80,
+    "layers": 48,
+    "experts_per_layer": 128,
+    "selected_experts_per_layer": 8,
+    "held_out_route_lookups": 29952,
+    "mean_adjacent_route_overlap": 0.40215773809523814
+  },
+  "simulation": {
+    "packet": "complete Q3 group-32 expert",
+    "expert_bytes": 2064384,
+    "cache_starts_empty": true,
+    "results": [
+      {"policy":"lru","budget_gib":2,"resident_capacity_experts":1040,"hit_rate":0.5741853632478633,"p95_missing_bytes":623443968,"p99_miss_layers":48,"compulsory_misses":3457,"capacity_misses":9297},
+      {"policy":"lru","budget_gib":3,"resident_capacity_experts":1560,"hit_rate":0.6839610042735043,"p95_missing_bytes":528482304,"p99_miss_layers":48,"compulsory_misses":3457,"capacity_misses":6009},
+      {"policy":"lru","budget_gib":4,"resident_capacity_experts":2080,"hit_rate":0.7873263888888888,"p95_missing_bytes":410812416,"p99_miss_layers":48,"compulsory_misses":3457,"capacity_misses":2913},
+      {"policy":"lru","budget_gib":6,"resident_capacity_experts":3120,"hit_rate":0.8837807158119658,"p95_missing_bytes":410812416,"p99_miss_layers":48,"compulsory_misses":3457,"capacity_misses":24},
+      {"policy":"lru","budget_gib":8,"resident_capacity_experts":4161,"hit_rate":0.8845819978632479,"p95_missing_bytes":410812416,"p99_miss_layers":48,"compulsory_misses":3457,"capacity_misses":0},
+      {"policy":"lru","budget_gib":10,"resident_capacity_experts":5201,"hit_rate":0.8845819978632479,"p95_missing_bytes":410812416,"p99_miss_layers":48,"compulsory_misses":3457,"capacity_misses":0},
+      {"policy":"lru","budget_gib":12,"resident_capacity_experts":6241,"hit_rate":0.8845819978632479,"p95_missing_bytes":410812416,"p99_miss_layers":48,"compulsory_misses":3457,"capacity_misses":0},
+      {"policy":"static-hot","budget_gib":2,"resident_capacity_experts":1040,"hit_rate":0.3656517094017094,"p95_missing_bytes":646152192,"p99_miss_layers":48},
+      {"policy":"static-hot","budget_gib":3,"resident_capacity_experts":1560,"hit_rate":0.4905849358974359,"p95_missing_bytes":580091904,"p99_miss_layers":48},
+      {"policy":"static-hot","budget_gib":4,"resident_capacity_experts":2080,"hit_rate":0.5969885149572649,"p95_missing_bytes":503709696,"p99_miss_layers":48},
+      {"policy":"static-hot","budget_gib":6,"resident_capacity_experts":3120,"hit_rate":0.7802483974358975,"p95_missing_bytes":326172672,"p99_miss_layers":48},
+      {"policy":"static-hot","budget_gib":8,"resident_capacity_experts":4161,"hit_rate":0.8776709401709402,"p95_missing_bytes":206438400,"p99_miss_layers":37},
+      {"policy":"static-hot","budget_gib":10,"resident_capacity_experts":5201,"hit_rate":0.9446781517094017,"p95_missing_bytes":90832896,"p99_miss_layers":18},
+      {"policy":"static-hot","budget_gib":12,"resident_capacity_experts":6241,"hit_rate":1.0,"p95_missing_bytes":0,"p99_miss_layers":0}
+    ]
+  },
+  "interpretation": [
+    "The target model loaded and emitted complete 48-layer top-8 routes on the 24 GiB M5 Pro.",
+    "This tiny two-prompt smoke validates instrumentation; it is not representative held-out promotion evidence.",
+    "Naive full-expert paging fails the 98% gate below the complete-expert payload tier in this smoke.",
+    "Cold and cross-prompt expert novelty dominate the observed tail; packetized experts and a much larger disjoint corpus remain the next tests."
+  ]
+}
