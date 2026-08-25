@@ -4,6 +4,7 @@
 use anyhow::{Result, bail};
 use half::f16;
 use memmap2::{Mmap, UncheckedAdvice};
+use qx_model::ModelShape;
 use qx_quant::{PackingLayout, QuantType, QuantizedTensor, unpack_cross_expert_tile_bytes};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -346,6 +347,10 @@ pub struct ExecutionPlanManifest {
     pub schema_version: u32,
     pub plan_id: String,
     pub model_id: String,
+    /// Semantic checkpoint topology sealed by the compiler. Legacy Granite
+    /// artifacts omit this and retain their fixed runtime shape.
+    #[serde(default)]
+    pub model_shape: Option<ModelShape>,
     pub target: TargetProfile,
     pub workload: WorkloadProfile,
     pub quality_budget: QualityBudget,
@@ -434,6 +439,7 @@ impl ExecutionPlanManifest {
             schema_version: 1,
             plan_id: "granite-m5-top8-canonical".to_owned(),
             model_id: model_id.to_owned(),
+            model_shape: Some(ModelShape::granite_v0()),
             target: TargetProfile {
                 target_id: target_id.to_owned(),
                 gpu_family: "apple-m5-pro".to_owned(),

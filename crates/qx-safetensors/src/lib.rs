@@ -73,6 +73,37 @@ impl Checkpoint {
         self.weight_map.keys().map(String::as_str)
     }
 
+    /// Inspect every tensor while mapping each shard only once. This is the
+    /// release-preflight path for large sharded checkpoints; repeatedly
+    /// calling `info` would deserialize a 3--4 GiB shard for every tensor.
+    pub fn tensor_infos(&self) -> Result<Vec<TensorInfo>> {
+        let mut by_shard = BTreeMap::<&str, Vec<&str>>::new();
+        for (name, shard) in &self.weight_map {
+            by_shard.entry(shard).or_default().push(name);
+        }
+        let mut infos = Vec::with_capacity(self.weight_map.len());
+        for (shard_name, names) in by_shard {
+            let shard = self.root.join(shard_name);
+            let mmap = map_file(&shard)?;
+            let tensors = SafeTensors::deserialize(&mmap)
+                .with_context(|| format!("parse {}", shard.display()))?;
+            for name in names {
+                let tensor = tensors
+                    .tensor(name)
+                    .with_context(|| format!("tensor {name} missing from {}", shard.display()))?;
+                infos.push(TensorInfo {
+                    name: name.to_owned(),
+                    shard: shard.clone(),
+                    dtype: format!("{:?}", tensor.dtype()),
+                    shape: tensor.shape().to_vec(),
+                    byte_len: tensor.data().len(),
+                });
+            }
+        }
+        infos.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(infos)
+    }
+
     pub fn info(&self, name: &str) -> Result<TensorInfo> {
         let shard_name = self
             .weight_map

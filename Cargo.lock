@@ -446,6 +446,7 @@ dependencies = [
  "anyhow",
  "half",
  "memmap2",
+ "qx-model",
  "qx-quant",
  "serde",
  "serde_json",
@@ -471,6 +472,7 @@ dependencies = [
  "qx-model",
  "qx-quant",
  "qx-safetensors",
+ "serde",
  "serde_json",
 ]
 
@@ -491,6 +493,7 @@ name = "qx-model"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]

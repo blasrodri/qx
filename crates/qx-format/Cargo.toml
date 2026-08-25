@@ -9,5 +9,6 @@ anyhow.workspace = true
 half.workspace = true
 memmap2.workspace = true
 qx-quant.workspace = true
+qx-model.workspace = true
 serde.workspace = true
 serde_json.workspace = true
