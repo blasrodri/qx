@@ -301,6 +301,94 @@ kernel void qx_q2s4_qwen_moe_dynamic(
     }
 }
 
+kernel void qx_q2s4_qwen_moe_gate_dynamic(
+    device const uchar* slab [[buffer(0)]],
+    device const ulong* gate_data_offsets [[buffer(1)]],
+    device const ulong* gate_scale_offsets [[buffer(2)]],
+    device const half* input [[buffer(3)]],
+    device const uint* expert_ids [[buffer(4)]],
+    device half* activations [[buffer(5)]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint slot [[threadgroup_position_in_grid]]) {
+    constexpr uint hidden = 2048;
+    constexpr uint intermediate = 768;
+    constexpr uint group_size = 32;
+    constexpr uint groups = hidden / group_size;
+    constexpr uint bytes_per_group = 8;
+    uint expert = expert_ids[slot];
+    device const uchar* gate_data = slab + gate_data_offsets[expert];
+    device const half* gate_scales =
+        reinterpret_cast<device const half*>(slab + gate_scale_offsets[expert]);
+    uint up_row = intermediate + lane;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint group = 0; group < groups; ++group) {
+        uint gate_base = (lane * groups + group) * bytes_per_group;
+        uint up_base = (up_row * groups + group) * bytes_per_group;
+        float gate_scale = float(gate_scales[lane * groups + group]);
+        float up_scale = float(gate_scales[up_row * groups + group]);
+        uint group_column = group * group_size;
+        for (uint packet = 0; packet < bytes_per_group; ++packet) {
+            uint gate_packet = uint(gate_data[gate_base + packet]);
+            uint up_packet = uint(gate_data[up_base + packet]);
+            uint packet_column = group_column + packet * 4;
+            for (uint element = 0; element < 4; ++element) {
+                uint shift = element * 2;
+                float value = float(input[packet_column + element]);
+                gate += qx_q2s4_decode((gate_packet >> shift) & 0x3, gate_scale) * value;
+                up += qx_q2s4_decode((up_packet >> shift) & 0x3, up_scale) * value;
+            }
+        }
+    }
+    half gate_half = half(gate);
+    half up_half = half(up);
+    float gate_rounded = float(gate_half);
+    activations[slot * intermediate + lane] =
+        half((gate_rounded / (1.0f + exp(-gate_rounded))) * float(up_half));
+}
+
+kernel void qx_q2s4_qwen_moe_down_tiled_dynamic(
+    device const uchar* slab [[buffer(0)]],
+    device const ulong* down_data_offsets [[buffer(1)]],
+    device const ulong* down_scale_offsets [[buffer(2)]],
+    device const half* activations [[buffer(3)]],
+    device const uint* expert_ids [[buffer(4)]],
+    device half* expert_outputs [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint group_id [[threadgroup_position_in_grid]]) {
+    constexpr uint hidden = 2048;
+    constexpr uint intermediate = 768;
+    constexpr uint group_size = 32;
+    constexpr uint groups = intermediate / group_size;
+    constexpr uint bytes_per_group = 8;
+    constexpr uint rows_per_tile = 256;
+    constexpr uint tiles_per_expert = hidden / rows_per_tile;
+    uint slot = group_id / tiles_per_expert;
+    uint tile = group_id % tiles_per_expert;
+    uint row = tile * rows_per_tile + tid;
+    uint expert = expert_ids[slot];
+    device const uchar* down_data = slab + down_data_offsets[expert];
+    device const half* down_scales =
+        reinterpret_cast<device const half*>(slab + down_scale_offsets[expert]);
+    device const half* activated = activations + slot * intermediate;
+    float down = 0.0f;
+    for (uint group = 0; group < groups; ++group) {
+        uint base = (row * groups + group) * bytes_per_group;
+        float scale = float(down_scales[row * groups + group]);
+        uint group_column = group * group_size;
+        for (uint packet = 0; packet < bytes_per_group; ++packet) {
+            uint codes = uint(down_data[base + packet]);
+            uint packet_column = group_column + packet * 4;
+            for (uint element = 0; element < 4; ++element) {
+                uint code = (codes >> (element * 2)) & 0x3;
+                down += qx_q2s4_decode(code, scale)
+                    * float(activated[packet_column + element]);
+            }
+        }
+    }
+    expert_outputs[slot * hidden + row] = half(down);
+}
+
 kernel void qx_qwen_moe_accumulate_dynamic(
     device const half* expert_outputs [[buffer(0)]],
     device const float* weights [[buffer(1)]],

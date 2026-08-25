@@ -58,7 +58,7 @@ mmap. On the M5 Pro:
 | Experts bound | 128 |
 | Layer-0 binding time after pipeline preparation | 2.9-5.0 ms |
 | Weight upload/repack | none |
-| Reusable layer activation workspace | 72,000 bytes |
+| Reusable layer activation workspace | 84,288 bytes (split-MoE canonical) |
 | Dynamic expert offset tables | 4,096 bytes per prepared layer |
 
 Metal's `currentAllocatedSize` increases by the logical buffer length because
@@ -163,3 +163,32 @@ relative L2.
 Against the first complete graph, the combined consumer and attention changes
 reduce position-0 latency by 36.2% and position-511 latency by 43.2%, while
 preserving deterministic selected tokens (`58` and `106094`, respectively).
+
+## Post-packet stage attribution and split MoE
+
+Because dispatch-boundary counters are unavailable to this process on the M5
+Pro, the opt-in `--stage-profile` path uses ordered command-buffer boundaries
+with no intermediate CPU wait. Canonical execution remains one command buffer.
+At position 0 it attributed the `55.9 ms` fused-control graph as:
+
+| Stage | GPU time |
+|---|---:|
+| Per-layer attention half | 22.2 ms |
+| Per-layer router + MoE half | 26.1 ms |
+| Final norm + LM head + argmax | 8.3 ms |
+| Embedding | <0.01 ms |
+
+The promoted split-MoE topology keeps eight 768-thread gate/SwiGLU groups but
+writes only 12 KiB of FP16 activations, then exposes the down projection as 64
+independent 256-row threadgroups. It adds one dispatch per layer and increases
+the reusable workspace from 72,000 to 84,288 bytes.
+
+| Full-token case | Fused packet expert | Split tiled-down expert |
+|---|---:|---:|
+| Position 0 | 55.864 ms GPU / 17.90 tok/s | 52.542 ms / 19.03 tok/s |
+| Position 511 | 80.552 ms / 12.41 tok/s | 78.196 ms / 12.79 tok/s |
+
+Position-0 MoE attribution falls from `26.1` to `22.9 ms`. The split mapping is
+canonical; `QX_QWEN_SPLIT_MOE=0` retains the fused control for regression
+measurement. Expert IDs, route weights, component parity, and selected tokens
+are unchanged.

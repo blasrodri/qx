@@ -626,7 +626,7 @@ pub struct PreparedQwenLayer {
 }
 
 /// Reusable activation storage for one batch-1 Qwen3 MoE decoder layer.
-/// Its 72,000-byte footprint is independent of model size and token position;
+/// Its 84,288-byte footprint is independent of model size and token position;
 /// caller-owned KV caches remain separate so all layers can share the shape.
 #[cfg(target_os = "macos")]
 pub struct QwenLayerWorkspace {
@@ -641,6 +641,7 @@ pub struct QwenLayerWorkspace {
     pub router_logits: qx_metal::platform::RuntimeBuffer,
     pub expert_ids: qx_metal::platform::RuntimeBuffer,
     pub expert_weights: qx_metal::platform::RuntimeBuffer,
+    pub expert_activations: qx_metal::platform::RuntimeBuffer,
     pub expert_outputs: qx_metal::platform::RuntimeBuffer,
     pub moe_output: qx_metal::platform::RuntimeBuffer,
 }
@@ -664,6 +665,7 @@ impl QwenLayerWorkspace {
             router_logits: buffer(128, HALF)?,
             expert_ids: buffer(8, std::mem::size_of::<u32>())?,
             expert_weights: buffer(8, FLOAT)?,
+            expert_activations: buffer(8 * 768, HALF)?,
             expert_outputs: buffer(8 * 2048, HALF)?,
             moe_output: buffer(2048, HALF)?,
         })
@@ -677,6 +679,7 @@ impl QwenLayerWorkspace {
             + 2048 * 2 * 4
             + 128 * 2
             + 8 * 4 * 2
+            + 8 * 768 * 2
             + 8 * 2048 * 2
     }
 }
@@ -885,6 +888,7 @@ impl PreparedQwenLayer {
             &workspace.hidden_after_attention,
             &workspace.moe_input,
         )?;
+        graph.diagnostic_stage_boundary(context)?;
         graph.encode_prepared_qwen_q4_stage(
             &self.router,
             &workspace.moe_input,
@@ -901,6 +905,7 @@ impl PreparedQwenLayer {
             &workspace.moe_input,
             &workspace.expert_ids,
             &workspace.expert_weights,
+            &workspace.expert_activations,
             &workspace.expert_outputs,
             &workspace.moe_output,
         )?;
@@ -909,7 +914,9 @@ impl PreparedQwenLayer {
             &workspace.hidden_after_attention,
             &workspace.moe_output,
             output,
-        )
+        )?;
+        graph.diagnostic_stage_boundary(context)?;
+        Ok(())
     }
 }
 
@@ -1084,7 +1091,9 @@ impl PreparedQwenModel {
                 state.max_context
             ));
         }
+        graph.diagnostic_stage_boundary(context)?;
         graph.encode_qwen_embedding_lookup(&self.embedding, input_token, &state.hidden_a)?;
+        graph.diagnostic_stage_boundary(context)?;
         for (index, layer) in self.layers.iter().enumerate() {
             let (input, output) = if index.is_multiple_of(2) {
                 (&state.hidden_a, &state.hidden_b)
@@ -1114,7 +1123,9 @@ impl PreparedQwenModel {
         };
         graph.encode_qwen_rms_norm(context, final_hidden, &self.final_norm, normalized)?;
         graph.encode_prepared_qwen_q4_stage(&self.lm_head, normalized, &state.logits)?;
-        graph.encode_qwen_argmax(context, &state.logits, output_token, self.vocabulary)
+        graph.encode_qwen_argmax(context, &state.logits, output_token, self.vocabulary)?;
+        graph.diagnostic_stage_boundary(context)?;
+        Ok(())
     }
 
     pub fn artifact(&self) -> &Arc<qx_format::MappedArtifact> {

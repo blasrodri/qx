@@ -87,6 +87,13 @@ pub mod platform {
     const INTERMEDIATE: usize = 512;
     const GROUP_SIZE: usize = 32;
 
+    fn qwen_split_moe_enabled() -> bool {
+        !matches!(
+            std::env::var("QX_QWEN_SPLIT_MOE").ok().as_deref(),
+            Some("0" | "false" | "no")
+        )
+    }
+
     /// Consumer choices supplied by the compiled Runtime V2 plan.  Production
     /// graph encoding passes this explicitly; the environment-backed wrapper
     /// remains only for legacy benchmark entry points.
@@ -906,6 +913,8 @@ pub mod platform {
 
     pub struct PreparedQwenDynamicMoe {
         expert_pipeline: Pipeline,
+        gate_pipeline: Pipeline,
+        down_tiled_pipeline: Pipeline,
         accumulate_pipeline: Pipeline,
         slab: RuntimeBuffer,
         gate_data_offsets: RuntimeBuffer,
@@ -1486,6 +1495,8 @@ pub mod platform {
         qwen_embedding_pipeline: Mutex<Option<Pipeline>>,
         qwen_argmax_pipeline: Mutex<Option<Pipeline>>,
         qwen_dynamic_moe_pipeline: Mutex<Option<Pipeline>>,
+        qwen_dynamic_gate_pipeline: Mutex<Option<Pipeline>>,
+        qwen_dynamic_down_tiled_pipeline: Mutex<Option<Pipeline>>,
         qwen_dynamic_accumulate_pipeline: Mutex<Option<Pipeline>>,
         logits_pipeline: Mutex<Option<Pipeline>>,
         dense_pipeline: Mutex<Option<Pipeline>>,
@@ -1541,6 +1552,7 @@ pub mod platform {
         encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         dispatches: u64,
         counter_timeline: Option<CounterTimeline>,
+        stage_diagnostics: bool,
         committed: Vec<(Retained<ProtocolObject<dyn MTLCommandBuffer>>, u64, u64)>,
         encoders: u64,
         encode_started_at: Instant,
@@ -2078,6 +2090,7 @@ pub mod platform {
             input: &RuntimeBuffer,
             ids: &RuntimeBuffer,
             weights: &RuntimeBuffer,
+            expert_activations: &RuntimeBuffer,
             expert_outputs: &RuntimeBuffer,
             output: &RuntimeBuffer,
         ) -> Result<(), String> {
@@ -2087,6 +2100,7 @@ pub mod platform {
             if input.len() < HIDDEN * std::mem::size_of::<u16>()
                 || ids.len() < TOP_K * std::mem::size_of::<u32>()
                 || weights.len() < TOP_K * std::mem::size_of::<f32>()
+                || expert_activations.len() < TOP_K * INTERMEDIATE * std::mem::size_of::<u16>()
                 || expert_outputs.len() < TOP_K * HIDDEN * std::mem::size_of::<u16>()
                 || output.len() < HIDDEN * std::mem::size_of::<u16>()
             {
@@ -2094,39 +2108,105 @@ pub mod platform {
                     "Qwen dynamic MoE buffers are smaller than their fixed shape".to_owned(),
                 );
             }
-            self.encoder
-                .setComputePipelineState(&prepared.expert_pipeline);
-            unsafe {
-                for (buffer, index) in [
-                    (&prepared.slab, 0),
-                    (&prepared.gate_data_offsets, 1),
-                    (&prepared.gate_scale_offsets, 2),
-                    (&prepared.down_data_offsets, 3),
-                    (&prepared.down_scale_offsets, 4),
-                    (input, 5),
-                    (ids, 6),
-                    (expert_outputs, 7),
-                ] {
-                    self.encoder.setBuffer_offset_atIndex(
-                        Some(&buffer.buffer),
-                        buffer.offset,
-                        index,
-                    );
+            if qwen_split_moe_enabled() {
+                self.encoder
+                    .setComputePipelineState(&prepared.gate_pipeline);
+                unsafe {
+                    for (buffer, index) in [
+                        (&prepared.slab, 0),
+                        (&prepared.gate_data_offsets, 1),
+                        (&prepared.gate_scale_offsets, 2),
+                        (input, 3),
+                        (ids, 4),
+                        (expert_activations, 5),
+                    ] {
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&buffer.buffer),
+                            buffer.offset,
+                            index,
+                        );
+                    }
                 }
+                self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: TOP_K,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: INTERMEDIATE,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                self.dispatches += 1;
+
+                self.encoder
+                    .setComputePipelineState(&prepared.down_tiled_pipeline);
+                unsafe {
+                    for (buffer, index) in [
+                        (&prepared.slab, 0),
+                        (&prepared.down_data_offsets, 1),
+                        (&prepared.down_scale_offsets, 2),
+                        (expert_activations, 3),
+                        (ids, 4),
+                        (expert_outputs, 5),
+                    ] {
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&buffer.buffer),
+                            buffer.offset,
+                            index,
+                        );
+                    }
+                }
+                self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: TOP_K * 8,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                self.dispatches += 1;
+            } else {
+                self.encoder
+                    .setComputePipelineState(&prepared.expert_pipeline);
+                unsafe {
+                    for (buffer, index) in [
+                        (&prepared.slab, 0),
+                        (&prepared.gate_data_offsets, 1),
+                        (&prepared.gate_scale_offsets, 2),
+                        (&prepared.down_data_offsets, 3),
+                        (&prepared.down_scale_offsets, 4),
+                        (input, 5),
+                        (ids, 6),
+                        (expert_outputs, 7),
+                    ] {
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&buffer.buffer),
+                            buffer.offset,
+                            index,
+                        );
+                    }
+                }
+                self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: TOP_K,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: INTERMEDIATE,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                self.dispatches += 1;
             }
-            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: TOP_K,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: INTERMEDIATE,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            self.dispatches += 1;
 
             self.encoder
                 .setComputePipelineState(&prepared.accumulate_pipeline);
@@ -8678,6 +8758,17 @@ pub mod platform {
             self.begin_next_command_buffer(context)
         }
 
+        /// Opt-in logical boundary used by runtime-owned diagnostic graphs.
+        /// It is a strict no-op for canonical execution. When diagnostics are
+        /// enabled it uses counters where available and ordered command-buffer
+        /// segments otherwise, without introducing a CPU wait.
+        pub fn diagnostic_stage_boundary(&mut self, context: &MetalContext) -> Result<(), String> {
+            if !self.stage_diagnostics {
+                return Ok(());
+            }
+            self.stage_boundary(context)
+        }
+
         pub fn encode_noop(
             &mut self,
             context: &MetalContext,
@@ -8950,6 +9041,8 @@ pub mod platform {
                 qwen_embedding_pipeline: Mutex::new(None),
                 qwen_argmax_pipeline: Mutex::new(None),
                 qwen_dynamic_moe_pipeline: Mutex::new(None),
+                qwen_dynamic_gate_pipeline: Mutex::new(None),
+                qwen_dynamic_down_tiled_pipeline: Mutex::new(None),
                 qwen_dynamic_accumulate_pipeline: Mutex::new(None),
                 logits_pipeline: Mutex::new(None),
                 dense_pipeline: Mutex::new(None),
@@ -9147,6 +9240,8 @@ pub mod platform {
             let _ = self.qwen_gqa_score_reuse_pipeline()?;
             let _ = self.qwen_top8_pipeline()?;
             let _ = self.qwen_dynamic_moe_pipeline()?;
+            let _ = self.qwen_dynamic_gate_pipeline()?;
+            let _ = self.qwen_dynamic_down_tiled_pipeline()?;
             let _ = self.qwen_dynamic_accumulate_pipeline()?;
             Ok(())
         }
@@ -9159,19 +9254,20 @@ pub mod platform {
             let encoder = command_buffer
                 .computeCommandEncoder()
                 .ok_or_else(|| "Runtime V2 encoder allocation failed".to_owned())?;
+            let stage_diagnostics = *self
+                .stage_counters
+                .lock()
+                .map_err(|_| "Metal stage-counter cache is poisoned".to_owned())?;
             Ok(DecodeGraph {
                 command_buffer,
                 encoder,
                 dispatches: 0,
-                counter_timeline: if *self
-                    .stage_counters
-                    .lock()
-                    .map_err(|_| "Metal stage-counter cache is poisoned".to_owned())?
-                {
+                counter_timeline: if stage_diagnostics {
                     CounterTimeline::new(&self.device)
                 } else {
                     None
                 },
+                stage_diagnostics,
                 committed: Vec::new(),
                 encoders: 1,
                 encode_started_at: Instant::now(),
@@ -9577,6 +9673,22 @@ pub mod platform {
                 &self.qwen_dynamic_moe_pipeline,
                 Q2_KERNEL_SOURCE,
                 "qx_q2s4_qwen_moe_dynamic",
+            )
+        }
+
+        fn qwen_dynamic_gate_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_dynamic_gate_pipeline,
+                Q2_KERNEL_SOURCE,
+                "qx_q2s4_qwen_moe_gate_dynamic",
+            )
+        }
+
+        fn qwen_dynamic_down_tiled_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_dynamic_down_tiled_pipeline,
+                Q2_KERNEL_SOURCE,
+                "qx_q2s4_qwen_moe_down_tiled_dynamic",
             )
         }
 
@@ -13966,6 +14078,8 @@ pub mod platform {
             };
             Ok(PreparedQwenDynamicMoe {
                 expert_pipeline: self.qwen_dynamic_moe_pipeline()?,
+                gate_pipeline: self.qwen_dynamic_gate_pipeline()?,
+                down_tiled_pipeline: self.qwen_dynamic_down_tiled_pipeline()?,
                 accumulate_pipeline: self.qwen_dynamic_accumulate_pipeline()?,
                 slab,
                 gate_data_offsets: offset_buffer(gate_data_offsets)?,
@@ -14642,7 +14756,12 @@ mod tests {
         for quant_type in [QuantType::Q2, QuantType::Q2S4, QuantType::Q3, QuantType::Q4] {
             assert!(kernel_source(quant_type).contains("kernel"));
         }
-        for name in ["qx_q2s4_qwen_moe_dynamic", "qx_qwen_moe_accumulate_dynamic"] {
+        for name in [
+            "qx_q2s4_qwen_moe_dynamic",
+            "qx_q2s4_qwen_moe_gate_dynamic",
+            "qx_q2s4_qwen_moe_down_tiled_dynamic",
+            "qx_qwen_moe_accumulate_dynamic",
+        ] {
             assert!(
                 Q2_KERNEL_SOURCE.contains(name),
                 "missing Qwen MoE kernel {name}"

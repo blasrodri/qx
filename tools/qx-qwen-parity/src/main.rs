@@ -36,6 +36,8 @@ struct Args {
     full_position: u32,
     #[arg(long, default_value_t = 2)]
     full_replays: usize,
+    #[arg(long)]
+    stage_profile: bool,
 }
 
 fn main() -> Result<()> {
@@ -312,6 +314,9 @@ fn run() -> Result<()> {
     let graph_expert_outputs = context
         .allocate_runtime_buffer(8 * HIDDEN * std::mem::size_of::<u16>())
         .map_err(anyhow::Error::msg)?;
+    let graph_expert_activations = context
+        .allocate_runtime_buffer(8 * INTERMEDIATE * std::mem::size_of::<u16>())
+        .map_err(anyhow::Error::msg)?;
     let graph_output = context
         .allocate_runtime_buffer(HIDDEN * std::mem::size_of::<u16>())
         .map_err(anyhow::Error::msg)?;
@@ -333,6 +338,7 @@ fn run() -> Result<()> {
             &graph_input,
             &graph_ids,
             &graph_weights,
+            &graph_expert_activations,
             &graph_expert_outputs,
             &graph_output,
         )
@@ -655,6 +661,29 @@ fn run_full_model(
             "complete Qwen replay was nondeterministic: first={next_token}, replay={replay_token}"
         );
     }
+    let stage_profile = if args.stage_profile {
+        context
+            .set_stage_counters(true)
+            .map_err(anyhow::Error::msg)?;
+        let mut profile = context.begin_decode().map_err(anyhow::Error::msg)?;
+        model
+            .encode_token(
+                &mut profile,
+                context,
+                &state,
+                &state.token,
+                &state.next_token,
+                args.full_position,
+            )
+            .map_err(anyhow::Error::msg)?;
+        profile.finish(context).map_err(anyhow::Error::msg)?;
+        context
+            .set_stage_counters(false)
+            .map_err(anyhow::Error::msg)?;
+        Some(context.last_stage_timeline().map_err(anyhow::Error::msg)?)
+    } else {
+        None
+    };
 
     println!();
     println!("QX complete Qwen token graph");
@@ -692,6 +721,67 @@ fn run_full_model(
             args.full_replays,
         );
     }
+    if let Some(timeline) = stage_profile {
+        print_full_model_stage_profile(&timeline, model.layers.len())?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn print_full_model_stage_profile(
+    timeline: &qx_metal::platform::StageTimeline,
+    layers: usize,
+) -> Result<()> {
+    let expected = 3 + layers * 2;
+    if timeline.timestamps.is_empty() && timeline.segment_gpu_seconds.len() == expected + 1 {
+        let segments = &timeline.segment_gpu_seconds;
+        let embedding = segments[1] * 1000.0;
+        let attention = (0..layers)
+            .map(|layer| segments[2 + layer * 2])
+            .sum::<f64>()
+            * 1000.0;
+        let moe = (0..layers)
+            .map(|layer| segments[3 + layer * 2])
+            .sum::<f64>()
+            * 1000.0;
+        let head = segments[2 + layers * 2] * 1000.0;
+        println!(
+            "stage GPU breakdown:  embedding {:.3} ms, attention {:.3} ms, MoE {:.3} ms, head {:.3} ms",
+            embedding, attention, moe, head
+        );
+        return Ok(());
+    }
+    if timeline.timestamps.len() != expected {
+        bail!(
+            "Qwen stage profile returned {} timestamps / {} segments, expected {expected} / {}",
+            timeline.timestamps.len(),
+            timeline.segment_gpu_seconds.len(),
+            expected + 1,
+        );
+    }
+    let first = timeline.timestamps[0];
+    let last = *timeline.timestamps.last().expect("nonempty stage timeline");
+    let span = last.saturating_sub(first);
+    if span == 0 {
+        bail!("Qwen stage profile timestamp span is zero");
+    }
+    let milliseconds_per_tick = timeline.gpu_duration_seconds * 1000.0 / span as f64;
+    let delta = |start: usize, end: usize| {
+        timeline.timestamps[end].saturating_sub(timeline.timestamps[start]) as f64
+            * milliseconds_per_tick
+    };
+    let embedding = delta(0, 1);
+    let mut attention = 0.0;
+    let mut moe = 0.0;
+    for layer in 0..layers {
+        attention += delta(1 + layer * 2, 2 + layer * 2);
+        moe += delta(2 + layer * 2, 3 + layer * 2);
+    }
+    let head = delta(1 + layers * 2, 2 + layers * 2);
+    println!(
+        "stage GPU breakdown:  embedding {:.3} ms, attention {:.3} ms, MoE {:.3} ms, head {:.3} ms",
+        embedding, attention, moe, head
+    );
     Ok(())
 }
 
