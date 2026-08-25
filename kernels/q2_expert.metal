@@ -258,18 +258,23 @@ kernel void qx_q2s4_qwen_moe_dynamic(
     float gate = 0.0f;
     float up = 0.0f;
     uint up_row = intermediate + lane;
-    for (uint column = 0; column < hidden; ++column) {
-        uint group = column / group_size;
-        uint local = column % group_size;
-        uint shift = (local % 4) * 2;
+    for (uint group = 0; group < gate_groups; ++group) {
         uint gate_base = (lane * gate_groups + group) * bytes_per_group;
         uint up_base = (up_row * gate_groups + group) * bytes_per_group;
-        uint gate_code = (gate_data[gate_base + local / 4] >> shift) & 0x3;
-        uint up_code = (gate_data[up_base + local / 4] >> shift) & 0x3;
-        gate += qx_q2s4_decode(gate_code, float(gate_scales[lane * gate_groups + group]))
-            * float(input[column]);
-        up += qx_q2s4_decode(up_code, float(gate_scales[up_row * gate_groups + group]))
-            * float(input[column]);
+        float gate_scale = float(gate_scales[lane * gate_groups + group]);
+        float up_scale = float(gate_scales[up_row * gate_groups + group]);
+        uint group_column = group * group_size;
+        for (uint packet = 0; packet < bytes_per_group; ++packet) {
+            uint gate_packet = uint(gate_data[gate_base + packet]);
+            uint up_packet = uint(gate_data[up_base + packet]);
+            uint packet_column = group_column + packet * 4;
+            for (uint element = 0; element < 4; ++element) {
+                uint shift = element * 2;
+                float value = float(input[packet_column + element]);
+                gate += qx_q2s4_decode((gate_packet >> shift) & 0x3, gate_scale) * value;
+                up += qx_q2s4_decode((up_packet >> shift) & 0x3, up_scale) * value;
+            }
+        }
     }
     half gate_half = half(gate);
     half up_half = half(up);
@@ -278,13 +283,19 @@ kernel void qx_q2s4_qwen_moe_dynamic(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint row = lane; row < hidden; row += intermediate) {
         float down = 0.0f;
-        for (uint column = 0; column < intermediate; ++column) {
-            uint group = column / group_size;
-            uint local = column % group_size;
+        for (uint group = 0; group < down_groups; ++group) {
             uint base = (row * down_groups + group) * bytes_per_group;
-            uint code = (down_data[base + local / 4] >> ((local % 4) * 2)) & 0x3;
-            down += qx_q2s4_decode(code, float(down_scales[row * down_groups + group]))
-                * float(activated[column]);
+            float scale = float(down_scales[row * down_groups + group]);
+            uint group_column = group * group_size;
+            for (uint packet = 0; packet < bytes_per_group; ++packet) {
+                uint codes = uint(down_data[base + packet]);
+                uint packet_column = group_column + packet * 4;
+                for (uint element = 0; element < 4; ++element) {
+                    uint code = (codes >> (element * 2)) & 0x3;
+                    down += qx_q2s4_decode(code, scale)
+                        * float(activated[packet_column + element]);
+                }
+            }
         }
         expert_outputs[slot * hidden + row] = half(down);
     }

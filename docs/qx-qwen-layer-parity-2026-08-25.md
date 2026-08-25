@@ -133,3 +133,18 @@ This is a 22.1% latency reduction with unchanged selected token and exact GQA
 parity in the context-38 component replay. Position-0 time remained effectively
 flat (`85.701 ms` versus `85.868 ms`), so the score-reuse specialization removes
 context growth without taxing the short-context path.
+
+The next context-independent change packetizes the Q2S4 expert decoder. The
+original scalar loop loaded each packed byte four times and each FP16 group
+scale up to 32 times. The packet consumer traverses the same columns in the
+same order while loading one scale per 32 weights and one byte per four
+weights. No artifact or quantization change is required.
+
+| Full-token case | Before packet decoder | After packet decoder | Gain |
+|---|---:|---:|---:|
+| Position 0 | 85.701 ms GPU / 11.67 tok/s | 75.817 ms / 13.19 tok/s | 11.5% latency |
+| Position 511, score reuse | 110.501 ms / 9.05 tok/s | 101.097 ms / 9.89 tok/s | 8.5% latency |
+
+The position-511 result is 28.8% lower latency than the original complete
+token baseline (`141.913 ms`). Dynamic-MoE parity remains below `1.6e-4`
+relative L2 on the late-layer replay and selected tokens remain unchanged.
