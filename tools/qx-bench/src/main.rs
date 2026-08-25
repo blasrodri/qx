@@ -4,8 +4,7 @@ use half::f16;
 use qx_compiler::QuantizedExpert;
 use qx_format::{MappedArtifact, TensorKind};
 use qx_model::{
-    EMBEDDING_MULTIPLIER, HEAD_DIM, HIDDEN, KV_HEADS, LAYERS, LOGITS_SCALING, RESIDUAL_MULTIPLIER,
-    TOP_K, VOCAB,
+    EMBEDDING_MULTIPLIER, HIDDEN, LAYERS, LOGITS_SCALING, RESIDUAL_MULTIPLIER, TOP_K, VOCAB,
 };
 use qx_runtime::{GenerationStats, GenerationTrace, GraniteModel, RuntimeProfile};
 use qx_runtime_v2::{BufferId, ExecutionPlan};
@@ -9265,7 +9264,7 @@ fn benchmark_v2_layer_block(
 
 #[cfg(target_os = "macos")]
 fn benchmark_v2_attention_stages(
-    _artifact_path: &std::path::Path,
+    artifact_path: &std::path::Path,
     context_length: usize,
     iterations: usize,
     requested_stage: Option<&str>,
@@ -9273,6 +9272,7 @@ fn benchmark_v2_attention_stages(
 ) -> Result<()> {
     use std::rc::Rc;
 
+    qx_runtime_v2::activate_artifact_execution_plan(artifact_path).map_err(anyhow::Error::msg)?;
     let context = Rc::new(
         qx_metal::platform::MetalContext::system_default()
             .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
@@ -9814,6 +9814,9 @@ struct MemorySnapshot {
 struct MemoryOwnership {
     artifact_file_bytes: u64,
     mapped_artifact_bytes: u64,
+    mapped_weight_slab_bytes: u64,
+    unique_weight_payload_bytes: u64,
+    artifact_metadata_and_padding_bytes: u64,
     arena_bytes: u64,
     arena_region_bytes: u64,
     arena_alignment_bytes: u64,
@@ -9821,7 +9824,11 @@ struct MemoryOwnership {
     attention_scratch_bytes: u64,
     moe_scratch_bytes: u64,
     logits_bytes: u64,
+    kv_key_cache_bytes: u64,
+    kv_value_cache_bytes: u64,
     kv_cache_bytes: u64,
+    optional_verifier_bytes: u64,
+    known_unique_logical_bytes: u64,
     pipeline_state_bytes: u64,
     pipeline_state_bytes_known: bool,
     duplicate_cpu_weight_bytes: u64,
@@ -9879,7 +9886,12 @@ fn benchmark_v2_memory_profile(
         .as_ref()
         .map(|plan| plan.plan_id.clone())
         .unwrap_or_else(|| "legacy-v1-unsealed".to_owned());
-    let plan = ExecutionPlan::granite(context_length).map_err(anyhow::Error::msg)?;
+    let kv_precision = sealed_plan
+        .as_ref()
+        .map(|plan| plan.topology.kv_precision)
+        .unwrap_or(qx_format::KvPrecision::Fp32);
+    let plan = ExecutionPlan::granite_with_kv_precision(context_length, kv_precision)
+        .map_err(anyhow::Error::msg)?;
     let metal = Rc::new(
         qx_metal::platform::MetalContext::system_default()
             .ok_or_else(|| anyhow::anyhow!("no Metal device is available"))?,
@@ -9896,8 +9908,9 @@ fn benchmark_v2_memory_profile(
     )
     .map_err(anyhow::Error::msg)?;
     phases.push(memory_snapshot("attention_weights_and_pipelines", &metal));
-    let moe = qx_runtime_v2::PreparedMoeStack::load_from_mapped_artifact(&metal, mapped_artifact)
-        .map_err(anyhow::Error::msg)?;
+    let moe =
+        qx_runtime_v2::PreparedMoeStack::load_from_mapped_artifact(&metal, mapped_artifact.clone())
+            .map_err(anyhow::Error::msg)?;
     phases.push(memory_snapshot("all_weights_and_pipelines", &metal));
 
     let token_bytes = 0_u32.to_le_bytes();
@@ -9924,11 +9937,25 @@ fn benchmark_v2_memory_profile(
     }
     phases.push(memory_snapshot("steady_state_after_measurement", &metal));
 
-    let ownership = memory_ownership(&plan, artifact_bytes);
+    let ownership = memory_ownership(&plan, mapped_artifact.as_ref(), artifact_bytes);
     let final_metal_allocated_bytes = phases
         .last()
         .map(|phase| phase.known_metal_allocated_bytes)
         .unwrap_or(0);
+    let mut limitations = vec![
+        "Metal currentAllocatedSize is aggregate; Metal does not expose per-buffer ownership through the current qx-metal API.",
+        "mapped_artifact_bytes is the file-backed mapping extent, not resident mapped pages.",
+        "peak RSS/physical footprint are process lifetime maxima and cannot be reset between phases.",
+    ];
+    if !ownership.pipeline_state_bytes_known {
+        limitations.push(
+            "pipeline_state_bytes is unknown because Metal does not expose pipeline allocation ownership.",
+        );
+    }
+    if !ownership.duplicate_cpu_weight_bytes_known {
+        limitations
+            .push("duplicate_cpu_weight_bytes is unknown for copied or hybrid artifact ownership.");
+    }
     let report = V2MemoryProfileReport {
         schema_version: 1,
         implementation: "qx-v2-memory-profile",
@@ -9947,12 +9974,7 @@ fn benchmark_v2_memory_profile(
         power_state: command_output("pmset", &["-g", "batt"]),
         thermal_state: command_output("pmset", &["-g", "therm"]),
         memory_pressure: command_output("memory_pressure", &["-Q"]),
-        limitations: vec![
-            "Metal currentAllocatedSize is aggregate; Metal does not expose per-buffer ownership through the current qx-metal API.",
-            "mapped_artifact_bytes is the file-backed mapping extent, not resident mapped pages.",
-            "pipeline_state_bytes and duplicate_cpu_weight_bytes are unknown because their allocations are not exposed by the current runtime API.",
-            "peak RSS/physical footprint are process lifetime maxima and cannot be reset between phases.",
-        ],
+        limitations,
     };
     println!("QX V2 memory ownership profile");
     println!("artifact:                 {}", report.artifact);
@@ -9960,8 +9982,21 @@ fn benchmark_v2_memory_profile(
         "artifact bytes/mapped:    {} / {}",
         artifact_bytes, ownership.mapped_artifact_bytes
     );
+    println!(
+        "unique weight payload:    {}",
+        ownership.unique_weight_payload_bytes
+    );
     println!("arena bytes:              {}", ownership.arena_bytes);
+    println!("K cache bytes:            {}", ownership.kv_key_cache_bytes);
+    println!(
+        "V cache bytes:            {}",
+        ownership.kv_value_cache_bytes
+    );
     println!("KV cache bytes:           {}", ownership.kv_cache_bytes);
+    println!(
+        "known unique logical:     {}",
+        ownership.known_unique_logical_bytes
+    );
     println!(
         "attention scratch bytes:  {}",
         ownership.attention_scratch_bytes
@@ -9999,7 +10034,11 @@ fn memory_snapshot(label: &str, metal: &qx_metal::platform::MetalContext) -> Mem
 }
 
 #[cfg(target_os = "macos")]
-fn memory_ownership(plan: &ExecutionPlan, artifact_bytes: u64) -> MemoryOwnership {
+fn memory_ownership(
+    plan: &ExecutionPlan,
+    artifact: &MappedArtifact,
+    artifact_bytes: u64,
+) -> MemoryOwnership {
     let region_bytes = |id: BufferId| {
         plan.regions
             .iter()
@@ -10028,24 +10067,28 @@ fn memory_ownership(plan: &ExecutionPlan, artifact_bytes: u64) -> MemoryOwnershi
     let attention_scratch_bytes = region_bytes(BufferId::AttentionScratch);
     let moe_scratch_bytes = region_bytes(BufferId::MoeScratch);
     let logits_bytes = region_bytes(BufferId::Logits);
-    let kv_cache_bytes = (0..LAYERS)
-        .map(|layer| {
-            let key_bytes = if qx_metal::platform::kv_key_fp16_for_layer(layer) {
-                std::mem::size_of::<u16>()
-            } else {
-                std::mem::size_of::<f32>()
-            };
-            let value_bytes = if qx_metal::platform::kv_value_fp16_for_layer(layer) {
-                std::mem::size_of::<u16>()
-            } else {
-                std::mem::size_of::<f32>()
-            };
-            context_kv_bytes(plan.context, key_bytes + value_bytes)
-        })
-        .sum();
+    let kv_key_cache_bytes = plan.kv_key_bytes() as u64;
+    let kv_value_cache_bytes = plan.kv_value_bytes() as u64;
+    let kv_cache_bytes = kv_key_cache_bytes + kv_value_cache_bytes;
+    let unique_weight_payload_bytes =
+        unique_tensor_payload_bytes(artifact.info().entries.iter().map(|entry| {
+            [
+                (entry.scale_offset, entry.scale_length),
+                (entry.data_offset, entry.data_length),
+            ]
+        }));
+    let mapped_weight_slab_bytes = artifact.info().header.weights_length;
+    let artifact_metadata_and_padding_bytes =
+        artifact_bytes.saturating_sub(unique_weight_payload_bytes);
+    let known_unique_logical_bytes = artifact_bytes
+        .saturating_add(plan.arena_bytes as u64)
+        .saturating_add(kv_cache_bytes);
     MemoryOwnership {
         artifact_file_bytes: artifact_bytes,
         mapped_artifact_bytes: artifact_bytes,
+        mapped_weight_slab_bytes,
+        unique_weight_payload_bytes,
+        artifact_metadata_and_padding_bytes,
         arena_bytes: plan.arena_bytes as u64,
         arena_region_bytes,
         arena_alignment_bytes: plan.arena_bytes as u64 - arena_region_bytes,
@@ -10053,17 +10096,51 @@ fn memory_ownership(plan: &ExecutionPlan, artifact_bytes: u64) -> MemoryOwnershi
         attention_scratch_bytes,
         moe_scratch_bytes,
         logits_bytes,
+        kv_key_cache_bytes,
+        kv_value_cache_bytes,
         kv_cache_bytes,
+        optional_verifier_bytes: 0,
+        known_unique_logical_bytes,
         pipeline_state_bytes: 0,
         pipeline_state_bytes_known: false,
         duplicate_cpu_weight_bytes: 0,
-        duplicate_cpu_weight_bytes_known: false,
+        duplicate_cpu_weight_bytes_known: artifact
+            .info()
+            .execution_plan
+            .as_ref()
+            .is_some_and(|plan| plan.memory.weight_storage == qx_format::WeightStorage::MmapNoCopy),
     }
 }
 
-#[cfg(target_os = "macos")]
-fn context_kv_bytes(context: usize, element_bytes: usize) -> u64 {
-    (context * KV_HEADS * HEAD_DIM * element_bytes) as u64
+fn unique_tensor_payload_bytes<I>(ranges_by_tensor: I) -> u64
+where
+    I: IntoIterator<Item = [(u64, u64); 2]>,
+{
+    let mut ranges = ranges_by_tensor
+        .into_iter()
+        .flatten()
+        .filter(|(_, length)| *length != 0)
+        .map(|(offset, length)| (offset, offset.saturating_add(length)))
+        .collect::<Vec<_>>();
+    ranges.sort_unstable_by_key(|range| range.0);
+    let mut total = 0_u64;
+    let mut current: Option<(u64, u64)> = None;
+    for range in ranges {
+        match current {
+            Some((start, end)) if range.0 <= end => {
+                current = Some((start, end.max(range.1)));
+            }
+            Some((start, end)) => {
+                total = total.saturating_add(end.saturating_sub(start));
+                current = Some(range);
+            }
+            None => current = Some(range),
+        }
+    }
+    if let Some((start, end)) = current {
+        total = total.saturating_add(end.saturating_sub(start));
+    }
+    total
 }
 
 #[cfg(target_os = "macos")]
@@ -11364,7 +11441,6 @@ fn print_memory_plan(artifact_path: &std::path::Path) -> Result<()> {
 }
 
 fn print_v2_plan(artifact: &MappedArtifact, context: usize) -> Result<()> {
-    let plan = ExecutionPlan::granite(context).map_err(anyhow::Error::msg)?;
     let sealed = artifact.info().execution_plan.as_ref();
     if let Some(sealed) = sealed
         && sealed.workload.context_limit as usize != context
@@ -11374,42 +11450,33 @@ fn print_v2_plan(artifact: &MappedArtifact, context: usize) -> Result<()> {
             sealed.workload.context_limit
         );
     }
-    let (expert_bytes, dense_bytes) =
+    let kv_precision = sealed
+        .map(|plan| plan.topology.kv_precision)
+        .unwrap_or(qx_format::KvPrecision::Fp32);
+    let plan = ExecutionPlan::granite_with_kv_precision(context, kv_precision)
+        .map_err(anyhow::Error::msg)?;
+    let entry_ranges = |expert: bool| {
         artifact
             .info()
             .entries
             .iter()
-            .fold((0_u64, 0_u64), |(expert, dense), entry| {
-                // Inline and transaction-packed tensors can expose their scale and
-                // data views as overlapping ranges in the same artifact stream.
-                // Count the union of those ranges instead of charging the aliased
-                // bytes twice.
-                let scale_end = entry.scale_offset.saturating_add(entry.scale_length);
-                let data_end = entry.data_offset.saturating_add(entry.data_length);
-                let overlap = scale_end
-                    .min(data_end)
-                    .saturating_sub(entry.scale_offset.max(entry.data_offset));
-                let bytes = entry
-                    .scale_length
-                    .saturating_add(entry.data_length)
-                    .saturating_sub(overlap);
-                if entry.is_expert() {
-                    (expert + bytes, dense)
-                } else {
-                    (expert, dense + bytes)
-                }
-            });
+            .filter(move |entry| entry.is_expert() == expert)
+            .map(|entry| {
+                [
+                    (entry.scale_offset, entry.scale_length),
+                    (entry.data_offset, entry.data_length),
+                ]
+            })
+    };
+    let expert_bytes = unique_tensor_payload_bytes(entry_ranges(true));
+    let dense_bytes = unique_tensor_payload_bytes(entry_ranges(false));
     let audit = plan.memory_audit_with_dense_artifact(expert_bytes as usize, dense_bytes as usize);
-    let key_kv_bytes = if qx_metal::platform::kv_key_fp16_enabled() {
-        plan.kv_bytes / 4
-    } else {
-        plan.kv_bytes / 2
-    };
-    let value_kv_bytes = if qx_metal::platform::kv_value_fp16_enabled() {
-        plan.kv_bytes / 4
-    } else {
-        plan.kv_bytes / 2
-    };
+    let mapped_artifact_bytes = artifact.mapped_bytes() as u64;
+    let known_unique_logical_bytes = mapped_artifact_bytes
+        .saturating_add(audit.arena_bytes as u64)
+        .saturating_add(audit.kv_bytes as u64);
+    let key_kv_bytes = plan.kv_key_bytes();
+    let value_kv_bytes = plan.kv_value_bytes();
     println!("QX Runtime V2 static audit");
     println!(
         "sealed plan:                {}",
@@ -11443,6 +11510,11 @@ fn print_v2_plan(artifact: &MappedArtifact, context: usize) -> Result<()> {
             .unwrap_or(0)
     );
     println!("context:                    {}", plan.context);
+    println!("mapped artifact bytes:       {mapped_artifact_bytes}");
+    println!(
+        "unique weight payload:      {}",
+        expert_bytes.saturating_add(dense_bytes)
+    );
     println!(
         "arena bytes:                {}",
         sealed
@@ -11450,15 +11522,21 @@ fn print_v2_plan(artifact: &MappedArtifact, context: usize) -> Result<()> {
             .map(|plan| plan.arena.arena_bytes as usize)
             .unwrap_or(audit.arena_bytes)
     );
-    println!("KV bytes (FP32 validation): {}", audit.kv_bytes);
+    println!("KV bytes (sealed plan):     {}", audit.kv_bytes);
     println!(
         "KV mode:                    K={} V={}",
-        if qx_metal::platform::kv_key_fp16_enabled() {
+        if matches!(
+            kv_precision,
+            qx_format::KvPrecision::Fp16KFp32V | qx_format::KvPrecision::Fp16
+        ) {
             "FP16"
         } else {
             "FP32"
         },
-        if qx_metal::platform::kv_value_fp16_enabled() {
+        if matches!(
+            kv_precision,
+            qx_format::KvPrecision::Fp32KFp16V | qx_format::KvPrecision::Fp16
+        ) {
             "FP16"
         } else {
             "FP32"
@@ -11470,6 +11548,7 @@ fn print_v2_plan(artifact: &MappedArtifact, context: usize) -> Result<()> {
         "KV bytes (runtime):          {}",
         key_kv_bytes + value_kv_bytes
     );
+    println!("known unique logical bytes: {known_unique_logical_bytes}");
     println!(
         "expert artifact bytes:      {}",
         audit.expert_artifact_bytes
@@ -11929,4 +12008,19 @@ where
     let mut values = stats.iter().map(selector).collect::<Vec<_>>();
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unique_tensor_payload_bytes;
+
+    #[test]
+    fn unique_payload_accounting_merges_aliases_and_inline_ranges() {
+        let bytes = unique_tensor_payload_bytes([
+            [(100, 20), (120, 40)],
+            [(100, 20), (120, 40)],
+            [(200, 0), (150, 30)],
+        ]);
+        assert_eq!(bytes, 80);
+    }
 }

@@ -454,7 +454,7 @@ impl ExecutionPlanManifest {
             memory: CompiledMemoryPlan {
                 budget_bytes: memory_plan.total_bytes,
                 predicted_peak_bytes: memory_plan.total_bytes,
-                weight_storage: WeightStorage::CopiedShared,
+                weight_storage: WeightStorage::MmapNoCopy,
                 page_alignment: WEIGHT_SLAB_ALIGNMENT,
             },
             representations: RepresentationPlan {
@@ -469,7 +469,11 @@ impl ExecutionPlanManifest {
                 rope_kv: RopeKvTopology::SplitDirect,
                 attention: AttentionTopology::HierarchicalGqa,
                 moe: MoeTopology::FourStage,
-                kv_precision: KvPrecision::Fp32,
+                // K remains FP32 because it directly controls attention
+                // probabilities. V is persisted as FP16: the complete-model
+                // parity gate passed, and this removes one quarter of the KV
+                // footprint without changing the compute precision.
+                kv_precision: KvPrecision::Fp32KFp16V,
             },
             moe_mapping: None,
             moe_consumer: None,
@@ -645,6 +649,13 @@ impl MappedArtifact {
 
     pub fn info(&self) -> &QxArtifactInfo {
         &self.info
+    }
+
+    /// Complete file-backed mapping extent. Memory ledgers should count this
+    /// once even when Metal creates multiple no-copy views into the weight
+    /// slab.
+    pub fn mapped_bytes(&self) -> usize {
+        self.mmap.len()
     }
 
     /// Ask the OS to reclaim file-backed pages already copied into Metal
@@ -1519,6 +1530,15 @@ mod tests {
         assert_eq!(
             artifact.info.execution_plan.as_ref().unwrap().plan_id,
             "granite-m5-top8-canonical"
+        );
+        let execution_plan = artifact.info.execution_plan.as_ref().unwrap();
+        assert_eq!(
+            execution_plan.topology.kv_precision,
+            KvPrecision::Fp32KFp16V
+        );
+        assert_eq!(
+            execution_plan.memory.weight_storage,
+            WeightStorage::MmapNoCopy
         );
         assert_eq!(artifact.info.entries[0].quant_type, QuantType::Q3);
         assert_eq!(artifact.info.memory_plan.total_bytes, 10);

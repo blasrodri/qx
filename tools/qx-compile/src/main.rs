@@ -5,8 +5,8 @@ use qx_compiler::{
     measure_sensitivity, quantized_bytes,
 };
 use qx_format::{
-    CompiledTensor, ExecutionPlanManifest, ExpertRepresentation, RawTensor, TensorKind,
-    VerifierMoeConsumerTopology, WeightStorage, write_artifact_with_raw_and_plan,
+    CompiledTensor, ExecutionPlanManifest, ExpertRepresentation, KvPrecision, RawTensor,
+    TensorKind, VerifierMoeConsumerTopology, WeightStorage, write_artifact_with_raw_and_plan,
 };
 use qx_model::{EXPERTS, Granite3A400M, GraniteConfig, LAYERS, MAX_CONTEXT, TOP_K};
 use qx_quant::{PackingLayout, QuantType, QuantizedTensor};
@@ -138,8 +138,12 @@ struct Args {
     #[arg(long, default_value = "")]
     benchmark_contract_hash: String,
     /// Static-weight ownership plan embedded into artifact v2.
-    #[arg(long, value_enum, default_value_t = WeightStorageArg::CopiedShared)]
+    #[arg(long, value_enum, default_value_t = WeightStorageArg::MmapNoCopy)]
     weight_storage: WeightStorageArg,
+    /// Persistent KV representation sealed into the artifact. The canonical
+    /// plan keeps attention keys in FP32 and stores values in FP16.
+    #[arg(long, value_enum, default_value_t = KvPrecisionArg::Fp32KFp16V)]
+    kv_precision: KvPrecisionArg,
     /// GPU-ordered command buffers per decode token. No intermediate CPU wait
     /// is permitted; layer boundaries are divided evenly between buffers.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=24))]
@@ -257,6 +261,25 @@ enum WeightStorageArg {
     Hybrid,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum KvPrecisionArg {
+    Fp32,
+    Fp32KFp16V,
+    Fp16KFp32V,
+    Fp16,
+}
+
+impl From<KvPrecisionArg> for KvPrecision {
+    fn from(value: KvPrecisionArg) -> Self {
+        match value {
+            KvPrecisionArg::Fp32 => Self::Fp32,
+            KvPrecisionArg::Fp32KFp16V => Self::Fp32KFp16V,
+            KvPrecisionArg::Fp16KFp32V => Self::Fp16KFp32V,
+            KvPrecisionArg::Fp16 => Self::Fp16,
+        }
+    }
+}
+
 impl From<WeightStorageArg> for WeightStorage {
     fn from(value: WeightStorageArg) -> Self {
         match value {
@@ -293,8 +316,10 @@ fn main() -> Result<()> {
     if args.group_size == 0 || args.context == 0 {
         bail!("group size and context must be positive");
     }
+    let kv_precision: KvPrecision = args.kv_precision.into();
     let runtime_plan =
-        qx_runtime_v2::ExecutionPlan::granite(args.context).map_err(anyhow::Error::msg)?;
+        qx_runtime_v2::ExecutionPlan::granite_with_kv_precision(args.context, kv_precision)
+            .map_err(anyhow::Error::msg)?;
     let fixed_dense_bytes = if args.experts_only {
         0
     } else {
@@ -1065,6 +1090,7 @@ fn main() -> Result<()> {
     execution_plan.plan_id.clone_from(&args.plan_id);
     execution_plan.memory.budget_bytes = args.memory_budget as u64;
     execution_plan.memory.weight_storage = args.weight_storage.into();
+    execution_plan.topology.kv_precision = kv_precision;
     execution_plan.schedule.command_buffers_per_token = args.command_buffers_per_token;
     execution_plan.schedule.encoders_per_token = args.command_buffers_per_token;
     execution_plan.schedule.expected_dispatches_per_token = 390;

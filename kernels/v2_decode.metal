@@ -329,6 +329,38 @@ kernel void qx_v2_rope_kv_simd(
     value_cache[cache_offset + paired_offset] = value_input[paired_offset];
 }
 
+// Canonical asymmetric-cache writer. It preserves the split SIMD RoPE
+// topology while narrowing only the persisted V store; the previous
+// compatibility kernel serialized query, K, and V through one thread.
+kernel void qx_v2_rope_kv_simd_kf32_vf16(
+    device const float* key_input [[buffer(0)]],
+    device const float* value_input [[buffer(1)]],
+    device float* key_cache [[buffer(2)]],
+    device half* value_cache [[buffer(3)]],
+    constant PositionParams& params [[buffer(4)]],
+    uint pair_id [[thread_position_in_grid]]) {
+    constexpr uint head_dim = 64;
+    constexpr uint kv_heads = 8;
+    constexpr uint pairs_per_head = head_dim / 2;
+    if (pair_id >= kv_heads * pairs_per_head) return;
+    constexpr float theta = 10000.0f;
+    uint head = pair_id / pairs_per_head;
+    uint pair = pair_id % pairs_per_head;
+    uint offset = head * head_dim + pair;
+    uint paired_offset = offset + pairs_per_head;
+    uint cache_offset = params.position * kv_heads * head_dim;
+    float inverse = pow(theta, -float(2 * pair) / float(head_dim));
+    float angle = float(params.position) * inverse;
+    float c = cos(angle);
+    float s = sin(angle);
+    float x = key_input[offset];
+    float y = key_input[paired_offset];
+    key_cache[cache_offset + offset] = x * c - y * s;
+    key_cache[cache_offset + paired_offset] = x * s + y * c;
+    value_cache[cache_offset + offset] = half(value_input[offset]);
+    value_cache[cache_offset + paired_offset] = half(value_input[paired_offset]);
+}
+
 struct BatchRopeParams {
     uint start_position;
     uint tokens;

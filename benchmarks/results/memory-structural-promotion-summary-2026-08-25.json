@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-25",
+  "device": "Apple M5 Pro",
+  "model": "ibm-granite-3.0-1b-a400m-instruct",
+  "contract": {
+    "context": 512,
+    "prefill_tokens": 384,
+    "measured_tokens": 128,
+    "rollout_depth": 2,
+    "command_buffers_per_token": 2,
+    "dispatches_per_token": 390,
+    "repetitions": 4,
+    "order": "balanced AB/BA",
+    "sampling": "greedy"
+  },
+  "control": {
+    "kv_precision": "fp32",
+    "tokens_per_second": [
+      390.7293359890718,
+      389.3390547356325,
+      390.11544979092247,
+      388.718065520252
+    ],
+    "mean_tokens_per_second": 389.7254765089697,
+    "median_tokens_per_second": 390.11544979092247,
+    "mean_wall_ms_per_token": 2.5659185390625003,
+    "mean_gpu_ms_per_token": 2.5630054541352365,
+    "known_metal_allocated_bytes": 802373632,
+    "known_unique_logical_bytes": 801748224
+  },
+  "candidate": {
+    "kv_precision": "fp32_k_fp16_v",
+    "tokens_per_second": [
+      392.0487610646574,
+      393.89508773589955,
+      389.82194157993166,
+      392.9894875496295
+    ],
+    "mean_tokens_per_second": 392.18881948252954,
+    "median_tokens_per_second": 392.9894875496295,
+    "mean_wall_ms_per_token": 2.549830322265625,
+    "mean_gpu_ms_per_token": 2.5465366204571183,
+    "known_metal_allocated_bytes": 789790720,
+    "known_unique_logical_bytes": 789165312
+  },
+  "delta": {
+    "kv_bytes": -12582912,
+    "known_metal_allocated_bytes": -12582912,
+    "known_unique_logical_bytes": -12582912,
+    "mean_tokens_per_second_percent": 0.632
+  },
+  "correctness": {
+    "control_token_history_hash": "19b4967c2513510e",
+    "candidate_token_history_hash": "19b4967c2513510e",
+    "control_last_token_id": 34,
+    "candidate_last_token_id": 34,
+    "all_repetitions_match": true
+  },
+  "promotion": "pass"
+}

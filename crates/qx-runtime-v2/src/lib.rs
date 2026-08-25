@@ -297,6 +297,26 @@ pub fn activate_artifact_execution_plan(
             plan.schedule.command_buffers_per_token
         ));
     }
+    let memory_plan = ExecutionPlan::granite_with_kv_precision(
+        plan.workload.context_limit as usize,
+        plan.topology.kv_precision,
+    )?;
+    let declared_kv_bytes = artifact.info().memory_plan.kv_cache_bytes;
+    if declared_kv_bytes != 0 && declared_kv_bytes != memory_plan.kv_bytes as u64 {
+        return Err(format!(
+            "artifact memory plan declares {declared_kv_bytes} KV bytes, but {:?} at context {} requires {}",
+            plan.topology.kv_precision, plan.workload.context_limit, memory_plan.kv_bytes
+        ));
+    }
+    if plan.arena.kv_bytes != 0 && plan.arena.kv_bytes != memory_plan.kv_bytes as u64 {
+        return Err(format!(
+            "execution plan declares {} KV bytes, but {:?} at context {} requires {}",
+            plan.arena.kv_bytes,
+            plan.topology.kv_precision,
+            plan.workload.context_limit,
+            memory_plan.kv_bytes
+        ));
+    }
     // The sealed plan remains authoritative for normal execution. A
     // benchmark-only override lets the planner measure alternative GPU
     // schedules without rebuilding the artifact. It never introduces a CPU
@@ -1146,6 +1166,29 @@ struct KWideVerifierBuffers {
     token_output: qx_metal::platform::RuntimeBuffer,
 }
 
+/// Logical bytes reserved by the production K-wide verifier allocation.
+/// Diagnostic replay captures are excluded because they are independently
+/// lazy. Canonical greedy rollout owns zero of these bytes.
+pub const fn granite_verifier_buffer_bytes(width: usize) -> usize {
+    let pair_count = width * TOP_K;
+    let f32_bytes = std::mem::size_of::<f32>();
+    let u32_bytes = std::mem::size_of::<u32>();
+    let hidden_matrices = 7 * width * HIDDEN * f32_bytes;
+    let kv = 2 * width * KV_HEADS * HEAD_DIM * f32_bytes;
+    let routes = width * EXPERTS * f32_bytes
+        + 3 * pair_count * u32_bytes
+        + EXPERTS * u32_bytes
+        + EXPERTS * pair_count * u32_bytes
+        + EXPERTS * u32_bytes
+        + 6 * u32_bytes;
+    let moe = pair_count * HIDDEN * f32_bytes
+        + pair_count * INTERMEDIATE * f32_bytes
+        + pair_count * HIDDEN * f32_bytes;
+    let vocab_partial_count = VOCAB.div_ceil(8);
+    let logits_scratch = (vocab_partial_count + 256) * 2 * u32_bytes;
+    width * u32_bytes + hidden_matrices + kv + routes + moe + logits_scratch + width * u32_bytes
+}
+
 #[cfg(target_os = "macos")]
 impl KWideVerifierBuffers {
     fn new(context: &qx_metal::platform::MetalContext, width: usize) -> Result<Self, String> {
@@ -1405,7 +1448,9 @@ pub struct GraniteV2Generator {
     context: Rc<qx_metal::platform::MetalContext>,
     resolved_plan: ResolvedExecutionPlan,
     buffers: GpuRuntimeBuffers,
-    verifier_buffers: KWideVerifierBuffers,
+    // Greedy rollout must not pay for speculative/diagnostic state. The
+    // K-wide allocation is created on first verifier or exit-probe use.
+    verifier_buffers: Option<KWideVerifierBuffers>,
     stack: PreparedAttentionStack,
     moe: PreparedMoeStack,
     position: usize,
@@ -1460,19 +1505,19 @@ impl GraniteV2Generator {
             qx_metal::platform::MetalContext::system_default()
                 .ok_or_else(|| "no Metal device is available".to_owned())?,
         );
-        let plan = ExecutionPlan::granite(context_length)?;
+        let plan =
+            ExecutionPlan::granite_with_kv_precision(context_length, resolved_plan.kv_precision)?;
         let buffers = GpuRuntimeBuffers::new(context.clone(), plan)?;
         let artifact = Arc::new(
             qx_format::MappedArtifact::open(&artifact_path).map_err(|error| error.to_string())?,
         );
         let stack = PreparedAttentionStack::load_from_mapped_artifact(&context, artifact.clone())?;
         let moe = PreparedMoeStack::load_from_mapped_artifact(&context, artifact)?;
-        let verifier_buffers = KWideVerifierBuffers::new(context.as_ref(), 4)?;
         Ok(Self {
             context,
             resolved_plan,
             buffers,
-            verifier_buffers,
+            verifier_buffers: None,
             stack,
             moe,
             position: 0,
@@ -1497,10 +1542,31 @@ impl GraniteV2Generator {
         self.position
     }
 
+    pub fn optional_verifier_bytes(&self) -> usize {
+        self.verifier_buffers
+            .as_ref()
+            .map_or(0, |_| granite_verifier_buffer_bytes(4))
+    }
+
+    fn ensure_verifier_buffers(&mut self) -> Result<&mut KWideVerifierBuffers, String> {
+        if self.verifier_buffers.is_none() {
+            self.verifier_buffers = Some(KWideVerifierBuffers::new(self.context.as_ref(), 4)?);
+        }
+        Ok(self
+            .verifier_buffers
+            .as_mut()
+            .expect("verifier buffers were initialized"))
+    }
+
+    fn ensure_verifier_probe_buffers(&mut self) -> Result<(), String> {
+        let context = self.context.clone();
+        self.ensure_verifier_buffers()?
+            .ensure_probe_buffers(context.as_ref(), 4)
+    }
+
     pub fn set_moe_capture(&mut self, enabled: bool) -> Result<(), String> {
         if enabled {
-            self.verifier_buffers
-                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+            self.ensure_verifier_probe_buffers()?;
         }
         self.verifier_moe_capture = enabled;
         if enabled {
@@ -1515,8 +1581,7 @@ impl GraniteV2Generator {
 
     pub fn set_moe_replay(&mut self, enabled: bool) -> Result<(), String> {
         if enabled {
-            self.verifier_buffers
-                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+            self.ensure_verifier_probe_buffers()?;
         }
         self.verifier_moe_replay = enabled;
         if enabled {
@@ -1531,8 +1596,7 @@ impl GraniteV2Generator {
 
     pub fn set_gate_up_capture(&mut self, enabled: bool) -> Result<(), String> {
         if enabled {
-            self.verifier_buffers
-                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+            self.ensure_verifier_probe_buffers()?;
         }
         self.verifier_gate_up_capture = enabled;
         if enabled {
@@ -1547,8 +1611,7 @@ impl GraniteV2Generator {
 
     pub fn set_gate_up_replay(&mut self, enabled: bool) -> Result<(), String> {
         if enabled {
-            self.verifier_buffers
-                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+            self.ensure_verifier_probe_buffers()?;
         }
         self.verifier_gate_up_replay = enabled;
         if enabled {
@@ -1563,8 +1626,7 @@ impl GraniteV2Generator {
 
     pub fn set_down_capture(&mut self, enabled: bool) -> Result<(), String> {
         if enabled {
-            self.verifier_buffers
-                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+            self.ensure_verifier_probe_buffers()?;
         }
         self.verifier_down_capture = enabled;
         if enabled {
@@ -1579,8 +1641,7 @@ impl GraniteV2Generator {
 
     pub fn set_down_replay(&mut self, enabled: bool) -> Result<(), String> {
         if enabled {
-            self.verifier_buffers
-                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+            self.ensure_verifier_probe_buffers()?;
         }
         self.verifier_down_replay = enabled;
         if enabled {
@@ -1604,8 +1665,7 @@ impl GraniteV2Generator {
 
     pub fn set_qkv_capture(&mut self, enabled: bool) -> Result<(), String> {
         if enabled {
-            self.verifier_buffers
-                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+            self.ensure_verifier_probe_buffers()?;
         }
         self.verifier_qkv_capture = enabled;
         if enabled {
@@ -1616,8 +1676,7 @@ impl GraniteV2Generator {
 
     pub fn set_qkv_replay(&mut self, enabled: bool) -> Result<(), String> {
         if enabled {
-            self.verifier_buffers
-                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+            self.ensure_verifier_probe_buffers()?;
         }
         self.verifier_qkv_replay = enabled;
         if enabled {
@@ -1633,8 +1692,7 @@ impl GraniteV2Generator {
 
     pub fn set_attention_capture(&mut self, enabled: bool) -> Result<(), String> {
         if enabled {
-            self.verifier_buffers
-                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+            self.ensure_verifier_probe_buffers()?;
         }
         self.verifier_attention_capture = enabled;
         if enabled {
@@ -1645,8 +1703,7 @@ impl GraniteV2Generator {
 
     pub fn set_attention_replay(&mut self, enabled: bool) -> Result<(), String> {
         if enabled {
-            self.verifier_buffers
-                .ensure_probe_buffers(self.context.as_ref(), 4)?;
+            self.ensure_verifier_probe_buffers()?;
         }
         self.verifier_attention_replay = enabled;
         if enabled {
@@ -1776,6 +1833,11 @@ impl GraniteV2Generator {
             ));
         }
 
+        self.ensure_verifier_buffers()?;
+        let verifier = self
+            .verifier_buffers
+            .as_ref()
+            .expect("exit probe initialized verifier buffers");
         let context = self.buffers.context().as_ref();
         context.write_runtime_buffer(
             self.buffers.buffer(BufferId::TokenOutput),
@@ -1821,12 +1883,11 @@ impl GraniteV2Generator {
                 &self.stack.final_norm,
                 &inverse_rms,
                 self.buffers.buffer(BufferId::MoeScratch),
-                &self.verifier_buffers.token_output,
+                &verifier.token_output,
                 1.0 / qx_model::LOGITS_SCALING,
             )?;
         } else {
-            let normalized = self
-                .verifier_buffers
+            let normalized = verifier
                 .normalized
                 .subregion(0, HIDDEN * std::mem::size_of::<f32>())?;
             graph.encode_rmsnorm(
@@ -1839,8 +1900,8 @@ impl GraniteV2Generator {
                 context,
                 &self.stack.embedding,
                 &normalized,
-                &self.verifier_buffers.logits_scratch,
-                &self.verifier_buffers.token_output,
+                &verifier.logits_scratch,
+                &verifier.token_output,
                 1.0 / qx_model::LOGITS_SCALING,
             )?;
         }
@@ -1896,9 +1957,7 @@ impl GraniteV2Generator {
         let full = self
             .context
             .read_runtime_u32(self.buffers.buffer(BufferId::TokenOutput))?;
-        let exit = self
-            .context
-            .read_runtime_u32(&self.verifier_buffers.token_output)?;
+        let exit = self.context.read_runtime_u32(&verifier.token_output)?;
         self.position += 1;
         Ok((full, exit))
     }
@@ -1997,11 +2056,15 @@ impl GraniteV2Generator {
                 self.context_length()
             ));
         }
+        self.ensure_verifier_buffers()?;
         // Buffers are allocated for the maximum verifier width, but the
         // route schedule must describe only the active width. Reusing the
         // capacity-sized pair count would make K=2 consume stale K=4 routes.
         let pair_count = width * TOP_K;
-        let verifier = &self.verifier_buffers;
+        let verifier = self
+            .verifier_buffers
+            .as_ref()
+            .expect("GPU verifier initialized verifier buffers");
         let token_bytes = unsafe {
             std::slice::from_raw_parts(inputs.as_ptr() as *const u8, std::mem::size_of_val(inputs))
         };
@@ -4564,10 +4627,13 @@ pub struct ExecutionPlan {
     pub context: usize,
     pub arena_bytes: usize,
     pub kv_bytes: usize,
+    pub kv_precision: qx_format::KvPrecision,
     pub regions: Vec<BufferRegion>,
     pub layers: [LayerPlan; LAYERS],
     pub command_buffers_per_token: usize,
     pub encoders_per_token: usize,
+    kv_key_element_bytes: [usize; LAYERS],
+    kv_value_element_bytes: [usize; LAYERS],
 }
 
 /// Fixed speculative-verifier widths supported by the planner. The GPU
@@ -4780,6 +4846,8 @@ pub struct MemoryAudit {
     pub dense_q4_full_bytes: usize,
     pub attention_q4_bytes: usize,
     pub arena_bytes: usize,
+    pub kv_key_bytes: usize,
+    pub kv_value_bytes: usize,
     pub kv_bytes: usize,
     pub estimated_fp32_reference_bytes: usize,
     pub estimated_q4_full_resident_bytes: usize,
@@ -4824,6 +4892,59 @@ pub const fn granite_dense_q4_bytes() -> usize {
 
 impl ExecutionPlan {
     pub fn granite(context: usize) -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        {
+            let key_bytes = std::array::from_fn(|layer| {
+                if qx_metal::platform::kv_key_fp16_for_layer(layer) {
+                    std::mem::size_of::<u16>()
+                } else {
+                    std::mem::size_of::<f32>()
+                }
+            });
+            let value_bytes = std::array::from_fn(|layer| {
+                if qx_metal::platform::kv_value_fp16_for_layer(layer) {
+                    std::mem::size_of::<u16>()
+                } else {
+                    std::mem::size_of::<f32>()
+                }
+            });
+            let precision = match (key_bytes[0], value_bytes[0]) {
+                (4, 4) => qx_format::KvPrecision::Fp32,
+                (4, 2) => qx_format::KvPrecision::Fp32KFp16V,
+                (2, 4) => qx_format::KvPrecision::Fp16KFp32V,
+                (2, 2) => qx_format::KvPrecision::Fp16,
+                _ => unreachable!("KV storage uses FP16 or FP32 elements"),
+            };
+            return Self::granite_with_kv_element_bytes(context, precision, key_bytes, value_bytes);
+        }
+        #[cfg(not(target_os = "macos"))]
+        Self::granite_with_kv_precision(context, qx_format::KvPrecision::Fp32)
+    }
+
+    pub fn granite_with_kv_precision(
+        context: usize,
+        precision: qx_format::KvPrecision,
+    ) -> Result<Self, String> {
+        let (key_bytes, value_bytes) = match precision {
+            qx_format::KvPrecision::Fp32 => (4, 4),
+            qx_format::KvPrecision::Fp32KFp16V => (4, 2),
+            qx_format::KvPrecision::Fp16KFp32V => (2, 4),
+            qx_format::KvPrecision::Fp16 => (2, 2),
+        };
+        Self::granite_with_kv_element_bytes(
+            context,
+            precision,
+            [key_bytes; LAYERS],
+            [value_bytes; LAYERS],
+        )
+    }
+
+    fn granite_with_kv_element_bytes(
+        context: usize,
+        kv_precision: qx_format::KvPrecision,
+        kv_key_element_bytes: [usize; LAYERS],
+        kv_value_element_bytes: [usize; LAYERS],
+    ) -> Result<Self, String> {
         if context == 0 || context > 4096 {
             return Err(format!("context {context} must be in 1..=4096"));
         }
@@ -4855,10 +4976,14 @@ impl ExecutionPlan {
         add(BufferId::Logits, 49155 * 4);
         add(BufferId::TokenOutput, std::mem::size_of::<u32>());
 
-        // V2's first decode kernels use FP32 activations and KV for validated
-        // numerical parity. The storage type can be lowered to FP16 after the
-        // fused path has a regression fixture.
-        let kv_bytes = LAYERS * context * KV_HEADS * HEAD_DIM * 2 * std::mem::size_of::<f32>();
+        let kv_bytes = (0..LAYERS)
+            .map(|layer| {
+                context
+                    * KV_HEADS
+                    * HEAD_DIM
+                    * (kv_key_element_bytes[layer] + kv_value_element_bytes[layer])
+            })
+            .sum();
         let layers = std::array::from_fn(|layer| LayerPlan {
             layer,
             input: if layer.is_multiple_of(2) {
@@ -4886,11 +5011,34 @@ impl ExecutionPlan {
             context,
             arena_bytes: align(offset, 256),
             kv_bytes,
+            kv_precision,
             regions,
             layers,
             command_buffers_per_token: 1,
             encoders_per_token: 1,
+            kv_key_element_bytes,
+            kv_value_element_bytes,
         })
+    }
+
+    pub fn kv_key_bytes(&self) -> usize {
+        (0..LAYERS)
+            .map(|layer| self.kv_key_layer_bytes(layer))
+            .sum()
+    }
+
+    pub fn kv_value_bytes(&self) -> usize {
+        (0..LAYERS)
+            .map(|layer| self.kv_value_layer_bytes(layer))
+            .sum()
+    }
+
+    fn kv_key_layer_bytes(&self, layer: usize) -> usize {
+        self.context * KV_HEADS * HEAD_DIM * self.kv_key_element_bytes[layer]
+    }
+
+    fn kv_value_layer_bytes(&self, layer: usize) -> usize {
+        self.context * KV_HEADS * HEAD_DIM * self.kv_value_element_bytes[layer]
     }
 
     pub fn region(&self, id: BufferId) -> BufferRegion {
@@ -4933,6 +5081,8 @@ impl ExecutionPlan {
             dense_q4_full_bytes,
             attention_q4_bytes,
             arena_bytes: self.arena_bytes,
+            kv_key_bytes: self.kv_key_bytes(),
+            kv_value_bytes: self.kv_value_bytes(),
             kv_bytes: self.kv_bytes,
             estimated_fp32_reference_bytes: expert_artifact_bytes
                 + dense_fp32_reference_bytes
@@ -5031,21 +5181,11 @@ impl GpuRuntimeBuffers {
     }
 
     fn key_layer_bytes(plan: &ExecutionPlan, layer: usize) -> usize {
-        let element_bytes = if qx_metal::platform::kv_key_fp16_for_layer(layer) {
-            std::mem::size_of::<u16>()
-        } else {
-            std::mem::size_of::<f32>()
-        };
-        plan.context * KV_HEADS * HEAD_DIM * element_bytes
+        plan.kv_key_layer_bytes(layer)
     }
 
     fn value_layer_bytes(plan: &ExecutionPlan, layer: usize) -> usize {
-        let element_bytes = if qx_metal::platform::kv_value_fp16_for_layer(layer) {
-            std::mem::size_of::<u16>()
-        } else {
-            std::mem::size_of::<f32>()
-        };
-        plan.context * KV_HEADS * HEAD_DIM * element_bytes
+        plan.kv_value_layer_bytes(layer)
     }
 
     fn kv_layer_offset(&self, layer: usize) -> usize {
@@ -5385,11 +5525,16 @@ mod tests {
 
     #[test]
     fn memory_audit_exposes_dense_and_runtime_costs() {
-        let plan = ExecutionPlan::granite(512).unwrap();
+        let plan =
+            ExecutionPlan::granite_with_kv_precision(512, qx_format::KvPrecision::Fp32KFp16V)
+                .unwrap();
         let audit = plan.memory_audit(679_477_248);
         assert!(audit.dense_fp32_reference_bytes > 500_000_000);
         assert!(audit.dense_q4_full_bytes < 100_000_000);
         assert!(audit.kv_bytes > 20_000_000);
+        assert_eq!(audit.kv_key_bytes, 25_165_824);
+        assert_eq!(audit.kv_value_bytes, 12_582_912);
+        assert_eq!(audit.kv_bytes, 37_748_736);
         assert_eq!(
             audit.estimated_fp32_reference_bytes,
             audit.expert_artifact_bytes
@@ -5397,6 +5542,26 @@ mod tests {
                 + audit.arena_bytes
                 + audit.kv_bytes
         );
+    }
+
+    #[test]
+    fn kv_precision_is_a_first_class_memory_plan_dimension() {
+        let fp32 =
+            ExecutionPlan::granite_with_kv_precision(512, qx_format::KvPrecision::Fp32).unwrap();
+        let asymmetric =
+            ExecutionPlan::granite_with_kv_precision(512, qx_format::KvPrecision::Fp32KFp16V)
+                .unwrap();
+        let fp16 =
+            ExecutionPlan::granite_with_kv_precision(512, qx_format::KvPrecision::Fp16).unwrap();
+
+        assert_eq!(fp32.kv_bytes, 50_331_648);
+        assert_eq!(asymmetric.kv_bytes, 37_748_736);
+        assert_eq!(fp16.kv_bytes, 25_165_824);
+        assert_eq!(fp32.kv_key_bytes(), asymmetric.kv_key_bytes());
+        assert_eq!(asymmetric.kv_value_bytes() * 2, fp32.kv_value_bytes());
+        assert_eq!(fp16.kv_bytes * 2, fp32.kv_bytes);
+        assert_eq!(fp32.arena_bytes, asymmetric.arena_bytes);
+        assert_eq!(granite_verifier_buffer_bytes(4), 515_264);
     }
 
     #[cfg(target_os = "macos")]

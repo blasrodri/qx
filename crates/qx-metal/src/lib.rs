@@ -1204,6 +1204,7 @@ pub mod platform {
         RopeKv,
         RopeQuerySimd,
         RopeKvSimd,
+        RopeKvSimdKf32Vf16,
         Attention,
         AttentionSimd,
         TopK,
@@ -1465,7 +1466,7 @@ pub mod platform {
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
-        v2_pipelines: Mutex<[Option<Pipeline>; 41]>,
+        v2_pipelines: Mutex<[Option<Pipeline>; 42]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
         stage_counters: Mutex<bool>,
@@ -6820,7 +6821,7 @@ pub mod platform {
             key_fp16: bool,
             value_fp16: bool,
         ) -> Result<(), String> {
-            if rope_kv_split_enabled() && !key_fp16 && !value_fp16 {
+            if rope_kv_split_enabled() && !key_fp16 {
                 return self.encode_rope_kv_split(
                     context,
                     query,
@@ -6830,6 +6831,7 @@ pub mod platform {
                     key_cache,
                     value_cache,
                     position,
+                    value_fp16,
                 );
             }
             #[repr(C)]
@@ -6873,6 +6875,7 @@ pub mod platform {
             key_cache: &RuntimeBuffer,
             value_cache: &RuntimeBuffer,
             position: usize,
+            value_fp16: bool,
         ) -> Result<(), String> {
             #[repr(C)]
             struct Params {
@@ -6899,7 +6902,11 @@ pub mod platform {
             )?;
             self.encode_decode_kernel(
                 context,
-                DecodeKernel::RopeKvSimd,
+                if value_fp16 {
+                    DecodeKernel::RopeKvSimdKf32Vf16
+                } else {
+                    DecodeKernel::RopeKvSimd
+                },
                 &[key, value, key_cache, value_cache],
                 bytes_of(&params),
                 MTLSize {
@@ -8194,7 +8201,7 @@ pub mod platform {
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
-                    None, None,
+                    None, None, None,
                 ]),
                 scratch: Mutex::new(MetalScratch {
                     input_f32: None,
@@ -9586,6 +9593,7 @@ pub mod platform {
                 DecodeKernel::RmsNormBatchScalar => 38,
                 DecodeKernel::AttentionBatchSimd => 39,
                 DecodeKernel::RmsNormBatchParallelWriteback => 40,
+                DecodeKernel::RopeKvSimdKf32Vf16 => 41,
             };
             let mut pipelines = self
                 .v2_pipelines
@@ -9626,6 +9634,7 @@ pub mod platform {
                 DecodeKernel::AttentionSoftmaxSimd => "qx_v2_attention_softmax_simd",
                 DecodeKernel::RopeQuerySimd => "qx_v2_rope_query_simd",
                 DecodeKernel::RopeKvSimd => "qx_v2_rope_kv_simd",
+                DecodeKernel::RopeKvSimdKf32Vf16 => "qx_v2_rope_kv_simd_kf32_vf16",
                 DecodeKernel::TopKMask => "qx_v2_topk_mask",
                 DecodeKernel::AttentionQkKMajor => "qx_v2_attention_qk_kmajor",
                 DecodeKernel::AttentionStreamGqa => "qx_v2_attention_stream_gqa",
