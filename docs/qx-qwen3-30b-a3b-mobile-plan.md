@@ -730,6 +730,53 @@ candidate reaches all of these gates:
 The committed aggregate is
 `benchmarks/results/qwen3-30b-a3b-structured-nll-smoke-2026-08-25.json`.
 
+### Expert-local residual distillation control
+
+End-to-end BF16 training is not physically possible on the first target
+machine. The upstream checkpoint index reports 61,064,245,248 bytes of model
+weights, while this M5 Pro has 24 GiB unified memory; optimizer and activation
+state would increase the gap substantially. QX therefore implements a serial
+expert-local control that keeps the 17 GiB quantized teacher resident and trains
+only one reduced down projection at a time.
+
+The capture path records real post-SwiGLU activations and unweighted teacher
+down outputs whenever a specified `(layer, expert)` is routed. It also exports
+that expert's quantized down matrix once in dequantized row-major form. The
+trainer retains fixed eight-neuron groups, uses the retained teacher columns as
+the student initialization, and fits only the missing output residual with a
+dual ridge solve. This is equivalent to a linear down-projection correction;
+gate/up weights remain fixed.
+
+Layer 8, expert 38 was chosen because it appeared on all six earlier calibration
+positions. A systems-oriented passage produced 25 routed samples; a disjoint
+ecology/statistics passage produced 31 held-out samples. The full-width control
+reconstructs the quantized teacher below `5.5e-7` p95 relative L2, validating
+activation capture, down-weight export, and projection orientation.
+
+The disjoint result rejects the tiny-data fit:
+
+| Retained neurons | Masked teacher mean L2 | Distilled mean L2 | Distilled p95 | Cosine |
+|---:|---:|---:|---:|---:|
+| 93.75% | 0.1570 | 0.1634 | 0.2455 | 0.9838 |
+| 75.00% | 0.3718 | 0.3812 | 0.5145 | 0.9177 |
+| 50.00% | 0.5981 | 0.6146 | 0.7969 | 0.7697 |
+
+The residual fit worsens mean held-out error at every pruned width. Do not feed
+this student into full-model NLL: it fails the cheaper local gate. The earlier
+adjacent-position split showed a small apparent improvement, so the disjoint
+failure is also direct evidence that same-passage expert distillation can give
+misleading results.
+
+The machine can execute a larger serial expert experiment, but data—not the
+linear solve—is now the bottleneck. The next attempt needs hundreds to thousands
+of diverse hits per layer/expert and must optimize gate/up/down jointly or use
+group-aware pretraining. A 1,024-token capture context failed with a Metal
+out-of-memory error at position 9; context 128 completed. Capture should
+therefore stream independent short sequences and reset KV state between them.
+
+The committed aggregate is
+`benchmarks/results/qwen3-30b-a3b-expert-local-distillation-smoke-2026-08-25.json`.
+
 ## Evidence layout
 
 Keep generated model files and raw traces under ignored `external/` paths.

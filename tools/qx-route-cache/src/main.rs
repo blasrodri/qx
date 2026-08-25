@@ -14,6 +14,7 @@ const SIMULATION_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_Q3_EXPERT_BYTES: u64 = 2_064_384;
 const DEFAULT_EXPERT_NEURONS: usize = 768;
 const MAX_GREEDY_CONTRIBUTION_PACKETS: usize = 64;
+const EXPERT_DOWN_WEIGHTS_MAGIC: &[u8; 8] = b"QXEDW001";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -63,6 +64,14 @@ enum Command {
         /// Model hidden width used by down-output contribution capture.
         #[arg(long, default_value_t = 2048)]
         hidden_size: usize,
+        /// Capture post-SwiGLU input and teacher down output when this layer uses sample-expert.
+        #[arg(long, requires = "sample_expert")]
+        sample_layer: Option<usize>,
+        #[arg(long, requires = "sample_layer")]
+        sample_expert: Option<u16>,
+        /// Binary dequantized teacher down matrix written on the first sampled hit.
+        #[arg(long, requires = "sample_layer")]
+        sample_weights_output: Option<PathBuf>,
         /// Trusted model SHA-256. If omitted, the complete GGUF is hashed.
         #[arg(long)]
         model_sha256: Option<String>,
@@ -184,6 +193,32 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Fit and evaluate one reduced expert down projection from captured teacher samples.
+    DistillExpert {
+        #[arg(long = "trace", required = true)]
+        traces: Vec<PathBuf>,
+        #[arg(long)]
+        teacher_down_weights: PathBuf,
+        #[arg(long = "calibration", required = true)]
+        calibrations: Vec<PathBuf>,
+        #[arg(long)]
+        layer: usize,
+        #[arg(long)]
+        expert: u16,
+        #[arg(long, default_value_t = 8)]
+        group_neurons: usize,
+        #[arg(long, default_value_t = 0.5)]
+        retained_fraction: f64,
+        #[arg(long, default_value_t = 0.1)]
+        relative_error: f64,
+        #[arg(long, default_value_t = 0.75)]
+        train_fraction: f64,
+        /// Ridge penalty relative to the mean train-kernel diagonal.
+        #[arg(long, default_value_t = 1e-3)]
+        ridge: f64,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum)]
@@ -270,6 +305,16 @@ struct TokenRoutes {
     packet_activation_energy: Option<Vec<PacketActivationEnergy>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     packet_down_contribution: Option<PacketDownContribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expert_distill_sample: Option<ExpertDistillSample>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ExpertDistillSample {
+    layer: usize,
+    expert: u16,
+    activation: Vec<f32>,
+    teacher_down_output: Vec<f32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -582,6 +627,40 @@ struct StructuredCalibration {
     layer_observations: HashMap<usize, Vec<Vec<u16>>>,
 }
 
+#[derive(Debug, Serialize)]
+struct ExpertDistillReport {
+    schema_version: u32,
+    classification: &'static str,
+    promotion_evidence: bool,
+    training_semantics: &'static str,
+    quality_semantics: &'static str,
+    traces: Vec<String>,
+    teacher_down_weights: String,
+    calibrations: Vec<String>,
+    trace_header: TraceHeader,
+    layer: usize,
+    expert: u16,
+    group_neurons: usize,
+    retained_groups: usize,
+    retained_neurons: usize,
+    retained_fraction: f64,
+    train_samples: usize,
+    heldout_samples: usize,
+    ridge_relative_to_mean_kernel_diagonal: f64,
+    ridge_absolute: f64,
+    student_down_parameters: usize,
+    student_down_f16_bytes: usize,
+    student_down_q4_payload_bytes: usize,
+    heldout_mean_relative_l2: f64,
+    heldout_p50_relative_l2: f64,
+    heldout_p95_relative_l2: f64,
+    heldout_mean_cosine: f64,
+    masked_teacher_mean_relative_l2: f64,
+    masked_teacher_p95_relative_l2: f64,
+    masked_teacher_mean_cosine: f64,
+    heldout_zero_baseline_relative_l2: f64,
+}
+
 fn default_greedy_selection_semantics() -> String {
     "perfect-knowledge-greedy-minimum-next-residual".to_owned()
 }
@@ -612,6 +691,9 @@ fn main() -> Result<()> {
             contribution_packet_neurons,
             expert_neurons,
             hidden_size,
+            sample_layer,
+            sample_expert,
+            sample_weights_output,
             model_sha256,
         } => capture(CaptureArgs {
             model,
@@ -629,6 +711,8 @@ fn main() -> Result<()> {
             contribution_packet_neurons,
             expert_neurons,
             hidden_size,
+            sample: sample_layer.zip(sample_expert),
+            sample_weights_output,
             model_sha256,
         }),
         Command::Simulate {
@@ -729,6 +813,31 @@ fn main() -> Result<()> {
             model_sha256,
             output,
         }),
+        Command::DistillExpert {
+            traces,
+            teacher_down_weights,
+            calibrations,
+            layer,
+            expert,
+            group_neurons,
+            retained_fraction,
+            relative_error,
+            train_fraction,
+            ridge,
+            output,
+        } => distill_expert(
+            &traces,
+            &teacher_down_weights,
+            &calibrations,
+            layer,
+            expert,
+            group_neurons,
+            retained_fraction,
+            relative_error,
+            train_fraction,
+            ridge,
+            &output,
+        ),
     }
 }
 
@@ -767,6 +876,8 @@ struct CaptureArgs {
     contribution_packet_neurons: Vec<usize>,
     expert_neurons: usize,
     hidden_size: usize,
+    sample: Option<(usize, u16)>,
+    sample_weights_output: Option<PathBuf>,
     model_sha256: Option<String>,
 }
 
@@ -812,6 +923,11 @@ fn capture(args: CaptureArgs) -> Result<()> {
     if args.hidden_size == 0 {
         bail!("hidden-size must be positive");
     }
+    if let Some((layer, expert)) = args.sample
+        && (layer >= args.layers || usize::from(expert) >= args.experts)
+    {
+        bail!("expert distillation sample target is outside the model shape");
+    }
     if let Some(&finest) = args.contribution_packet_neurons.iter().min()
         && args
             .contribution_packet_neurons
@@ -848,8 +964,10 @@ fn capture(args: CaptureArgs) -> Result<()> {
             threads: args.threads,
             intermediate: (!args.activation_packet_neurons.is_empty()
                 || !args.contribution_packet_neurons.is_empty())
-            .then_some(args.expert_neurons),
+            .then_some(args.expert_neurons)
+            .or(args.sample.map(|_| args.expert_neurons)),
             hidden: args.hidden_size,
+            sample: args.sample,
             contribution_packet_neurons: &args.contribution_packet_neurons,
         },
     )?;
@@ -888,7 +1006,14 @@ fn capture(args: CaptureArgs) -> Result<()> {
             routes,
             activations,
             down_contribution,
+            expert_sample,
+            expert_down_weights,
         } = llama.step(token)?;
+        if let Some(weights) = expert_down_weights
+            && let Some(path) = &args.sample_weights_output
+        {
+            write_expert_down_weights(path, args.expert_neurons, args.hidden_size, &weights)?;
+        }
         validate_routes(&routes, args.layers, args.top_k, args.experts)?;
         write_trace_line(
             &mut writer,
@@ -908,6 +1033,16 @@ fn capture(args: CaptureArgs) -> Result<()> {
                     )
                 }),
                 packet_down_contribution: down_contribution,
+                expert_distill_sample: expert_sample.map(|(activation, teacher_down_output)| {
+                    let (layer, expert) =
+                        args.sample.expect("sample exists when bridge returns one");
+                    ExpertDistillSample {
+                        layer,
+                        expert,
+                        activation,
+                        teacher_down_output,
+                    }
+                }),
             }),
         )?;
         position += 1;
@@ -924,7 +1059,14 @@ fn capture(args: CaptureArgs) -> Result<()> {
             routes,
             activations,
             down_contribution,
+            expert_sample,
+            expert_down_weights,
         } = llama.step(next)?;
+        if let Some(weights) = expert_down_weights
+            && let Some(path) = &args.sample_weights_output
+        {
+            write_expert_down_weights(path, args.expert_neurons, args.hidden_size, &weights)?;
+        }
         validate_routes(&routes, args.layers, args.top_k, args.experts)?;
         write_trace_line(
             &mut writer,
@@ -944,6 +1086,16 @@ fn capture(args: CaptureArgs) -> Result<()> {
                     )
                 }),
                 packet_down_contribution: down_contribution,
+                expert_distill_sample: expert_sample.map(|(activation, teacher_down_output)| {
+                    let (layer, expert) =
+                        args.sample.expect("sample exists when bridge returns one");
+                    ExpertDistillSample {
+                        layer,
+                        expert,
+                        activation,
+                        teacher_down_output,
+                    }
+                }),
             }),
         )?;
         position += 1;
@@ -2017,6 +2169,7 @@ fn open_structured_capture(args: &StructuredNllArgs) -> Result<llama_capture::Ca
             threads: args.threads,
             intermediate: Some(args.expert_neurons),
             hidden: args.hidden_size,
+            sample: None,
             contribution_packet_neurons: &[],
         },
     )
@@ -2043,6 +2196,332 @@ fn measure_teacher_forced_nll(
         perplexity: mean_nll.exp(),
         top1_tokens,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn distill_expert(
+    traces: &[PathBuf],
+    teacher_down_weights: &Path,
+    calibration_paths: &[PathBuf],
+    layer: usize,
+    expert: u16,
+    group_neurons: usize,
+    retained_fraction: f64,
+    relative_error: f64,
+    train_fraction: f64,
+    ridge: f64,
+    output: &Path,
+) -> Result<()> {
+    if traces.is_empty() {
+        bail!("at least one expert sample trace is required");
+    }
+    if group_neurons == 0 {
+        bail!("group-neurons must be positive");
+    }
+    if !retained_fraction.is_finite() || retained_fraction <= 0.0 || retained_fraction > 1.0 {
+        bail!("retained-fraction must be a finite value in (0, 1]");
+    }
+    if !train_fraction.is_finite() || train_fraction <= 0.0 || train_fraction >= 1.0 {
+        bail!("train-fraction must be a finite value in (0, 1)");
+    }
+    if !ridge.is_finite() || ridge <= 0.0 {
+        bail!("ridge must be finite and positive");
+    }
+    let trace_header = read_trace_header(&traces[0])?;
+    if layer >= trace_header.layers || usize::from(expert) >= trace_header.experts {
+        bail!("distillation target is outside the trace model shape");
+    }
+    let mut samples = Vec::<ExpertDistillSample>::new();
+    for trace in traces {
+        let candidate_header = read_trace_header(trace)?;
+        validate_compatible_headers(&trace_header, &candidate_header)?;
+        visit_trace(trace, &trace_header, |token| {
+            if let Some(sample) = token.expert_distill_sample {
+                if sample.layer != layer || sample.expert != expert {
+                    bail!("trace contains an expert sample for a different target");
+                }
+                samples.push(sample);
+            }
+            Ok(())
+        })?;
+    }
+    if samples.len() < 4 {
+        bail!(
+            "distillation requires at least four expert hits, found {}",
+            samples.len()
+        );
+    }
+    let expert_neurons = samples[0].activation.len();
+    let hidden = samples[0].teacher_down_output.len();
+    if expert_neurons == 0
+        || hidden == 0
+        || samples.iter().any(|sample| {
+            sample.activation.len() != expert_neurons
+                || sample.teacher_down_output.len() != hidden
+                || sample
+                    .activation
+                    .iter()
+                    .chain(&sample.teacher_down_output)
+                    .any(|value| !value.is_finite())
+        })
+    {
+        bail!("expert samples have inconsistent, empty, or non-finite vectors");
+    }
+    if !expert_neurons.is_multiple_of(group_neurons) {
+        bail!("group-neurons must divide the sampled expert width");
+    }
+    let (calibration_header, calibration) =
+        train_structured_calibration(calibration_paths, relative_error, expert_neurons)?;
+    validate_compatible_headers(&trace_header, &calibration_header)?;
+    let groups_per_expert = expert_neurons / group_neurons;
+    let retained_groups = ((groups_per_expert as f64 * retained_fraction).ceil() as usize)
+        .clamp(1, groups_per_expert);
+    let full_mask = build_structured_mask(
+        &calibration,
+        trace_header.layers,
+        trace_header.experts,
+        expert_neurons,
+        group_neurons,
+        retained_groups,
+    )?;
+    let mask_base = (layer * trace_header.experts + usize::from(expert)) * expert_neurons;
+    let retained_indices = full_mask[mask_base..mask_base + expert_neurons]
+        .iter()
+        .enumerate()
+        .filter_map(|(neuron, &retained)| (retained != 0).then_some(neuron))
+        .collect::<Vec<_>>();
+    let (weight_neurons, weight_hidden, teacher_weights) =
+        read_expert_down_weights(teacher_down_weights)?;
+    if (weight_neurons, weight_hidden) != (expert_neurons, hidden) {
+        bail!("teacher down weight dimensions do not match captured samples");
+    }
+    let train_samples =
+        ((samples.len() as f64 * train_fraction).floor() as usize).clamp(2, samples.len() - 1);
+    let train = &samples[..train_samples];
+    let heldout = &samples[train_samples..];
+    let train_residuals = train
+        .iter()
+        .map(|sample| {
+            let base = project_down_subset(
+                &teacher_weights,
+                &sample.activation,
+                &retained_indices,
+                expert_neurons,
+                hidden,
+            );
+            sample
+                .teacher_down_output
+                .iter()
+                .zip(base)
+                .map(|(&target, predicted)| target - predicted)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut kernel = vec![0.0f64; train_samples * train_samples];
+    for row in 0..train_samples {
+        for column in 0..=row {
+            let value = retained_indices
+                .iter()
+                .map(|&neuron| {
+                    train[row].activation[neuron] as f64 * train[column].activation[neuron] as f64
+                })
+                .sum::<f64>();
+            kernel[row * train_samples + column] = value;
+            kernel[column * train_samples + row] = value;
+        }
+    }
+    let mean_diagonal = (0..train_samples)
+        .map(|index| kernel[index * train_samples + index])
+        .sum::<f64>()
+        / train_samples as f64;
+    let ridge_absolute = ridge * mean_diagonal.max(f64::EPSILON);
+    for index in 0..train_samples {
+        kernel[index * train_samples + index] += ridge_absolute;
+    }
+    cholesky_in_place(&mut kernel, train_samples)?;
+
+    let mut relative_l2 = Vec::with_capacity(heldout.len());
+    let mut cosines = Vec::with_capacity(heldout.len());
+    let mut masked_relative_l2 = Vec::with_capacity(heldout.len());
+    let mut masked_cosines = Vec::with_capacity(heldout.len());
+    for sample in heldout {
+        let mut coefficients = train
+            .iter()
+            .map(|training| {
+                retained_indices
+                    .iter()
+                    .map(|&neuron| {
+                        training.activation[neuron] as f64 * sample.activation[neuron] as f64
+                    })
+                    .sum::<f64>()
+            })
+            .collect::<Vec<_>>();
+        cholesky_solve(&kernel, train_samples, &mut coefficients);
+        let mut squared_error = 0.0f64;
+        let mut target_norm = 0.0f64;
+        let mut predicted_norm = 0.0f64;
+        let mut dot = 0.0f64;
+        let base = project_down_subset(
+            &teacher_weights,
+            &sample.activation,
+            &retained_indices,
+            expert_neurons,
+            hidden,
+        );
+        let mut masked_squared_error = 0.0f64;
+        let mut masked_norm = 0.0f64;
+        let mut masked_dot = 0.0f64;
+        for output_index in 0..hidden {
+            let residual = train_residuals
+                .iter()
+                .zip(&coefficients)
+                .map(|(training_residual, coefficient)| {
+                    *coefficient * training_residual[output_index] as f64
+                })
+                .sum::<f64>();
+            let masked = base[output_index] as f64;
+            let predicted = masked + residual;
+            let target = sample.teacher_down_output[output_index] as f64;
+            squared_error += (predicted - target).powi(2);
+            masked_squared_error += (masked - target).powi(2);
+            target_norm += target * target;
+            predicted_norm += predicted * predicted;
+            masked_norm += masked * masked;
+            dot += predicted * target;
+            masked_dot += masked * target;
+        }
+        relative_l2.push((squared_error / target_norm.max(f64::MIN_POSITIVE)).sqrt());
+        cosines.push(dot / (predicted_norm * target_norm).sqrt().max(f64::MIN_POSITIVE));
+        masked_relative_l2.push((masked_squared_error / target_norm.max(f64::MIN_POSITIVE)).sqrt());
+        masked_cosines.push(masked_dot / (masked_norm * target_norm).sqrt().max(f64::MIN_POSITIVE));
+    }
+    let retained_neurons = retained_indices.len();
+    let student_down_parameters = retained_neurons * hidden;
+    let report = ExpertDistillReport {
+        schema_version: 1,
+        classification: "expert-local-fixed-group-ridge-distillation-smoke",
+        promotion_evidence: false,
+        training_semantics: "kernel-ridge-fit-of-reduced-down-projection-from-real-teacher-activations",
+        quality_semantics: "heldout-local-expert-down-output-not-logit-or-nll",
+        traces: traces
+            .iter()
+            .map(|trace| trace.display().to_string())
+            .collect(),
+        teacher_down_weights: teacher_down_weights.display().to_string(),
+        calibrations: calibration_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        trace_header,
+        layer,
+        expert,
+        group_neurons,
+        retained_groups,
+        retained_neurons,
+        retained_fraction: retained_neurons as f64 / expert_neurons as f64,
+        train_samples,
+        heldout_samples: heldout.len(),
+        ridge_relative_to_mean_kernel_diagonal: ridge,
+        ridge_absolute,
+        student_down_parameters,
+        student_down_f16_bytes: student_down_parameters * 2,
+        student_down_q4_payload_bytes: student_down_parameters.div_ceil(2),
+        heldout_mean_relative_l2: relative_l2.iter().sum::<f64>() / relative_l2.len() as f64,
+        heldout_p50_relative_l2: percentile_f64(&relative_l2, 0.50)
+            .expect("heldout split is non-empty"),
+        heldout_p95_relative_l2: percentile_f64(&relative_l2, 0.95)
+            .expect("heldout split is non-empty"),
+        heldout_mean_cosine: cosines.iter().sum::<f64>() / cosines.len() as f64,
+        masked_teacher_mean_relative_l2: masked_relative_l2.iter().sum::<f64>()
+            / masked_relative_l2.len() as f64,
+        masked_teacher_p95_relative_l2: percentile_f64(&masked_relative_l2, 0.95)
+            .expect("heldout split is non-empty"),
+        masked_teacher_mean_cosine: masked_cosines.iter().sum::<f64>()
+            / masked_cosines.len() as f64,
+        heldout_zero_baseline_relative_l2: 1.0,
+    };
+    let mut writer = BufWriter::new(
+        File::create(output).with_context(|| format!("create {}", output.display()))?,
+    );
+    serde_json::to_writer_pretty(&mut writer, &report)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    println!("expert distillation report: {}", output.display());
+    println!(
+        "layer {} expert {}: train {}, heldout {}, retain {:.1}%, masked/distilled relative L2 {:.4}/{:.4}, distilled p95 {:.4}, cosine {:.4}",
+        layer,
+        expert,
+        train_samples,
+        heldout.len(),
+        report.retained_fraction * 100.0,
+        report.masked_teacher_mean_relative_l2,
+        report.heldout_mean_relative_l2,
+        report.heldout_p95_relative_l2,
+        report.heldout_mean_cosine,
+    );
+    Ok(())
+}
+
+fn project_down_subset(
+    weights: &[f32],
+    activation: &[f32],
+    retained_indices: &[usize],
+    neurons: usize,
+    hidden: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(weights.len(), neurons * hidden);
+    debug_assert_eq!(activation.len(), neurons);
+    (0..hidden)
+        .map(|output| {
+            retained_indices
+                .iter()
+                .map(|&neuron| weights[output * neurons + neuron] * activation[neuron])
+                .sum()
+        })
+        .collect()
+}
+
+fn cholesky_in_place(matrix: &mut [f64], size: usize) -> Result<()> {
+    if matrix.len() != size * size || size == 0 {
+        bail!("Cholesky matrix has an invalid shape");
+    }
+    for row in 0..size {
+        for column in 0..=row {
+            let mut value = matrix[row * size + column];
+            for inner in 0..column {
+                value -= matrix[row * size + inner] * matrix[column * size + inner];
+            }
+            if row == column {
+                if !value.is_finite() || value <= 0.0 {
+                    bail!("ridge kernel is not positive definite");
+                }
+                matrix[row * size + column] = value.sqrt();
+            } else {
+                matrix[row * size + column] = value / matrix[column * size + column];
+            }
+        }
+        for column in row + 1..size {
+            matrix[row * size + column] = 0.0;
+        }
+    }
+    Ok(())
+}
+
+fn cholesky_solve(cholesky: &[f64], size: usize, values: &mut [f64]) {
+    debug_assert_eq!(cholesky.len(), size * size);
+    debug_assert_eq!(values.len(), size);
+    for row in 0..size {
+        let correction = (0..row)
+            .map(|column| cholesky[row * size + column] * values[column])
+            .sum::<f64>();
+        values[row] = (values[row] - correction) / cholesky[row * size + row];
+    }
+    for row in (0..size).rev() {
+        let correction = (row + 1..size)
+            .map(|column| cholesky[column * size + row] * values[column])
+            .sum::<f64>();
+        values[row] = (values[row] - correction) / cholesky[row * size + row];
+    }
 }
 
 fn frequency_packed_groups(frequency: &[u32], group_neurons: usize) -> Vec<usize> {
@@ -2903,6 +3382,56 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn write_expert_down_weights(
+    path: &Path,
+    neurons: usize,
+    hidden: usize,
+    weights: &[f32],
+) -> Result<()> {
+    if weights.len() != neurons * hidden {
+        bail!("expert down weight buffer does not match its dimensions");
+    }
+    let mut writer =
+        BufWriter::new(File::create(path).with_context(|| format!("create {}", path.display()))?);
+    writer.write_all(EXPERT_DOWN_WEIGHTS_MAGIC)?;
+    writer.write_all(&u32::try_from(neurons)?.to_le_bytes())?;
+    writer.write_all(&u32::try_from(hidden)?.to_le_bytes())?;
+    for &value in weights {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn read_expert_down_weights(path: &Path) -> Result<(usize, usize, Vec<f32>)> {
+    let mut reader =
+        BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic)?;
+    if &magic != EXPERT_DOWN_WEIGHTS_MAGIC {
+        bail!("expert down weights have an invalid magic");
+    }
+    let mut dimension = [0u8; 4];
+    reader.read_exact(&mut dimension)?;
+    let neurons = u32::from_le_bytes(dimension) as usize;
+    reader.read_exact(&mut dimension)?;
+    let hidden = u32::from_le_bytes(dimension) as usize;
+    let values = neurons
+        .checked_mul(hidden)
+        .ok_or_else(|| anyhow::anyhow!("expert down weight dimensions overflow"))?;
+    let mut bytes = vec![0u8; values * std::mem::size_of::<f32>()];
+    reader.read_exact(&mut bytes)?;
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        bail!("expert down weights contain trailing bytes");
+    }
+    let weights = bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+        .collect();
+    Ok((neurons, hidden, weights))
+}
+
 #[cfg(target_os = "macos")]
 mod llama_capture {
     use super::*;
@@ -2918,6 +3447,8 @@ mod llama_capture {
             threads: c_int,
             intermediate: c_int,
             hidden: c_int,
+            sample_layer: c_int,
+            sample_expert: c_int,
             contribution_packet_neurons: *const c_int,
             contribution_size_count: c_int,
         ) -> *mut c_void;
@@ -2925,6 +3456,18 @@ mod llama_capture {
             route: *mut c_void,
             mask: *const u8,
             mask_count: c_int,
+        ) -> c_int;
+        fn qx_llama_route_take_expert_sample(
+            route: *mut c_void,
+            activation: *mut f32,
+            activation_count: c_int,
+            down_output: *mut f32,
+            down_count: c_int,
+        ) -> c_int;
+        fn qx_llama_route_take_expert_weights(
+            route: *mut c_void,
+            weights: *mut f32,
+            weight_count: c_int,
         ) -> c_int;
         fn qx_llama_route_close(route: *mut c_void);
         fn qx_llama_route_error(route: *const c_void) -> *const c_char;
@@ -2962,6 +3505,8 @@ mod llama_capture {
         intermediate: Option<usize>,
         contribution_packet_neurons: Vec<usize>,
         contribution_total_packets: usize,
+        sample: bool,
+        hidden: usize,
     }
 
     pub struct StepOutput {
@@ -2970,6 +3515,8 @@ mod llama_capture {
         pub routes: Vec<Vec<u16>>,
         pub activations: Option<Vec<f32>>,
         pub down_contribution: Option<PacketDownContribution>,
+        pub expert_sample: Option<(Vec<f32>, Vec<f32>)>,
+        pub expert_down_weights: Option<Vec<f32>>,
     }
 
     pub struct OpenConfig<'a> {
@@ -2981,6 +3528,7 @@ mod llama_capture {
         pub threads: i32,
         pub intermediate: Option<usize>,
         pub hidden: usize,
+        pub sample: Option<(usize, u16)>,
         pub contribution_packet_neurons: &'a [usize],
     }
 
@@ -2995,6 +3543,7 @@ mod llama_capture {
                 threads,
                 intermediate,
                 hidden,
+                sample,
                 contribution_packet_neurons,
             } = config;
             let path = CString::new(path.to_string_lossy().as_bytes())?;
@@ -3017,6 +3566,8 @@ mod llama_capture {
                     threads,
                     intermediate.unwrap_or(0).try_into()?,
                     hidden.try_into()?,
+                    sample.map_or(-1, |(layer, _)| layer as c_int),
+                    sample.map_or(-1, |(_, expert)| c_int::from(expert)),
                     contribution_packet_neurons_i32.as_ptr(),
                     contribution_packet_neurons_i32.len().try_into()?,
                 )
@@ -3038,6 +3589,8 @@ mod llama_capture {
                     })
                     .unwrap_or(0),
                 contribution_packet_neurons: contribution_packet_neurons.to_vec(),
+                sample: sample.is_some(),
+                hidden,
             })
         }
 
@@ -3172,12 +3725,63 @@ mod llama_capture {
                     self.structure_contributions(norms, residuals, order, reconstruction)
                 })
                 .transpose()?;
+            let expert_sample = if self.sample {
+                let intermediate = self
+                    .intermediate
+                    .expect("expert sample has activation width");
+                let mut activation = vec![0.0f32; intermediate];
+                let mut down_output = vec![0.0f32; self.hidden];
+                let status = unsafe {
+                    qx_llama_route_take_expert_sample(
+                        self.raw,
+                        activation.as_mut_ptr(),
+                        activation.len().try_into()?,
+                        down_output.as_mut_ptr(),
+                        down_output.len().try_into()?,
+                    )
+                };
+                match status {
+                    0 => None,
+                    1 => Some((activation, down_output)),
+                    _ => bail!(
+                        "llama expert sample read failed ({status}): {}",
+                        self.error()
+                    ),
+                }
+            } else {
+                None
+            };
+            let expert_down_weights = if self.sample {
+                let intermediate = self
+                    .intermediate
+                    .expect("expert sample has activation width");
+                let mut weights = vec![0.0f32; self.hidden * intermediate];
+                let status = unsafe {
+                    qx_llama_route_take_expert_weights(
+                        self.raw,
+                        weights.as_mut_ptr(),
+                        weights.len().try_into()?,
+                    )
+                };
+                match status {
+                    0 => None,
+                    1 => Some(weights),
+                    _ => bail!(
+                        "llama expert weight read failed ({status}): {}",
+                        self.error()
+                    ),
+                }
+            } else {
+                None
+            };
             Ok(StepOutput {
                 predicted: output,
                 target_nll: target.map(|_| target_nll),
                 routes,
                 activations,
                 down_contribution,
+                expert_sample,
+                expert_down_weights,
             })
         }
 
@@ -3376,6 +3980,35 @@ mod tests {
     }
 
     #[test]
+    fn cholesky_solver_recovers_a_known_solution() {
+        let mut matrix = vec![4.0, 1.0, 1.0, 3.0];
+        cholesky_in_place(&mut matrix, 2).unwrap();
+        let mut values = vec![1.0, 2.0];
+        cholesky_solve(&matrix, 2, &mut values);
+        assert!((values[0] - 1.0 / 11.0).abs() < 1e-12);
+        assert!((values[1] - 7.0 / 11.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn expert_down_weight_sidecar_round_trips_and_projects_a_subset() {
+        let path = std::env::temp_dir().join(format!(
+            "qx-expert-down-{}-{}.qxedw",
+            std::process::id(),
+            SCHEMA_VERSION
+        ));
+        let weights = vec![1.0, 2.0, 3.0, 4.0, -1.0, -2.0, -3.0, -4.0];
+        write_expert_down_weights(&path, 4, 2, &weights).unwrap();
+        let (neurons, hidden, decoded) = read_expert_down_weights(&path).unwrap();
+        assert_eq!((neurons, hidden), (4, 2));
+        assert_eq!(decoded, weights);
+        assert_eq!(
+            project_down_subset(&decoded, &[1.0, 10.0, 100.0, 1000.0], &[0, 2], 4, 2),
+            vec![301.0, -301.0]
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn synthetic_trace_reports_hits_misses_and_tail_bytes() {
         let path = std::env::temp_dir().join(format!(
             "qx-route-cache-{}-{}.jsonl",
@@ -3413,6 +4046,7 @@ mod tests {
                     routes,
                     packet_activation_energy: None,
                     packet_down_contribution: None,
+                    expert_distill_sample: None,
                 }),
             )
             .unwrap();

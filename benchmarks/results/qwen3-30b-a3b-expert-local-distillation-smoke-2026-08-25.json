@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "classification": "expert-local-fixed-group-ridge-distillation-smoke",
+  "promotion_evidence": false,
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "llama_revision": "5cedcbfbc1713c9557af31ddcf5fb4b5287112f8",
+  "machine": {
+    "chip": "Apple M5 Pro",
+    "unified_memory_gib": 24,
+    "full_bf16_checkpoint_bytes": 61064245248,
+    "full_bf16_training_feasible": false
+  },
+  "target": {
+    "layer": 8,
+    "expert": 38,
+    "hidden": 2048,
+    "expert_neurons": 768,
+    "group_neurons": 8
+  },
+  "training": {
+    "semantics": "teacher-initialized-reduced-down-projection-plus-kernel-ridge-fit-of-removed-neuron-residual",
+    "calibration_prompt_expert_hits": 25,
+    "disjoint_heldout_prompt_expert_hits": 31,
+    "ridge_relative_to_mean_kernel_diagonal": 0.001
+  },
+  "control": {
+    "retained_fraction": 1.0,
+    "masked_teacher_mean_relative_l2": 4.648241061916914e-7,
+    "distilled_mean_relative_l2": 4.965177173922352e-7,
+    "distilled_p95_relative_l2": 5.480683351251956e-7,
+    "distilled_mean_cosine": 0.9999999999998771
+  },
+  "results": [
+    {"retained_fraction":0.9375,"masked_teacher_mean_relative_l2":0.15698376840349476,"distilled_mean_relative_l2":0.16342536864881468,"distilled_p95_relative_l2":0.24553544436130798,"distilled_mean_cosine":0.9838400713243177,"student_down_q4_payload_bytes":737280},
+    {"retained_fraction":0.75,"masked_teacher_mean_relative_l2":0.37184574147777166,"distilled_mean_relative_l2":0.3811795278583997,"distilled_p95_relative_l2":0.5144579722660005,"distilled_mean_cosine":0.9177164828098294,"student_down_q4_payload_bytes":589824},
+    {"retained_fraction":0.5,"masked_teacher_mean_relative_l2":0.5980937709543367,"distilled_mean_relative_l2":0.6145936197518075,"distilled_p95_relative_l2":0.7968541366040911,"distilled_mean_cosine":0.7697344764896511,"student_down_q4_payload_bytes":393216}
+  ],
+  "capture_limit": {
+    "context_1024": "failed-at-position-9-metal-out-of-memory",
+    "context_128": "completed",
+    "calibration_token_positions": 86,
+    "heldout_token_positions": 74
+  },
+  "conclusions": [
+    "The dequantized teacher-matrix control reconstructs the quantized down output below 5.5e-7 p95 relative L2, validating sample capture, weight export, physical group masking, and evaluation.",
+    "A 25-sample residual fit does not generalize to 31 expert hits from a disjoint topic. It worsens mean relative L2 at every pruned width, including 0.1570 to 0.1634 when only 6.25% of neurons are removed.",
+    "Do not inject this student into full-model NLL or build a grouped kernel. The local gate fails before model-level quality evaluation.",
+    "The next training attempt requires a diverse corpus with hundreds to thousands of hits per layer/expert and either joint gate/up/down optimization or group-aware pretraining; this 24 GiB machine can capture and train experts serially but cannot hold the 61.1 GB BF16 checkpoint for end-to-end training."
+  ]
+}
