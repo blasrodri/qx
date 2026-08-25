@@ -5,8 +5,14 @@ use qx_model::{
 };
 use qx_quant::{QuantType, QuantizedTensor};
 use qx_safetensors::{Checkpoint, TensorInfo};
-use serde::Serialize;
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{BufReader, Read},
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -30,6 +36,10 @@ struct Args {
     /// Immutable upstream revision recorded in the audit report.
     #[arg(long)]
     model_revision: Option<String>,
+    /// Pinned source manifest containing immutable shard sizes and SHA-256.
+    /// Required for a release-ready audit.
+    #[arg(long)]
+    reference_manifest: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -66,6 +76,8 @@ struct CheckpointAudit {
     ready_for_qx_compilation: bool,
     model_id: String,
     model_revision: Option<String>,
+    source_files_verified: bool,
+    shard_verification: Vec<ShardVerification>,
     shape: ModelShape,
     tensor_count: usize,
     source_tensor_bytes: u64,
@@ -78,6 +90,35 @@ struct CheckpointAudit {
     unmodified: CapacityProjection,
     structured_width_672: CapacityProjection,
     limitations: Vec<&'static str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceReference {
+    model: SourceModelReference,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceModelReference {
+    repository: String,
+    revision: String,
+    shards: Vec<SourceShardReference>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceShardReference {
+    filename: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ShardVerification {
+    filename: String,
+    expected_size_bytes: u64,
+    actual_size_bytes: u64,
+    expected_sha256: String,
+    actual_sha256: String,
+    verified: bool,
 }
 
 fn parse_quant_type(value: &str) -> Result<QuantType, String> {
@@ -109,7 +150,22 @@ fn main() -> Result<()> {
         println!("\ntensors indexed: {}", checkpoint.tensor_names().count());
     }
     if let Some(output) = args.audit_output {
-        let audit = audit_checkpoint(&checkpoint, &model, args.model_revision)?;
+        let (revision, shard_verification) = match args.reference_manifest.as_deref() {
+            Some(reference) => {
+                let (reference_revision, verification) =
+                    verify_source_reference(&args.model, reference)?;
+                if args
+                    .model_revision
+                    .as_ref()
+                    .is_some_and(|revision| revision != &reference_revision)
+                {
+                    bail!("--model-revision disagrees with the source reference manifest");
+                }
+                (Some(reference_revision), verification)
+            }
+            None => (args.model_revision, Vec::new()),
+        };
+        let audit = audit_checkpoint(&checkpoint, &model, revision, shard_verification)?;
         let bytes = serde_json::to_vec_pretty(&audit)?;
         fs::write(&output, [bytes.as_slice(), b"\n"].concat())
             .with_context(|| format!("write {}", output.display()))?;
@@ -289,10 +345,13 @@ fn print_quantization(
 ) {
     println!("\n{name}:\n    shape: [{rows}, {cols}]");
     println!("    source bytes (FP16/BF16): {}", values.len() * 2);
-    for quant_type in requested
-        .into_iter()
-        .chain([QuantType::Q4, QuantType::Q3, QuantType::Q2])
-    {
+    let mut quant_types = requested.into_iter().collect::<Vec<_>>();
+    for quant_type in [QuantType::Q4, QuantType::Q3, QuantType::Q2] {
+        if !quant_types.contains(&quant_type) {
+            quant_types.push(quant_type);
+        }
+    }
+    for quant_type in quant_types {
         let q = QuantizedTensor::quantize(values, rows, cols, quant_type, 32);
         println!(
             "    {quant_type}: {} bytes, compression: {:.2}x, MSE: {:.6}, relative L2: {:.6}",
@@ -308,6 +367,7 @@ fn audit_checkpoint(
     checkpoint: &Checkpoint,
     model: &InspectedModel,
     revision: Option<String>,
+    shard_verification: Vec<ShardVerification>,
 ) -> Result<CheckpointAudit> {
     let infos = checkpoint.tensor_infos()?;
     let actual = infos
@@ -349,7 +409,10 @@ fn audit_checkpoint(
         .map(|info| info.byte_len as u64)
         .sum();
     let source_non_expert_bytes = source_tensor_bytes - source_expert_bytes;
-    let ready = missing_tensors.is_empty()
+    let source_files_verified =
+        !shard_verification.is_empty() && shard_verification.iter().all(|shard| shard.verified);
+    let ready = source_files_verified
+        && missing_tensors.is_empty()
         && unexpected_tensors.is_empty()
         && shape_mismatches.is_empty()
         && non_bf16_tensors.is_empty();
@@ -359,6 +422,8 @@ fn audit_checkpoint(
         ready_for_qx_compilation: ready,
         model_id: model.model_id.to_owned(),
         model_revision: revision,
+        source_files_verified,
+        shard_verification,
         shape: model.shape.clone(),
         tensor_count: infos.len(),
         source_tensor_bytes,
@@ -376,6 +441,61 @@ fn audit_checkpoint(
             "source readiness does not imply runtime semantic parity or quality promotion",
         ],
     })
+}
+
+fn verify_source_reference(
+    model_root: &Path,
+    manifest_path: &Path,
+) -> Result<(String, Vec<ShardVerification>)> {
+    let reference: SourceReference = serde_json::from_slice(
+        &fs::read(manifest_path).with_context(|| format!("read {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("parse {}", manifest_path.display()))?;
+    if reference.model.repository != QWEN3_30B_A3B_MODEL_ID {
+        bail!("source reference repository does not match the inspected model");
+    }
+    if reference.model.shards.is_empty() {
+        bail!("source reference contains no checkpoint shards");
+    }
+    let mut verification = Vec::with_capacity(reference.model.shards.len());
+    for expected in reference.model.shards {
+        if expected.filename.contains('/') || expected.filename.contains("..") {
+            bail!("unsafe source shard filename {}", expected.filename);
+        }
+        let path = model_root.join(&expected.filename);
+        let actual_size_bytes = fs::metadata(&path)
+            .with_context(|| format!("stat {}", path.display()))?
+            .len();
+        let actual_sha256 = sha256_file(&path)?;
+        let verified = actual_size_bytes == expected.size_bytes
+            && actual_sha256.eq_ignore_ascii_case(&expected.sha256);
+        verification.push(ShardVerification {
+            filename: expected.filename,
+            expected_size_bytes: expected.size_bytes,
+            actual_size_bytes,
+            expected_sha256: expected.sha256,
+            actual_sha256,
+            verified,
+        });
+    }
+    Ok((reference.model.revision, verification))
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
+    let mut buffer = vec![0_u8; 4 * 1024 * 1024];
+    let mut digest = Sha256::new();
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("hash {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn is_expert_tensor(info: &TensorInfo) -> bool {

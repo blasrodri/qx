@@ -104,6 +104,41 @@ impl Checkpoint {
         Ok(infos)
     }
 
+    /// Decode a sharded checkpoint with one mmap/metadata parse per shard.
+    /// The decoded slice is valid only for the callback, allowing callers to
+    /// quantize one tensor and release its F32 expansion before visiting the
+    /// next multi-gigabyte source tensor.
+    pub fn visit_tensors_f32(
+        &self,
+        mut visitor: impl FnMut(&TensorInfo, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        let mut by_shard = BTreeMap::<&str, Vec<&str>>::new();
+        for (name, shard) in &self.weight_map {
+            by_shard.entry(shard).or_default().push(name);
+        }
+        for (shard_name, names) in by_shard {
+            let shard = self.root.join(shard_name);
+            let mmap = map_file(&shard)?;
+            let tensors = SafeTensors::deserialize(&mmap)
+                .with_context(|| format!("parse {}", shard.display()))?;
+            for name in names {
+                let tensor = tensors
+                    .tensor(name)
+                    .with_context(|| format!("tensor {name} missing from {}", shard.display()))?;
+                let values = decode_f32(tensor.dtype(), tensor.data())?;
+                let info = TensorInfo {
+                    name: name.to_owned(),
+                    shard: shard.clone(),
+                    dtype: format!("{:?}", tensor.dtype()),
+                    shape: tensor.shape().to_vec(),
+                    byte_len: tensor.data().len(),
+                };
+                visitor(&info, &values)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn info(&self, name: &str) -> Result<TensorInfo> {
         let shard_name = self
             .weight_map

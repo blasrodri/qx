@@ -407,6 +407,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "qx-compile-qwen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "qx-format",
+ "qx-model",
+ "qx-quant",
+ "qx-safetensors",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "qx-compiler"
 version = "0.1.0"
 dependencies = [
@@ -474,6 +488,7 @@ dependencies = [
  "qx-safetensors",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

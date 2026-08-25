@@ -11,6 +11,7 @@ members = [
     "crates/qx-tokenizer",
     "crates/qx-eval",
     "tools/qx-inspect",
+    "tools/qx-compile-qwen",
     "tools/qx-compile",
     "tools/qx-bench",
     "tools/qx-parity",

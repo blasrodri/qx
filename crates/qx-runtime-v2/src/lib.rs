@@ -81,6 +81,16 @@ impl ResolvedExecutionPlan {
                 manifest.schema_version
             ));
         }
+        if manifest
+            .model_shape
+            .as_ref()
+            .is_some_and(|shape| shape != &qx_model::ModelShape::granite_v0())
+        {
+            return Err(
+                "execution plan targets a model topology not supported by Granite Runtime V2"
+                    .to_owned(),
+            );
+        }
         let command_buffers_per_token = std::env::var("QX_V2_COMMAND_BUFFERS_OVERRIDE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -286,6 +296,15 @@ pub fn activate_artifact_execution_plan(
             plan.schema_version
         ));
     }
+    if plan
+        .model_shape
+        .as_ref()
+        .is_some_and(|shape| shape != &qx_model::ModelShape::granite_v0())
+    {
+        return Err(
+            "artifact targets a model topology not supported by Granite Runtime V2".to_owned(),
+        );
+    }
     if plan.schedule.internal_cpu_waits != 0 {
         return Err("compiled plan requests internal CPU waits".to_owned());
     }
@@ -426,6 +445,10 @@ pub fn activate_artifact_execution_plan(
         }
     }
     match plan.representations.gate_up {
+        qx_format::ExpertRepresentation::Group32Q3RowMajor
+        | qx_format::ExpertRepresentation::Group32Q2RowMajor => {
+            return Err("Q2/Q3 row-major plans require the Qwen runtime backend".to_owned());
+        }
         qx_format::ExpertRepresentation::Group32Q4RowMajor => {
             set_plan_env("QX_V2_MOE_LAYOUT", "rowmajor")
         }
@@ -5424,6 +5447,19 @@ mod tests {
         manifest.verifier_attention = Some(qx_format::VerifierAttentionTopology::ScoreReuse);
         let error = ResolvedExecutionPlan::from_manifest(&manifest).unwrap_err();
         assert!(error.contains("score-reuse verifier attention"));
+    }
+
+    #[test]
+    fn granite_runtime_rejects_a_different_sealed_model_shape() {
+        let mut manifest = qx_format::ExecutionPlanManifest::granite_m5_canonical(
+            "qwen",
+            "apple-a19-pro",
+            512,
+            qx_format::MemoryPlan::default(),
+        );
+        manifest.model_shape.as_mut().unwrap().layers = 48;
+        let error = ResolvedExecutionPlan::from_manifest(&manifest).unwrap_err();
+        assert!(error.contains("model topology"));
     }
 
     #[test]

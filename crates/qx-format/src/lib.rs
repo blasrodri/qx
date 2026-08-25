@@ -9,6 +9,7 @@ use qx_quant::{PackingLayout, QuantType, QuantizedTensor, unpack_cross_expert_ti
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
 
@@ -21,6 +22,8 @@ pub const WEIGHT_SLAB_ALIGNMENT: u64 = 16 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum ExpertRepresentation {
     Group32Q4RowMajor,
+    Group32Q3RowMajor,
+    Group32Q2RowMajor,
     Group32Q4MetalTile32,
     Group32Q4RowInline,
     MixedQ2Q3Q4,
@@ -528,6 +531,9 @@ pub enum TensorKind {
     InputNorm = 8,
     PostAttentionNorm = 9,
     FinalNorm = 10,
+    QueryNorm = 11,
+    KeyNorm = 12,
+    LmHead = 13,
 }
 
 impl TensorKind {
@@ -544,6 +550,9 @@ impl TensorKind {
             8 => Ok(Self::InputNorm),
             9 => Ok(Self::PostAttentionNorm),
             10 => Ok(Self::FinalNorm),
+            11 => Ok(Self::QueryNorm),
+            12 => Ok(Self::KeyNorm),
+            13 => Ok(Self::LmHead),
             _ => bail!("unknown QX tensor kind {value}"),
         }
     }
@@ -954,7 +963,11 @@ impl MappedArtifact {
             .ok_or_else(|| anyhow::anyhow!("QX tensor index out of range"))?;
         if !matches!(
             entry.kind,
-            TensorKind::InputNorm | TensorKind::PostAttentionNorm | TensorKind::FinalNorm
+            TensorKind::InputNorm
+                | TensorKind::PostAttentionNorm
+                | TensorKind::FinalNorm
+                | TensorKind::QueryNorm
+                | TensorKind::KeyNorm
         ) || entry.scale_length != 0
         {
             bail!("QX tensor is not a raw FP32 tensor");
@@ -1081,8 +1094,16 @@ fn write_artifact_internal(
     let plan_offset = memory_offset + memory_length;
     let plan_length = execution_plan_bytes.len() as u64;
     let data_offset = align_u64(plan_offset + plan_length, WEIGHT_SLAB_ALIGNMENT);
+    enum PayloadOp {
+        Encoded(usize),
+        CrossExpert(Vec<usize>),
+        Scales(Vec<usize>),
+        Data(Vec<usize>),
+        Raw(usize),
+    }
     let mut quantized_entries = vec![None; tensors.len()];
-    let mut blobs = Vec::new();
+    let mut payload_ops = Vec::<PayloadOp>::new();
+    let mut payload_cursor = data_offset;
     let mut physical_order = (0..tensors.len()).collect::<Vec<_>>();
     physical_order.sort_by_key(|index| {
         let tensor = &tensors[*index];
@@ -1116,14 +1137,10 @@ fn write_artifact_internal(
         if first.tensor.layout.is_q4_row_inline() {
             for index in group {
                 let compiled = &tensors[*index];
-                let inline = compiled
-                    .tensor
-                    .row_inline_packet_bytes(
-                        compiled.tensor.layout.row_inline_packet_rows().unwrap(),
-                    )
-                    .map_err(|error| anyhow::anyhow!(error))?;
-                let offset = data_offset + blobs.len() as u64;
-                blobs.extend_from_slice(&inline);
+                let length = compiled.tensor.serialized_bytes() as u64;
+                let offset = payload_cursor;
+                payload_cursor += length;
+                payload_ops.push(PayloadOp::Encoded(*index));
                 quantized_entries[*index] = Some(TensorDirectoryEntry {
                     layer: compiled.layer,
                     expert: compiled.expert,
@@ -1137,9 +1154,9 @@ fn write_artifact_internal(
                     // same exact byte stream. Runtime preparation selects
                     // the inline Metal kernel from the layout tag.
                     scale_offset: offset,
-                    scale_length: inline.len() as u64,
+                    scale_length: length,
                     data_offset: offset,
-                    data_length: inline.len() as u64,
+                    data_length: length,
                 });
             }
             group_start = group_end;
@@ -1148,14 +1165,10 @@ fn write_artifact_internal(
         if first.tensor.layout.is_q4_transaction() {
             for index in group {
                 let compiled = &tensors[*index];
-                let stream = compiled
-                    .tensor
-                    .transaction_block_bytes(
-                        compiled.tensor.layout == PackingLayout::Q4Transaction160,
-                    )
-                    .map_err(|error| anyhow::anyhow!(error))?;
-                let offset = data_offset + blobs.len() as u64;
-                blobs.extend_from_slice(&stream);
+                let length = compiled.tensor.serialized_bytes() as u64;
+                let offset = payload_cursor;
+                payload_cursor += length;
+                payload_ops.push(PayloadOp::Encoded(*index));
                 quantized_entries[*index] = Some(TensorDirectoryEntry {
                     layer: compiled.layer,
                     expert: compiled.expert,
@@ -1169,9 +1182,9 @@ fn write_artifact_internal(
                     // one fused stream. The scale bytes are decoded from
                     // their per-group position by `quantized_tensor`.
                     scale_offset: offset,
-                    scale_length: stream.len() as u64,
+                    scale_length: length,
                     data_offset: offset,
-                    data_length: stream.len() as u64,
+                    data_length: length,
                 });
             }
             group_start = group_end;
@@ -1180,12 +1193,10 @@ fn write_artifact_internal(
         if first.tensor.layout.is_q4_superblock() {
             for index in group {
                 let compiled = &tensors[*index];
-                let stream = compiled
-                    .tensor
-                    .superblock_bytes()
-                    .map_err(|error| anyhow::anyhow!(error))?;
-                let offset = data_offset + blobs.len() as u64;
-                blobs.extend_from_slice(&stream);
+                let length = compiled.tensor.serialized_bytes() as u64;
+                let offset = payload_cursor;
+                payload_cursor += length;
+                payload_ops.push(PayloadOp::Encoded(*index));
                 quantized_entries[*index] = Some(TensorDirectoryEntry {
                     layer: compiled.layer,
                     expert: compiled.expert,
@@ -1196,9 +1207,9 @@ fn write_artifact_internal(
                     cols: compiled.tensor.cols as u32,
                     group_size: compiled.tensor.group_size as u16,
                     scale_offset: offset,
-                    scale_length: stream.len() as u64,
+                    scale_length: length,
                     data_offset: offset,
-                    data_length: stream.len() as u64,
+                    data_length: length,
                 });
             }
             group_start = group_end;
@@ -1207,12 +1218,10 @@ fn write_artifact_internal(
         if first.tensor.layout.is_q3_superblock() {
             for index in group {
                 let compiled = &tensors[*index];
-                let stream = compiled
-                    .tensor
-                    .q3_superblock_bytes()
-                    .map_err(|error| anyhow::anyhow!(error))?;
-                let offset = data_offset + blobs.len() as u64;
-                blobs.extend_from_slice(&stream);
+                let length = compiled.tensor.serialized_bytes() as u64;
+                let offset = payload_cursor;
+                payload_cursor += length;
+                payload_ops.push(PayloadOp::Encoded(*index));
                 quantized_entries[*index] = Some(TensorDirectoryEntry {
                     layer: compiled.layer,
                     expert: compiled.expert,
@@ -1223,26 +1232,22 @@ fn write_artifact_internal(
                     cols: compiled.tensor.cols as u32,
                     group_size: compiled.tensor.group_size as u16,
                     scale_offset: offset,
-                    scale_length: stream.len() as u64,
+                    scale_length: length,
                     data_offset: offset,
-                    data_length: stream.len() as u64,
+                    data_length: length,
                 });
             }
             group_start = group_end;
             continue;
         }
         if first.tensor.layout.is_q4_cross_expert_tile() {
-            let experts = group
+            let length = group
                 .iter()
-                .map(|index| &tensors[*index].tensor)
-                .collect::<Vec<_>>();
-            let stream = QuantizedTensor::cross_expert_tile_bytes(
-                &experts,
-                first.tensor.layout.cross_expert_tile_rows().unwrap(),
-            )
-            .map_err(|error| anyhow::anyhow!(error))?;
-            let offset = data_offset + blobs.len() as u64;
-            blobs.extend_from_slice(&stream);
+                .map(|index| tensors[*index].tensor.serialized_bytes() as u64)
+                .sum::<u64>();
+            let offset = payload_cursor;
+            payload_cursor += length;
+            payload_ops.push(PayloadOp::CrossExpert(group.to_vec()));
             for index in group {
                 let compiled = &tensors[*index];
                 quantized_entries[*index] = Some(TensorDirectoryEntry {
@@ -1258,9 +1263,9 @@ fn write_artifact_internal(
                     // stream. Its expert ID selects the lane during decode;
                     // the manifest carries the traversal contract.
                     scale_offset: offset,
-                    scale_length: stream.len() as u64,
+                    scale_length: length,
                     data_offset: offset,
-                    data_length: stream.len() as u64,
+                    data_length: length,
                 });
             }
             group_start = group_end;
@@ -1269,16 +1274,15 @@ fn write_artifact_internal(
         let mut scale_locations = Vec::with_capacity(group.len());
         for index in group {
             let tensor = &tensors[*index].tensor;
-            let offset = data_offset + blobs.len() as u64;
-            for scale in &tensor.scales {
-                blobs.extend_from_slice(&scale.to_bits().to_le_bytes());
-            }
-            scale_locations.push((offset, tensor.scales.len() as u64 * 2));
+            let length = tensor.scales.len() as u64 * 2;
+            scale_locations.push((payload_cursor, length));
+            payload_cursor += length;
         }
+        payload_ops.push(PayloadOp::Scales(group.to_vec()));
         for (slot, index) in group.iter().enumerate() {
             let compiled = &tensors[*index];
-            let tensor_data_offset = data_offset + blobs.len() as u64;
-            blobs.extend_from_slice(&compiled.tensor.data);
+            let tensor_data_offset = payload_cursor;
+            payload_cursor += compiled.tensor.data.len() as u64;
             let (scale_offset, scale_length) = scale_locations[slot];
             quantized_entries[*index] = Some(TensorDirectoryEntry {
                 layer: compiled.layer,
@@ -1295,21 +1299,21 @@ fn write_artifact_internal(
                 data_length: compiled.tensor.data.len() as u64,
             });
         }
+        payload_ops.push(PayloadOp::Data(group.to_vec()));
         group_start = group_end;
     }
     let mut entries = quantized_entries
         .into_iter()
         .map(|entry| entry.expect("every quantized tensor receives a physical location"))
         .collect::<Vec<_>>();
-    for raw in raw_tensors {
+    for (raw_index, raw) in raw_tensors.iter().enumerate() {
         if raw.values.len() != raw.rows.saturating_mul(raw.cols) {
             bail!("raw tensor dimensions do not match values");
         }
-        let blob_start = blobs.len();
-        let data_offset = data_offset + blobs.len() as u64;
-        for value in &raw.values {
-            blobs.extend_from_slice(&value.to_le_bytes());
-        }
+        let raw_offset = payload_cursor;
+        let raw_length = raw.values.len() as u64 * 4;
+        payload_cursor += raw_length;
+        payload_ops.push(PayloadOp::Raw(raw_index));
         entries.push(TensorDirectoryEntry {
             layer: raw.layer,
             expert: raw.expert,
@@ -1319,44 +1323,50 @@ fn write_artifact_internal(
             rows: raw.rows as u32,
             cols: raw.cols as u32,
             group_size: 0,
-            scale_offset: data_offset,
+            scale_offset: raw_offset,
             scale_length: 0,
-            data_offset,
-            data_length: (blobs.len() - blob_start) as u64,
+            data_offset: raw_offset,
+            data_length: raw_length,
         });
     }
-    let weights_length = blobs.len() as u64;
+    let weights_length = payload_cursor - data_offset;
     let padded_file_length = align_u64(data_offset + weights_length, WEIGHT_SLAB_ALIGNMENT);
-    let mut output = Vec::with_capacity(padded_file_length as usize);
-    output.extend_from_slice(&MAGIC);
-    output.extend_from_slice(&VERSION.to_le_bytes());
-    output.extend_from_slice(&(model.len() as u16).to_le_bytes());
-    output.extend_from_slice(&(target.len() as u16).to_le_bytes());
-    output.extend_from_slice(&context_limit.to_le_bytes());
-    output.extend_from_slice(&directory_offset.to_le_bytes());
-    output.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    output.extend_from_slice(&memory_offset.to_le_bytes());
-    output.extend_from_slice(&memory_length.to_le_bytes());
-    output.extend_from_slice(&(fixed_header as u32).to_le_bytes());
-    output.extend_from_slice(&plan_offset.to_le_bytes());
-    output.extend_from_slice(&plan_length.to_le_bytes());
-    output.extend_from_slice(&data_offset.to_le_bytes());
-    output.extend_from_slice(&weights_length.to_le_bytes());
-    output.extend_from_slice(model);
-    output.extend_from_slice(target);
+    // Stream the physical payload plan directly from each quantized tensor.
+    // At most one layer-scale slab or one transformed tensor is materialized,
+    // rather than two additional complete 8--12 GiB artifact copies.
+    let file = fs::File::create(path)?;
+    let mut output = BufWriter::with_capacity(4 * 1024 * 1024, file);
+    output.write_all(&MAGIC)?;
+    output.write_all(&VERSION.to_le_bytes())?;
+    output.write_all(&(model.len() as u16).to_le_bytes())?;
+    output.write_all(&(target.len() as u16).to_le_bytes())?;
+    output.write_all(&context_limit.to_le_bytes())?;
+    output.write_all(&directory_offset.to_le_bytes())?;
+    output.write_all(&(entries.len() as u32).to_le_bytes())?;
+    output.write_all(&memory_offset.to_le_bytes())?;
+    output.write_all(&memory_length.to_le_bytes())?;
+    output.write_all(&(fixed_header as u32).to_le_bytes())?;
+    output.write_all(&plan_offset.to_le_bytes())?;
+    output.write_all(&plan_length.to_le_bytes())?;
+    output.write_all(&data_offset.to_le_bytes())?;
+    output.write_all(&weights_length.to_le_bytes())?;
+    output.write_all(model)?;
+    output.write_all(target)?;
     for entry in &entries {
-        output.extend_from_slice(&entry.layer.to_le_bytes());
-        output.push(entry.expert);
-        output.push(entry.kind as u8);
-        output.push(quant_code(entry.quant_type));
-        output.push(entry.layout as u8);
-        output.extend_from_slice(&entry.group_size.to_le_bytes());
-        output.extend_from_slice(&entry.rows.to_le_bytes());
-        output.extend_from_slice(&entry.cols.to_le_bytes());
-        output.extend_from_slice(&entry.scale_offset.to_le_bytes());
-        output.extend_from_slice(&entry.scale_length.to_le_bytes());
-        output.extend_from_slice(&entry.data_offset.to_le_bytes());
-        output.extend_from_slice(&entry.data_length.to_le_bytes());
+        output.write_all(&entry.layer.to_le_bytes())?;
+        output.write_all(&[
+            entry.expert,
+            entry.kind as u8,
+            quant_code(entry.quant_type),
+            entry.layout as u8,
+        ])?;
+        output.write_all(&entry.group_size.to_le_bytes())?;
+        output.write_all(&entry.rows.to_le_bytes())?;
+        output.write_all(&entry.cols.to_le_bytes())?;
+        output.write_all(&entry.scale_offset.to_le_bytes())?;
+        output.write_all(&entry.scale_length.to_le_bytes())?;
+        output.write_all(&entry.data_offset.to_le_bytes())?;
+        output.write_all(&entry.data_length.to_le_bytes())?;
     }
     for value in [
         memory_plan.weights_bytes,
@@ -1368,13 +1378,97 @@ fn write_artifact_internal(
         memory_plan.logits_bytes,
         memory_plan.total_bytes,
     ] {
-        output.extend_from_slice(&value.to_le_bytes());
+        output.write_all(&value.to_le_bytes())?;
     }
-    output.extend_from_slice(&execution_plan_bytes);
-    output.resize(data_offset as usize, 0);
-    output.extend_from_slice(&blobs);
-    output.resize(padded_file_length as usize, 0);
-    fs::write(path, output)?;
+    output.write_all(&execution_plan_bytes)?;
+    let prefix_length = plan_offset + plan_length;
+    write_zeroes(&mut output, data_offset - prefix_length)?;
+    for op in payload_ops {
+        match op {
+            PayloadOp::Encoded(index) => {
+                let tensor = &tensors[index].tensor;
+                let stream = if tensor.layout.is_q4_row_inline() {
+                    tensor.row_inline_packet_bytes(tensor.layout.row_inline_packet_rows().unwrap())
+                } else if tensor.layout.is_q4_transaction() {
+                    tensor.transaction_block_bytes(tensor.layout == PackingLayout::Q4Transaction160)
+                } else if tensor.layout.is_q4_superblock() {
+                    tensor.superblock_bytes()
+                } else if tensor.layout.is_q3_superblock() {
+                    tensor.q3_superblock_bytes()
+                } else {
+                    Err(format!(
+                        "unsupported encoded artifact layout {:?}",
+                        tensor.layout
+                    ))
+                }
+                .map_err(anyhow::Error::msg)?;
+                if stream.len() != tensor.serialized_bytes() {
+                    bail!("encoded tensor length changed between planning and write");
+                }
+                output.write_all(&stream)?;
+            }
+            PayloadOp::CrossExpert(indices) => {
+                let experts = indices
+                    .iter()
+                    .map(|index| &tensors[*index].tensor)
+                    .collect::<Vec<_>>();
+                let stream = QuantizedTensor::cross_expert_tile_bytes(
+                    &experts,
+                    experts[0].layout.cross_expert_tile_rows().unwrap(),
+                )
+                .map_err(anyhow::Error::msg)?;
+                let expected = experts
+                    .iter()
+                    .map(|tensor| tensor.serialized_bytes())
+                    .sum::<usize>();
+                if stream.len() != expected {
+                    bail!("cross-expert tensor length changed between planning and write");
+                }
+                output.write_all(&stream)?;
+            }
+            PayloadOp::Scales(indices) => {
+                let scale_bytes = indices
+                    .iter()
+                    .map(|index| tensors[*index].tensor.scales.len() * 2)
+                    .sum::<usize>();
+                let mut stream = Vec::with_capacity(scale_bytes);
+                for index in indices {
+                    for scale in &tensors[index].tensor.scales {
+                        stream.extend_from_slice(&scale.to_bits().to_le_bytes());
+                    }
+                }
+                output.write_all(&stream)?;
+            }
+            PayloadOp::Data(indices) => {
+                for index in indices {
+                    output.write_all(&tensors[index].tensor.data)?;
+                }
+            }
+            PayloadOp::Raw(index) => {
+                let raw = &raw_tensors[index];
+                let mut stream = Vec::with_capacity(raw.values.len() * 4);
+                for value in &raw.values {
+                    stream.extend_from_slice(&value.to_le_bytes());
+                }
+                output.write_all(&stream)?;
+            }
+        }
+    }
+    write_zeroes(
+        &mut output,
+        padded_file_length - (data_offset + weights_length),
+    )?;
+    output.flush()?;
+    Ok(())
+}
+
+fn write_zeroes(writer: &mut impl Write, mut bytes: u64) -> Result<()> {
+    const ZEROES: [u8; 16 * 1024] = [0; 16 * 1024];
+    while bytes > 0 {
+        let chunk = bytes.min(ZEROES.len() as u64) as usize;
+        writer.write_all(&ZEROES[..chunk])?;
+        bytes -= chunk as u64;
+    }
     Ok(())
 }
 
