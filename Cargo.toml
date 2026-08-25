@@ -12,6 +12,7 @@ members = [
     "crates/qx-eval",
     "tools/qx-inspect",
     "tools/qx-compile-qwen",
+    "tools/qx-qwen-parity",
     "tools/qx-compile",
     "tools/qx-bench",
     "tools/qx-parity",

@@ -18,6 +18,8 @@ pub const V2_KERNEL_SOURCE: &str = include_str!("../../../kernels/v2_decode.meta
 pub const Q4_DENSE_KERNEL_SOURCE: &str = include_str!("../../../kernels/q4_dense.metal");
 pub const DYNAMIC_MOE_KERNEL_SOURCE: &str = include_str!("../../../kernels/dynamic_moe.metal");
 pub const Q4_EMBEDDING_KERNEL_SOURCE: &str = include_str!("../../../kernels/q4_embedding.metal");
+pub const QWEN_ATTENTION_KERNEL_SOURCE: &str =
+    include_str!("../../../kernels/qwen_attention.metal");
 
 pub fn kernel_source(quant_type: QuantType) -> &'static str {
     match quant_type {
@@ -76,8 +78,9 @@ pub mod platform {
 
     use super::{
         ARGMAX_KERNEL_SOURCE, DENSE_KERNEL_SOURCE, DYNAMIC_MOE_KERNEL_SOURCE,
-        F16_DENSE_KERNEL_SOURCE, LOGITS_KERNEL_SOURCE, PackingLayout, Q4_DENSE_KERNEL_SOURCE,
-        Q4_EMBEDDING_KERNEL_SOURCE, QuantType, V2_KERNEL_SOURCE, kernel_source,
+        F16_DENSE_KERNEL_SOURCE, LOGITS_KERNEL_SOURCE, PackingLayout, Q2_KERNEL_SOURCE,
+        Q4_DENSE_KERNEL_SOURCE, Q4_EMBEDDING_KERNEL_SOURCE, QWEN_ATTENTION_KERNEL_SOURCE,
+        QuantType, V2_KERNEL_SOURCE, kernel_source,
     };
 
     const HIDDEN: usize = 1024;
@@ -890,6 +893,17 @@ pub mod platform {
         down_scales: RuntimeBuffer,
     }
 
+    /// One Qwen3-30B-A3B group-32 Q2S4 expert. This initial path is
+    /// shape-specific by design and executes gate/up, SwiGLU, and down in a
+    /// single Metal dispatch without an intermediate host synchronization.
+    pub struct PreparedQwenQ2S4Expert {
+        pipeline: Pipeline,
+        gate_up_packed: RuntimeBuffer,
+        gate_up_scales: RuntimeBuffer,
+        down_packed: RuntimeBuffer,
+        down_scales: RuntimeBuffer,
+    }
+
     /// A single Q4 matrix stage used by the kernel microbenchmarks. It keeps
     /// the artifact's packing layout so expert gate/up and down projections
     /// can be measured independently.
@@ -1435,6 +1449,9 @@ pub mod platform {
         pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
         pipelines: Mutex<[Option<Pipeline>; 4]>,
         aggregate_pipelines: Mutex<[Option<Pipeline>; 4]>,
+        qwen_q2s4_expert_pipeline: Mutex<Option<Pipeline>>,
+        qwen_qk_norm_rope_pipeline: Mutex<Option<Pipeline>>,
+        qwen_gqa_attention_pipeline: Mutex<Option<Pipeline>>,
         logits_pipeline: Mutex<Option<Pipeline>>,
         dense_pipeline: Mutex<Option<Pipeline>>,
         f16_dense_pipeline: Mutex<Option<Pipeline>>,
@@ -8291,6 +8308,9 @@ pub mod platform {
                 queue,
                 pipelines: Mutex::new([None, None, None, None]),
                 aggregate_pipelines: Mutex::new([None, None, None, None]),
+                qwen_q2s4_expert_pipeline: Mutex::new(None),
+                qwen_qk_norm_rope_pipeline: Mutex::new(None),
+                qwen_gqa_attention_pipeline: Mutex::new(None),
                 logits_pipeline: Mutex::new(None),
                 dense_pipeline: Mutex::new(None),
                 f16_dense_pipeline: Mutex::new(None),
@@ -8725,6 +8745,81 @@ pub mod platform {
                 .map_err(|_| "Metal compute pipeline creation failed".to_owned())?;
             pipelines[index] = Some(pipeline.clone());
             Ok(pipeline)
+        }
+
+        fn qwen_q2s4_expert_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .qwen_q2s4_expert_pipeline
+                .lock()
+                .map_err(|_| "Metal Qwen Q2S4 pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let source = NSString::from_str(Q2_KERNEL_SOURCE);
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&source, None)
+                .map_err(|_| "Metal Qwen Q2S4 library compilation failed".to_owned())?;
+            let name = NSString::from_str("qx_q2s4_qwen_expert");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal Qwen Q2S4 expert function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal Qwen Q2S4 pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn qwen_qk_norm_rope_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .qwen_qk_norm_rope_pipeline
+                .lock()
+                .map_err(|_| "Metal Qwen Q/K pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let source = NSString::from_str(QWEN_ATTENTION_KERNEL_SOURCE);
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&source, None)
+                .map_err(|_| "Metal Qwen attention library compilation failed".to_owned())?;
+            let name = NSString::from_str("qx_qwen_qk_norm_rope");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal Qwen Q/K function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal Qwen Q/K pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
+        fn qwen_gqa_attention_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .qwen_gqa_attention_pipeline
+                .lock()
+                .map_err(|_| "Metal Qwen GQA pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let source = NSString::from_str(QWEN_ATTENTION_KERNEL_SOURCE);
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&source, None)
+                .map_err(|_| "Metal Qwen GQA library compilation failed".to_owned())?;
+            let name = NSString::from_str("qx_qwen_gqa_attention");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal Qwen GQA function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal Qwen GQA pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
         }
 
         fn q4_gemv_pipeline(&self) -> Result<Pipeline, String> {
@@ -12703,6 +12798,444 @@ pub mod platform {
             self.record_command(&command_buffer, 1, encode_start, wait_start)?;
             let contents = output_buffer.contents().as_ptr() as *const u16;
             Ok(unsafe { std::slice::from_raw_parts(contents, prepared.rows) }.to_vec())
+        }
+
+        /// Apply Qwen3 per-head Q/K RMSNorm and split-half RoPE to FP16
+        /// projection outputs. This is the semantic front end required before
+        /// GQA attention and KV-cache insertion.
+        pub fn run_qwen_qk_norm_rope(
+            &self,
+            query: &[u16],
+            key: &[u16],
+            query_norm: &[f32],
+            key_norm: &[f32],
+            position: u32,
+        ) -> Result<(Vec<u16>, Vec<u16>), String> {
+            const QUERY_ELEMENTS: usize = 32 * 128;
+            const KEY_ELEMENTS: usize = 4 * 128;
+            if query.len() != QUERY_ELEMENTS
+                || key.len() != KEY_ELEMENTS
+                || query_norm.len() != 128
+                || key_norm.len() != 128
+            {
+                return Err(format!(
+                    "invalid Qwen Q/K shapes: q={}, k={}, q_norm={}, k_norm={}",
+                    query.len(),
+                    key.len(),
+                    query_norm.len(),
+                    key_norm.len()
+                ));
+            }
+            let bytes = |values: &[u16]| unsafe {
+                std::slice::from_raw_parts(
+                    values.as_ptr() as *const u8,
+                    std::mem::size_of_val(values),
+                )
+            };
+            let float_bytes = |values: &[f32]| unsafe {
+                std::slice::from_raw_parts(
+                    values.as_ptr() as *const u8,
+                    std::mem::size_of_val(values),
+                )
+            };
+            let shared = |values: &[u8]| {
+                let pointer = NonNull::new(values.as_ptr() as *mut c_void)
+                    .ok_or_else(|| "Qwen attention buffer cannot be empty".to_owned())?;
+                unsafe {
+                    self.device.newBufferWithBytes_length_options(
+                        pointer,
+                        values.len(),
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                }
+                .ok_or_else(|| "Metal Qwen attention buffer allocation failed".to_owned())
+            };
+            let query_buffer = shared(bytes(query))?;
+            let key_buffer = shared(bytes(key))?;
+            let query_norm_buffer = shared(float_bytes(query_norm))?;
+            let key_norm_buffer = shared(float_bytes(key_norm))?;
+            let command_buffer = self.queue.commandBuffer().ok_or_else(|| {
+                "Metal Qwen attention command buffer allocation failed".to_owned()
+            })?;
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or_else(|| "Metal Qwen attention encoder allocation failed".to_owned())?;
+            let pipeline = self.qwen_qk_norm_rope_pipeline()?;
+            encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                for (buffer, index) in [
+                    (&query_buffer, 0),
+                    (&key_buffer, 1),
+                    (&query_norm_buffer, 2),
+                    (&key_norm_buffer, 3),
+                ] {
+                    encoder.setBuffer_offset_atIndex(Some(buffer), 0, index);
+                }
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(&position).cast(),
+                    std::mem::size_of_val(&position),
+                    4,
+                );
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: 36,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 36,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            let encode_start = Instant::now();
+            command_buffer.commit();
+            let wait_start = Instant::now();
+            command_buffer.waitUntilCompleted();
+            if command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
+                return Err("Metal Qwen attention command buffer execution failed".to_owned());
+            }
+            self.record_command(&command_buffer, 1, encode_start, wait_start)?;
+            let query_result = unsafe {
+                std::slice::from_raw_parts(
+                    query_buffer.contents().as_ptr() as *const u16,
+                    QUERY_ELEMENTS,
+                )
+                .to_vec()
+            };
+            let key_result = unsafe {
+                std::slice::from_raw_parts(
+                    key_buffer.contents().as_ptr() as *const u16,
+                    KEY_ELEMENTS,
+                )
+                .to_vec()
+            };
+            Ok((query_result, key_result))
+        }
+
+        /// Execute correctness-first Qwen 32Q/4KV grouped-query attention over
+        /// an FP16 position-major KV cache. Query and output contain 4096 FP16
+        /// elements; each cache position contains 4 x 128 elements.
+        pub fn run_qwen_gqa_attention(
+            &self,
+            query: &[u16],
+            key_cache: &[u16],
+            value_cache: &[u16],
+        ) -> Result<Vec<u16>, String> {
+            const QUERY_ELEMENTS: usize = 32 * 128;
+            const KV_ELEMENTS: usize = 4 * 128;
+            if query.len() != QUERY_ELEMENTS
+                || key_cache.is_empty()
+                || key_cache.len() != value_cache.len()
+                || !key_cache.len().is_multiple_of(KV_ELEMENTS)
+            {
+                return Err(format!(
+                    "invalid Qwen GQA shapes: q={}, k_cache={}, v_cache={}",
+                    query.len(),
+                    key_cache.len(),
+                    value_cache.len()
+                ));
+            }
+            let context = u32::try_from(key_cache.len() / KV_ELEMENTS)
+                .map_err(|_| "Qwen GQA context exceeds u32".to_owned())?;
+            let bytes = |values: &[u16]| unsafe {
+                std::slice::from_raw_parts(
+                    values.as_ptr() as *const u8,
+                    std::mem::size_of_val(values),
+                )
+            };
+            let query_buffer = self.input_buffer(bytes(query))?;
+            let key_buffer = self.input_buffer(bytes(key_cache))?;
+            let value_buffer = self.input_buffer(bytes(value_cache))?;
+            let output = self
+                .device
+                .newBufferWithLength_options(
+                    QUERY_ELEMENTS * std::mem::size_of::<u16>(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .ok_or_else(|| "Metal Qwen GQA output allocation failed".to_owned())?;
+            let command_buffer = self
+                .queue
+                .commandBuffer()
+                .ok_or_else(|| "Metal Qwen GQA command buffer allocation failed".to_owned())?;
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or_else(|| "Metal Qwen GQA encoder allocation failed".to_owned())?;
+            let pipeline = self.qwen_gqa_attention_pipeline()?;
+            encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                for (buffer, index) in [
+                    (&query_buffer, 0),
+                    (&key_buffer, 1),
+                    (&value_buffer, 2),
+                    (&output, 3),
+                ] {
+                    encoder.setBuffer_offset_atIndex(Some(buffer), 0, index);
+                }
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(&context).cast(),
+                    std::mem::size_of_val(&context),
+                    4,
+                );
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: QUERY_ELEMENTS,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            let encode_start = Instant::now();
+            command_buffer.commit();
+            let wait_start = Instant::now();
+            command_buffer.waitUntilCompleted();
+            if command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
+                return Err("Metal Qwen GQA command buffer execution failed".to_owned());
+            }
+            self.record_command(&command_buffer, 1, encode_start, wait_start)?;
+            let contents = output.contents().as_ptr() as *const u16;
+            Ok(unsafe { std::slice::from_raw_parts(contents, QUERY_ELEMENTS).to_vec() })
+        }
+
+        /// Prepare one Qwen3-30B-A3B Q2S4 expert. The byte slices may come
+        /// directly from a mapped QX artifact; this correctness path currently
+        /// uploads the selected expert into persistent private Metal buffers.
+        pub fn prepare_qwen_q2s4_expert_bytes(
+            &self,
+            gate_up_packed: &[u8],
+            gate_up_scales: &[u8],
+            down_packed: &[u8],
+            down_scales: &[u8],
+        ) -> Result<PreparedQwenQ2S4Expert, String> {
+            const QWEN_HIDDEN: usize = 2048;
+            const QWEN_INTERMEDIATE: usize = 768;
+            const QWEN_GATE_UP_ROWS: usize = QWEN_INTERMEDIATE * 2;
+            let expected_gate_up = buffer_len(QWEN_GATE_UP_ROWS, QWEN_HIDDEN, QuantType::Q2S4);
+            let expected_down = buffer_len(QWEN_HIDDEN, QWEN_INTERMEDIATE, QuantType::Q2S4);
+            let expected_gate_up_scales = scale_len(QWEN_GATE_UP_ROWS, QWEN_HIDDEN);
+            let expected_down_scales = scale_len(QWEN_HIDDEN, QWEN_INTERMEDIATE);
+            for (name, actual, expected) in [
+                ("gate/up packed", gate_up_packed.len(), expected_gate_up),
+                (
+                    "gate/up scales",
+                    gate_up_scales.len(),
+                    expected_gate_up_scales,
+                ),
+                ("down packed", down_packed.len(), expected_down),
+                ("down scales", down_scales.len(), expected_down_scales),
+            ] {
+                if actual != expected {
+                    return Err(format!("Qwen {name} length {actual}, expected {expected}"));
+                }
+            }
+            Ok(PreparedQwenQ2S4Expert {
+                pipeline: self.qwen_q2s4_expert_pipeline()?,
+                gate_up_packed: self.input_runtime_buffer(gate_up_packed)?,
+                gate_up_scales: self.input_runtime_buffer(gate_up_scales)?,
+                down_packed: self.input_runtime_buffer(down_packed)?,
+                down_scales: self.input_runtime_buffer(down_scales)?,
+            })
+        }
+
+        /// Execute one prepared Qwen Q2S4 expert with one command buffer and
+        /// one dispatch. Input and output are FP16 bit patterns.
+        pub fn run_prepared_qwen_q2s4_expert(
+            &self,
+            prepared: &PreparedQwenQ2S4Expert,
+            input: &[u16],
+        ) -> Result<Vec<u16>, String> {
+            const QWEN_HIDDEN: usize = 2048;
+            const QWEN_INTERMEDIATE: usize = 768;
+            if input.len() != QWEN_HIDDEN {
+                return Err(format!(
+                    "Qwen expert input length {}, expected {QWEN_HIDDEN}",
+                    input.len()
+                ));
+            }
+            let input_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    input.as_ptr() as *const u8,
+                    std::mem::size_of_val(input),
+                )
+            };
+            let input_buffer = self.input_buffer(input_bytes)?;
+            let output = self
+                .device
+                .newBufferWithLength_options(
+                    QWEN_HIDDEN * std::mem::size_of::<u16>(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .ok_or_else(|| "Metal Qwen expert output allocation failed".to_owned())?;
+            let command_buffer = self
+                .queue
+                .commandBuffer()
+                .ok_or_else(|| "Metal Qwen expert command buffer allocation failed".to_owned())?;
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or_else(|| "Metal Qwen expert encoder allocation failed".to_owned())?;
+            encoder.setComputePipelineState(&prepared.pipeline);
+            unsafe {
+                for (buffer, index) in [
+                    (&prepared.gate_up_packed, 0),
+                    (&prepared.gate_up_scales, 1),
+                    (&prepared.down_packed, 2),
+                    (&prepared.down_scales, 3),
+                ] {
+                    encoder.setBuffer_offset_atIndex(Some(&buffer.buffer), buffer.offset, index);
+                }
+                encoder.setBuffer_offset_atIndex(Some(&input_buffer), 0, 4);
+                encoder.setBuffer_offset_atIndex(Some(&output), 0, 5);
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: QWEN_INTERMEDIATE,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            let encode_start = Instant::now();
+            command_buffer.commit();
+            let wait_start = Instant::now();
+            command_buffer.waitUntilCompleted();
+            if command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
+                return Err("Metal Qwen expert command buffer execution failed".to_owned());
+            }
+            self.record_command(&command_buffer, 1, encode_start, wait_start)?;
+            let contents = output.contents().as_ptr() as *const u16;
+            Ok(unsafe { std::slice::from_raw_parts(contents, QWEN_HIDDEN).to_vec() })
+        }
+
+        /// Execute and router-weight eight prepared Qwen experts in one
+        /// command buffer. Expert kernels remain independent dispatches, but
+        /// the activated outputs never cross the host boundary.
+        pub fn run_prepared_qwen_q2s4_experts_weighted(
+            &self,
+            prepared: &[&PreparedQwenQ2S4Expert],
+            input: &[u16],
+            weights: &[f32; 8],
+        ) -> Result<Vec<u16>, String> {
+            const QWEN_HIDDEN: usize = 2048;
+            const QWEN_INTERMEDIATE: usize = 768;
+            if prepared.len() != 8 || input.len() != QWEN_HIDDEN {
+                return Err(format!(
+                    "Qwen weighted MoE requires 8 experts and {QWEN_HIDDEN} inputs; got {} and {}",
+                    prepared.len(),
+                    input.len()
+                ));
+            }
+            let input_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    input.as_ptr() as *const u8,
+                    std::mem::size_of_val(input),
+                )
+            };
+            let input_buffer = self.input_buffer(input_bytes)?;
+            let mut outputs = Vec::with_capacity(8);
+            for _ in 0..8 {
+                outputs.push(
+                    self.device
+                        .newBufferWithLength_options(
+                            QWEN_HIDDEN * std::mem::size_of::<u16>(),
+                            MTLResourceOptions::StorageModeShared,
+                        )
+                        .ok_or_else(|| "Metal Qwen expert output allocation failed".to_owned())?,
+                );
+            }
+            let moe_output = self
+                .device
+                .newBufferWithLength_options(
+                    QWEN_HIDDEN * std::mem::size_of::<u16>(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .ok_or_else(|| "Metal Qwen MoE output allocation failed".to_owned())?;
+            let command_buffer = self
+                .queue
+                .commandBuffer()
+                .ok_or_else(|| "Metal Qwen MoE command buffer allocation failed".to_owned())?;
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or_else(|| "Metal Qwen MoE encoder allocation failed".to_owned())?;
+            for (expert, output) in prepared.iter().zip(&outputs) {
+                encoder.setComputePipelineState(&expert.pipeline);
+                unsafe {
+                    for (buffer, index) in [
+                        (&expert.gate_up_packed, 0),
+                        (&expert.gate_up_scales, 1),
+                        (&expert.down_packed, 2),
+                        (&expert.down_scales, 3),
+                    ] {
+                        encoder.setBuffer_offset_atIndex(
+                            Some(&buffer.buffer),
+                            buffer.offset,
+                            index,
+                        );
+                    }
+                    encoder.setBuffer_offset_atIndex(Some(&input_buffer), 0, 4);
+                    encoder.setBuffer_offset_atIndex(Some(output), 0, 5);
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: QWEN_INTERMEDIATE,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            }
+            let aggregate = self.aggregate_pipeline(QuantType::Q2S4)?;
+            encoder.setComputePipelineState(&aggregate);
+            unsafe {
+                for (index, output) in outputs.iter().enumerate() {
+                    encoder.setBuffer_offset_atIndex(Some(output), 0, index);
+                }
+                encoder.setBytes_length_atIndex(
+                    NonNull::from(weights).cast(),
+                    std::mem::size_of_val(weights),
+                    8,
+                );
+                encoder.setBuffer_offset_atIndex(Some(&moe_output), 0, 9);
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: QWEN_HIDDEN,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            let encode_start = Instant::now();
+            command_buffer.commit();
+            let wait_start = Instant::now();
+            command_buffer.waitUntilCompleted();
+            if command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
+                return Err("Metal Qwen MoE command buffer execution failed".to_owned());
+            }
+            self.record_command(&command_buffer, 9, encode_start, wait_start)?;
+            let contents = moe_output.contents().as_ptr() as *const u16;
+            Ok(unsafe { std::slice::from_raw_parts(contents, QWEN_HIDDEN).to_vec() })
         }
 
         /// Prepare one fixed-shape Granite V0 expert without materializing

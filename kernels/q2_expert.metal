@@ -174,6 +174,61 @@ kernel void qx_q2s4_expert(
     output[row] = half(down_sum);
 }
 
+// Qwen3-30B-A3B expert correctness path. One 768-thread group computes the
+// complete SwiGLU expert: every lane owns one gate/up row, then strides over
+// the 2,048 down rows. Packed weights remain group-32 Q2S4 throughout.
+kernel void qx_q2s4_qwen_expert(
+    device const uchar* gate_up_packed [[buffer(0)]],
+    device const half* gate_up_scales [[buffer(1)]],
+    device const uchar* down_packed [[buffer(2)]],
+    device const half* down_scales [[buffer(3)]],
+    device const half* input [[buffer(4)]],
+    device half* output [[buffer(5)]],
+    uint lane [[thread_position_in_threadgroup]]) {
+    constexpr uint hidden = 2048;
+    constexpr uint intermediate = 768;
+    constexpr uint group_size = 32;
+    constexpr uint gate_groups = hidden / group_size;
+    constexpr uint down_groups = intermediate / group_size;
+    constexpr uint bytes_per_group = 8;
+    threadgroup half activated[intermediate];
+
+    float gate = 0.0f;
+    float up = 0.0f;
+    uint up_row = intermediate + lane;
+    for (uint column = 0; column < hidden; ++column) {
+        uint group = column / group_size;
+        uint local = column % group_size;
+        uint gate_base = (lane * gate_groups + group) * bytes_per_group;
+        uint up_base = (up_row * gate_groups + group) * bytes_per_group;
+        uint shift = (local % 4) * 2;
+        uint gate_code = (gate_up_packed[gate_base + local / 4] >> shift) & 0x3;
+        uint up_code = (gate_up_packed[up_base + local / 4] >> shift) & 0x3;
+        gate += qx_q2s4_decode(gate_code, float(gate_up_scales[lane * gate_groups + group]))
+            * float(input[column]);
+        up += qx_q2s4_decode(up_code, float(gate_up_scales[up_row * gate_groups + group]))
+            * float(input[column]);
+    }
+    half gate_half = half(gate);
+    half up_half = half(up);
+    float gate_rounded = float(gate_half);
+    activated[lane] = half((gate_rounded / (1.0f + exp(-gate_rounded))) * float(up_half));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = lane; row < hidden; row += intermediate) {
+        float down = 0.0f;
+        for (uint column = 0; column < intermediate; ++column) {
+            uint group = column / group_size;
+            uint local = column % group_size;
+            uint base = (row * down_groups + group) * bytes_per_group;
+            uint code = (down_packed[base + local / 4] >> ((local % 4) * 2)) & 0x3;
+            down += qx_q2s4_decode(code, float(down_scales[row * down_groups + group]))
+                * float(activated[column]);
+        }
+        output[row] = half(down);
+    }
+}
+
 kernel void qx_moe_accumulate(
     device const half* expert0 [[buffer(0)]],
     device const half* expert1 [[buffer(1)]],

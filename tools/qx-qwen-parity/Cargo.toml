@@ -1,0 +1,14 @@
+[package]
+name = "qx-qwen-parity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+half.workspace = true
+qx-format.workspace = true
+qx-metal.workspace = true
+qx-model.workspace = true
+qx-quant.workspace = true

@@ -558,6 +558,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "qx-qwen-parity"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "half",
+ "qx-format",
+ "qx-metal",
+ "qx-model",
+ "qx-quant",
+]
+
+[[package]]
 name = "qx-route-cache"
 version = "0.1.0"
 dependencies = [
