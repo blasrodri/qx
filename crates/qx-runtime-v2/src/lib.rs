@@ -3813,6 +3813,12 @@ fn load_no_copy_moe_stack_expertwise(
             down_q4
                 .as_ref()
                 .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q4RowInline),
+            gate_q4
+                .as_ref()
+                .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q4Superblock144),
+            down_q4
+                .as_ref()
+                .is_some_and(|value| value.layout == qx_quant::PackingLayout::Q4Superblock144),
         )?;
         layers.push(prepared);
     }
@@ -3914,12 +3920,14 @@ fn expertwise_typed_slab(
         } else {
             matches!(
                 entry.layout,
-                qx_quant::PackingLayout::RowMajor | qx_quant::PackingLayout::Q4RowInline
+                qx_quant::PackingLayout::RowMajor
+                    | qx_quant::PackingLayout::Q4RowInline
+                    | qx_quant::PackingLayout::Q4Superblock144
             )
         };
         if !valid_layout {
             return Err(
-                "expertwise Q3 requires row-major and Q4 requires row-major or row-inline"
+                "expertwise Q3 requires row-major and Q4 requires row-major, row-inline, or superblock-144"
                     .to_owned(),
             );
         }

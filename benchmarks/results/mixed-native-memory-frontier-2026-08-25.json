@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-25",
+  "device": "Apple M5 Pro",
+  "model": "ibm-granite-3.0-1b-a400m-instruct",
+  "context": 512,
+  "fixture": "benchmarks/fixtures/general.json",
+  "canonical": {
+    "mapped_artifact_bytes": 751009792,
+    "unique_weight_payload_bytes": 750900928,
+    "known_logical_bytes": 789165312,
+    "paired_throughput_tok_s": [396.75, 395.08, 393.99],
+    "paired_mean_tok_s": 395.273333,
+    "paired_mean_gpu_ms_per_token": 2.526667,
+    "dispatches_per_token": 390
+  },
+  "mixed_40_mib": {
+    "mapped_artifact_bytes": 709001216,
+    "unique_weight_payload_bytes": 708892352,
+    "known_logical_bytes": 747156736,
+    "weight_bytes_saved": 42008576,
+    "q3_expert_tensors": 375,
+    "q4_expert_tensors": 1161,
+    "paired_throughput_tok_s": [353.92, 354.57, 354.84],
+    "paired_mean_tok_s": 354.443333,
+    "paired_mean_gpu_ms_per_token": 2.818,
+    "dispatches_per_token": 390,
+    "throughput_change_percent": -10.3296
+  },
+  "quality": {
+    "corpus_note": "two disjoint 1023-position PTB windows; local frontier probe",
+    "control_nll": [3.102323, 3.384970],
+    "tiers": [
+      {
+        "target_mib": 32,
+        "candidate_nll": [3.093799, 3.399676],
+        "window_ppl_change_percent": [-0.848852, 1.48156],
+        "aggregate_ppl_change_percent": 0.309578,
+        "gate": "pass"
+      },
+      {
+        "target_mib": 40,
+        "candidate_nll": [3.105836, 3.398531],
+        "window_ppl_change_percent": [0.351921, 1.36537],
+        "aggregate_ppl_change_percent": 0.857354,
+        "gate": "pass"
+      },
+      {
+        "target_mib": 48,
+        "candidate_nll": [3.105856, 3.410841],
+        "window_ppl_change_percent": [0.353939, 2.62089],
+        "aggregate_ppl_change_percent": 1.48106,
+        "gate": "fail"
+      }
+    ]
+  }
+}

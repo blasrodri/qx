@@ -1102,6 +1102,11 @@ pub mod platform {
         expertwise_q3_gate_up_norm_pipeline: Option<Pipeline>,
         expertwise_q4_down_pipeline: Option<Pipeline>,
         expertwise_q3_down_pipeline: Option<Pipeline>,
+        expertwise_superblock_gate_up_pipeline: Option<Pipeline>,
+        expertwise_superblock_gate_up_norm_pipeline: Option<Pipeline>,
+        expertwise_superblock_down_pipeline: Option<Pipeline>,
+        expertwise_q4_gate_up_superblock: bool,
+        expertwise_q4_down_superblock: bool,
         expertwise_q4_gate_up_packed: Option<RuntimeBuffer>,
         expertwise_q4_gate_up_scales: Option<RuntimeBuffer>,
         expertwise_q3_gate_up_packed: Option<RuntimeBuffer>,
@@ -5153,7 +5158,70 @@ pub mod platform {
                 Ok(())
             };
 
-            if let Some((weights, inverse)) = norm {
+            if prepared.expertwise_q4_gate_up_superblock {
+                let pipeline = if norm.is_some() {
+                    prepared
+                        .expertwise_superblock_gate_up_norm_pipeline
+                        .as_ref()
+                        .unwrap()
+                } else {
+                    prepared
+                        .expertwise_superblock_gate_up_pipeline
+                        .as_ref()
+                        .unwrap()
+                };
+                self.encoder.setComputePipelineState(pipeline);
+                unsafe {
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(&q4_gate.buffer), q4_gate.offset, 0);
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(&input.buffer), input.offset, 4);
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&expert_ids.buffer),
+                        expert_ids.offset,
+                        5,
+                    );
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(&gate_up.buffer), gate_up.offset, 6);
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(&map.buffer), map.offset, 10);
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&q3_gate.buffer),
+                        q3_gate.offset,
+                        11,
+                    );
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&q3_gate_scales.buffer),
+                        q3_gate_scales.offset,
+                        12,
+                    );
+                    if let Some((weights, inverse)) = norm {
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&weights.buffer),
+                            weights.offset,
+                            8,
+                        );
+                        self.encoder.setBuffer_offset_atIndex(
+                            Some(&inverse.buffer),
+                            inverse.offset,
+                            9,
+                        );
+                    }
+                }
+                self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: 8 * (1024 / 32),
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                self.dispatches += 1;
+            } else if let Some((weights, inverse)) = norm {
                 dispatch_projection(
                     self,
                     prepared
@@ -5175,7 +5243,9 @@ pub mod platform {
                     None,
                 )?;
             }
-            if let Some(block_bytes) = prepared.expertwise_q3_gate_up_block_bytes {
+            if !prepared.expertwise_q4_gate_up_superblock
+                && let Some(block_bytes) = prepared.expertwise_q3_gate_up_block_bytes
+            {
                 if let Some((weights, inverse)) = norm {
                     dispatch_projection(
                         self,
@@ -5277,21 +5347,77 @@ pub mod platform {
                 this.dispatches += 1;
                 Ok(())
             };
-            dispatch_down(
-                self,
-                prepared.expertwise_q4_down_pipeline.as_ref().unwrap(),
-                q4_down,
-                q4_down_scales,
-                None,
-            )?;
-            if let Some(block_bytes) = prepared.expertwise_q3_down_block_bytes {
+            if prepared.expertwise_q4_down_superblock {
+                self.encoder.setComputePipelineState(
+                    prepared
+                        .expertwise_superblock_down_pipeline
+                        .as_ref()
+                        .unwrap(),
+                );
+                unsafe {
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(&q4_down.buffer), q4_down.offset, 0);
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&activated.buffer),
+                        activated.offset,
+                        4,
+                    );
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&expert_ids.buffer),
+                        expert_ids.offset,
+                        5,
+                    );
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&expert_output.buffer),
+                        expert_output.offset,
+                        6,
+                    );
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&down_map.buffer),
+                        down_map.offset,
+                        10,
+                    );
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&q3_down.buffer),
+                        q3_down.offset,
+                        11,
+                    );
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&q3_down_scales.buffer),
+                        q3_down_scales.offset,
+                        12,
+                    );
+                }
+                self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: 8 * (1024 / 32),
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                self.dispatches += 1;
+            } else {
                 dispatch_down(
                     self,
-                    prepared.expertwise_q3_down_pipeline.as_ref().unwrap(),
-                    q3_down,
-                    q3_down_scales,
-                    Some(block_bytes),
+                    prepared.expertwise_q4_down_pipeline.as_ref().unwrap(),
+                    q4_down,
+                    q4_down_scales,
+                    None,
                 )?;
+                if let Some(block_bytes) = prepared.expertwise_q3_down_block_bytes {
+                    dispatch_down(
+                        self,
+                        prepared.expertwise_q3_down_pipeline.as_ref().unwrap(),
+                        q3_down,
+                        q3_down_scales,
+                        Some(block_bytes),
+                    )?;
+                }
             }
 
             self.encoder
@@ -10650,6 +10776,11 @@ pub mod platform {
                 expertwise_q3_gate_up_norm_pipeline: None,
                 expertwise_q4_down_pipeline: None,
                 expertwise_q3_down_pipeline: None,
+                expertwise_superblock_gate_up_pipeline: None,
+                expertwise_superblock_gate_up_norm_pipeline: None,
+                expertwise_superblock_down_pipeline: None,
+                expertwise_q4_gate_up_superblock: false,
+                expertwise_q4_down_superblock: false,
                 expertwise_q4_gate_up_packed: None,
                 expertwise_q4_gate_up_scales: None,
                 expertwise_q3_gate_up_packed: None,
@@ -11082,6 +11213,11 @@ pub mod platform {
                 expertwise_q3_gate_up_norm_pipeline: None,
                 expertwise_q4_down_pipeline: None,
                 expertwise_q3_down_pipeline: None,
+                expertwise_superblock_gate_up_pipeline: None,
+                expertwise_superblock_gate_up_norm_pipeline: None,
+                expertwise_superblock_down_pipeline: None,
+                expertwise_q4_gate_up_superblock: false,
+                expertwise_q4_down_superblock: false,
                 expertwise_q4_gate_up_packed: None,
                 expertwise_q4_gate_up_scales: None,
                 expertwise_q3_gate_up_packed: None,
@@ -11199,6 +11335,8 @@ pub mod platform {
             q3_down_block_bytes: Option<usize>,
             q4_gate_up_inline: bool,
             q4_down_inline: bool,
+            q4_gate_up_superblock: bool,
+            q4_down_superblock: bool,
         ) -> Result<PreparedDynamicQ4Moe, String> {
             if gate_up_map.length < 32 * std::mem::size_of::<u32>()
                 || down_map.length < 32 * std::mem::size_of::<u32>()
@@ -11445,6 +11583,27 @@ pub mod platform {
                 expertwise_q3_down_pipeline: Some(
                     self.dynamic_moe_named_pipeline("qx_dynamic_q3_moe_down_expertwise_simd")?,
                 ),
+                expertwise_superblock_gate_up_pipeline: q4_gate_up_superblock
+                    .then(|| {
+                        self.dynamic_moe_named_pipeline(
+                            "qx_dynamic_mixed_moe_gate_up_superblock_simd",
+                        )
+                    })
+                    .transpose()?,
+                expertwise_superblock_gate_up_norm_pipeline: q4_gate_up_superblock
+                    .then(|| {
+                        self.dynamic_moe_named_pipeline(
+                            "qx_dynamic_mixed_moe_gate_up_superblock_norm_simd",
+                        )
+                    })
+                    .transpose()?,
+                expertwise_superblock_down_pipeline: q4_down_superblock
+                    .then(|| {
+                        self.dynamic_moe_named_pipeline("qx_dynamic_mixed_moe_down_superblock_simd")
+                    })
+                    .transpose()?,
+                expertwise_q4_gate_up_superblock: q4_gate_up_superblock,
+                expertwise_q4_down_superblock: q4_down_superblock,
                 expertwise_q4_gate_up_packed: Some(q4_gate_up_packed.clone()),
                 expertwise_q4_gate_up_scales: Some(q4_gate_up_scales.clone()),
                 expertwise_q3_gate_up_packed: Some(q3_gate_up_packed.clone()),
@@ -11879,6 +12038,11 @@ pub mod platform {
                 expertwise_q3_gate_up_norm_pipeline: None,
                 expertwise_q4_down_pipeline: None,
                 expertwise_q3_down_pipeline: None,
+                expertwise_superblock_gate_up_pipeline: None,
+                expertwise_superblock_gate_up_norm_pipeline: None,
+                expertwise_superblock_down_pipeline: None,
+                expertwise_q4_gate_up_superblock: false,
+                expertwise_q4_down_superblock: false,
                 expertwise_q4_gate_up_packed: None,
                 expertwise_q4_gate_up_scales: None,
                 expertwise_q3_gate_up_packed: None,

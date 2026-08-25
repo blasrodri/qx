@@ -50,6 +50,11 @@ struct Args {
     /// expert-level routing selection remains a later slab-format step.
     #[arg(long)]
     tensorwise_q3: bool,
+    /// Target expert bytes to remove with layer/tensor-family Q3 choices,
+    /// ranked by traced incremental quality cost per byte. This preserves one
+    /// native projection dispatch per family and requires `--tensorwise-q3`.
+    #[arg(long, value_parser = parse_budget, requires = "tensorwise_q3")]
+    tensorwise_q3_savings: Option<usize>,
     /// Select Q3 independently for every (layer, expert, gate/up|down)
     /// tensor. This emits compact typed slabs and requires the expertwise
     /// GPU-map runtime path.
@@ -57,6 +62,11 @@ struct Args {
     expertwise_q3: bool,
     #[arg(long, default_value_t = 0.01)]
     expertwise_q3_threshold: f32,
+    /// Target expert bytes to remove with Q3, ranked by traced incremental
+    /// quality cost per byte. This is an experimental alternative to the raw
+    /// reconstruction-error threshold and requires `--expertwise-q3`.
+    #[arg(long, value_parser = parse_budget, requires = "expertwise_q3")]
+    expertwise_q3_savings: Option<usize>,
     #[arg(long, default_value_t = 32)]
     group_size: usize,
     /// Expert-only scientific control; dense tensors remain QX group-32 Q4.
@@ -405,11 +415,11 @@ fn main() -> Result<()> {
             || args.tensorwise_q3
             || !matches!(
                 args.expert_layout,
-                ExpertLayout::RowMajor | ExpertLayout::RowInline
+                ExpertLayout::RowMajor | ExpertLayout::RowInline | ExpertLayout::Superblock144
             )
         {
             bail!(
-                "--expertwise-q3 requires traced QX Q4 row-major or row-inline experts and cannot be combined with layerwise/tensorwise Q3"
+                "--expertwise-q3 requires traced QX Q4 row-major, row-inline, or superblock-144 experts and cannot be combined with layerwise/tensorwise Q3"
             );
         }
         if !(0.0..=1.0).contains(&args.expertwise_q3_threshold) {
@@ -434,7 +444,7 @@ fn main() -> Result<()> {
         || args.uniform_expert_bits.is_some()
         || args.layerwise_q3
         || args.tensorwise_q3
-        || args.expertwise_q3
+        || (args.expertwise_q3 && args.expert_layout != ExpertLayout::Superblock144)
         || args.group_size != 32)
     {
         bail!(
@@ -656,46 +666,54 @@ fn main() -> Result<()> {
         [false; LAYERS]
     };
     let tensorwise_q3_layers = if args.tensorwise_q3 {
-        let mut gate = [false; LAYERS];
-        let mut down = [false; LAYERS];
-        for layer in 0..LAYERS {
-            let items = sensitivities
-                .iter()
-                .filter(|item| item.layer == layer as u16)
-                .collect::<Vec<_>>();
-            let total_importance = items.iter().map(|item| item.importance()).sum::<f32>();
-            let gate_error = items
-                .iter()
-                .map(|item| item.importance() * item.gate_up_q3_error)
-                .sum::<f32>()
-                / total_importance.max(f32::EPSILON);
-            let down_error = items
-                .iter()
-                .map(|item| item.importance() * item.down_q3_error)
-                .sum::<f32>()
-                / total_importance.max(f32::EPSILON);
-            let measured = items.len() == EXPERTS
-                && items.iter().all(|item| {
-                    item.gate_up_q3_error.is_finite() && item.down_q3_error.is_finite()
-                });
-            gate[layer] = measured && gate_error <= args.layerwise_q3_threshold;
-            down[layer] = measured && down_error <= args.layerwise_q3_threshold;
+        if let Some(target_savings) = args.tensorwise_q3_savings {
+            select_tensorwise_q3_for_savings(&sensitivities, args.group_size, target_savings)
+        } else {
+            let mut gate = [false; LAYERS];
+            let mut down = [false; LAYERS];
+            for layer in 0..LAYERS {
+                let items = sensitivities
+                    .iter()
+                    .filter(|item| item.layer == layer as u16)
+                    .collect::<Vec<_>>();
+                let total_importance = items.iter().map(|item| item.importance()).sum::<f32>();
+                let gate_error = items
+                    .iter()
+                    .map(|item| item.importance() * item.gate_up_q3_error)
+                    .sum::<f32>()
+                    / total_importance.max(f32::EPSILON);
+                let down_error = items
+                    .iter()
+                    .map(|item| item.importance() * item.down_q3_error)
+                    .sum::<f32>()
+                    / total_importance.max(f32::EPSILON);
+                let measured = items.len() == EXPERTS
+                    && items.iter().all(|item| {
+                        item.gate_up_q3_error.is_finite() && item.down_q3_error.is_finite()
+                    });
+                gate[layer] = measured && gate_error <= args.layerwise_q3_threshold;
+                down[layer] = measured && down_error <= args.layerwise_q3_threshold;
+            }
+            (gate, down)
         }
-        (gate, down)
     } else {
         ([false; LAYERS], [false; LAYERS])
     };
     let expertwise_q3_tensors = if args.expertwise_q3 {
-        let threshold = args.expertwise_q3_threshold;
-        sensitivities
-            .iter()
-            .map(|item| {
-                (
-                    item.gate_up_q3_error.is_finite() && item.gate_up_q3_error <= threshold,
-                    item.down_q3_error.is_finite() && item.down_q3_error <= threshold,
-                )
-            })
-            .collect::<Vec<_>>()
+        if let Some(target_savings) = args.expertwise_q3_savings {
+            select_expertwise_q3_for_savings(&sensitivities, args.group_size, target_savings)
+        } else {
+            let threshold = args.expertwise_q3_threshold;
+            sensitivities
+                .iter()
+                .map(|item| {
+                    (
+                        item.gate_up_q3_error.is_finite() && item.gate_up_q3_error <= threshold,
+                        item.down_q3_error.is_finite() && item.down_q3_error <= threshold,
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
     } else {
         vec![(false, false); sensitivities.len()]
     };
@@ -836,10 +854,10 @@ fn main() -> Result<()> {
             uniform
         } else if args.layerwise_q3 && layerwise_q3_layers[layer as usize] {
             QuantType::Q3
-        } else if args.tensorwise_q3
-            && (tensorwise_q3_layers.0[layer as usize] || tensorwise_q3_layers.1[layer as usize])
-        {
-            QuantType::Q3
+        } else if args.tensorwise_q3 {
+            // Gate/up and down are overridden independently below. Keep the
+            // family-local fallback at Q4 when only its sibling selected Q3.
+            QuantType::Q4
         } else if args.expertwise_q3 {
             // Expertwise mode is deliberately a Q3/Q4 experiment. Do not
             // let the general allocator silently introduce Q2 tensors that
@@ -1261,6 +1279,165 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn select_expertwise_q3_for_savings(
+    sensitivities: &[ExpertSensitivity],
+    group_size: usize,
+    target_savings: usize,
+) -> Vec<(bool, bool)> {
+    #[derive(Clone, Copy)]
+    struct Candidate {
+        sensitivity_index: usize,
+        gate_up: bool,
+        bytes_saved: usize,
+        incremental_cost_per_byte: f32,
+    }
+
+    let mut candidates = Vec::with_capacity(sensitivities.len() * 2);
+    for (sensitivity_index, item) in sensitivities.iter().enumerate() {
+        for (gate_up, rows, cols, q3_error, q4_error) in [
+            (
+                true,
+                item.gate_up_rows,
+                item.gate_up_cols,
+                item.gate_up_q3_error,
+                item.gate_up_q4_error,
+            ),
+            (
+                false,
+                item.down_rows,
+                item.down_cols,
+                item.down_q3_error,
+                item.down_q4_error,
+            ),
+        ] {
+            if !q3_error.is_finite() || !q4_error.is_finite() {
+                continue;
+            }
+            let q4_bytes = quantized_bytes(rows, cols, QuantType::Q4, group_size);
+            let q3_bytes = quantized_bytes(rows, cols, QuantType::Q3, group_size);
+            let bytes_saved = q4_bytes.saturating_sub(q3_bytes);
+            if bytes_saved == 0 {
+                continue;
+            }
+            let incremental_error = (q3_error - q4_error).max(0.0);
+            candidates.push(Candidate {
+                sensitivity_index,
+                gate_up,
+                bytes_saved,
+                incremental_cost_per_byte: item.importance() * incremental_error
+                    / bytes_saved as f32,
+            });
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.incremental_cost_per_byte
+            .total_cmp(&right.incremental_cost_per_byte)
+            .then_with(|| right.bytes_saved.cmp(&left.bytes_saved))
+            .then_with(|| left.sensitivity_index.cmp(&right.sensitivity_index))
+            .then_with(|| right.gate_up.cmp(&left.gate_up))
+    });
+
+    let mut selected = vec![(false, false); sensitivities.len()];
+    let mut saved = 0usize;
+    for candidate in candidates {
+        if saved >= target_savings {
+            break;
+        }
+        if candidate.gate_up {
+            selected[candidate.sensitivity_index].0 = true;
+        } else {
+            selected[candidate.sensitivity_index].1 = true;
+        }
+        saved += candidate.bytes_saved;
+    }
+    selected
+}
+
+fn select_tensorwise_q3_for_savings(
+    sensitivities: &[ExpertSensitivity],
+    group_size: usize,
+    target_savings: usize,
+) -> ([bool; LAYERS], [bool; LAYERS]) {
+    #[derive(Clone, Copy)]
+    struct Candidate {
+        layer: usize,
+        gate_up: bool,
+        bytes_saved: usize,
+        incremental_cost_per_byte: f32,
+    }
+
+    let mut candidates = Vec::with_capacity(LAYERS * 2);
+    for layer in 0..LAYERS {
+        let items = sensitivities
+            .iter()
+            .filter(|item| item.layer == layer as u16)
+            .collect::<Vec<_>>();
+        if items.len() != EXPERTS {
+            continue;
+        }
+        for gate_up in [true, false] {
+            let mut bytes_saved = 0usize;
+            let mut incremental_cost = 0.0f32;
+            let mut measured = true;
+            for item in &items {
+                let (rows, cols, q3_error, q4_error) = if gate_up {
+                    (
+                        item.gate_up_rows,
+                        item.gate_up_cols,
+                        item.gate_up_q3_error,
+                        item.gate_up_q4_error,
+                    )
+                } else {
+                    (
+                        item.down_rows,
+                        item.down_cols,
+                        item.down_q3_error,
+                        item.down_q4_error,
+                    )
+                };
+                if !q3_error.is_finite() || !q4_error.is_finite() {
+                    measured = false;
+                    break;
+                }
+                bytes_saved += quantized_bytes(rows, cols, QuantType::Q4, group_size)
+                    .saturating_sub(quantized_bytes(rows, cols, QuantType::Q3, group_size));
+                incremental_cost += item.importance() * (q3_error - q4_error).max(0.0);
+            }
+            if measured && bytes_saved > 0 {
+                candidates.push(Candidate {
+                    layer,
+                    gate_up,
+                    bytes_saved,
+                    incremental_cost_per_byte: incremental_cost / bytes_saved as f32,
+                });
+            }
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.incremental_cost_per_byte
+            .total_cmp(&right.incremental_cost_per_byte)
+            .then_with(|| right.bytes_saved.cmp(&left.bytes_saved))
+            .then_with(|| left.layer.cmp(&right.layer))
+            .then_with(|| right.gate_up.cmp(&left.gate_up))
+    });
+
+    let mut gate = [false; LAYERS];
+    let mut down = [false; LAYERS];
+    let mut saved = 0usize;
+    for candidate in candidates {
+        if saved >= target_savings {
+            break;
+        }
+        if candidate.gate_up {
+            gate[candidate.layer] = true;
+        } else {
+            down[candidate.layer] = true;
+        }
+        saved += candidate.bytes_saved;
+    }
+    (gate, down)
+}
+
 fn representation_for(tensors: &[CompiledTensor], kind: TensorKind) -> ExpertRepresentation {
     let matching = tensors
         .iter()
@@ -1496,4 +1673,58 @@ fn validate_expert_tensor(shape: &[usize], values: &[f32], name: &str) -> Result
 
 fn first_expert(values: &[f32], expert: usize, elements: usize) -> Vec<f32> {
     values[expert * elements..(expert + 1) * elements].to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sensitivity(layer: u16, expert: u8, importance: f32) -> ExpertSensitivity {
+        ExpertSensitivity {
+            layer,
+            expert,
+            q2_error: 1.0,
+            q3_error: 0.2,
+            q4_error: 0.1,
+            q2_mse: 1.0,
+            q3_mse: 0.2,
+            q4_mse: 0.1,
+            q2_cosine: 0.0,
+            q3_cosine: 0.9,
+            q4_cosine: 0.99,
+            gate_up_q3_error: 0.2,
+            down_q3_error: 0.3,
+            gate_up_q4_error: 0.1,
+            down_q4_error: 0.1,
+            activation_frequency: importance,
+            mean_router_weight: 1.0,
+            gate_up_rows: 1,
+            gate_up_cols: 32,
+            down_rows: 1,
+            down_cols: 32,
+        }
+    }
+
+    #[test]
+    fn expertwise_savings_prefers_lower_incremental_cost() {
+        let sensitivities = vec![sensitivity(0, 0, 0.01), sensitivity(0, 1, 1.0)];
+        let one_tensor_saving =
+            quantized_bytes(1, 32, QuantType::Q4, 32) - quantized_bytes(1, 32, QuantType::Q3, 32);
+        let selected = select_expertwise_q3_for_savings(&sensitivities, 32, one_tensor_saving);
+        assert_eq!(selected, vec![(true, false), (false, false)]);
+    }
+
+    #[test]
+    fn tensorwise_savings_preserves_family_granularity() {
+        let sensitivities = (0..EXPERTS)
+            .map(|expert| sensitivity(0, expert as u8, 0.01))
+            .collect::<Vec<_>>();
+        let family_saving = EXPERTS
+            * (quantized_bytes(1, 32, QuantType::Q4, 32)
+                - quantized_bytes(1, 32, QuantType::Q3, 32));
+        let (gate, down) = select_tensorwise_q3_for_savings(&sensitivities, 32, family_saving);
+        assert!(gate[0]);
+        assert!(!down[0]);
+        assert_eq!(gate.iter().filter(|&&selected| selected).count(), 1);
+    }
 }
