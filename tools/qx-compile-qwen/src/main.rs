@@ -27,7 +27,7 @@ struct Args {
     output: PathBuf,
     #[arg(long, default_value_t = 4096)]
     context: usize,
-    #[arg(long, value_parser = parse_expert_bits, default_value = "q2")]
+    #[arg(long, value_parser = parse_expert_bits, default_value = "q2_s4")]
     expert_bits: QuantType,
     #[arg(long, default_value = "qwen3-a19pro-provisional")]
     plan_id: String,
@@ -50,8 +50,8 @@ struct PendingGateUp {
 
 fn parse_expert_bits(value: &str) -> Result<QuantType, String> {
     match QuantType::parse(value) {
-        Some(bits @ (QuantType::Q2 | QuantType::Q3 | QuantType::Q4)) => Ok(bits),
-        _ => Err("expected q2, q3, or q4".to_owned()),
+        Some(bits @ (QuantType::Q2 | QuantType::Q2S4 | QuantType::Q3 | QuantType::Q4)) => Ok(bits),
+        _ => Err("expected q2, q2_s4, q3, or q4".to_owned()),
     }
 }
 
@@ -125,6 +125,7 @@ fn main() -> Result<()> {
     execution_plan.memory.weight_storage = WeightStorage::MmapNoCopy;
     let expert_representation = match args.expert_bits {
         QuantType::Q2 => ExpertRepresentation::Group32Q2RowMajor,
+        QuantType::Q2S4 => ExpertRepresentation::Group32Q2S4RowMajor,
         QuantType::Q3 => ExpertRepresentation::Group32Q3RowMajor,
         QuantType::Q4 => ExpertRepresentation::Group32Q4RowMajor,
         _ => unreachable!(),
@@ -411,6 +412,7 @@ mod tests {
 
     #[test]
     fn parses_qwen_expert_and_layer_names() {
+        assert_eq!(parse_expert_bits("q2_s4").unwrap(), QuantType::Q2S4);
         assert_eq!(
             parse_expert_name("model.layers.47.mlp.experts.127.down_proj.weight"),
             Some((47, 127, "down_proj"))
@@ -423,8 +425,8 @@ mod tests {
 
     #[test]
     fn gate_up_quantized_rows_compose_without_requantization() {
-        let gate = QuantizedTensor::quantize(&[1.0; 64], 2, 32, QuantType::Q2, 32);
-        let up = QuantizedTensor::quantize(&[2.0; 64], 2, 32, QuantType::Q2, 32);
+        let gate = QuantizedTensor::quantize(&[1.0; 64], 2, 32, QuantType::Q2S4, 32);
+        let up = QuantizedTensor::quantize(&[2.0; 64], 2, 32, QuantType::Q2S4, 32);
         let mut pending = PendingGateUp::default();
         pending.gate.insert((0, 0), gate);
         let mut output = Vec::new();

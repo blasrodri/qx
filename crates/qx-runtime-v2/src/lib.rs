@@ -446,8 +446,9 @@ pub fn activate_artifact_execution_plan(
     }
     match plan.representations.gate_up {
         qx_format::ExpertRepresentation::Group32Q3RowMajor
-        | qx_format::ExpertRepresentation::Group32Q2RowMajor => {
-            return Err("Q2/Q3 row-major plans require the Qwen runtime backend".to_owned());
+        | qx_format::ExpertRepresentation::Group32Q2RowMajor
+        | qx_format::ExpertRepresentation::Group32Q2S4RowMajor => {
+            return Err("Q2/Q2S4/Q3 row-major plans require the Qwen runtime backend".to_owned());
         }
         qx_format::ExpertRepresentation::Group32Q4RowMajor => {
             set_plan_env("QX_V2_MOE_LAYOUT", "rowmajor")

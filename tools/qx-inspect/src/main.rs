@@ -3,7 +3,7 @@ use clap::Parser;
 use qx_model::{
     Granite3A400M, ModelArchitecture, ModelShape, QWEN3_30B_A3B_MODEL_ID, Qwen3MoeConfig,
 };
-use qx_quant::{QuantType, QuantizedTensor};
+use qx_quant::{QuantType, QuantizedTensor, q2_symmetric4_metrics};
 use qx_safetensors::{Checkpoint, TensorInfo};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -137,6 +137,7 @@ struct ArtifactAudit {
     context_limit: u32,
     tensor_entries: usize,
     q2_entries: usize,
+    q2s4_entries: usize,
     q4_entries: usize,
     raw_entries: usize,
     gate_up_entries: usize,
@@ -156,7 +157,7 @@ struct ArtifactMemoryAudit {
 }
 
 fn parse_quant_type(value: &str) -> Result<QuantType, String> {
-    QuantType::parse(value).ok_or_else(|| "expected q2, q3, or q4".to_owned())
+    QuantType::parse(value).ok_or_else(|| "expected q2, q2_s4, q3, or q4".to_owned())
 }
 
 fn main() -> Result<()> {
@@ -251,6 +252,11 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
         .iter()
         .filter(|entry| entry.group_size != 0 && entry.quant_type == QuantType::Q2)
         .count();
+    let q2s4_entries = info
+        .entries
+        .iter()
+        .filter(|entry| entry.group_size != 0 && entry.quant_type == QuantType::Q2S4)
+        .count();
     let q4_entries = info
         .entries
         .iter()
@@ -276,7 +282,7 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
         && info.header.target_id == "apple-a19-pro"
         && info.header.context_limit == 4096
         && info.entries.len() == 12_723
-        && q2_entries == 12_288
+        && q2_entries + q2s4_entries == 12_288
         && q4_entries == 242
         && raw_entries == 193
         && gate_up_entries == 6_144
@@ -292,7 +298,11 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
     let runtime_bytes = memory.total_bytes - memory.weights_bytes - memory.kv_cache_bytes;
     Ok(ArtifactAudit {
         schema_version: 1,
-        classification: "qwen3-a19pro-q2-capacity-baseline-artifact",
+        classification: if q2s4_entries == 12_288 {
+            "qwen3-a19pro-q2s4-capacity-candidate-artifact"
+        } else {
+            "qwen3-a19pro-q2-capacity-baseline-artifact"
+        },
         capacity_baseline_complete: complete,
         execution_promoted: false,
         artifact_sha256: sha256_file(path)?,
@@ -302,6 +312,7 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
         context_limit: info.header.context_limit,
         tensor_entries: info.entries.len(),
         q2_entries,
+        q2s4_entries,
         q4_entries,
         raw_entries,
         gate_up_entries,
@@ -315,7 +326,7 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
         model_shape: plan.and_then(|plan| plan.model_shape.clone()),
         plan_id: plan.map(|plan| plan.plan_id.clone()),
         limitations: vec![
-            "uniform symmetric Q2 has not passed the QX quality gates",
+            "the expert codec has not passed end-to-end perplexity and task quality gates",
             "the Qwen Metal runtime and physical iPhone memory gate are not implemented",
             "this artifact validates capacity and conversion only; it is not an app release model",
         ],
@@ -329,8 +340,8 @@ fn print_artifact_audit(audit: &ArtifactAudit) {
     println!("file bytes:         {}", audit.file_bytes);
     println!("tensor entries:     {}", audit.tensor_entries);
     println!(
-        "Q2/Q4/raw entries:  {}/{}/{}",
-        audit.q2_entries, audit.q4_entries, audit.raw_entries
+        "Q2/Q2S4/Q4/raw:    {}/{}/{}/{}",
+        audit.q2_entries, audit.q2s4_entries, audit.q4_entries, audit.raw_entries
     );
     println!(
         "gate-up/down:       {}/{}",
@@ -421,7 +432,7 @@ fn print_layer_overview(
         }
     }
     println!("\nestimated group-32 payload per expert:");
-    for quant_type in [QuantType::Q4, QuantType::Q3, QuantType::Q2] {
+    for quant_type in [QuantType::Q4, QuantType::Q3, QuantType::Q2S4, QuantType::Q2] {
         println!(
             "    {quant_type}: {} bytes",
             estimate_quantized_bytes(model.shape.expert_weight_elements(), quant_type)
@@ -507,7 +518,7 @@ fn print_quantization(
     println!("\n{name}:\n    shape: [{rows}, {cols}]");
     println!("    source bytes (FP16/BF16): {}", values.len() * 2);
     let mut quant_types = requested.into_iter().collect::<Vec<_>>();
-    for quant_type in [QuantType::Q4, QuantType::Q3, QuantType::Q2] {
+    for quant_type in [QuantType::Q4, QuantType::Q3, QuantType::Q2S4, QuantType::Q2] {
         if !quant_types.contains(&quant_type) {
             quant_types.push(quant_type);
         }
@@ -522,6 +533,15 @@ fn print_quantization(
             q.relative_l2(values)
         );
     }
+    let q2s4 = (15..=55)
+        .map(|percent| q2_symmetric4_metrics(values, rows, cols, 32, percent as f32 / 100.0))
+        .min_by(|left, right| left.relative_l2.total_cmp(&right.relative_l2))
+        .expect("non-empty Q2S4 ratio sweep");
+    let q2_bytes = QuantizedTensor::quantize(values, rows, cols, QuantType::Q2, 32).bytes();
+    println!(
+        "    q2s4 oracle (same {} bytes): inner ratio {:.2}, MSE: {:.6}, relative L2: {:.6}",
+        q2_bytes, q2s4.inner_ratio, q2s4.mse, q2s4.relative_l2
+    );
 }
 
 fn audit_checkpoint(

@@ -21,7 +21,7 @@ pub const Q4_EMBEDDING_KERNEL_SOURCE: &str = include_str!("../../../kernels/q4_e
 
 pub fn kernel_source(quant_type: QuantType) -> &'static str {
     match quant_type {
-        QuantType::Q2 => Q2_KERNEL_SOURCE,
+        QuantType::Q2 | QuantType::Q2S4 => Q2_KERNEL_SOURCE,
         QuantType::Q3 => Q3_KERNEL_SOURCE,
         QuantType::Q4 => Q4_KERNEL_SOURCE,
         QuantType::Q4K => Q4_KERNEL_SOURCE,
@@ -862,7 +862,7 @@ pub mod platform {
 
     fn bytes_per_group(quant_type: QuantType) -> usize {
         match quant_type {
-            QuantType::Q2 => 8,
+            QuantType::Q2 | QuantType::Q2S4 => 8,
             QuantType::Q3 => 12,
             QuantType::Q4 => 16,
             QuantType::Q4K => 140,
@@ -1433,8 +1433,8 @@ pub mod platform {
     pub struct MetalContext {
         pub device: Retained<ProtocolObject<dyn MTLDevice>>,
         pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-        pipelines: Mutex<[Option<Pipeline>; 3]>,
-        aggregate_pipelines: Mutex<[Option<Pipeline>; 3]>,
+        pipelines: Mutex<[Option<Pipeline>; 4]>,
+        aggregate_pipelines: Mutex<[Option<Pipeline>; 4]>,
         logits_pipeline: Mutex<Option<Pipeline>>,
         dense_pipeline: Mutex<Option<Pipeline>>,
         f16_dense_pipeline: Mutex<Option<Pipeline>>,
@@ -8289,8 +8289,8 @@ pub mod platform {
             Some(Self {
                 device,
                 queue,
-                pipelines: Mutex::new([None, None, None]),
-                aggregate_pipelines: Mutex::new([None, None, None]),
+                pipelines: Mutex::new([None, None, None, None]),
+                aggregate_pipelines: Mutex::new([None, None, None, None]),
                 logits_pipeline: Mutex::new(None),
                 dense_pipeline: Mutex::new(None),
                 f16_dense_pipeline: Mutex::new(None),
@@ -8687,8 +8687,9 @@ pub mod platform {
         fn pipeline_index(quant_type: QuantType) -> usize {
             match quant_type {
                 QuantType::Q2 => 0,
-                QuantType::Q3 => 1,
-                QuantType::Q4 => 2,
+                QuantType::Q2S4 => 1,
+                QuantType::Q3 => 2,
+                QuantType::Q4 => 3,
                 QuantType::Q4K => panic!("Q4_K uses the dedicated dynamic MoE pipeline"),
             }
         }
@@ -8710,7 +8711,11 @@ pub mod platform {
                 .device
                 .newLibraryWithSource_options_error(&source, None)
                 .map_err(|_| "Metal library compilation failed".to_owned())?;
-            let name = NSString::from_str(&format!("qx_q{}_expert", quant_type.bits()));
+            let function_name = match quant_type {
+                QuantType::Q2S4 => "qx_q2s4_expert".to_owned(),
+                _ => format!("qx_q{}_expert", quant_type.bits()),
+            };
+            let name = NSString::from_str(&function_name);
             let function = library
                 .newFunctionWithName(&name)
                 .ok_or_else(|| "Metal fused expert function was not found".to_owned())?;
@@ -13171,7 +13176,7 @@ mod tests {
 
     #[test]
     fn every_quant_type_has_a_kernel() {
-        for quant_type in [QuantType::Q2, QuantType::Q3, QuantType::Q4] {
+        for quant_type in [QuantType::Q2, QuantType::Q2S4, QuantType::Q3, QuantType::Q4] {
             assert!(kernel_source(quant_type).contains("kernel"));
         }
     }
@@ -13228,7 +13233,7 @@ mod tests {
 
         let context = platform::MetalContext::system_default().expect("Metal device");
         let input = vec![f16::from_f32(1.0 / 1024.0).to_bits(); 1024];
-        for quant_type in [QuantType::Q2, QuantType::Q3, QuantType::Q4] {
+        for quant_type in [QuantType::Q2, QuantType::Q2S4, QuantType::Q3, QuantType::Q4] {
             let qmax = (1_u8 << (quant_type.bits() - 1)) - 1;
             let gate_up_packed = packed(1024, 1024, quant_type, qmax + 1);
             let down_packed = packed(1024, 512, quant_type, qmax + 1);
@@ -13244,7 +13249,13 @@ mod tests {
                     &input,
                 )
                 .expect("fused Metal dispatch");
-            let expected = f16::from_f32(374.3019).to_f32();
+            let weight = if quant_type == QuantType::Q2S4 {
+                qx_quant::Q2S4_INNER_RATIO
+            } else {
+                1.0
+            };
+            let activated = (weight / (1.0 + (-weight).exp())) * weight;
+            let expected = f16::from_f32(512.0 * weight * activated).to_f32();
             for value in output {
                 assert!((f16::from_bits(value).to_f32() - expected).abs() < 0.5);
             }

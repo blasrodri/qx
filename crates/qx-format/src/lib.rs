@@ -24,6 +24,8 @@ pub enum ExpertRepresentation {
     Group32Q4RowMajor,
     Group32Q3RowMajor,
     Group32Q2RowMajor,
+    /// Symmetric four-level Q2 using all codes with a fixed 0.32 inner level.
+    Group32Q2S4RowMajor,
     Group32Q4MetalTile32,
     Group32Q4RowInline,
     MixedQ2Q3Q4,
@@ -1623,6 +1625,7 @@ fn quant_code(value: QuantType) -> u8 {
         QuantType::Q3 => 3,
         QuantType::Q4 => 4,
         QuantType::Q4K => 5,
+        QuantType::Q2S4 => 6,
     }
 }
 
@@ -1632,6 +1635,7 @@ fn quant_from_code(value: u8) -> Result<QuantType> {
         3 => Ok(QuantType::Q3),
         4 => Ok(QuantType::Q4),
         5 => Ok(QuantType::Q4K),
+        6 => Ok(QuantType::Q2S4),
         _ => bail!("unknown QX quantization code {value}"),
     }
 }
@@ -1706,6 +1710,33 @@ mod tests {
         );
         assert_eq!(artifact.info.entries[0].quant_type, QuantType::Q3);
         assert_eq!(artifact.info.memory_plan.total_bytes, 10);
+    }
+
+    #[test]
+    fn artifact_round_trip_preserves_q2s4_codec_identity() {
+        let values = (0..64)
+            .map(|index| ((index as f32 - 24.0) * 0.03125).sin())
+            .collect::<Vec<_>>();
+        let tensor = QuantizedTensor::quantize(&values, 2, 32, QuantType::Q2S4, 32);
+        let path = std::env::temp_dir().join(format!("qx-q2s4-{}.qx", std::process::id()));
+        write_artifact_with_raw(
+            &path,
+            "qwen",
+            "apple-a19-pro",
+            4096,
+            MemoryPlan::default(),
+            &[CompiledTensor {
+                layer: 0,
+                expert: 0,
+                kind: TensorKind::Down,
+                tensor,
+            }],
+            &[],
+        )
+        .unwrap();
+        let artifact = MappedArtifact::open(&path).unwrap();
+        assert_eq!(artifact.info.entries[0].quant_type, QuantType::Q2S4);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

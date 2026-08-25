@@ -6,9 +6,14 @@
 
 use half::f16;
 
+pub const Q2S4_INNER_RATIO: f32 = 0.32;
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum QuantType {
     Q2,
+    /// Symmetric four-level Q2 with codebook `[-1, -0.32, 0.32, 1]`.
+    /// This is a distinct codec so legacy Q2 artifacts remain decodable.
+    Q2S4,
     Q3,
     Q4,
     Q4K,
@@ -124,7 +129,7 @@ impl PackingLayout {
 impl QuantType {
     pub const fn bits(self) -> usize {
         match self {
-            Self::Q2 => 2,
+            Self::Q2 | Self::Q2S4 => 2,
             Self::Q3 => 3,
             Self::Q4 => 4,
             Self::Q4K => 4,
@@ -138,6 +143,7 @@ impl QuantType {
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "q2" => Some(Self::Q2),
+            "q2s4" | "q2_s4" => Some(Self::Q2S4),
             "q3" => Some(Self::Q3),
             "q4" => Some(Self::Q4),
             "q4_k" | "q4k" => Some(Self::Q4K),
@@ -149,6 +155,7 @@ impl QuantType {
 impl std::fmt::Display for QuantType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Q2S4 => f.write_str("q2_s4"),
             Self::Q4K => f.write_str("q4_k"),
             _ => write!(f, "q{}", self.bits()),
         }
@@ -169,6 +176,91 @@ impl QuantCodec for PackedCodec {
 
     fn dequantize(src: &[u8], dst: &mut [f32], bits: QuantType) {
         unpack_values(src, dst, bits);
+    }
+}
+
+/// Error metrics for the experimental symmetric four-level Q2 codebook.
+///
+/// The existing `Q2` codec is intentionally left unchanged for artifact
+/// compatibility. This oracle evaluates the same eight code bytes and one
+/// FP16 scale per group-32 block, but uses `[-1, -r, +r, +1] * scale` so all
+/// four 2-bit codes carry information. The scale is refined with a small
+/// least-squares/Lloyd iteration before being rounded to the FP16 value that
+/// an artifact would actually store.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Q2Symmetric4Metrics {
+    pub inner_ratio: f32,
+    pub mse: f32,
+    pub relative_l2: f32,
+}
+
+pub fn q2_symmetric4_metrics(
+    src: &[f32],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    inner_ratio: f32,
+) -> Q2Symmetric4Metrics {
+    assert!(rows > 0 && cols > 0 && group_size > 0);
+    assert_eq!(src.len(), rows * cols);
+    assert!(inner_ratio > 0.0 && inner_ratio < 1.0);
+
+    let mut squared_error = 0.0_f64;
+    let mut squared_signal = 0.0_f64;
+    for row in src.chunks_exact(cols) {
+        for group in row.chunks(group_size) {
+            let mut scale = group.iter().copied().map(f32::abs).fold(0.0, f32::max);
+            if scale == 0.0 {
+                continue;
+            }
+
+            // Alternate nearest-code assignment and the closed-form optimal
+            // scale. Eight iterations are cheap in the offline compiler and
+            // converge for these 32-value groups.
+            for _ in 0..8 {
+                let threshold = scale * (1.0 + inner_ratio) * 0.5;
+                let mut numerator = 0.0_f32;
+                let mut denominator = 0.0_f32;
+                for &value in group {
+                    let magnitude = if value.abs() < threshold {
+                        inner_ratio
+                    } else {
+                        1.0
+                    };
+                    let level = if value < 0.0 { -magnitude } else { magnitude };
+                    numerator += value * level;
+                    denominator += level * level;
+                }
+                if denominator > 0.0 {
+                    scale = numerator / denominator;
+                }
+            }
+
+            let stored_scale = f16::from_f32(scale).to_f32();
+            let threshold = stored_scale * (1.0 + inner_ratio) * 0.5;
+            for &value in group {
+                let magnitude = if value.abs() < threshold {
+                    inner_ratio
+                } else {
+                    1.0
+                };
+                let level = if value < 0.0 { -magnitude } else { magnitude };
+                let reconstructed = level * stored_scale;
+                let error = f64::from(value - reconstructed);
+                squared_error += error * error;
+                squared_signal += f64::from(value) * f64::from(value);
+            }
+        }
+    }
+
+    Q2Symmetric4Metrics {
+        inner_ratio,
+        mse: (squared_error / src.len() as f64) as f32,
+        relative_l2: if squared_signal == 0.0 {
+            0.0
+        } else {
+            (squared_error / squared_signal).sqrt() as f32
+        },
     }
 }
 
@@ -204,16 +296,21 @@ impl QuantizedTensor {
 
         for row in src.chunks_exact(cols) {
             for group in row.chunks(group_size) {
-                let max_abs = group.iter().copied().map(f32::abs).fold(0.0, f32::max);
-                let scale = if max_abs == 0.0 {
-                    1.0
+                let scale = if quant_type == QuantType::Q2S4 {
+                    q2s4_scale(group, Q2S4_INNER_RATIO)
                 } else {
-                    max_abs / quant_type.qmax() as f32
+                    let max_abs = group.iter().copied().map(f32::abs).fold(0.0, f32::max);
+                    if max_abs == 0.0 {
+                        1.0
+                    } else {
+                        max_abs / quant_type.qmax() as f32
+                    }
                 };
-                scales.push(f16::from_f32(scale));
+                let scale = f16::from_f32(scale);
+                scales.push(scale);
                 let start = data.len();
                 data.resize(start + packed_len(group.len(), quant_type), 0);
-                pack_scaled(group, scale, &mut data[start..], quant_type);
+                pack_scaled(group, scale.to_f32(), &mut data[start..], quant_type);
             }
         }
 
@@ -737,7 +834,7 @@ impl QuantizedTensor {
                 let packed = &self.data[data_offset..data_offset + bytes];
                 for offset in 0..len {
                     let code = unpack_code(packed, offset, self.quant_type);
-                    let value = (code as i32 - self.quant_type.qmax()) as f32 * scale;
+                    let value = decode_scaled(code, scale, self.quant_type);
                     accumulator += value * input[column + offset];
                 }
                 remaining -= len;
@@ -769,7 +866,7 @@ impl QuantizedTensor {
             let packed = &self.data[data_offset..data_offset + bytes];
             for offset in 0..len {
                 let code = unpack_code(packed, offset, self.quant_type);
-                output.push((code as i32 - self.quant_type.qmax()) as f32 * scale);
+                output.push(decode_scaled(code, scale, self.quant_type));
             }
             remaining -= len;
             group += 1;
@@ -1185,6 +1282,11 @@ fn mat_vec_q4k(tensor: &QuantizedTensor, input: &[f32]) -> Vec<f32> {
 }
 
 fn pack_values(values: &[f32], dst: &mut [u8], bits: QuantType) {
+    if bits == QuantType::Q2S4 {
+        let scale = f16::from_f32(q2s4_scale(values, Q2S4_INNER_RATIO)).to_f32();
+        pack_scaled(values, scale, dst, bits);
+        return;
+    }
     let max_abs = values.iter().copied().map(f32::abs).fold(0.0, f32::max);
     let scale = if max_abs == 0.0 {
         1.0
@@ -1198,10 +1300,15 @@ fn pack_scaled(values: &[f32], scale: f32, dst: &mut [u8], bits: QuantType) {
     dst.fill(0);
     let mask = (1_u8 << bits.bits()) - 1;
     for (index, value) in values.iter().enumerate() {
-        let quantized = (value / scale)
-            .round()
-            .clamp(-(bits.qmax() as f32), bits.qmax() as f32) as i32;
-        let code = (quantized + bits.qmax()) as u8;
+        let code = if bits == QuantType::Q2S4 {
+            q2s4_code(*value, scale, Q2S4_INNER_RATIO)
+        } else {
+            let quantized = (value / scale)
+                .round()
+                .clamp(-(bits.qmax() as f32), bits.qmax() as f32)
+                as i32;
+            (quantized + bits.qmax()) as u8
+        };
         let bit = index * bits.bits();
         let byte = bit / 8;
         let shift = bit % 8;
@@ -1238,7 +1345,58 @@ fn unpack_scaled(src: &[u8], dst: &mut [f32], scale: f32, bits: QuantType) {
         if shift + bits.bits() > 8 {
             code |= (src[byte + 1] << (8 - shift)) & mask;
         }
-        *value = (code as i32 - bits.qmax()) as f32 * scale;
+        *value = decode_scaled(code, scale, bits);
+    }
+}
+
+fn q2s4_scale(values: &[f32], inner_ratio: f32) -> f32 {
+    let mut scale = values.iter().copied().map(f32::abs).fold(0.0, f32::max);
+    if scale == 0.0 {
+        return 1.0;
+    }
+    for _ in 0..8 {
+        let threshold = scale * (1.0 + inner_ratio) * 0.5;
+        let mut numerator = 0.0_f32;
+        let mut denominator = 0.0_f32;
+        for &value in values {
+            let magnitude = if value.abs() < threshold {
+                inner_ratio
+            } else {
+                1.0
+            };
+            let level = if value < 0.0 { -magnitude } else { magnitude };
+            numerator += value * level;
+            denominator += level * level;
+        }
+        if denominator > 0.0 {
+            scale = numerator / denominator;
+        }
+    }
+    scale
+}
+
+fn q2s4_code(value: f32, scale: f32, inner_ratio: f32) -> u8 {
+    let outer = value.abs() >= scale * (1.0 + inner_ratio) * 0.5;
+    match (value < 0.0, outer) {
+        (true, true) => 0,
+        (true, false) => 1,
+        (false, false) => 2,
+        (false, true) => 3,
+    }
+}
+
+fn decode_scaled(code: u8, scale: f32, bits: QuantType) -> f32 {
+    if bits == QuantType::Q2S4 {
+        let level = match code {
+            0 => -1.0,
+            1 => -Q2S4_INNER_RATIO,
+            2 => Q2S4_INNER_RATIO,
+            3 => 1.0,
+            _ => unreachable!("2-bit code exceeds the codebook"),
+        };
+        level * scale
+    } else {
+        (code as i32 - bits.qmax()) as f32 * scale
     }
 }
 
@@ -1249,12 +1407,12 @@ mod tests {
     #[test]
     fn all_codecs_round_trip_with_bounded_error() {
         let input = (0..32).map(|i| (i as f32 - 16.0) / 7.0).collect::<Vec<_>>();
-        for quant_type in [QuantType::Q2, QuantType::Q3, QuantType::Q4] {
+        for quant_type in [QuantType::Q2, QuantType::Q2S4, QuantType::Q3, QuantType::Q4] {
             let q = QuantizedTensor::quantize(&input, 1, input.len(), quant_type, 32);
             assert_eq!(
                 q.data.len(),
                 match quant_type {
-                    QuantType::Q2 => 8,
+                    QuantType::Q2 | QuantType::Q2S4 => 8,
                     QuantType::Q3 => 12,
                     QuantType::Q4 => 16,
                     QuantType::Q4K => unreachable!(),
@@ -1266,6 +1424,19 @@ mod tests {
                 q.relative_l2(&input)
             );
         }
+    }
+
+    #[test]
+    fn symmetric_four_level_q2_uses_the_same_storage_but_lowers_error() {
+        let input = (0..1024)
+            .map(|index| ((index as f32 * 0.173).sin() + (index as f32 * 0.071).cos()) * 0.2)
+            .collect::<Vec<_>>();
+        let legacy = QuantizedTensor::quantize(&input, 1, input.len(), QuantType::Q2, 32);
+        let symmetric = q2_symmetric4_metrics(&input, 1, input.len(), 32, 1.0 / 3.0);
+        let codec = QuantizedTensor::quantize(&input, 1, input.len(), QuantType::Q2S4, 32);
+        assert_eq!(legacy.bytes(), input.len() / 4 + input.len() / 32 * 2);
+        assert!(symmetric.relative_l2 < legacy.relative_l2(&input));
+        assert!(codec.relative_l2(&input) < legacy.relative_l2(&input));
     }
 
     #[test]

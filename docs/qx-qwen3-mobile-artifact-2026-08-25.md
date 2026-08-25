@@ -4,14 +4,16 @@ Date: 2026-08-25
 Source: `Qwen/Qwen3-30B-A3B` at
 `ad44e777bcd18fa416d9da3bd8f70d33ebb85d39`  
 Target: iPhone 17 Pro-class / Apple A19 Pro  
-Status: source and capacity artifact complete; quality and execution not promoted
+Status: source and Q2S4 capacity candidate complete; quality and execution not promoted
 
 ## Result
 
 QX now has a hash-gated source checkpoint and a complete, reproducible
-Q2-expert/Q4-shared capacity artifact for the unmodified Qwen shape. This is
-the first complete Qwen `.qx` file, but it is deliberately marked as a capacity
-baseline rather than an application model.
+Q2S4-expert/Q4-shared capacity artifact for the unmodified Qwen shape. Q2S4 is
+a symmetric four-level 2-bit codec with levels `[-1, -0.32, 0.32, 1]`. It uses
+the same payload and FP16 scale bytes as Q2, while the offline compiler refines
+each group scale with a least-squares/Lloyd iteration. The file is deliberately
+marked as a capacity/quality candidate rather than an application model.
 
 The source audit passed:
 
@@ -25,7 +27,7 @@ The generated baseline is stored outside Git at:
 
 ```text
 /Users/blas/projects/qx/external/models/
-  qwen3-30b-a3b-a19pro-q2-capacity-baseline.qx
+  qwen3-30b-a3b-a19pro-q2s4-capacity-candidate.qx
 ```
 
 Its immutable identity and layout are:
@@ -33,9 +35,9 @@ Its immutable identity and layout are:
 | Field | Value |
 |---|---:|
 | File bytes | 9,927,917,568 (9.246 GiB) |
-| SHA-256 | `a9ed2b8f13d9b3facead70207cdb735ab3519797e1807732a313b445528dd377` |
+| SHA-256 | `7262a69d8230f0f78dcd12266035fedff5e9145dcace504c93fc27ccadef91c4` |
 | Tensor entries | 12,723 |
-| Native Q2 expert entries | 12,288 |
+| Native Q2S4 expert entries | 12,288 |
 | Q4 shared/dense entries | 242 |
 | Raw norm vectors | 193 |
 | Gate/up expert entries | 6,144 |
@@ -48,6 +50,25 @@ The artifact writer was changed to stream planned tensor slabs directly to the
 file. It no longer constructs a complete payload blob and then a second
 complete output buffer. This removes roughly 20 GiB of avoidable transient
 copies for this build and makes conversion viable on the 24 GiB M5 Pro.
+
+## Same-byte Q2 correction
+
+The legacy Q2 encoder only emitted codes for -1, 0, and +1 even though two bits
+carry four codes; its fourth code was unreachable. It also decoded the unused
+code asymmetrically as +2. Q2S4 is a separately tagged codec so existing Q2
+artifacts keep their original semantics.
+
+On sampled early, middle, and final Qwen experts, the best four-level inner
+ratio stayed within 0.30-0.32. The fixed 0.32 production codec produced:
+
+| Sample | Legacy Q2 relative L2 | Q2S4 relative L2 |
+|---|---:|---:|
+| Layer 0, expert 0, gate/up/down | 0.659-0.662 | 0.336-0.339 |
+| Layer 24, expert 64, gate/up/down oracle | 0.662-0.663 | 0.339-0.341 |
+| Layer 47, expert 127, gate/up/down oracle | 0.662-0.667 | 0.340-0.357 |
+
+This roughly halves weight reconstruction error at zero capacity cost. It is a
+necessary correction, not proof that 2-bit end-to-end model quality is good.
 
 ## Structural target
 
@@ -64,11 +85,10 @@ overhead remains too close to a 12 GB phone's practical application ceiling.
 
 ## Why this is not yet the release model
 
-The sampled BF16 expert has approximately 0.66 relative weight L2 error under
-plain group-32 symmetric Q2. That metric is not equivalent to NLL, but it is
-far too large to assume acceptable model quality. The artifact therefore seals
-zero expected dispatches and Granite Runtime V2 explicitly rejects its Qwen
-topology.
+The improved codec still has approximately 0.34 relative weight L2 error. That
+metric is not equivalent to NLL, and no teacher-forced perplexity or task suite
+has promoted it. The artifact therefore seals zero expected dispatches and
+Granite Runtime V2 explicitly rejects its Qwen topology.
 
 Promotion still requires:
 
@@ -77,11 +97,11 @@ Promotion still requires:
    the 1% / 2% gates;
 3. Qwen semantic parity for Q/K norm, RoPE, GQA, router normalization, untied
    logits, tokenizer, and chat template;
-4. consumer-native Q2/Q3 mixed-bit Metal kernels at Qwen shapes;
+4. consumer-native Q2S4/Q3 mixed-bit Metal kernels at Qwen shapes;
 5. measured iPhone physical footprint, jetsam, thermal, energy, and sustained
    throughput gates.
 
-Do not distribute the capacity baseline as a user-facing model.
+Do not distribute the capacity candidate as a user-facing model.
 
 ## Reproduce
 
@@ -94,11 +114,11 @@ target/release/qx-inspect \
 target/release/qx-compile-qwen \
   /Users/blas/projects/qx/external/models/qwen3-30b-a3b-hf-ad44e777 \
   --source-audit benchmarks/results/qwen3-30b-a3b-bf16-source-audit-2026-08-25.json \
-  --expert-bits q2 --context 4096 \
-  --plan-id qwen3-30b-a3b-a19pro-q2-capacity-baseline \
-  --output /Users/blas/projects/qx/external/models/qwen3-30b-a3b-a19pro-q2-capacity-baseline.qx
+  --expert-bits q2_s4 --context 4096 \
+  --plan-id qwen3-a19pro-q2s4-capacity-candidate \
+  --output /Users/blas/projects/qx/external/models/qwen3-30b-a3b-a19pro-q2s4-capacity-candidate.qx
 
 target/release/qx-inspect \
-  --artifact /Users/blas/projects/qx/external/models/qwen3-30b-a3b-a19pro-q2-capacity-baseline.qx \
-  --audit-output benchmarks/results/qwen3-30b-a3b-a19pro-q2-capacity-artifact-2026-08-25.json
+  --artifact /Users/blas/projects/qx/external/models/qwen3-30b-a3b-a19pro-q2s4-capacity-candidate.qx \
+  --audit-output benchmarks/results/qwen3-30b-a3b-a19pro-q2s4-capacity-artifact-2026-08-25.json
 ```

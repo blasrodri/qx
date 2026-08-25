@@ -19,6 +19,12 @@ inline uint qx_scale_offset(uint row, uint group, uint groups, uint layout) {
     return (row / 32) * 32 * groups + group * 32 + row % 32;
 }
 
+inline float qx_q2s4_decode(uint code, float scale) {
+    constexpr float inner = 0.32f;
+    float level = code == 0 ? -1.0f : (code == 1 ? -inner : (code == 2 ? inner : 1.0f));
+    return level * scale;
+}
+
 // One output row per thread. Values remain packed until the multiply.
 kernel void qx_q2_gemv(
     device const uchar* packed [[buffer(0)]],
@@ -38,6 +44,28 @@ kernel void qx_q2_gemv(
         uchar byte = packed[row * groups * bytes_per_group + group * bytes_per_group + local / 4];
         uint code = (byte >> ((local % 4) * 2)) & 0x3;
         float weight = (float(int(code) - int(qmax))) * float(scales[row * groups + group]);
+        sum += weight * float(input[column]);
+    }
+    output[row] = half(sum);
+}
+
+kernel void qx_q2s4_gemv(
+    device const uchar* packed [[buffer(0)]],
+    device const half* scales [[buffer(1)]],
+    device const half* input [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    constant uint& cols [[buffer(4)]],
+    uint row [[thread_position_in_grid]]) {
+    constexpr uint group_size = 32;
+    constexpr uint bytes_per_group = 8;
+    uint groups = (cols + group_size - 1) / group_size;
+    float sum = 0.0f;
+    for (uint column = 0; column < cols; ++column) {
+        uint group = column / group_size;
+        uint local = column % group_size;
+        uchar byte = packed[row * groups * bytes_per_group + group * bytes_per_group + local / 4];
+        uint code = (byte >> ((local % 4) * 2)) & 0x3;
+        float weight = qx_q2s4_decode(code, float(scales[row * groups + group]));
         sum += weight * float(input[column]);
     }
     output[row] = half(sum);
@@ -90,6 +118,57 @@ kernel void qx_q2_expert(
         uchar byte = down_packed[base + local / 4];
         uint code = (byte >> ((local % 4) * 2)) & 0x3;
         float weight = float(int(code) - int(qmax)) * float(down_scales[qx_scale_offset(row, group, down_groups, layout)]);
+        down_sum += weight * float(activated[column]);
+    }
+    output[row] = half(down_sum);
+}
+
+kernel void qx_q2s4_expert(
+    device const uchar* gate_up_packed [[buffer(0)]],
+    device const half* gate_up_scales [[buffer(1)]],
+    device const uchar* down_packed [[buffer(2)]],
+    device const half* down_scales [[buffer(3)]],
+    device const half* input [[buffer(4)]],
+    device half* output [[buffer(5)]],
+    constant uint& layout [[buffer(6)]],
+    uint row [[thread_position_in_threadgroup]]) {
+    constexpr uint hidden = 1024;
+    constexpr uint intermediate = 512;
+    constexpr uint group_size = 32;
+    constexpr uint bytes_per_group = 8;
+    constexpr uint groups = hidden / group_size;
+    threadgroup half gate_up[hidden];
+    threadgroup half activated[intermediate];
+
+    float gate_up_sum = 0.0f;
+    for (uint column = 0; column < hidden; ++column) {
+        uint group = column / group_size;
+        uint local = column % group_size;
+        uint base = qx_group_offset(row, group, groups, bytes_per_group, layout);
+        uchar byte = gate_up_packed[base + local / 4];
+        uint code = (byte >> ((local % 4) * 2)) & 0x3;
+        float weight = qx_q2s4_decode(code, float(gate_up_scales[qx_scale_offset(row, group, groups, layout)]));
+        gate_up_sum += weight * float(input[column]);
+    }
+    gate_up[row] = half(gate_up_sum);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row < intermediate) {
+        float gate = float(gate_up[row]);
+        float up = float(gate_up[intermediate + row]);
+        activated[row] = half((gate / (1.0f + exp(-gate))) * up);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float down_sum = 0.0f;
+    for (uint column = 0; column < intermediate; ++column) {
+        uint group = column / group_size;
+        uint local = column % group_size;
+        uint down_groups = intermediate / group_size;
+        uint base = qx_group_offset(row, group, down_groups, bytes_per_group, layout);
+        uchar byte = down_packed[base + local / 4];
+        uint code = (byte >> ((local % 4) * 2)) & 0x3;
+        float weight = qx_q2s4_decode(code, float(down_scales[qx_scale_offset(row, group, down_groups, layout)]));
         down_sum += weight * float(activated[column]);
     }
     output[row] = half(down_sum);

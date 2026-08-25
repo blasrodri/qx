@@ -207,7 +207,7 @@ impl ExpertSensitivity {
 
     pub fn error_for(&self, quant_type: QuantType) -> f32 {
         match quant_type {
-            QuantType::Q2 => self.q2_error,
+            QuantType::Q2 | QuantType::Q2S4 => self.q2_error,
             QuantType::Q3 => self.q3_error,
             QuantType::Q4 => self.q4_error,
             QuantType::Q4K => self.q4_error,
@@ -383,9 +383,13 @@ pub fn allocate_with_minimum_options(
     let mut selected = sensitivities
         .iter()
         .map(|item| match minimum {
-            QuantType::Q2 if item.q2_error.is_finite() => QuantType::Q2,
-            QuantType::Q2 | QuantType::Q3 if allow_q3 && item.q3_error.is_finite() => QuantType::Q3,
-            QuantType::Q4 | QuantType::Q3 | QuantType::Q2 => QuantType::Q4,
+            QuantType::Q2 | QuantType::Q2S4 if item.q2_error.is_finite() => minimum,
+            QuantType::Q2 | QuantType::Q2S4 | QuantType::Q3
+                if allow_q3 && item.q3_error.is_finite() =>
+            {
+                QuantType::Q3
+            }
+            QuantType::Q4 | QuantType::Q3 | QuantType::Q2 | QuantType::Q2S4 => QuantType::Q4,
             QuantType::Q4K => QuantType::Q4,
         })
         .collect::<Vec<_>>();
@@ -404,8 +408,10 @@ pub fn allocate_with_minimum_options(
             .enumerate()
             .filter_map(|(index, item)| {
                 let next = match selected[index] {
-                    QuantType::Q2 if allow_q3 && minimum <= QuantType::Q3 => QuantType::Q3,
-                    QuantType::Q2 => QuantType::Q4,
+                    QuantType::Q2 | QuantType::Q2S4 if allow_q3 && minimum <= QuantType::Q3 => {
+                        QuantType::Q3
+                    }
+                    QuantType::Q2 | QuantType::Q2S4 => QuantType::Q4,
                     QuantType::Q3 if allow_q3 => QuantType::Q4,
                     QuantType::Q3 => return None,
                     QuantType::Q4 => return None,
