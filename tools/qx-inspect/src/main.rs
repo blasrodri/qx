@@ -142,10 +142,20 @@ struct ArtifactAudit {
     raw_entries: usize,
     gate_up_entries: usize,
     down_entries: usize,
+    storage: ArtifactStorageAudit,
     memory_plan: ArtifactMemoryAudit,
     model_shape: Option<ModelShape>,
     plan_id: Option<String>,
     limitations: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactStorageAudit {
+    expert_bytes: u64,
+    dense_quantized_bytes: u64,
+    raw_vector_bytes: u64,
+    directory_plan_and_alignment_bytes: u64,
+    trailing_slab_padding_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -296,8 +306,24 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
         && plan.is_some_and(|plan| plan.schedule.expected_dispatches_per_token == 0);
     let memory = info.memory_plan;
     let runtime_bytes = memory.total_bytes - memory.weights_bytes - memory.kv_cache_bytes;
+    let file_bytes = fs::metadata(path)?.len();
+    let expert_bytes = unique_entry_payload_bytes(
+        info.entries
+            .iter()
+            .filter(|entry| entry.group_size != 0 && entry.is_expert()),
+    );
+    let dense_quantized_bytes = unique_entry_payload_bytes(
+        info.entries
+            .iter()
+            .filter(|entry| entry.group_size != 0 && !entry.is_expert()),
+    );
+    let raw_vector_bytes =
+        unique_entry_payload_bytes(info.entries.iter().filter(|entry| entry.group_size == 0));
+    let trailing_slab_padding_bytes = file_bytes
+        .saturating_sub(info.header.weights_offset)
+        .saturating_sub(info.header.weights_length);
     Ok(ArtifactAudit {
-        schema_version: 1,
+        schema_version: 2,
         classification: if q2s4_entries == 12_288 {
             "qwen3-a19pro-q2s4-capacity-candidate-artifact"
         } else {
@@ -306,7 +332,7 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
         capacity_baseline_complete: complete,
         execution_promoted: false,
         artifact_sha256: sha256_file(path)?,
-        file_bytes: fs::metadata(path)?.len(),
+        file_bytes,
         model_id: info.header.model_id.clone(),
         target_id: info.header.target_id.clone(),
         context_limit: info.header.context_limit,
@@ -317,6 +343,13 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
         raw_entries,
         gate_up_entries,
         down_entries,
+        storage: ArtifactStorageAudit {
+            expert_bytes,
+            dense_quantized_bytes,
+            raw_vector_bytes,
+            directory_plan_and_alignment_bytes: info.header.weights_offset,
+            trailing_slab_padding_bytes,
+        },
         memory_plan: ArtifactMemoryAudit {
             weights_bytes: memory.weights_bytes,
             kv_cache_bytes: memory.kv_cache_bytes,
@@ -333,6 +366,21 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
     })
 }
 
+fn unique_entry_payload_bytes<'a>(
+    entries: impl Iterator<Item = &'a qx_format::TensorDirectoryEntry>,
+) -> u64 {
+    let mut ranges = std::collections::BTreeSet::<(u64, u64)>::new();
+    for entry in entries {
+        if entry.scale_length != 0 {
+            ranges.insert((entry.scale_offset, entry.scale_length));
+        }
+        if entry.data_length != 0 {
+            ranges.insert((entry.data_offset, entry.data_length));
+        }
+    }
+    ranges.into_iter().map(|(_, length)| length).sum()
+}
+
 fn print_artifact_audit(audit: &ArtifactAudit) {
     println!("QX Artifact Inspector\n");
     println!("model:              {}", audit.model_id);
@@ -346,6 +394,20 @@ fn print_artifact_audit(audit: &ArtifactAudit) {
     println!(
         "gate-up/down:       {}/{}",
         audit.gate_up_entries, audit.down_entries
+    );
+    println!("expert payload:     {}", audit.storage.expert_bytes);
+    println!(
+        "dense quantized:    {}",
+        audit.storage.dense_quantized_bytes
+    );
+    println!("raw vectors:        {}", audit.storage.raw_vector_bytes);
+    println!(
+        "metadata/alignment: {}",
+        audit.storage.directory_plan_and_alignment_bytes
+    );
+    println!(
+        "slab tail padding:  {}",
+        audit.storage.trailing_slab_padding_bytes
     );
     println!("logical weights:    {}", audit.memory_plan.weights_bytes);
     println!("logical total:      {}", audit.memory_plan.total_bytes);

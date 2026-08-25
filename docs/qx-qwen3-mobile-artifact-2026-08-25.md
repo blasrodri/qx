@@ -46,6 +46,21 @@ Its immutable identity and layout are:
 | FP16 KV bytes at context 4K | 402,653,184 |
 | Known logical total | 10,331,178,496 (9.622 GiB) |
 
+The artifact inspector now reports the physical payload ledger rather than
+leaving the total as a single number:
+
+| Payload | Bytes | Share of logical weights |
+|---|---:|---:|
+| Q2S4 experts | 9,059,696,640 | 91.26% |
+| Q4 shared/dense | 866,746,368 | 8.73% |
+| Raw vectors | 843,776 | 0.01% |
+| Directory, plan and leading alignment | 622,592 | file overhead |
+| Trailing slab padding | 8,192 | file overhead |
+
+This rules out metadata, tensor-directory packing and runtime scratch as useful
+capacity targets. Sparse top-8 routing reduces the active computation but does
+not remove any of the 128 experts per layer from resident model storage.
+
 The artifact writer was changed to stream planned tensor slabs directly to the
 file. It no longer constructs a complete payload blob and then a second
 complete output buffer. This removes roughly 20 GiB of avoidable transient
@@ -72,7 +87,7 @@ necessary correction, not proof that 2-bit end-to-end model quality is good.
 
 ## Structural target
 
-The audited projection for a jointly trained width-672 student is:
+The earlier first-step projection for a jointly trained width-672 student is:
 
 | Payload | Bytes | GiB |
 |---|---:|---:|
@@ -82,6 +97,24 @@ The audited projection for a jointly trained width-672 student is:
 That is the first tier with credible room for runtime allocations and iOS
 headroom. The unmodified-width baseline at 9.622 GiB before complete runtime
 overhead remains too close to a 12 GB phone's practical application ceiling.
+
+It is not, however, "way under" a 12 GiB physical ceiling. The stronger product
+target is width 512, with width 576 as an intermediate quality bracket. These
+projections preserve the current Q2S4 expert and Q4 dense codecs and scale only
+the joint gate/up/down expert width:
+
+| Expert width | Logical weights | Plus FP16 KV at 4K | Device headroom from 12 GiB |
+|---:|---:|---:|---:|
+| 768 (current) | 9.246 GiB | 9.621 GiB | 2.379 GiB |
+| 672 | 8.191 GiB | 8.566 GiB | 3.434 GiB |
+| 576 | 7.136 GiB | 7.511 GiB | 4.489 GiB |
+| 512 | 6.433 GiB | 6.808 GiB | 5.192 GiB |
+
+Width 512 removes one third of every expert's intermediate neurons and cuts the
+complete weight payload by 3.020 GB without relying on expert paging. It is a
+new trained model, not a file-format conversion: gate, up and down must be
+jointly distilled or fine-tuned, then the resulting student must pass the
+sealed perplexity and task gates before QX emits its deployable artifact.
 
 ## Why this is not yet the release model
 
