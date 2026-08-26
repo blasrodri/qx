@@ -339,6 +339,42 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Compare several jointly distilled gate/up/down students simultaneously.
+    MultiJointExpertStudentNll {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long = "corpus", required = true)]
+        corpora: Vec<PathBuf>,
+        #[arg(long = "student", required = true)]
+        students: Vec<PathBuf>,
+        /// Skip this many scoreable corpus paragraphs before evaluation.
+        #[arg(long, default_value_t = 0)]
+        skip_sequences: usize,
+        #[arg(long, default_value_t = 64)]
+        max_sequences: usize,
+        #[arg(long, default_value_t = 96)]
+        max_tokens_per_sequence: usize,
+        #[arg(long, default_value_t = 128)]
+        context: usize,
+        #[arg(long, default_value_t = 48)]
+        layers: usize,
+        #[arg(long, default_value_t = 128)]
+        experts: usize,
+        #[arg(long, default_value_t = 8)]
+        top_k: usize,
+        #[arg(long, default_value_t = -1)]
+        gpu_layers: i32,
+        #[arg(long, default_value_t = 4)]
+        threads: i32,
+        #[arg(long, default_value_t = DEFAULT_EXPERT_NEURONS)]
+        expert_neurons: usize,
+        #[arg(long, default_value_t = 2048)]
+        hidden_size: usize,
+        #[arg(long)]
+        model_sha256: Option<String>,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Compare several simultaneously active folded students with the teacher.
     MultiExpertStudentNll {
         #[arg(long)]
@@ -857,6 +893,35 @@ struct MultiExpertStudentResult {
     student_route_hits: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct MultiJointExpertStudentNllReport {
+    schema_version: u32,
+    classification: &'static str,
+    promotion_evidence: bool,
+    quality_semantics: &'static str,
+    model_sha256: String,
+    corpora: Vec<String>,
+    students: Vec<MultiJointExpertStudentResult>,
+    skipped_sequences: usize,
+    sequences: usize,
+    scored_tokens: usize,
+    exact_mean_nll: f64,
+    student_mean_nll: f64,
+    nll_delta: f64,
+    relative_perplexity_delta: f64,
+    top1_agreement: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct MultiJointExpertStudentResult {
+    layer: usize,
+    expert: u16,
+    width: usize,
+    sidecar: String,
+    exact_route_hits: usize,
+    student_route_hits: usize,
+}
+
 #[derive(Default)]
 struct StructuredCalibration {
     token_positions: usize,
@@ -1198,6 +1263,41 @@ fn main() -> Result<()> {
             model_sha256,
             output,
         }),
+        Command::MultiJointExpertStudentNll {
+            model,
+            corpora,
+            students,
+            skip_sequences,
+            max_sequences,
+            max_tokens_per_sequence,
+            context,
+            layers,
+            experts,
+            top_k,
+            gpu_layers,
+            threads,
+            expert_neurons,
+            hidden_size,
+            model_sha256,
+            output,
+        } => multi_joint_expert_student_nll(MultiJointExpertStudentNllArgs {
+            model,
+            corpora,
+            students,
+            skip_sequences,
+            max_sequences,
+            max_tokens_per_sequence,
+            context,
+            layers,
+            experts,
+            top_k,
+            gpu_layers,
+            threads,
+            expert_neurons,
+            hidden_size,
+            model_sha256,
+            output,
+        }),
         Command::MultiExpertStudentNll {
             model,
             corpora,
@@ -1344,6 +1444,25 @@ struct MultiExpertStudentNllArgs {
     model: PathBuf,
     corpora: Vec<PathBuf>,
     students: Vec<String>,
+    max_sequences: usize,
+    max_tokens_per_sequence: usize,
+    context: usize,
+    layers: usize,
+    experts: usize,
+    top_k: usize,
+    gpu_layers: i32,
+    threads: i32,
+    expert_neurons: usize,
+    hidden_size: usize,
+    model_sha256: Option<String>,
+    output: PathBuf,
+}
+
+struct MultiJointExpertStudentNllArgs {
+    model: PathBuf,
+    corpora: Vec<PathBuf>,
+    students: Vec<PathBuf>,
+    skip_sequences: usize,
     max_sequences: usize,
     max_tokens_per_sequence: usize,
     context: usize,
@@ -2123,6 +2242,173 @@ fn measure_corpus_nll(
 }
 
 #[cfg(target_os = "macos")]
+fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Result<()> {
+    if !args.model.is_file()
+        || args.corpora.is_empty()
+        || args.corpora.iter().any(|path| !path.is_file())
+        || args.students.is_empty()
+        || args.students.iter().any(|path| !path.is_file())
+    {
+        bail!("model, corpus, and joint student inputs must exist");
+    }
+    if args.max_sequences == 0
+        || args.max_tokens_per_sequence < 2
+        || args.max_tokens_per_sequence > args.context
+    {
+        bail!("multi-joint-student corpus arguments are invalid");
+    }
+    let model_hash = match args.model_sha256.as_ref() {
+        Some(value) => {
+            validate_sha256(value)?;
+            value.clone()
+        }
+        None => sha256_file(&args.model)?,
+    };
+    let mut targets = HashSet::new();
+    let mut students = Vec::new();
+    for path in &args.students {
+        let student = read_joint_expert_student(path)?;
+        if student.layer >= args.layers
+            || usize::from(student.expert) >= args.experts
+            || student.hidden != args.hidden_size
+            || student.teacher_width != args.expert_neurons
+        {
+            bail!(
+                "joint student {} does not match the requested model",
+                path.display()
+            );
+        }
+        if !targets.insert((student.layer, student.expert)) {
+            bail!(
+                "duplicate joint student target {}:{}",
+                student.layer,
+                student.expert
+            );
+        }
+        students.push((path.clone(), student));
+    }
+    let mut capture = llama_capture::Capture::open(
+        &args.model,
+        llama_capture::OpenConfig {
+            context: args.context,
+            layers: args.layers,
+            experts: args.experts,
+            top_k: args.top_k,
+            gpu_layers: args.gpu_layers,
+            threads: args.threads,
+            intermediate: Some(args.expert_neurons),
+            hidden: args.hidden_size,
+            sample: None,
+            sample_all_layer: None,
+            capture_all_routes: true,
+            capture_all_activations: true,
+            contribution_packet_neurons: &[],
+        },
+    )?;
+    let mut sequences = Vec::new();
+    let mut scoreable_seen = 0usize;
+    for path in &args.corpora {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("read corpus {}", path.display()))?;
+        for paragraph in split_corpus_paragraphs(&contents) {
+            if sequences.len() >= args.max_sequences {
+                break;
+            }
+            let mut tokens = capture.tokenize(&paragraph)?;
+            tokens.truncate(args.max_tokens_per_sequence);
+            if tokens.len() >= 2 {
+                if scoreable_seen < args.skip_sequences {
+                    scoreable_seen += 1;
+                    continue;
+                }
+                sequences.push(tokens);
+            }
+        }
+        if sequences.len() >= args.max_sequences {
+            break;
+        }
+    }
+    if sequences.is_empty() {
+        bail!("corpus produced no scoreable token sequences");
+    }
+    let target_pairs = students
+        .iter()
+        .map(|(_, student)| (student.layer, student.expert))
+        .collect::<Vec<_>>();
+    let exact = measure_multi_corpus_nll(&mut capture, &sequences, &target_pairs)?;
+    for (_, student) in &students {
+        capture.add_joint_expert_student(student)?;
+    }
+    let student_measurement = measure_multi_corpus_nll(&mut capture, &sequences, &target_pairs)?;
+    if exact.scored_tokens != student_measurement.scored_tokens
+        || exact.top1_tokens.len() != student_measurement.top1_tokens.len()
+    {
+        bail!("exact and multi-joint-student passes produced incompatible measurements");
+    }
+    let exact_mean_nll = exact.mean_nll();
+    let student_mean_nll = student_measurement.mean_nll();
+    let top1_matches = exact
+        .top1_tokens
+        .iter()
+        .zip(&student_measurement.top1_tokens)
+        .filter(|(exact, student)| exact == student)
+        .count();
+    let report = MultiJointExpertStudentNllReport {
+        schema_version: 1,
+        classification: "simultaneous-joint-expert-student-corpus-nll-control",
+        promotion_evidence: false,
+        quality_semantics: "teacher-forced-corpus-nll-with-multiple-gate-up-down-experts-replaced",
+        model_sha256: model_hash,
+        corpora: args
+            .corpora
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        students: students
+            .iter()
+            .zip(exact.route_hits.iter().zip(&student_measurement.route_hits))
+            .map(
+                |((path, student), (&exact_route_hits, &student_route_hits))| {
+                    MultiJointExpertStudentResult {
+                        layer: student.layer,
+                        expert: student.expert,
+                        width: student.width,
+                        sidecar: path.display().to_string(),
+                        exact_route_hits,
+                        student_route_hits,
+                    }
+                },
+            )
+            .collect(),
+        skipped_sequences: args.skip_sequences,
+        sequences: sequences.len(),
+        scored_tokens: exact.scored_tokens,
+        exact_mean_nll,
+        student_mean_nll,
+        nll_delta: student_mean_nll - exact_mean_nll,
+        relative_perplexity_delta: (student_mean_nll - exact_mean_nll).exp() - 1.0,
+        top1_agreement: top1_matches as f64 / exact.top1_tokens.len().max(1) as f64,
+    };
+    let mut writer = BufWriter::new(
+        File::create(&args.output).with_context(|| format!("create {}", args.output.display()))?,
+    );
+    serde_json::to_writer_pretty(&mut writer, &report)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    println!(
+        "multi-joint students {}, sequences {}, scored {}, NLL {:.6} -> {:.6} ({:+.4}% PPL), top1 {:.2}%",
+        report.students.len(),
+        report.sequences,
+        report.scored_tokens,
+        exact_mean_nll,
+        student_mean_nll,
+        report.relative_perplexity_delta * 100.0,
+        report.top1_agreement * 100.0,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn multi_expert_student_nll(args: MultiExpertStudentNllArgs) -> Result<()> {
     if !args.model.is_file()
         || args.corpora.is_empty()
@@ -2326,6 +2612,11 @@ fn measure_multi_corpus_nll(
 #[cfg(not(target_os = "macos"))]
 fn multi_expert_student_nll(_args: MultiExpertStudentNllArgs) -> Result<()> {
     bail!("multi-expert student NLL currently requires the macOS llama.cpp bridge")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn multi_joint_expert_student_nll(_args: MultiJointExpertStudentNllArgs) -> Result<()> {
+    bail!("multi-joint expert student NLL currently requires the macOS llama.cpp bridge")
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -4881,6 +5172,18 @@ mod llama_capture {
             down_weights: *const f32,
             down_count: c_int,
         ) -> c_int;
+        fn qx_llama_route_add_joint_expert_student(
+            route: *mut c_void,
+            layer: c_int,
+            expert: c_int,
+            width: c_int,
+            gate_weights: *const f32,
+            gate_count: c_int,
+            up_weights: *const f32,
+            up_count: c_int,
+            down_weights: *const f32,
+            down_count: c_int,
+        ) -> c_int;
         fn qx_llama_route_add_expert_student(
             route: *mut c_void,
             layer: c_int,
@@ -5121,6 +5424,27 @@ mod llama_capture {
             let status = unsafe {
                 qx_llama_route_set_joint_expert_student(
                     self.raw,
+                    student.width.try_into()?,
+                    student.gate.as_ptr(),
+                    student.gate.len().try_into()?,
+                    student.up.as_ptr(),
+                    student.up.len().try_into()?,
+                    student.down.as_ptr(),
+                    student.down.len().try_into()?,
+                )
+            };
+            if status != 0 {
+                bail!("llama bridge rejected joint expert student with status {status}");
+            }
+            Ok(())
+        }
+
+        pub fn add_joint_expert_student(&mut self, student: &JointExpertStudent) -> Result<()> {
+            let status = unsafe {
+                qx_llama_route_add_joint_expert_student(
+                    self.raw,
+                    student.layer.try_into()?,
+                    c_int::from(student.expert),
                     student.width.try_into()?,
                     student.gate.as_ptr(),
                     student.gate.len().try_into()?,

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-width512-nine-expert-composition-smoke",
+  "promotion_evidence": false,
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "student_policy": {
+    "teacher_width": 768,
+    "student_width": 512,
+    "gate_codec": "q2s4",
+    "up_codec": "q3",
+    "down_codec": "q2s4"
+  },
+  "projected_complete_weight_bytes": 7712694272,
+  "projected_with_4k_fp16_kv_bytes": 8115347456,
+  "experts": [
+    {"layer": 2, "expert": 125, "tier": "high", "train_hits": 81, "heldout_hits": 34, "heldout_relative_l2": 0.5749648213386536, "heldout_cosine": 0.8123711943626404},
+    {"layer": 2, "expert": 16, "tier": "median", "train_hits": 20, "heldout_hits": 15, "heldout_relative_l2": 0.5046032071113586, "heldout_cosine": 0.853622317314148},
+    {"layer": 2, "expert": 124, "tier": "low", "train_hits": 5, "heldout_hits": 4, "heldout_relative_l2": 0.4298152029514313, "heldout_cosine": 0.8982973098754883},
+    {"layer": 24, "expert": 2, "tier": "high", "train_hits": 164, "heldout_hits": 61, "heldout_relative_l2": 0.6340978741645813, "heldout_cosine": 0.7715700268745422},
+    {"layer": 24, "expert": 73, "tier": "median", "train_hits": 36, "heldout_hits": 10, "heldout_relative_l2": 0.6164442300796509, "heldout_cosine": 0.7841919660568237},
+    {"layer": 24, "expert": 96, "tier": "low", "train_hits": 12, "heldout_hits": 5, "heldout_relative_l2": 0.4651847779750824, "heldout_cosine": 0.8805856704711914},
+    {"layer": 44, "expert": 6, "tier": "high", "train_hits": 229, "heldout_hits": 72, "heldout_relative_l2": 0.6195873618125916, "heldout_cosine": 0.769614040851593},
+    {"layer": 44, "expert": 56, "tier": "median", "train_hits": 19, "heldout_hits": 24, "heldout_relative_l2": 0.6786100268363953, "heldout_cosine": 0.7362918257713318},
+    {"layer": 44, "expert": 46, "tier": "low", "train_hits": 6, "heldout_hits": 11, "heldout_relative_l2": 0.5407765507698059, "heldout_cosine": 0.8398895263671875}
+  ],
+  "composition_replays": {
+    "development_heldout": {
+      "sequences": 4,
+      "scored_tokens": 88,
+      "relative_perplexity_delta": -0.034167489038612664,
+      "top1_agreement": 0.9204545454545454
+    },
+    "untouched_test_paragraphs": {
+      "skipped_sequences": 4,
+      "sequences": 4,
+      "scored_tokens": 143,
+      "relative_perplexity_delta": -0.01571639866813901,
+      "top1_agreement": 0.9300699300699301,
+      "exact_route_hits": [69, 12, 14, 98, 35, 6, 117, 24, 8]
+    }
+  },
+  "limitations": [
+    "nine of 6144 experts",
+    "WikiText-2 only",
+    "F32 diagnostic injection of dequantized packed-codec values",
+    "no task benchmark suite",
+    "no native width-512 runtime or iPhone measurement"
+  ]
+}

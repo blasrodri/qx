@@ -48,6 +48,15 @@ typedef struct qx_llama_route {
     float * sample_joint_up_weights;
     float * sample_joint_down_weights;
     float * sample_joint_activation;
+    int32_t joint_count;
+    int32_t * joint_layers;
+    int32_t * joint_experts;
+    int32_t * joint_widths;
+    float ** joint_gate_weights;
+    float ** joint_up_weights;
+    float ** joint_down_weights;
+    float ** joint_activations;
+    float * joint_output;
     int32_t student_count;
     int32_t * student_layers;
     int32_t * student_experts;
@@ -441,9 +450,7 @@ static bool qx_capture_expert_input(
         qx_llama_route * route,
         struct ggml_tensor * tensor,
         int32_t layer) {
-    if (layer != route->sample_layer) {
-        return true;
-    }
+    (void) layer;
     const struct ggml_tensor * input = qx_find_expert_input(tensor, route->hidden, 3);
     const struct ggml_type_traits * traits = input ? ggml_get_type_traits(input->type) : NULL;
     const size_t bytes = input ? ggml_nbytes(input) : 0;
@@ -475,6 +482,75 @@ static bool qx_has_student_layer(const qx_llama_route * route, int32_t layer) {
         }
     }
     return false;
+}
+
+static bool qx_has_joint_student_layer(const qx_llama_route * route, int32_t layer) {
+    for (int32_t index = 0; index < route->joint_count; ++index) {
+        if (route->joint_layers[index] == layer) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool qx_apply_joint_expert_students(
+        qx_llama_route * route,
+        struct ggml_tensor * tensor,
+        int32_t layer) {
+    if (!route->sample_input_ready || tensor->type != GGML_TYPE_F32 ||
+        tensor->ne[0] != route->hidden || tensor->ne[1] != route->top_k) {
+        qx_set_error(route, "unexpected joint expert student tensor state, shape, or type");
+        return false;
+    }
+    for (int32_t student = 0; student < route->joint_count; ++student) {
+        if (route->joint_layers[student] != layer) {
+            continue;
+        }
+        int32_t slot = -1;
+        for (int32_t candidate = 0; candidate < route->top_k; ++candidate) {
+            if (route->active_routes[layer * route->top_k + candidate] ==
+                    route->joint_experts[student]) {
+                slot = candidate;
+                break;
+            }
+        }
+        if (slot < 0) {
+            continue;
+        }
+        const int32_t width = route->joint_widths[student];
+        float * activation = route->joint_activations[student];
+        for (int32_t neuron = 0; neuron < width; ++neuron) {
+            float gate = 0.0f;
+            float up = 0.0f;
+            const float * gate_row = route->joint_gate_weights[student] +
+                (size_t) neuron * route->hidden;
+            const float * up_row = route->joint_up_weights[student] +
+                (size_t) neuron * route->hidden;
+            for (int32_t input = 0; input < route->hidden; ++input) {
+                gate += gate_row[input] * route->sample_input[input];
+                up += up_row[input] * route->sample_input[input];
+            }
+            const float sigmoid = gate >= 0.0f
+                ? 1.0f / (1.0f + expf(-gate))
+                : expf(gate) / (1.0f + expf(gate));
+            activation[neuron] = gate * sigmoid * up;
+        }
+        for (int32_t output = 0; output < route->hidden; ++output) {
+            float value = 0.0f;
+            const float * row = route->joint_down_weights[student] +
+                (size_t) output * width;
+            for (int32_t neuron = 0; neuron < width; ++neuron) {
+                value += row[neuron] * activation[neuron];
+            }
+            route->joint_output[output] = value;
+        }
+        ggml_backend_tensor_set(
+            tensor,
+            route->joint_output,
+            (size_t) slot * tensor->nb[1],
+            (size_t) route->hidden * sizeof(float));
+    }
+    return true;
 }
 
 static bool qx_apply_expert_students(
@@ -531,7 +607,7 @@ static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user
     const bool is_activation = route->intermediate > 0 &&
         strncmp(tensor->name, activation_prefix, sizeof(activation_prefix) - 1) == 0;
     const bool is_down = (route->contribution_size_count > 0 || route->sample_layer >= 0 ||
-        route->student_count > 0) &&
+        route->student_count > 0 || route->joint_count > 0) &&
         strncmp(tensor->name, contribution_prefix, sizeof(contribution_prefix) - 1) == 0;
     if (!is_route && !is_activation && !is_down) {
         return false;
@@ -542,14 +618,16 @@ static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user
     if (layer < 0 || layer >= route->layers) {
         return false;
     }
-    if (is_route && !route->capture_all_routes && layer != route->sample_layer) {
+    if (is_route && !route->capture_all_routes && layer != route->sample_layer &&
+        !qx_has_joint_student_layer(route, layer)) {
         return false;
     }
-    if (is_activation && !route->capture_all_activations && layer != route->sample_layer) {
+    if (is_activation && !route->capture_all_activations && layer != route->sample_layer &&
+        !qx_has_joint_student_layer(route, layer)) {
         return false;
     }
     if (is_down && route->contribution_size_count == 0 && layer != route->sample_layer &&
-        !qx_has_student_layer(route, layer)) {
+        !qx_has_student_layer(route, layer) && !qx_has_joint_student_layer(route, layer)) {
         return false;
     }
     if (ask) {
@@ -578,6 +656,9 @@ static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user
         if (route->student_count > 0) {
             qx_apply_expert_students(route, tensor, layer);
         }
+        if (qx_has_joint_student_layer(route, layer)) {
+            qx_apply_joint_expert_students(route, tensor, layer);
+        }
         return true;
     }
     if (!route->active_activations || tensor->type != GGML_TYPE_F32 ||
@@ -585,7 +666,8 @@ static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user
         qx_set_error(route, "unexpected ffn_moe_swiglu tensor shape or type");
         return true;
     }
-    if (layer == route->sample_layer && !qx_capture_expert_input(route, tensor, layer)) {
+    if ((layer == route->sample_layer || qx_has_joint_student_layer(route, layer)) &&
+        !qx_capture_expert_input(route, tensor, layer)) {
         return true;
     }
     ggml_backend_tensor_get(
@@ -817,6 +899,20 @@ void qx_llama_route_close(qx_llama_route * route) {
     free(route->sample_joint_up_weights);
     free(route->sample_joint_down_weights);
     free(route->sample_joint_activation);
+    for (int32_t index = 0; index < route->joint_count; ++index) {
+        free(route->joint_gate_weights[index]);
+        free(route->joint_up_weights[index]);
+        free(route->joint_down_weights[index]);
+        free(route->joint_activations[index]);
+    }
+    free(route->joint_layers);
+    free(route->joint_experts);
+    free(route->joint_widths);
+    free(route->joint_gate_weights);
+    free(route->joint_up_weights);
+    free(route->joint_down_weights);
+    free(route->joint_activations);
+    free(route->joint_output);
     for (int32_t index = 0; index < route->student_count; ++index) {
         free(route->student_down_weights[index]);
     }
@@ -984,6 +1080,107 @@ int qx_llama_route_set_joint_expert_student(
     route->sample_joint_up_weights = up;
     route->sample_joint_down_weights = down;
     route->sample_joint_activation = activation;
+    return 0;
+}
+
+int qx_llama_route_add_joint_expert_student(
+        qx_llama_route * route,
+        int32_t layer,
+        int32_t expert,
+        int32_t width,
+        const float * gate_weights,
+        int32_t gate_count,
+        const float * up_weights,
+        int32_t up_count,
+        const float * down_weights,
+        int32_t down_count) {
+    const size_t matrix_values = route && width > 0 ? (size_t) width * route->hidden : 0;
+    if (!route || layer < 0 || layer >= route->layers || expert < 0 ||
+        expert >= route->experts || width <= 0 || width > route->intermediate ||
+        !gate_weights || !up_weights || !down_weights || gate_count < 0 || up_count < 0 ||
+        down_count < 0 || (size_t) gate_count != matrix_values ||
+        (size_t) up_count != matrix_values || (size_t) down_count != matrix_values) {
+        return -1;
+    }
+    for (int32_t index = 0; index < route->joint_count; ++index) {
+        if (route->joint_layers[index] == layer && route->joint_experts[index] == expert) {
+            return -2;
+        }
+    }
+    const size_t count = (size_t) route->joint_count + 1;
+    int32_t * layers = malloc(count * sizeof(int32_t));
+    int32_t * experts = malloc(count * sizeof(int32_t));
+    int32_t * widths = malloc(count * sizeof(int32_t));
+    float ** gates = malloc(count * sizeof(float *));
+    float ** ups = malloc(count * sizeof(float *));
+    float ** downs = malloc(count * sizeof(float *));
+    float ** activations = malloc(count * sizeof(float *));
+    float * gate = malloc(matrix_values * sizeof(float));
+    float * up = malloc(matrix_values * sizeof(float));
+    float * down = malloc(matrix_values * sizeof(float));
+    float * activation = malloc((size_t) width * sizeof(float));
+    float * input = route->sample_input ? route->sample_input :
+        malloc((size_t) route->hidden * sizeof(float));
+    float * output = route->joint_output ? route->joint_output :
+        malloc((size_t) route->hidden * sizeof(float));
+    if (!layers || !experts || !widths || !gates || !ups || !downs || !activations ||
+        !gate || !up || !down || !activation || !input || !output) {
+        free(layers);
+        free(experts);
+        free(widths);
+        free(gates);
+        free(ups);
+        free(downs);
+        free(activations);
+        free(gate);
+        free(up);
+        free(down);
+        free(activation);
+        if (!route->sample_input) {
+            free(input);
+        }
+        if (!route->joint_output) {
+            free(output);
+        }
+        return -3;
+    }
+    if (route->joint_count > 0) {
+        const size_t previous = (size_t) route->joint_count;
+        memcpy(layers, route->joint_layers, previous * sizeof(int32_t));
+        memcpy(experts, route->joint_experts, previous * sizeof(int32_t));
+        memcpy(widths, route->joint_widths, previous * sizeof(int32_t));
+        memcpy(gates, route->joint_gate_weights, previous * sizeof(float *));
+        memcpy(ups, route->joint_up_weights, previous * sizeof(float *));
+        memcpy(downs, route->joint_down_weights, previous * sizeof(float *));
+        memcpy(activations, route->joint_activations, previous * sizeof(float *));
+    }
+    memcpy(gate, gate_weights, matrix_values * sizeof(float));
+    memcpy(up, up_weights, matrix_values * sizeof(float));
+    memcpy(down, down_weights, matrix_values * sizeof(float));
+    layers[route->joint_count] = layer;
+    experts[route->joint_count] = expert;
+    widths[route->joint_count] = width;
+    gates[route->joint_count] = gate;
+    ups[route->joint_count] = up;
+    downs[route->joint_count] = down;
+    activations[route->joint_count] = activation;
+    free(route->joint_layers);
+    free(route->joint_experts);
+    free(route->joint_widths);
+    free(route->joint_gate_weights);
+    free(route->joint_up_weights);
+    free(route->joint_down_weights);
+    free(route->joint_activations);
+    route->joint_layers = layers;
+    route->joint_experts = experts;
+    route->joint_widths = widths;
+    route->joint_gate_weights = gates;
+    route->joint_up_weights = ups;
+    route->joint_down_weights = downs;
+    route->joint_activations = activations;
+    route->sample_input = input;
+    route->joint_output = output;
+    route->joint_count += 1;
     return 0;
 }
 
