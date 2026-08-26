@@ -1,2 +1,4 @@
 /target
 /external
+__pycache__/
+*.pyc

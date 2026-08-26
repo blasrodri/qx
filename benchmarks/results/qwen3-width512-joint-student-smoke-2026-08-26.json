@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-width512-single-expert-structural-memory-smoke",
+  "promotion_evidence": false,
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "layer": 8,
+  "expert": 38,
+  "teacher_width": 768,
+  "student_width": 512,
+  "projection_codecs": {
+    "gate": "q2s4",
+    "up": "q3",
+    "down": "q2s4"
+  },
+  "training_hits": 32,
+  "local_heldout_hits": 39,
+  "local_heldout_mean_relative_l2": 0.41676801443099976,
+  "projected_complete_weight_bytes": 7712694272,
+  "projected_complete_weight_gib": 7.183006286621094,
+  "projected_with_4k_kv_bytes": 8115347456,
+  "projected_with_4k_kv_gib": 7.558006286621094,
+  "expanded_replay": {
+    "corpus": "wikitext-2-test",
+    "sequences": 8,
+    "scored_tokens": 183,
+    "expert_hits": 92,
+    "exact_mean_nll": 3.2537136359152417,
+    "student_mean_nll": 3.2473229653060582,
+    "relative_perplexity_delta": -0.0063702937042353636,
+    "top1_agreement": 0.9508196721311475
+  },
+  "limitations": [
+    "one expert only",
+    "small single-domain routed corpus",
+    "F32 diagnostic injection rather than packed runtime consumption",
+    "no simultaneous multi-expert composition",
+    "no iPhone measurement"
+  ]
+}

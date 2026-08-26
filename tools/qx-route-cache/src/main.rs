@@ -15,6 +15,7 @@ const DEFAULT_Q3_EXPERT_BYTES: u64 = 2_064_384;
 const DEFAULT_EXPERT_NEURONS: usize = 768;
 const MAX_GREEDY_CONTRIBUTION_PACKETS: usize = 64;
 const EXPERT_DOWN_WEIGHTS_MAGIC: &[u8; 8] = b"QXEDW001";
+const JOINT_EXPERT_STUDENT_MAGIC: &[u8; 8] = b"QXEJS001";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -304,6 +305,39 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Compare one jointly distilled gate/up/down expert student with the teacher.
+    JointExpertStudentNll {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long = "corpus", required = true)]
+        corpora: Vec<PathBuf>,
+        #[arg(long)]
+        student: PathBuf,
+        #[arg(long, default_value_t = 64)]
+        max_sequences: usize,
+        #[arg(long, default_value_t = 96)]
+        max_tokens_per_sequence: usize,
+        #[arg(long, default_value_t = 128)]
+        context: usize,
+        #[arg(long, default_value_t = 48)]
+        layers: usize,
+        #[arg(long, default_value_t = 128)]
+        experts: usize,
+        #[arg(long, default_value_t = 8)]
+        top_k: usize,
+        #[arg(long, default_value_t = -1)]
+        gpu_layers: i32,
+        #[arg(long, default_value_t = 4)]
+        threads: i32,
+        #[arg(long, default_value_t = DEFAULT_EXPERT_NEURONS)]
+        expert_neurons: usize,
+        #[arg(long, default_value_t = 2048)]
+        hidden_size: usize,
+        #[arg(long)]
+        model_sha256: Option<String>,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Compare several simultaneously active folded students with the teacher.
     MultiExpertStudentNll {
         #[arg(long)]
@@ -432,6 +466,8 @@ struct TokenRoutes {
 struct ExpertDistillSample {
     layer: usize,
     expert: u16,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    input: Vec<f32>,
     activation: Vec<f32>,
     teacher_down_output: Vec<f32>,
 }
@@ -755,6 +791,40 @@ struct ExpertStudentNllReport {
     nll_delta: f64,
     relative_perplexity_delta: f64,
     top1_agreement: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct JointExpertStudentNllReport {
+    schema_version: u32,
+    classification: &'static str,
+    promotion_evidence: bool,
+    quality_semantics: &'static str,
+    model_sha256: String,
+    corpora: Vec<String>,
+    student: String,
+    layer: usize,
+    expert: u16,
+    teacher_width: usize,
+    student_width: usize,
+    sequences: usize,
+    scored_tokens: usize,
+    expert_hits: usize,
+    exact_mean_nll: f64,
+    student_mean_nll: f64,
+    nll_delta: f64,
+    relative_perplexity_delta: f64,
+    top1_agreement: f64,
+}
+
+struct JointExpertStudent {
+    layer: usize,
+    expert: u16,
+    hidden: usize,
+    width: usize,
+    teacher_width: usize,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    down: Vec<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1092,6 +1162,39 @@ fn main() -> Result<()> {
             model_sha256,
             output,
         }),
+        Command::JointExpertStudentNll {
+            model,
+            corpora,
+            student,
+            max_sequences,
+            max_tokens_per_sequence,
+            context,
+            layers,
+            experts,
+            top_k,
+            gpu_layers,
+            threads,
+            expert_neurons,
+            hidden_size,
+            model_sha256,
+            output,
+        } => joint_expert_student_nll(JointExpertStudentNllArgs {
+            model,
+            corpora,
+            student,
+            max_sequences,
+            max_tokens_per_sequence,
+            context,
+            layers,
+            experts,
+            top_k,
+            gpu_layers,
+            threads,
+            expert_neurons,
+            hidden_size,
+            model_sha256,
+            output,
+        }),
         Command::MultiExpertStudentNll {
             model,
             corpora,
@@ -1194,6 +1297,24 @@ struct ExpertStudentNllArgs {
     student_down_weights: PathBuf,
     layer: usize,
     expert: u16,
+    max_sequences: usize,
+    max_tokens_per_sequence: usize,
+    context: usize,
+    layers: usize,
+    experts: usize,
+    top_k: usize,
+    gpu_layers: i32,
+    threads: i32,
+    expert_neurons: usize,
+    hidden_size: usize,
+    model_sha256: Option<String>,
+    output: PathBuf,
+}
+
+struct JointExpertStudentNllArgs {
+    model: PathBuf,
+    corpora: Vec<PathBuf>,
+    student: PathBuf,
     max_sequences: usize,
     max_tokens_per_sequence: usize,
     context: usize,
@@ -1320,6 +1441,9 @@ fn capture(args: CaptureArgs) -> Result<()> {
             .or(args.sample.map(|_| args.expert_neurons)),
             hidden: args.hidden_size,
             sample: args.sample,
+            capture_all_routes: true,
+            capture_all_activations: !args.activation_packet_neurons.is_empty()
+                || !args.contribution_packet_neurons.is_empty(),
             contribution_packet_neurons: &args.contribution_packet_neurons,
         },
     )?;
@@ -1385,16 +1509,19 @@ fn capture(args: CaptureArgs) -> Result<()> {
                     )
                 }),
                 packet_down_contribution: down_contribution,
-                expert_distill_sample: expert_sample.map(|(activation, teacher_down_output)| {
-                    let (layer, expert) =
-                        args.sample.expect("sample exists when bridge returns one");
-                    ExpertDistillSample {
-                        layer,
-                        expert,
-                        activation,
-                        teacher_down_output,
-                    }
-                }),
+                expert_distill_sample: expert_sample.map(
+                    |(input, activation, teacher_down_output)| {
+                        let (layer, expert) =
+                            args.sample.expect("sample exists when bridge returns one");
+                        ExpertDistillSample {
+                            layer,
+                            expert,
+                            input,
+                            activation,
+                            teacher_down_output,
+                        }
+                    },
+                ),
             }),
         )?;
         position += 1;
@@ -1438,16 +1565,19 @@ fn capture(args: CaptureArgs) -> Result<()> {
                     )
                 }),
                 packet_down_contribution: down_contribution,
-                expert_distill_sample: expert_sample.map(|(activation, teacher_down_output)| {
-                    let (layer, expert) =
-                        args.sample.expect("sample exists when bridge returns one");
-                    ExpertDistillSample {
-                        layer,
-                        expert,
-                        activation,
-                        teacher_down_output,
-                    }
-                }),
+                expert_distill_sample: expert_sample.map(
+                    |(input, activation, teacher_down_output)| {
+                        let (layer, expert) =
+                            args.sample.expect("sample exists when bridge returns one");
+                        ExpertDistillSample {
+                            layer,
+                            expert,
+                            input,
+                            activation,
+                            teacher_down_output,
+                        }
+                    },
+                ),
             }),
         )?;
         position += 1;
@@ -1500,6 +1630,8 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
             intermediate: Some(args.expert_neurons),
             hidden: args.hidden_size,
             sample: Some((args.sample_layer, args.sample_expert)),
+            capture_all_routes: false,
+            capture_all_activations: false,
             contribution_packet_neurons: &[],
         },
     )?;
@@ -1526,7 +1658,7 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
             layers: args.layers,
             experts: args.experts,
             top_k: args.top_k,
-            source: "llama.cpp-eval-callback-corpus-reset".to_owned(),
+            source: "llama.cpp-eval-callback-target-expert-corpus-reset".to_owned(),
         }),
     )?;
 
@@ -1557,7 +1689,13 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
                 expert_sample,
                 expert_down_weights,
             } = llama.step(token)?;
-            validate_routes(&routes, args.layers, args.top_k, args.experts)?;
+            validate_sample_route(
+                &routes,
+                args.layers,
+                args.top_k,
+                args.experts,
+                args.sample_layer,
+            )?;
             if let Some(weights) = expert_down_weights {
                 write_expert_down_weights(
                     &args.sample_weights_output,
@@ -1582,9 +1720,10 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
                     packet_activation_energy: None,
                     packet_down_contribution: None,
                     expert_distill_sample: expert_sample.map(
-                        |(activation, teacher_down_output)| ExpertDistillSample {
+                        |(input, activation, teacher_down_output)| ExpertDistillSample {
                             layer: args.sample_layer,
                             expert: args.sample_expert,
+                            input,
                             activation,
                             teacher_down_output,
                         },
@@ -1685,6 +1824,8 @@ fn expert_student_nll(args: ExpertStudentNllArgs) -> Result<()> {
             intermediate: Some(args.expert_neurons),
             hidden: args.hidden_size,
             sample: Some((args.layer, args.expert)),
+            capture_all_routes: false,
+            capture_all_activations: false,
             contribution_packet_neurons: &[],
         },
     )?;
@@ -1759,6 +1900,138 @@ fn expert_student_nll(args: ExpertStudentNllArgs) -> Result<()> {
         "layer {} expert {}: sequences {}, scored {}, hits {}, NLL {:.6} -> {:.6} ({:+.4}% PPL), top1 {:.2}%",
         args.layer,
         args.expert,
+        report.sequences,
+        report.scored_tokens,
+        report.expert_hits,
+        exact_mean_nll,
+        student_mean_nll,
+        report.relative_perplexity_delta * 100.0,
+        report.top1_agreement * 100.0,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn joint_expert_student_nll(args: JointExpertStudentNllArgs) -> Result<()> {
+    if !args.model.is_file()
+        || args.corpora.is_empty()
+        || args.corpora.iter().any(|path| !path.is_file())
+        || !args.student.is_file()
+    {
+        bail!("model, corpus, and joint student inputs must exist");
+    }
+    if args.max_sequences == 0
+        || args.max_tokens_per_sequence < 2
+        || args.max_tokens_per_sequence > args.context
+    {
+        bail!("joint student corpus arguments are invalid");
+    }
+    let joint = read_joint_expert_student(&args.student)?;
+    if joint.layer >= args.layers
+        || usize::from(joint.expert) >= args.experts
+        || joint.hidden != args.hidden_size
+        || joint.teacher_width != args.expert_neurons
+    {
+        bail!("joint student dimensions or target do not match the requested model");
+    }
+    let model_hash = match args.model_sha256.as_ref() {
+        Some(value) => {
+            validate_sha256(value)?;
+            value.clone()
+        }
+        None => sha256_file(&args.model)?,
+    };
+    let mut capture = llama_capture::Capture::open(
+        &args.model,
+        llama_capture::OpenConfig {
+            context: args.context,
+            layers: args.layers,
+            experts: args.experts,
+            top_k: args.top_k,
+            gpu_layers: args.gpu_layers,
+            threads: args.threads,
+            intermediate: Some(args.expert_neurons),
+            hidden: args.hidden_size,
+            sample: Some((joint.layer, joint.expert)),
+            capture_all_routes: false,
+            capture_all_activations: false,
+            contribution_packet_neurons: &[],
+        },
+    )?;
+    let mut sequences = Vec::new();
+    for path in &args.corpora {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("read corpus {}", path.display()))?;
+        for paragraph in split_corpus_paragraphs(&contents) {
+            if sequences.len() >= args.max_sequences {
+                break;
+            }
+            let mut tokens = capture.tokenize(&paragraph)?;
+            tokens.truncate(args.max_tokens_per_sequence);
+            if tokens.len() >= 2 {
+                sequences.push(tokens);
+            }
+        }
+        if sequences.len() >= args.max_sequences {
+            break;
+        }
+    }
+    if sequences.is_empty() {
+        bail!("corpus produced no scoreable token sequences");
+    }
+    let exact = measure_corpus_nll(&mut capture, &sequences)?;
+    capture.set_joint_expert_student(&joint)?;
+    let student = measure_corpus_nll(&mut capture, &sequences)?;
+    if exact.scored_tokens != student.scored_tokens
+        || exact.top1_tokens.len() != student.top1_tokens.len()
+    {
+        bail!("exact and joint-student corpus passes produced different token counts");
+    }
+    let exact_mean_nll = exact.mean_nll();
+    let student_mean_nll = student.mean_nll();
+    let top1_matches = exact
+        .top1_tokens
+        .iter()
+        .zip(&student.top1_tokens)
+        .filter(|(exact, student)| exact == student)
+        .count();
+    let report = JointExpertStudentNllReport {
+        schema_version: 1,
+        classification: "single-joint-expert-student-corpus-nll-control",
+        promotion_evidence: false,
+        quality_semantics: "teacher-forced-corpus-nll-with-one-gate-up-down-expert-replaced",
+        model_sha256: model_hash,
+        corpora: args
+            .corpora
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        student: args.student.display().to_string(),
+        layer: joint.layer,
+        expert: joint.expert,
+        teacher_width: joint.teacher_width,
+        student_width: joint.width,
+        sequences: sequences.len(),
+        scored_tokens: exact.scored_tokens,
+        expert_hits: exact.expert_hits,
+        exact_mean_nll,
+        student_mean_nll,
+        nll_delta: student_mean_nll - exact_mean_nll,
+        relative_perplexity_delta: (student_mean_nll - exact_mean_nll).exp() - 1.0,
+        top1_agreement: top1_matches as f64 / exact.top1_tokens.len().max(1) as f64,
+    };
+    let mut writer = BufWriter::new(
+        File::create(&args.output).with_context(|| format!("create {}", args.output.display()))?,
+    );
+    serde_json::to_writer_pretty(&mut writer, &report)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    println!("joint expert student NLL report: {}", args.output.display());
+    println!(
+        "layer {} expert {} width {}: sequences {}, scored {}, hits {}, NLL {:.6} -> {:.6} ({:+.4}% PPL), top1 {:.2}%",
+        joint.layer,
+        joint.expert,
+        joint.width,
         report.sequences,
         report.scored_tokens,
         report.expert_hits,
@@ -1862,6 +2135,8 @@ fn multi_expert_student_nll(args: MultiExpertStudentNllArgs) -> Result<()> {
             intermediate: Some(args.expert_neurons),
             hidden: args.hidden_size,
             sample: None,
+            capture_all_routes: true,
+            capture_all_activations: true,
             contribution_packet_neurons: &[],
         },
     )?;
@@ -1998,6 +2273,11 @@ fn multi_expert_student_nll(_args: MultiExpertStudentNllArgs) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn expert_student_nll(_args: ExpertStudentNllArgs) -> Result<()> {
     bail!("expert student NLL currently requires the macOS llama.cpp bridge")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn joint_expert_student_nll(_args: JointExpertStudentNllArgs) -> Result<()> {
+    bail!("joint expert student NLL currently requires the macOS llama.cpp bridge")
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3063,6 +3343,8 @@ fn open_structured_capture(args: &StructuredNllArgs) -> Result<llama_capture::Ca
             intermediate: Some(args.expert_neurons),
             hidden: args.hidden_size,
             sample: None,
+            capture_all_routes: true,
+            capture_all_activations: true,
             contribution_packet_neurons: &[],
         },
     )
@@ -4297,6 +4579,29 @@ fn validate_routes(routes: &[Vec<u16>], layers: usize, top_k: usize, experts: us
     Ok(())
 }
 
+fn validate_sample_route(
+    routes: &[Vec<u16>],
+    layers: usize,
+    top_k: usize,
+    experts: usize,
+    sample_layer: usize,
+) -> Result<()> {
+    if routes.len() != layers || sample_layer >= routes.len() {
+        bail!("partial route record does not match its model shape");
+    }
+    let ids = &routes[sample_layer];
+    if ids.len() != top_k {
+        bail!("sample route has {} experts; expected {top_k}", ids.len());
+    }
+    let mut unique = HashSet::with_capacity(top_k);
+    for &expert in ids {
+        if expert as usize >= experts || !unique.insert(expert) {
+            bail!("sample route contains an invalid or repeated expert {expert}");
+        }
+    }
+    Ok(())
+}
+
 fn write_trace_line(writer: &mut impl Write, line: &TraceLine) -> Result<()> {
     serde_json::to_writer(&mut *writer, line)?;
     writer.write_all(b"\n")?;
@@ -4422,6 +4727,54 @@ fn read_expert_down_weights(path: &Path) -> Result<(usize, usize, Vec<f32>)> {
     Ok((neurons, hidden, weights))
 }
 
+fn read_joint_expert_student(path: &Path) -> Result<JointExpertStudent> {
+    let mut reader =
+        BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic)?;
+    if &magic != JOINT_EXPERT_STUDENT_MAGIC {
+        bail!("joint expert student has an invalid magic");
+    }
+    let mut dimensions = [0u32; 5];
+    for value in &mut dimensions {
+        let mut bytes = [0u8; 4];
+        reader.read_exact(&mut bytes)?;
+        *value = u32::from_le_bytes(bytes);
+    }
+    let [layer, expert, hidden, width, teacher_width] = dimensions.map(|value| value as usize);
+    if hidden == 0 || width == 0 || teacher_width == 0 || width > teacher_width {
+        bail!("joint expert student has invalid dimensions");
+    }
+    let matrix_values = hidden
+        .checked_mul(width)
+        .ok_or_else(|| anyhow::anyhow!("joint expert student dimensions overflow"))?;
+    let mut read_matrix = || -> Result<Vec<f32>> {
+        let mut bytes = vec![0u8; matrix_values * std::mem::size_of::<f32>()];
+        reader.read_exact(&mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+            .collect())
+    };
+    let gate = read_matrix()?;
+    let up = read_matrix()?;
+    let down = read_matrix()?;
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        bail!("joint expert student contains trailing bytes");
+    }
+    Ok(JointExpertStudent {
+        layer,
+        expert: u16::try_from(expert).context("joint student expert exceeds u16")?,
+        hidden,
+        width,
+        teacher_width,
+        gate,
+        up,
+        down,
+    })
+}
+
 #[cfg(target_os = "macos")]
 mod llama_capture {
     use super::*;
@@ -4439,6 +4792,8 @@ mod llama_capture {
             hidden: c_int,
             sample_layer: c_int,
             sample_expert: c_int,
+            capture_all_routes: c_int,
+            capture_all_activations: c_int,
             contribution_packet_neurons: *const c_int,
             contribution_size_count: c_int,
         ) -> *mut c_void;
@@ -4452,6 +4807,16 @@ mod llama_capture {
             weights: *const f32,
             weight_count: c_int,
         ) -> c_int;
+        fn qx_llama_route_set_joint_expert_student(
+            route: *mut c_void,
+            width: c_int,
+            gate_weights: *const f32,
+            gate_count: c_int,
+            up_weights: *const f32,
+            up_count: c_int,
+            down_weights: *const f32,
+            down_count: c_int,
+        ) -> c_int;
         fn qx_llama_route_add_expert_student(
             route: *mut c_void,
             layer: c_int,
@@ -4461,6 +4826,8 @@ mod llama_capture {
         ) -> c_int;
         fn qx_llama_route_take_expert_sample(
             route: *mut c_void,
+            input: *mut f32,
+            input_count: c_int,
             activation: *mut f32,
             activation_count: c_int,
             down_output: *mut f32,
@@ -4509,6 +4876,7 @@ mod llama_capture {
         contribution_packet_neurons: Vec<usize>,
         contribution_total_packets: usize,
         sample: bool,
+        capture_all_routes: bool,
         hidden: usize,
     }
 
@@ -4518,7 +4886,7 @@ mod llama_capture {
         pub routes: Vec<Vec<u16>>,
         pub activations: Option<Vec<f32>>,
         pub down_contribution: Option<PacketDownContribution>,
-        pub expert_sample: Option<(Vec<f32>, Vec<f32>)>,
+        pub expert_sample: Option<(Vec<f32>, Vec<f32>, Vec<f32>)>,
         pub expert_down_weights: Option<Vec<f32>>,
     }
 
@@ -4532,6 +4900,8 @@ mod llama_capture {
         pub intermediate: Option<usize>,
         pub hidden: usize,
         pub sample: Option<(usize, u16)>,
+        pub capture_all_routes: bool,
+        pub capture_all_activations: bool,
         pub contribution_packet_neurons: &'a [usize],
     }
 
@@ -4547,6 +4917,8 @@ mod llama_capture {
                 intermediate,
                 hidden,
                 sample,
+                capture_all_routes,
+                capture_all_activations,
                 contribution_packet_neurons,
             } = config;
             let path = CString::new(path.to_string_lossy().as_bytes())?;
@@ -4571,6 +4943,8 @@ mod llama_capture {
                     hidden.try_into()?,
                     sample.map_or(-1, |(layer, _)| layer as c_int),
                     sample.map_or(-1, |(_, expert)| c_int::from(expert)),
+                    c_int::from(capture_all_routes),
+                    c_int::from(capture_all_activations),
                     contribution_packet_neurons_i32.as_ptr(),
                     contribution_packet_neurons_i32.len().try_into()?,
                 )
@@ -4593,6 +4967,7 @@ mod llama_capture {
                     .unwrap_or(0),
                 contribution_packet_neurons: contribution_packet_neurons.to_vec(),
                 sample: sample.is_some(),
+                capture_all_routes,
                 hidden,
             })
         }
@@ -4658,6 +5033,25 @@ mod llama_capture {
                 unsafe { qx_llama_route_set_expert_student(self.raw, weights.as_ptr(), count) };
             if status != 0 {
                 bail!("llama bridge rejected expert student weights with status {status}");
+            }
+            Ok(())
+        }
+
+        pub fn set_joint_expert_student(&mut self, student: &JointExpertStudent) -> Result<()> {
+            let status = unsafe {
+                qx_llama_route_set_joint_expert_student(
+                    self.raw,
+                    student.width.try_into()?,
+                    student.gate.as_ptr(),
+                    student.gate.len().try_into()?,
+                    student.up.as_ptr(),
+                    student.up.len().try_into()?,
+                    student.down.as_ptr(),
+                    student.down.len().try_into()?,
+                )
+            };
+            if status != 0 {
+                bail!("llama bridge rejected joint expert student with status {status}");
             }
             Ok(())
         }
@@ -4759,7 +5153,13 @@ mod llama_capture {
                 .map(|chunk| {
                     chunk
                         .iter()
-                        .map(|&value| u16::try_from(value).context("negative expert ID"))
+                        .map(|&value| {
+                            if value < 0 && !self.capture_all_routes {
+                                Ok(u16::MAX)
+                            } else {
+                                u16::try_from(value).context("negative expert ID")
+                            }
+                        })
                         .collect::<Result<Vec<_>>>()
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -4775,11 +5175,14 @@ mod llama_capture {
                 let intermediate = self
                     .intermediate
                     .expect("expert sample has activation width");
+                let mut input = vec![0.0f32; self.hidden];
                 let mut activation = vec![0.0f32; intermediate];
                 let mut down_output = vec![0.0f32; self.hidden];
                 let status = unsafe {
                     qx_llama_route_take_expert_sample(
                         self.raw,
+                        input.as_mut_ptr(),
+                        input.len().try_into()?,
                         activation.as_mut_ptr(),
                         activation.len().try_into()?,
                         down_output.as_mut_ptr(),
@@ -4788,7 +5191,7 @@ mod llama_capture {
                 };
                 match status {
                     0 => None,
-                    1 => Some((activation, down_output)),
+                    1 => Some((input, activation, down_output)),
                     _ => bail!(
                         "llama expert sample read failed ({status}): {}",
                         self.error()
@@ -5059,6 +5462,36 @@ mod tests {
             project_down_subset(&decoded, &[1.0, 10.0, 100.0, 1000.0], &[0, 2], 4, 2),
             vec![301.0, -301.0]
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn joint_expert_student_sidecar_round_trips() {
+        let path = std::env::temp_dir().join(format!(
+            "qx-joint-expert-student-{}-{}.qxejs",
+            std::process::id(),
+            SCHEMA_VERSION
+        ));
+        let mut file = File::create(&path).unwrap();
+        file.write_all(JOINT_EXPERT_STUDENT_MAGIC).unwrap();
+        for dimension in [7_u32, 11, 3, 2, 4] {
+            file.write_all(&dimension.to_le_bytes()).unwrap();
+        }
+        let values: Vec<f32> = (0..18).map(|value| value as f32 * 0.25 - 1.0).collect();
+        for value in &values {
+            file.write_all(&value.to_le_bytes()).unwrap();
+        }
+        drop(file);
+
+        let student = read_joint_expert_student(&path).unwrap();
+        assert_eq!(student.layer, 7);
+        assert_eq!(student.expert, 11);
+        assert_eq!(student.hidden, 3);
+        assert_eq!(student.width, 2);
+        assert_eq!(student.teacher_width, 4);
+        assert_eq!(student.gate, values[0..6]);
+        assert_eq!(student.up, values[6..12]);
+        assert_eq!(student.down, values[12..18]);
         std::fs::remove_file(path).unwrap();
     }
 
