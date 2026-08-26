@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-layer2-complete-transformation-gate",
+  "promotion_evidence": false,
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "layer": 2,
+  "capture": {
+    "train_sequences": 32,
+    "train_token_positions": 1423,
+    "retained_train_samples": 5389,
+    "heldout_sequences": 4,
+    "heldout_token_positions": 76,
+    "retained_heldout_samples": 571
+  },
+  "evidence_policy": {
+    "min_train_samples": 4,
+    "min_heldout_samples": 2,
+    "under_evidenced_policy": "retain_teacher_width",
+    "transformed_experts": 79,
+    "teacher_width_exceptions": 49,
+    "heldout_route_coverage": 0.9737302977232924
+  },
+  "complete_route_results": [
+    {
+      "policy": "width512-q2s4-gate-q3-up-q2s4-down-bf16-target",
+      "scored_tokens": 111,
+      "relative_perplexity_delta": 0.9085007034899089,
+      "top1_agreement": 0.5675675675675675
+    },
+    {
+      "policy": "width512-q2s4-gate-q3-up-q2s4-down-captured-q4-target",
+      "scored_tokens": 59,
+      "relative_perplexity_delta": 0.923009275994664,
+      "top1_agreement": 0.576271186440678
+    },
+    {
+      "policy": "width640-all-q3-captured-q4-target",
+      "scored_tokens": 47,
+      "relative_perplexity_delta": 0.1747507061406215,
+      "top1_agreement": 0.8723404255319149
+    }
+  ],
+  "hot_expert_policy_race": [
+    {"policy": "width512-all-q3", "weighted_local_relative_l2": 0.4936},
+    {"policy": "width640-mixed", "weighted_local_relative_l2": 0.4727},
+    {"policy": "width640-all-q3", "weighted_local_relative_l2": 0.4087},
+    {"policy": "width704-mixed", "weighted_local_relative_l2": 0.4348}
+  ],
+  "width640_q3_prefix_sweep": [
+    {"active_students": 7, "relative_perplexity_delta": -0.0522902397056243, "top1_agreement": 0.9787234042553191},
+    {"active_students": 13, "relative_perplexity_delta": 0.09403292507163741, "top1_agreement": 0.851063829787234},
+    {"active_students": 24, "relative_perplexity_delta": 0.11478881176810285, "top1_agreement": 0.851063829787234},
+    {"active_students": 28, "relative_perplexity_delta": 0.124957939009128, "top1_agreement": 0.851063829787234},
+    {"active_students": 43, "relative_perplexity_delta": 0.09523459058602901, "top1_agreement": 0.8297872340425532}
+  ],
+  "decision": {
+    "uniform_width512": "rejected",
+    "uniform_width640_all_q3": "rejected_for_quality_and_capacity",
+    "local_error_as_promotion_oracle": "rejected",
+    "next_iteration": "coordinated_layer-output_residual_recovery"
+  },
+  "limitations": [
+    "single layer and WikiText evaluation",
+    "short kill-test slices after the initial complete-route failure",
+    "diagnostic dequantized F32 student injection",
+    "no packed artifact or iPhone measurement"
+  ]
+}

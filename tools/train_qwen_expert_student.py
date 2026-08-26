@@ -45,6 +45,12 @@ def parse_args():
     parser.add_argument("--gate-codec", choices=("q2s4", "q3"), default="q2s4")
     parser.add_argument("--up-codec", choices=("q2s4", "q3"), default="q2s4")
     parser.add_argument("--down-codec", choices=("q2s4", "q3"), default="q2s4")
+    parser.add_argument(
+        "--teacher-target",
+        choices=("bf16", "captured-q4"),
+        default="bf16",
+        help="Output target for distillation; captured-q4 matches the paired GGUF control.",
+    )
     parser.add_argument("--report", type=pathlib.Path, required=True)
     return parser.parse_args()
 
@@ -77,14 +83,20 @@ def load_trace(paths, layer, expert):
     )
 
 
-def load_teacher(root, layer, expert):
-    index = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
-    tensors = {}
+def load_teacher(root, layer, expert, weight_map=None):
+    if weight_map is None:
+        weight_map = json.loads(
+            (root / "model.safetensors.index.json").read_text()
+        )["weight_map"]
+    names_by_shard = {}
     for projection in ("gate", "up", "down"):
         name = f"model.layers.{layer}.mlp.experts.{expert}.{projection}_proj.weight"
-        shard = root / index[name]
-        with safe_open(shard, framework="pt", device="cpu") as stream:
-            tensors[projection] = stream.get_tensor(name).float().contiguous()
+        names_by_shard.setdefault(weight_map[name], []).append((projection, name))
+    tensors = {}
+    for shard_name, names in names_by_shard.items():
+        with safe_open(root / shard_name, framework="pt", device="cpu") as stream:
+            for projection, name in names:
+                tensors[projection] = stream.get_tensor(name).float().contiguous()
     return tensors
 
 
@@ -368,12 +380,22 @@ def main():
     if train_inputs.shape[1] != hidden or heldout_inputs.shape[1] != hidden:
         raise ValueError("captured input width does not match BF16 teacher")
     with torch.no_grad():
-        train_targets, _ = expert_forward(
+        bf16_train_targets, _ = expert_forward(
             train_inputs, teacher["gate"], teacher["up"], teacher["down"]
         )
-        heldout_targets, _ = expert_forward(
+        bf16_heldout_targets, _ = expert_forward(
             heldout_inputs, teacher["gate"], teacher["up"], teacher["down"]
         )
+    train_targets = (
+        captured_train_outputs
+        if args.teacher_target == "captured-q4"
+        else bf16_train_targets
+    )
+    heldout_targets = (
+        captured_heldout_outputs
+        if args.teacher_target == "captured-q4"
+        else bf16_heldout_targets
+    )
     student, initial, indices, training = train(
         args, train_inputs, train_targets, heldout_inputs, heldout_targets, teacher
     )
@@ -414,7 +436,8 @@ def main():
         "classification": "expert-local-joint-gate-up-down-width-student-smoke",
         "promotion_evidence": False,
         "teacher_semantics": "pinned-bf16-expert-on-real-q4-llama-routed-input-states",
-        "training_semantics": "joint-gate-up-down-output-distillation-with-magnitude-initialization-and-optional-projection-codec-ste-qat",
+        "teacher_target": args.teacher_target,
+        "training_semantics": "joint-gate-up-down-output-distillation-with-activation-contribution-initialization-and-optional-projection-codec-ste-qat",
         "layer": args.layer,
         "expert": args.expert,
         "teacher_width": 768,
@@ -438,7 +461,9 @@ def main():
         "quantized_trained_heldout": metrics(quantized_student(heldout_inputs), heldout_targets)
         if quantized_student is not None
         else metrics(qat_quantized_predictions, heldout_targets),
-        "bf16_vs_captured_q4_heldout": metrics(heldout_targets, captured_heldout_outputs),
+        "bf16_vs_captured_q4_heldout": metrics(
+            bf16_heldout_targets, captured_heldout_outputs
+        ),
         "selected_neurons_sha256": __import__("hashlib").sha256(
             indices.numpy().astype("<u2", copy=False).tobytes()
         ).hexdigest(),

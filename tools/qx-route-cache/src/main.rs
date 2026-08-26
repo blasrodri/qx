@@ -92,6 +92,9 @@ enum Command {
         /// Selected experts to retain, repeated or comma-delimited. Empty captures every routed expert.
         #[arg(long = "sample-expert", value_delimiter = ',')]
         sample_experts: Vec<u16>,
+        /// Maximum retained samples per expert. Zero retains every routed hit.
+        #[arg(long, default_value_t = 0)]
+        max_samples_per_expert: usize,
         #[arg(long, default_value_t = 64)]
         max_sequences: usize,
         #[arg(long, default_value_t = 96)]
@@ -347,6 +350,9 @@ enum Command {
         corpora: Vec<PathBuf>,
         #[arg(long = "student", required = true)]
         students: Vec<PathBuf>,
+        /// Evaluate sorted student prefixes in one loaded-model session. Empty evaluates all.
+        #[arg(long, value_delimiter = ',')]
+        active_prefixes: Vec<usize>,
         /// Skip this many scoreable corpus paragraphs before evaluation.
         #[arg(long, default_value_t = 0)]
         skip_sequences: usize,
@@ -910,6 +916,18 @@ struct MultiJointExpertStudentNllReport {
     nll_delta: f64,
     relative_perplexity_delta: f64,
     top1_agreement: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    prefix_results: Vec<MultiJointExpertStudentPrefixResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct MultiJointExpertStudentPrefixResult {
+    active_students: usize,
+    scored_tokens: usize,
+    student_mean_nll: f64,
+    nll_delta: f64,
+    relative_perplexity_delta: f64,
+    top1_agreement: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1034,6 +1052,7 @@ fn main() -> Result<()> {
             sample_weights_output,
             sample_layer,
             sample_experts,
+            max_samples_per_expert,
             max_sequences,
             max_tokens_per_sequence,
             context,
@@ -1052,6 +1071,7 @@ fn main() -> Result<()> {
             sample_weights_output,
             sample_layer,
             sample_experts,
+            max_samples_per_expert,
             max_sequences,
             max_tokens_per_sequence,
             context,
@@ -1267,6 +1287,7 @@ fn main() -> Result<()> {
             model,
             corpora,
             students,
+            active_prefixes,
             skip_sequences,
             max_sequences,
             max_tokens_per_sequence,
@@ -1284,6 +1305,7 @@ fn main() -> Result<()> {
             model,
             corpora,
             students,
+            active_prefixes,
             skip_sequences,
             max_sequences,
             max_tokens_per_sequence,
@@ -1381,6 +1403,7 @@ struct CaptureCorpusArgs {
     sample_weights_output: Option<PathBuf>,
     sample_layer: usize,
     sample_experts: Vec<u16>,
+    max_samples_per_expert: usize,
     max_sequences: usize,
     max_tokens_per_sequence: usize,
     context: usize,
@@ -1462,6 +1485,7 @@ struct MultiJointExpertStudentNllArgs {
     model: PathBuf,
     corpora: Vec<PathBuf>,
     students: Vec<PathBuf>,
+    active_prefixes: Vec<usize>,
     skip_sequences: usize,
     max_sequences: usize,
     max_tokens_per_sequence: usize,
@@ -1814,7 +1838,8 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
     let mut sequences = 0usize;
     let mut token_positions = 0usize;
     let mut expert_hits = 0usize;
-    let mut hit_counts = vec![0usize; args.experts];
+    let mut observed_hit_counts = vec![0usize; args.experts];
+    let mut retained_hit_counts = vec![0usize; args.experts];
     let mut wrote_weights = args.sample_weights_output.is_none();
     for paragraph in paragraphs {
         if sequences >= args.max_sequences {
@@ -1878,8 +1903,19 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
                 selected_experts.is_empty() || selected_experts.contains(&sample.expert)
             });
             for sample in &samples {
-                hit_counts[usize::from(sample.expert)] += 1;
+                observed_hit_counts[usize::from(sample.expert)] += 1;
             }
+            samples.retain(|sample| {
+                let expert = usize::from(sample.expert);
+                if args.max_samples_per_expert > 0
+                    && retained_hit_counts[expert] >= args.max_samples_per_expert
+                {
+                    false
+                } else {
+                    retained_hit_counts[expert] += 1;
+                    true
+                }
+            });
             expert_hits += samples.len();
             write_trace_line(
                 &mut writer,
@@ -1910,14 +1946,24 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
     println!(
         "sequences: {sequences}, routed token positions: {token_positions}, expert hits: {expert_hits}"
     );
-    let populated = hit_counts
+    let populated = retained_hit_counts
         .iter()
         .enumerate()
         .filter(|(_, count)| **count > 0)
         .map(|(expert, count)| format!("{expert}:{count}"))
         .collect::<Vec<_>>()
         .join(",");
-    println!("expert hit counts: {populated}");
+    println!("retained expert hit counts: {populated}");
+    if args.max_samples_per_expert > 0 {
+        let observed = observed_hit_counts
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(expert, count)| format!("{expert}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("observed expert hit counts: {observed}");
+    }
     Ok(())
 }
 
@@ -2285,8 +2331,23 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
                 student.expert
             );
         }
-        students.push((path.clone(), student));
+        students.push((path.clone(), student.layer, student.expert, student.width));
     }
+    let active_prefixes = if args.active_prefixes.is_empty() {
+        vec![students.len()]
+    } else {
+        let mut previous = 0usize;
+        for &prefix in &args.active_prefixes {
+            if prefix == 0 || prefix > students.len() || prefix <= previous {
+                bail!(
+                    "active prefixes must be strictly increasing within 1..={}",
+                    students.len()
+                );
+            }
+            previous = prefix;
+        }
+        args.active_prefixes.clone()
+    };
     let mut capture = llama_capture::Capture::open(
         &args.model,
         llama_capture::OpenConfig {
@@ -2333,18 +2394,30 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
     }
     let target_pairs = students
         .iter()
-        .map(|(_, student)| (student.layer, student.expert))
+        .map(|(_, layer, expert, _)| (*layer, *expert))
         .collect::<Vec<_>>();
     let exact = measure_multi_corpus_nll(&mut capture, &sequences, &target_pairs)?;
-    for (_, student) in &students {
-        capture.add_joint_expert_student(student)?;
+    for (path, layer, expert, width) in &students {
+        let student = read_joint_expert_student(path)?;
+        if student.layer != *layer || student.expert != *expert || student.width != *width {
+            bail!("joint student changed while evaluating: {}", path.display());
+        }
+        capture.add_joint_expert_student(&student)?;
     }
-    let student_measurement = measure_multi_corpus_nll(&mut capture, &sequences, &target_pairs)?;
-    if exact.scored_tokens != student_measurement.scored_tokens
-        || exact.top1_tokens.len() != student_measurement.top1_tokens.len()
-    {
-        bail!("exact and multi-joint-student passes produced incompatible measurements");
+    let mut prefix_measurements = Vec::new();
+    for &prefix in &active_prefixes {
+        capture.set_joint_active_prefix(prefix)?;
+        let measurement = measure_multi_corpus_nll(&mut capture, &sequences, &target_pairs)?;
+        if exact.scored_tokens != measurement.scored_tokens
+            || exact.top1_tokens.len() != measurement.top1_tokens.len()
+        {
+            bail!("exact and multi-joint-student passes produced incompatible measurements");
+        }
+        prefix_measurements.push((prefix, measurement));
     }
+    let (_, student_measurement) = prefix_measurements
+        .last()
+        .expect("at least one active prefix is always evaluated");
     let exact_mean_nll = exact.mean_nll();
     let student_mean_nll = student_measurement.mean_nll();
     let top1_matches = exact
@@ -2368,11 +2441,11 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
             .iter()
             .zip(exact.route_hits.iter().zip(&student_measurement.route_hits))
             .map(
-                |((path, student), (&exact_route_hits, &student_route_hits))| {
+                |((path, layer, expert, width), (&exact_route_hits, &student_route_hits))| {
                     MultiJointExpertStudentResult {
-                        layer: student.layer,
-                        expert: student.expert,
-                        width: student.width,
+                        layer: *layer,
+                        expert: *expert,
+                        width: *width,
                         sidecar: path.display().to_string(),
                         exact_route_hits,
                         student_route_hits,
@@ -2388,6 +2461,26 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         nll_delta: student_mean_nll - exact_mean_nll,
         relative_perplexity_delta: (student_mean_nll - exact_mean_nll).exp() - 1.0,
         top1_agreement: top1_matches as f64 / exact.top1_tokens.len().max(1) as f64,
+        prefix_results: prefix_measurements
+            .iter()
+            .map(|(active_students, measurement)| {
+                let mean_nll = measurement.mean_nll();
+                let matches = exact
+                    .top1_tokens
+                    .iter()
+                    .zip(&measurement.top1_tokens)
+                    .filter(|(exact, student)| exact == student)
+                    .count();
+                MultiJointExpertStudentPrefixResult {
+                    active_students: *active_students,
+                    scored_tokens: measurement.scored_tokens,
+                    student_mean_nll: mean_nll,
+                    nll_delta: mean_nll - exact_mean_nll,
+                    relative_perplexity_delta: (mean_nll - exact_mean_nll).exp() - 1.0,
+                    top1_agreement: matches as f64 / exact.top1_tokens.len().max(1) as f64,
+                }
+            })
+            .collect(),
     };
     let mut writer = BufWriter::new(
         File::create(&args.output).with_context(|| format!("create {}", args.output.display()))?,
@@ -5184,6 +5277,7 @@ mod llama_capture {
             down_weights: *const f32,
             down_count: c_int,
         ) -> c_int;
+        fn qx_llama_route_set_joint_active_prefix(route: *mut c_void, count: c_int) -> c_int;
         fn qx_llama_route_add_expert_student(
             route: *mut c_void,
             layer: c_int,
@@ -5456,6 +5550,15 @@ mod llama_capture {
             };
             if status != 0 {
                 bail!("llama bridge rejected joint expert student with status {status}");
+            }
+            Ok(())
+        }
+
+        pub fn set_joint_active_prefix(&mut self, count: usize) -> Result<()> {
+            let status =
+                unsafe { qx_llama_route_set_joint_active_prefix(self.raw, count.try_into()?) };
+            if status != 0 {
+                bail!("llama bridge rejected joint active prefix with status {status}");
             }
             Ok(())
         }

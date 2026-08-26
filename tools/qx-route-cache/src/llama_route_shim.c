@@ -49,6 +49,7 @@ typedef struct qx_llama_route {
     float * sample_joint_down_weights;
     float * sample_joint_activation;
     int32_t joint_count;
+    int32_t joint_active_count;
     int32_t * joint_layers;
     int32_t * joint_experts;
     int32_t * joint_widths;
@@ -485,7 +486,7 @@ static bool qx_has_student_layer(const qx_llama_route * route, int32_t layer) {
 }
 
 static bool qx_has_joint_student_layer(const qx_llama_route * route, int32_t layer) {
-    for (int32_t index = 0; index < route->joint_count; ++index) {
+    for (int32_t index = 0; index < route->joint_active_count; ++index) {
         if (route->joint_layers[index] == layer) {
             return true;
         }
@@ -502,7 +503,7 @@ static bool qx_apply_joint_expert_students(
         qx_set_error(route, "unexpected joint expert student tensor state, shape, or type");
         return false;
     }
-    for (int32_t student = 0; student < route->joint_count; ++student) {
+    for (int32_t student = 0; student < route->joint_active_count; ++student) {
         if (route->joint_layers[student] != layer) {
             continue;
         }
@@ -1181,6 +1182,15 @@ int qx_llama_route_add_joint_expert_student(
     route->sample_input = input;
     route->joint_output = output;
     route->joint_count += 1;
+    route->joint_active_count = route->joint_count;
+    return 0;
+}
+
+int qx_llama_route_set_joint_active_prefix(qx_llama_route * route, int32_t count) {
+    if (!route || count < 0 || count > route->joint_count) {
+        return -1;
+    }
+    route->joint_active_count = count;
     return 0;
 }
 
