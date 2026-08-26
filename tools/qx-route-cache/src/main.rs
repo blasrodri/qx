@@ -77,7 +77,7 @@ enum Command {
         #[arg(long)]
         model_sha256: Option<String>,
     },
-    /// Capture one expert across many independently reset corpus paragraphs.
+    /// Capture selected routed experts in one layer across reset corpus paragraphs.
     CaptureCorpus {
         #[arg(long)]
         model: PathBuf,
@@ -86,11 +86,12 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
         #[arg(long)]
-        sample_weights_output: PathBuf,
+        sample_weights_output: Option<PathBuf>,
         #[arg(long)]
         sample_layer: usize,
-        #[arg(long)]
-        sample_expert: u16,
+        /// Selected experts to retain, repeated or comma-delimited. Empty captures every routed expert.
+        #[arg(long = "sample-expert", value_delimiter = ',')]
+        sample_experts: Vec<u16>,
         #[arg(long, default_value_t = 64)]
         max_sequences: usize,
         #[arg(long, default_value_t = 96)]
@@ -460,6 +461,8 @@ struct TokenRoutes {
     packet_down_contribution: Option<PacketDownContribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expert_distill_sample: Option<ExpertDistillSample>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    expert_distill_samples: Vec<ExpertDistillSample>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -965,7 +968,7 @@ fn main() -> Result<()> {
             output,
             sample_weights_output,
             sample_layer,
-            sample_expert,
+            sample_experts,
             max_sequences,
             max_tokens_per_sequence,
             context,
@@ -983,7 +986,7 @@ fn main() -> Result<()> {
             output,
             sample_weights_output,
             sample_layer,
-            sample_expert,
+            sample_experts,
             max_sequences,
             max_tokens_per_sequence,
             context,
@@ -1275,9 +1278,9 @@ struct CaptureCorpusArgs {
     model: PathBuf,
     corpora: Vec<PathBuf>,
     output: PathBuf,
-    sample_weights_output: PathBuf,
+    sample_weights_output: Option<PathBuf>,
     sample_layer: usize,
-    sample_expert: u16,
+    sample_experts: Vec<u16>,
     max_sequences: usize,
     max_tokens_per_sequence: usize,
     context: usize,
@@ -1289,6 +1292,14 @@ struct CaptureCorpusArgs {
     expert_neurons: usize,
     hidden_size: usize,
     model_sha256: Option<String>,
+}
+
+fn corpus_sample_modes(layer: usize, experts: &[u16]) -> (Option<(usize, u16)>, Option<usize>) {
+    if let [expert] = experts {
+        (Some((layer, *expert)), None)
+    } else {
+        (None, Some(layer))
+    }
 }
 
 struct ExpertStudentNllArgs {
@@ -1441,6 +1452,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
             .or(args.sample.map(|_| args.expert_neurons)),
             hidden: args.hidden_size,
             sample: args.sample,
+            sample_all_layer: None,
             capture_all_routes: true,
             capture_all_activations: !args.activation_packet_neurons.is_empty()
                 || !args.contribution_packet_neurons.is_empty(),
@@ -1483,6 +1495,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
             activations,
             down_contribution,
             expert_sample,
+            expert_samples: _,
             expert_down_weights,
         } = llama.step(token)?;
         if let Some(weights) = expert_down_weights
@@ -1522,6 +1535,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
                         }
                     },
                 ),
+                expert_distill_samples: Vec::new(),
             }),
         )?;
         position += 1;
@@ -1539,6 +1553,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
             activations,
             down_contribution,
             expert_sample,
+            expert_samples: _,
             expert_down_weights,
         } = llama.step(next)?;
         if let Some(weights) = expert_down_weights
@@ -1578,6 +1593,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
                         }
                     },
                 ),
+                expert_distill_samples: Vec::new(),
             }),
         )?;
         position += 1;
@@ -1608,8 +1624,20 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
     {
         bail!("corpus capture requires positive sequences and 2..=context tokens per sequence");
     }
-    if args.sample_layer >= args.layers || usize::from(args.sample_expert) >= args.experts {
+    if args.sample_layer >= args.layers
+        || args
+            .sample_experts
+            .iter()
+            .any(|&expert| usize::from(expert) >= args.experts)
+    {
         bail!("expert sample target is outside the model shape");
+    }
+    let selected_experts: HashSet<u16> = args.sample_experts.iter().copied().collect();
+    if selected_experts.len() != args.sample_experts.len() {
+        bail!("sample expert selection contains duplicates");
+    }
+    if args.sample_weights_output.is_some() && args.sample_experts.len() != 1 {
+        bail!("sample weights output requires exactly one selected expert");
     }
     let model_hash = match args.model_sha256.as_ref() {
         Some(value) => {
@@ -1618,6 +1646,7 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
         }
         None => sha256_file(&args.model)?,
     };
+    let (sample, sample_all_layer) = corpus_sample_modes(args.sample_layer, &args.sample_experts);
     let mut llama = llama_capture::Capture::open(
         &args.model,
         llama_capture::OpenConfig {
@@ -1629,7 +1658,8 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
             threads: args.threads,
             intermediate: Some(args.expert_neurons),
             hidden: args.hidden_size,
-            sample: Some((args.sample_layer, args.sample_expert)),
+            sample,
+            sample_all_layer,
             capture_all_routes: false,
             capture_all_activations: false,
             contribution_packet_neurons: &[],
@@ -1658,14 +1688,15 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
             layers: args.layers,
             experts: args.experts,
             top_k: args.top_k,
-            source: "llama.cpp-eval-callback-target-expert-corpus-reset".to_owned(),
+            source: "llama.cpp-eval-callback-selected-expert-batch-corpus-reset".to_owned(),
         }),
     )?;
 
     let mut sequences = 0usize;
     let mut token_positions = 0usize;
     let mut expert_hits = 0usize;
-    let mut wrote_weights = false;
+    let mut hit_counts = vec![0usize; args.experts];
+    let mut wrote_weights = args.sample_weights_output.is_none();
     for paragraph in paragraphs {
         if sequences >= args.max_sequences {
             break;
@@ -1687,6 +1718,7 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
                 activations: _,
                 down_contribution: _,
                 expert_sample,
+                expert_samples,
                 expert_down_weights,
             } = llama.step(token)?;
             validate_sample_route(
@@ -1696,18 +1728,40 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
                 args.experts,
                 args.sample_layer,
             )?;
-            if let Some(weights) = expert_down_weights {
-                write_expert_down_weights(
-                    &args.sample_weights_output,
-                    args.expert_neurons,
-                    args.hidden_size,
-                    &weights,
-                )?;
+            if let Some(weights) = expert_down_weights
+                && let Some(path) = &args.sample_weights_output
+            {
+                write_expert_down_weights(path, args.expert_neurons, args.hidden_size, &weights)?;
                 wrote_weights = true;
             }
-            if expert_sample.is_some() {
-                expert_hits += 1;
+            let mut samples = expert_samples
+                .into_iter()
+                .map(
+                    |(expert, input, activation, teacher_down_output)| ExpertDistillSample {
+                        layer: args.sample_layer,
+                        expert,
+                        input,
+                        activation,
+                        teacher_down_output,
+                    },
+                )
+                .collect::<Vec<_>>();
+            if let Some((input, activation, teacher_down_output)) = expert_sample {
+                samples.push(ExpertDistillSample {
+                    layer: args.sample_layer,
+                    expert: args.sample_experts[0],
+                    input,
+                    activation,
+                    teacher_down_output,
+                });
             }
+            samples.retain(|sample| {
+                selected_experts.is_empty() || selected_experts.contains(&sample.expert)
+            });
+            for sample in &samples {
+                hit_counts[usize::from(sample.expert)] += 1;
+            }
+            expert_hits += samples.len();
             write_trace_line(
                 &mut writer,
                 &TraceLine::Token(TokenRoutes {
@@ -1719,15 +1773,8 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
                     routes,
                     packet_activation_energy: None,
                     packet_down_contribution: None,
-                    expert_distill_sample: expert_sample.map(
-                        |(input, activation, teacher_down_output)| ExpertDistillSample {
-                            layer: args.sample_layer,
-                            expert: args.sample_expert,
-                            input,
-                            activation,
-                            teacher_down_output,
-                        },
-                    ),
+                    expert_distill_sample: None,
+                    expert_distill_samples: samples,
                 }),
             )?;
             token_positions += 1;
@@ -1744,6 +1791,14 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
     println!(
         "sequences: {sequences}, routed token positions: {token_positions}, expert hits: {expert_hits}"
     );
+    let populated = hit_counts
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count > 0)
+        .map(|(expert, count)| format!("{expert}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("expert hit counts: {populated}");
     Ok(())
 }
 
@@ -1824,6 +1879,7 @@ fn expert_student_nll(args: ExpertStudentNllArgs) -> Result<()> {
             intermediate: Some(args.expert_neurons),
             hidden: args.hidden_size,
             sample: Some((args.layer, args.expert)),
+            sample_all_layer: None,
             capture_all_routes: false,
             capture_all_activations: false,
             contribution_packet_neurons: &[],
@@ -1953,6 +2009,7 @@ fn joint_expert_student_nll(args: JointExpertStudentNllArgs) -> Result<()> {
             intermediate: Some(args.expert_neurons),
             hidden: args.hidden_size,
             sample: Some((joint.layer, joint.expert)),
+            sample_all_layer: None,
             capture_all_routes: false,
             capture_all_activations: false,
             contribution_packet_neurons: &[],
@@ -2135,6 +2192,7 @@ fn multi_expert_student_nll(args: MultiExpertStudentNllArgs) -> Result<()> {
             intermediate: Some(args.expert_neurons),
             hidden: args.hidden_size,
             sample: None,
+            sample_all_layer: None,
             capture_all_routes: true,
             capture_all_activations: true,
             contribution_packet_neurons: &[],
@@ -3343,6 +3401,7 @@ fn open_structured_capture(args: &StructuredNllArgs) -> Result<llama_capture::Ca
             intermediate: Some(args.expert_neurons),
             hidden: args.hidden_size,
             sample: None,
+            sample_all_layer: None,
             capture_all_routes: true,
             capture_all_activations: true,
             contribution_packet_neurons: &[],
@@ -3727,6 +3786,11 @@ fn read_expert_samples(
                     bail!("trace contains an expert sample for a different target");
                 }
                 samples.push(sample);
+            }
+            for sample in token.expert_distill_samples {
+                if sample.layer == layer && sample.expert == expert {
+                    samples.push(sample);
+                }
             }
             Ok(())
         })?;
@@ -4833,6 +4897,13 @@ mod llama_capture {
             down_output: *mut f32,
             down_count: c_int,
         ) -> c_int;
+        fn qx_llama_route_take_expert_samples(
+            route: *mut c_void,
+            input: *mut f32,
+            input_count: c_int,
+            down_outputs: *mut f32,
+            down_output_count: c_int,
+        ) -> c_int;
         fn qx_llama_route_take_expert_weights(
             route: *mut c_void,
             weights: *mut f32,
@@ -4875,7 +4946,8 @@ mod llama_capture {
         intermediate: Option<usize>,
         contribution_packet_neurons: Vec<usize>,
         contribution_total_packets: usize,
-        sample: bool,
+        sample: Option<(usize, u16)>,
+        sample_all_layer: Option<usize>,
         capture_all_routes: bool,
         hidden: usize,
     }
@@ -4887,6 +4959,7 @@ mod llama_capture {
         pub activations: Option<Vec<f32>>,
         pub down_contribution: Option<PacketDownContribution>,
         pub expert_sample: Option<(Vec<f32>, Vec<f32>, Vec<f32>)>,
+        pub expert_samples: Vec<(u16, Vec<f32>, Vec<f32>, Vec<f32>)>,
         pub expert_down_weights: Option<Vec<f32>>,
     }
 
@@ -4900,6 +4973,7 @@ mod llama_capture {
         pub intermediate: Option<usize>,
         pub hidden: usize,
         pub sample: Option<(usize, u16)>,
+        pub sample_all_layer: Option<usize>,
         pub capture_all_routes: bool,
         pub capture_all_activations: bool,
         pub contribution_packet_neurons: &'a [usize],
@@ -4917,10 +4991,15 @@ mod llama_capture {
                 intermediate,
                 hidden,
                 sample,
+                sample_all_layer,
                 capture_all_routes,
                 capture_all_activations,
                 contribution_packet_neurons,
             } = config;
+            if sample.is_some() && sample_all_layer.is_some() {
+                bail!("single-expert and all-expert capture modes are mutually exclusive");
+            }
+            let sample_layer = sample.map(|(layer, _)| layer).or(sample_all_layer);
             let path = CString::new(path.to_string_lossy().as_bytes())?;
             let contribution_packet_neurons_i32 = contribution_packet_neurons
                 .iter()
@@ -4941,7 +5020,7 @@ mod llama_capture {
                     threads,
                     intermediate.unwrap_or(0).try_into()?,
                     hidden.try_into()?,
-                    sample.map_or(-1, |(layer, _)| layer as c_int),
+                    sample_layer.map_or(-1, |layer| layer as c_int),
                     sample.map_or(-1, |(_, expert)| c_int::from(expert)),
                     c_int::from(capture_all_routes),
                     c_int::from(capture_all_activations),
@@ -4966,7 +5045,8 @@ mod llama_capture {
                     })
                     .unwrap_or(0),
                 contribution_packet_neurons: contribution_packet_neurons.to_vec(),
-                sample: sample.is_some(),
+                sample,
+                sample_all_layer,
                 capture_all_routes,
                 hidden,
             })
@@ -5171,7 +5251,7 @@ mod llama_capture {
                     self.structure_contributions(norms, residuals, order, reconstruction)
                 })
                 .transpose()?;
-            let expert_sample = if self.sample {
+            let expert_sample = if self.sample.is_some() {
                 let intermediate = self
                     .intermediate
                     .expect("expert sample has activation width");
@@ -5200,7 +5280,53 @@ mod llama_capture {
             } else {
                 None
             };
-            let expert_down_weights = if self.sample {
+            let mut expert_samples = Vec::new();
+            if let Some(layer) = self.sample_all_layer {
+                let intermediate = self
+                    .intermediate
+                    .expect("expert samples have activation width");
+                let mut input = vec![0.0f32; self.hidden];
+                let mut down_outputs = vec![0.0f32; self.top_k * self.hidden];
+                let status = unsafe {
+                    qx_llama_route_take_expert_samples(
+                        self.raw,
+                        input.as_mut_ptr(),
+                        input.len().try_into()?,
+                        down_outputs.as_mut_ptr(),
+                        down_outputs.len().try_into()?,
+                    )
+                };
+                if status < 0 {
+                    bail!(
+                        "llama expert sample batch read failed ({status}): {}",
+                        self.error()
+                    );
+                }
+                if status > 0 {
+                    let count = usize::try_from(status)?;
+                    if count != self.top_k {
+                        bail!(
+                            "llama expert sample batch returned {count} of {} slots",
+                            self.top_k
+                        );
+                    }
+                    let all_activations = activations
+                        .as_ref()
+                        .expect("expert sample batch has activation storage");
+                    for slot in 0..count {
+                        let activation_start = (layer * self.top_k + slot) * intermediate;
+                        let output_start = slot * self.hidden;
+                        expert_samples.push((
+                            routes[layer][slot],
+                            input.clone(),
+                            all_activations[activation_start..activation_start + intermediate]
+                                .to_vec(),
+                            down_outputs[output_start..output_start + self.hidden].to_vec(),
+                        ));
+                    }
+                }
+            }
+            let expert_down_weights = if self.sample.is_some() {
                 let intermediate = self
                     .intermediate
                     .expect("expert sample has activation width");
@@ -5230,6 +5356,7 @@ mod llama_capture {
                 activations,
                 down_contribution,
                 expert_sample,
+                expert_samples,
                 expert_down_weights,
             })
         }
@@ -5366,6 +5493,13 @@ mod tests {
     fn percentile_uses_an_upper_rank() {
         assert_eq!(percentile(&[0, 1, 2, 3, 4], 0.50), 2);
         assert_eq!(percentile(&[0, 1, 2, 3, 4], 0.95), 4);
+    }
+
+    #[test]
+    fn corpus_capture_uses_batch_mode_for_zero_or_multiple_experts() {
+        assert_eq!(corpus_sample_modes(8, &[]), (None, Some(8)));
+        assert_eq!(corpus_sample_modes(8, &[11]), (Some((8, 11)), None));
+        assert_eq!(corpus_sample_modes(8, &[11, 38]), (None, Some(8)));
     }
 
     #[test]
@@ -5534,6 +5668,7 @@ mod tests {
                     packet_activation_energy: None,
                     packet_down_contribution: None,
                     expert_distill_sample: None,
+                    expert_distill_samples: Vec::new(),
                 }),
             )
             .unwrap();

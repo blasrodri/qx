@@ -40,6 +40,7 @@ typedef struct qx_llama_route {
     float * sample_input;
     float * sample_activation;
     float * sample_down_output;
+    float * sample_all_down_outputs;
     float * sample_down_weights;
     float * sample_student_down_weights;
     int32_t sample_joint_width;
@@ -305,6 +306,17 @@ static bool qx_capture_expert_sample(
         tensor->ne[1] != route->top_k) {
         qx_set_error(route, "unexpected expert sample tensor state, shape, or type");
         return false;
+    }
+    if (route->sample_expert < 0) {
+        for (int32_t slot = 0; slot < route->top_k; ++slot) {
+            ggml_backend_tensor_get(
+                tensor,
+                route->sample_all_down_outputs + (size_t) slot * route->hidden,
+                (size_t) slot * tensor->nb[1],
+                (size_t) route->hidden * sizeof(float));
+        }
+        route->sample_ready = true;
+        return true;
     }
     for (int32_t slot = 0; slot < route->top_k; ++slot) {
         if (route->active_routes[layer * route->top_k + slot] != route->sample_expert) {
@@ -627,9 +639,11 @@ qx_llama_route * qx_llama_route_open(
         int32_t contribution_size_count) {
     if (!path || layers <= 0 || experts <= 0 || top_k <= 0 || intermediate < 0 || hidden < 0 ||
         contribution_size_count < 0 ||
-        ((sample_layer >= 0 || sample_expert >= 0) &&
-            (sample_layer < 0 || sample_layer >= layers || sample_expert < 0 ||
-             sample_expert >= experts || intermediate <= 0 || hidden <= 0)) ||
+        (sample_expert < -1 ||
+            (sample_layer < 0 && sample_expert >= 0) ||
+            (sample_layer >= 0 &&
+                (sample_layer >= layers || sample_expert >= experts ||
+                 intermediate <= 0 || hidden <= 0))) ||
         (contribution_size_count > 0 &&
             (!contribution_packet_neurons || intermediate <= 0 || hidden <= 0))) {
         return NULL;
@@ -692,19 +706,23 @@ qx_llama_route * qx_llama_route_open(
         malloc((size_t) intermediate * sizeof(float)) : NULL;
     route->sample_down_output = sample_layer >= 0 ?
         malloc((size_t) hidden * sizeof(float)) : NULL;
+    route->sample_all_down_outputs = sample_layer >= 0 && sample_expert < 0 ?
+        malloc((size_t) top_k * hidden * sizeof(float)) : NULL;
     route->sample_down_weights = sample_layer >= 0 ?
         malloc((size_t) hidden * intermediate * sizeof(float)) : NULL;
     if (!route->seen_layers || (intermediate > 0 && !route->seen_activations) ||
         (contribution_size_count > 0 && !route->seen_contributions) ||
         (sample_layer >= 0 && (!route->sample_input || !route->sample_activation ||
             !route->sample_down_output ||
-            !route->sample_down_weights))) {
+            !route->sample_down_weights ||
+            (sample_expert < 0 && !route->sample_all_down_outputs)))) {
         free(route->seen_layers);
         free(route->seen_activations);
         free(route->seen_contributions);
         free(route->sample_input);
         free(route->sample_activation);
         free(route->sample_down_output);
+        free(route->sample_all_down_outputs);
         free(route->sample_down_weights);
         free(route->contribution_packet_neurons);
         free(route);
@@ -723,6 +741,7 @@ qx_llama_route * qx_llama_route_open(
         free(route->sample_input);
         free(route->sample_activation);
         free(route->sample_down_output);
+        free(route->sample_all_down_outputs);
         free(route->sample_down_weights);
         free(route->contribution_packet_neurons);
         free(route);
@@ -736,6 +755,7 @@ qx_llama_route * qx_llama_route_open(
         free(route->sample_input);
         free(route->sample_activation);
         free(route->sample_down_output);
+        free(route->sample_all_down_outputs);
         free(route->sample_down_weights);
         free(route->contribution_packet_neurons);
         free(route);
@@ -762,6 +782,7 @@ qx_llama_route * qx_llama_route_open(
         free(route->sample_input);
         free(route->sample_activation);
         free(route->sample_down_output);
+        free(route->sample_all_down_outputs);
         free(route->sample_down_weights);
         free(route->contribution_packet_neurons);
         free(route);
@@ -789,6 +810,7 @@ void qx_llama_route_close(qx_llama_route * route) {
     free(route->sample_input);
     free(route->sample_activation);
     free(route->sample_down_output);
+    free(route->sample_all_down_outputs);
     free(route->sample_down_weights);
     free(route->sample_student_down_weights);
     free(route->sample_joint_gate_weights);
@@ -836,6 +858,28 @@ int qx_llama_route_take_expert_sample(
     route->sample_ready = false;
     route->sample_input_ready = false;
     return 1;
+}
+
+int qx_llama_route_take_expert_samples(
+        qx_llama_route * route,
+        float * input,
+        int32_t input_count,
+        float * down_outputs,
+        int32_t down_output_count) {
+    const size_t expected_outputs = route ? (size_t) route->top_k * route->hidden : 0;
+    if (!route || !input || !down_outputs || route->sample_expert >= 0 ||
+        input_count != route->hidden || down_output_count < 0 ||
+        (size_t) down_output_count != expected_outputs || route->sample_layer < 0) {
+        return -1;
+    }
+    if (!route->sample_ready) {
+        return 0;
+    }
+    memcpy(input, route->sample_input, (size_t) input_count * sizeof(float));
+    memcpy(down_outputs, route->sample_all_down_outputs, expected_outputs * sizeof(float));
+    route->sample_ready = false;
+    route->sample_input_ready = false;
+    return route->top_k;
 }
 
 int qx_llama_route_take_expert_weights(

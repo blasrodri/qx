@@ -56,16 +56,20 @@ def load_trace(paths, layer, expert):
         with path.open() as stream:
             for line in stream:
                 record = json.loads(line)
-                sample = record.get("expert_distill_sample")
-                if sample is None:
-                    continue
-                if sample["layer"] != layer or sample["expert"] != expert:
-                    raise ValueError(f"{path} contains a sample for another expert")
-                values = sample.get("input", [])
-                if not values:
-                    raise ValueError(f"{path} predates normalized expert-input capture")
-                inputs.append(values)
-                captured_outputs.append(sample["teacher_down_output"])
+                samples = record.get("expert_distill_samples", [])
+                single = record.get("expert_distill_sample")
+                if single is not None:
+                    samples = [single, *samples]
+                for sample in samples:
+                    if sample["layer"] != layer or sample["expert"] != expert:
+                        continue
+                    values = sample.get("input", [])
+                    if not values:
+                        raise ValueError(
+                            f"{path} predates normalized expert-input capture"
+                        )
+                    inputs.append(values)
+                    captured_outputs.append(sample["teacher_down_output"])
     if not inputs:
         raise ValueError("trace set contains no target-expert hits")
     return torch.tensor(inputs, dtype=torch.float32), torch.tensor(
