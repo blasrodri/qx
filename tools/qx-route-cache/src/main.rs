@@ -350,6 +350,9 @@ enum Command {
         corpora: Vec<PathBuf>,
         #[arg(long = "student", required = true)]
         students: Vec<PathBuf>,
+        /// Optional low-rank correction injected after aggregated MoE output.
+        #[arg(long)]
+        layer_residual: Option<PathBuf>,
         /// Evaluate sorted student prefixes in one loaded-model session. Empty evaluates all.
         #[arg(long, value_delimiter = ',')]
         active_prefixes: Vec<usize>,
@@ -872,6 +875,14 @@ struct JointExpertStudent {
     down: Vec<f32>,
 }
 
+struct LayerResidual {
+    layer: usize,
+    rank: usize,
+    hidden: usize,
+    down: Vec<f32>,
+    up: Vec<f32>,
+}
+
 #[derive(Debug, Serialize)]
 struct MultiExpertStudentNllReport {
     schema_version: u32,
@@ -908,6 +919,7 @@ struct MultiJointExpertStudentNllReport {
     model_sha256: String,
     corpora: Vec<String>,
     students: Vec<MultiJointExpertStudentResult>,
+    layer_residual: Option<String>,
     skipped_sequences: usize,
     sequences: usize,
     scored_tokens: usize,
@@ -1287,6 +1299,7 @@ fn main() -> Result<()> {
             model,
             corpora,
             students,
+            layer_residual,
             active_prefixes,
             skip_sequences,
             max_sequences,
@@ -1305,6 +1318,7 @@ fn main() -> Result<()> {
             model,
             corpora,
             students,
+            layer_residual,
             active_prefixes,
             skip_sequences,
             max_sequences,
@@ -1485,6 +1499,7 @@ struct MultiJointExpertStudentNllArgs {
     model: PathBuf,
     corpora: Vec<PathBuf>,
     students: Vec<PathBuf>,
+    layer_residual: Option<PathBuf>,
     active_prefixes: Vec<usize>,
     skip_sequences: usize,
     max_sequences: usize,
@@ -2294,6 +2309,10 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         || args.corpora.iter().any(|path| !path.is_file())
         || args.students.is_empty()
         || args.students.iter().any(|path| !path.is_file())
+        || args
+            .layer_residual
+            .as_ref()
+            .is_some_and(|path| !path.is_file())
     {
         bail!("model, corpus, and joint student inputs must exist");
     }
@@ -2404,6 +2423,16 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         }
         capture.add_joint_expert_student(&student)?;
     }
+    if let Some(path) = &args.layer_residual {
+        let residual = read_layer_residual(path)?;
+        if residual.layer >= args.layers || residual.hidden != args.hidden_size {
+            bail!(
+                "layer residual {} does not match the requested model",
+                path.display()
+            );
+        }
+        capture.set_layer_residual(&residual)?;
+    }
     let mut prefix_measurements = Vec::new();
     for &prefix in &active_prefixes {
         capture.set_joint_active_prefix(prefix)?;
@@ -2453,6 +2482,10 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
                 },
             )
             .collect(),
+        layer_residual: args
+            .layer_residual
+            .as_ref()
+            .map(|path| path.display().to_string()),
         skipped_sequences: args.skip_sequences,
         sequences: sequences.len(),
         scored_tokens: exact.scored_tokens,
@@ -5223,6 +5256,50 @@ fn read_joint_expert_student(path: &Path) -> Result<JointExpertStudent> {
     })
 }
 
+fn read_layer_residual(path: &Path) -> Result<LayerResidual> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic)?;
+    if &magic != b"QXLRA001" {
+        bail!("layer residual has an invalid magic");
+    }
+    let mut read_u32 = || -> Result<usize> {
+        let mut bytes = [0u8; 4];
+        reader.read_exact(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes) as usize)
+    };
+    let layer = read_u32()?;
+    let rank = read_u32()?;
+    let hidden = read_u32()?;
+    if rank == 0 || hidden == 0 {
+        bail!("layer residual has invalid dimensions");
+    }
+    let values = rank
+        .checked_mul(hidden)
+        .ok_or_else(|| anyhow::anyhow!("layer residual dimensions overflow"))?;
+    let mut read_values = || -> Result<Vec<f32>> {
+        let mut bytes = vec![0u8; values * std::mem::size_of::<f32>()];
+        reader.read_exact(&mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+            .collect())
+    };
+    let down = read_values()?;
+    let up = read_values()?;
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        bail!("layer residual contains trailing bytes");
+    }
+    Ok(LayerResidual {
+        layer,
+        rank,
+        hidden,
+        down,
+        up,
+    })
+}
+
 #[cfg(target_os = "macos")]
 mod llama_capture {
     use super::*;
@@ -5278,6 +5355,15 @@ mod llama_capture {
             down_count: c_int,
         ) -> c_int;
         fn qx_llama_route_set_joint_active_prefix(route: *mut c_void, count: c_int) -> c_int;
+        fn qx_llama_route_set_layer_residual(
+            route: *mut c_void,
+            layer: c_int,
+            rank: c_int,
+            down: *const f32,
+            down_count: c_int,
+            up: *const f32,
+            up_count: c_int,
+        ) -> c_int;
         fn qx_llama_route_add_expert_student(
             route: *mut c_void,
             layer: c_int,
@@ -5559,6 +5645,24 @@ mod llama_capture {
                 unsafe { qx_llama_route_set_joint_active_prefix(self.raw, count.try_into()?) };
             if status != 0 {
                 bail!("llama bridge rejected joint active prefix with status {status}");
+            }
+            Ok(())
+        }
+
+        pub fn set_layer_residual(&mut self, residual: &LayerResidual) -> Result<()> {
+            let status = unsafe {
+                qx_llama_route_set_layer_residual(
+                    self.raw,
+                    residual.layer.try_into()?,
+                    residual.rank.try_into()?,
+                    residual.down.as_ptr(),
+                    residual.down.len().try_into()?,
+                    residual.up.as_ptr(),
+                    residual.up.len().try_into()?,
+                )
+            };
+            if status != 0 {
+                bail!("llama bridge rejected layer residual with status {status}");
             }
             Ok(())
         }
@@ -6053,6 +6157,33 @@ mod tests {
         assert_eq!(student.gate, values[0..6]);
         assert_eq!(student.up, values[6..12]);
         assert_eq!(student.down, values[12..18]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn layer_residual_sidecar_round_trips() {
+        let path = std::env::temp_dir().join(format!(
+            "qx-layer-residual-{}-{}.qxlra",
+            std::process::id(),
+            SCHEMA_VERSION
+        ));
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"QXLRA001").unwrap();
+        for dimension in [7_u32, 2, 3] {
+            file.write_all(&dimension.to_le_bytes()).unwrap();
+        }
+        let values: Vec<f32> = (0..12).map(|value| value as f32 * 0.25 - 1.0).collect();
+        for value in &values {
+            file.write_all(&value.to_le_bytes()).unwrap();
+        }
+        drop(file);
+
+        let residual = read_layer_residual(&path).unwrap();
+        assert_eq!(residual.layer, 7);
+        assert_eq!(residual.rank, 2);
+        assert_eq!(residual.hidden, 3);
+        assert_eq!(residual.down, values[0..6]);
+        assert_eq!(residual.up, values[6..12]);
         std::fs::remove_file(path).unwrap();
     }
 

@@ -58,6 +58,12 @@ typedef struct qx_llama_route {
     float ** joint_down_weights;
     float ** joint_activations;
     float * joint_output;
+    int32_t residual_layer;
+    int32_t residual_rank;
+    float * residual_down;
+    float * residual_up;
+    float * residual_hidden;
+    float * residual_output;
     int32_t student_count;
     int32_t * student_layers;
     int32_t * student_experts;
@@ -554,6 +560,44 @@ static bool qx_apply_joint_expert_students(
     return true;
 }
 
+static bool qx_apply_layer_residual(
+        qx_llama_route * route,
+        struct ggml_tensor * tensor,
+        int32_t layer) {
+    if (layer != route->residual_layer || !route->sample_input_ready ||
+        tensor->type != GGML_TYPE_F32 || tensor->ne[0] != route->hidden || tensor->ne[1] != 1) {
+        qx_set_error(route, "unexpected layer residual tensor state, shape, or type");
+        return false;
+    }
+    for (int32_t rank = 0; rank < route->residual_rank; ++rank) {
+        float value = 0.0f;
+        const float * row = route->residual_down + (size_t) rank * route->hidden;
+        for (int32_t input = 0; input < route->hidden; ++input) {
+            value += row[input] * route->sample_input[input];
+        }
+        route->residual_hidden[rank] = value;
+    }
+    ggml_backend_tensor_get(
+        tensor,
+        route->residual_output,
+        0,
+        (size_t) route->hidden * sizeof(float));
+    for (int32_t output = 0; output < route->hidden; ++output) {
+        const float * row = route->residual_up + (size_t) output * route->residual_rank;
+        float correction = 0.0f;
+        for (int32_t rank = 0; rank < route->residual_rank; ++rank) {
+            correction += row[rank] * route->residual_hidden[rank];
+        }
+        route->residual_output[output] += correction;
+    }
+    ggml_backend_tensor_set(
+        tensor,
+        route->residual_output,
+        0,
+        (size_t) route->hidden * sizeof(float));
+    return true;
+}
+
 static bool qx_apply_expert_students(
         qx_llama_route * route,
         struct ggml_tensor * tensor,
@@ -601,6 +645,7 @@ static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user
     static const char route_prefix[] = "ffn_moe_topk-";
     static const char activation_prefix[] = "ffn_moe_swiglu-";
     static const char contribution_prefix[] = "ffn_moe_down-";
+    static const char output_prefix[] = "ffn_moe_out-";
     if (!route) {
         return false;
     }
@@ -610,11 +655,14 @@ static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user
     const bool is_down = (route->contribution_size_count > 0 || route->sample_layer >= 0 ||
         route->student_count > 0 || route->joint_count > 0) &&
         strncmp(tensor->name, contribution_prefix, sizeof(contribution_prefix) - 1) == 0;
-    if (!is_route && !is_activation && !is_down) {
+    const bool is_output = route->residual_layer >= 0 &&
+        strncmp(tensor->name, output_prefix, sizeof(output_prefix) - 1) == 0;
+    if (!is_route && !is_activation && !is_down && !is_output) {
         return false;
     }
     const char * suffix = tensor->name + (is_route ? sizeof(route_prefix) - 1 :
-        (is_activation ? sizeof(activation_prefix) - 1 : sizeof(contribution_prefix) - 1));
+        (is_activation ? sizeof(activation_prefix) - 1 :
+        (is_down ? sizeof(contribution_prefix) - 1 : sizeof(output_prefix) - 1)));
     int layer = atoi(suffix);
     if (layer < 0 || layer >= route->layers) {
         return false;
@@ -631,6 +679,9 @@ static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user
         !qx_has_student_layer(route, layer) && !qx_has_joint_student_layer(route, layer)) {
         return false;
     }
+    if (is_output && layer != route->residual_layer) {
+        return false;
+    }
     if (ask) {
         return true;
     }
@@ -645,6 +696,10 @@ static bool qx_route_callback(struct ggml_tensor * tensor, bool ask, void * user
             0,
             (size_t) route->top_k * sizeof(int32_t));
         route->seen_layers[layer] = 1;
+        return true;
+    }
+    if (is_output) {
+        qx_apply_layer_residual(route, tensor, layer);
         return true;
     }
     if (is_down) {
@@ -742,6 +797,7 @@ qx_llama_route * qx_llama_route_open(
     route->hidden = hidden;
     route->sample_layer = sample_layer;
     route->sample_expert = sample_expert;
+    route->residual_layer = -1;
     route->capture_all_routes = capture_all_routes != 0;
     route->capture_all_activations = capture_all_activations != 0;
     route->contribution_size_count = contribution_size_count;
@@ -914,6 +970,10 @@ void qx_llama_route_close(qx_llama_route * route) {
     free(route->joint_down_weights);
     free(route->joint_activations);
     free(route->joint_output);
+    free(route->residual_down);
+    free(route->residual_up);
+    free(route->residual_hidden);
+    free(route->residual_output);
     for (int32_t index = 0; index < route->student_count; ++index) {
         free(route->student_down_weights[index]);
     }
@@ -1191,6 +1251,46 @@ int qx_llama_route_set_joint_active_prefix(qx_llama_route * route, int32_t count
         return -1;
     }
     route->joint_active_count = count;
+    return 0;
+}
+
+int qx_llama_route_set_layer_residual(
+        qx_llama_route * route,
+        int32_t layer,
+        int32_t rank,
+        const float * down,
+        int32_t down_count,
+        const float * up,
+        int32_t up_count) {
+    const size_t values = route && rank > 0 ? (size_t) rank * route->hidden : 0;
+    if (!route || layer < 0 || layer >= route->layers || rank <= 0 || !down || !up ||
+        down_count < 0 || up_count < 0 || (size_t) down_count != values ||
+        (size_t) up_count != values) {
+        return -1;
+    }
+    float * copied_down = malloc(values * sizeof(float));
+    float * copied_up = malloc(values * sizeof(float));
+    float * hidden = malloc((size_t) rank * sizeof(float));
+    float * output = malloc((size_t) route->hidden * sizeof(float));
+    if (!copied_down || !copied_up || !hidden || !output) {
+        free(copied_down);
+        free(copied_up);
+        free(hidden);
+        free(output);
+        return -2;
+    }
+    memcpy(copied_down, down, values * sizeof(float));
+    memcpy(copied_up, up, values * sizeof(float));
+    free(route->residual_down);
+    free(route->residual_up);
+    free(route->residual_hidden);
+    free(route->residual_output);
+    route->residual_layer = layer;
+    route->residual_rank = rank;
+    route->residual_down = copied_down;
+    route->residual_up = copied_up;
+    route->residual_hidden = hidden;
+    route->residual_output = output;
     return 0;
 }
 

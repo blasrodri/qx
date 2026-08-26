@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-layer2-coordinated-residual-recovery",
+  "promotion_evidence": false,
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "layer": 2,
+  "expert_policy": {
+    "transformed_experts": 79,
+    "heldout_route_coverage": 0.9737302977232924,
+    "student_width": 640,
+    "gate_codec": "q3",
+    "up_codec": "q3",
+    "down_codec": "q3"
+  },
+  "residual": {
+    "rank": 64,
+    "parameters": 262144,
+    "fp16_bytes_per_layer": 524288,
+    "projected_fp16_bytes_for_48_layers": 25165824,
+    "offline_train_complete_positions": 231,
+    "offline_heldout_complete_positions": 48,
+    "offline_uncorrected_normalized_mse": 0.003050269093364477,
+    "offline_corrected_normalized_mse": 0.00008691854600328952
+  },
+  "live_replays": [
+    {
+      "skipped_sequences": 4,
+      "sequences": 1,
+      "scored_tokens": 47,
+      "relative_perplexity_delta": -0.025088461992910704,
+      "top1_agreement": 0.8936170212765957
+    },
+    {
+      "skipped_sequences": 5,
+      "sequences": 2,
+      "scored_tokens": 59,
+      "relative_perplexity_delta": 0.019729140872012385,
+      "top1_agreement": 0.9322033898305084
+    }
+  ],
+  "combined_live": {
+    "scored_tokens": 106,
+    "exact_mean_nll": 3.2888607493751896,
+    "student_mean_nll": 3.288469089919888,
+    "relative_perplexity_delta": -0.0003915827667493321,
+    "top1_agreement": 0.9150943396226415
+  },
+  "width512_capacity_gate": {
+    "expert_policy": {
+      "transformed_experts": 79,
+      "student_width": 512,
+      "gate_codec": "q2s4",
+      "up_codec": "q3",
+      "down_codec": "q2s4",
+      "projected_complete_weight_gib": 7.183006286621094
+    },
+    "residual": {
+      "rank": 64,
+      "fp16_bytes_per_layer": 524288,
+      "offline_uncorrected_normalized_mse": 0.5812199711799622,
+      "offline_corrected_normalized_mse": 0.019860634580254555
+    },
+    "live_replay": {
+      "skipped_sequences": 4,
+      "sequences": 1,
+      "scored_tokens": 47,
+      "exact_mean_nll": 3.644960676136605,
+      "student_mean_nll": 10.363580272552815,
+      "relative_perplexity_delta": 826.6741981167952,
+      "top1_agreement": 0.0425531914893617
+    },
+    "decision": "reject_uniform_width512_capacity_tier"
+  },
+  "decision": {
+    "model_loss_gate": "pass_on_small_single-domain_replay",
+    "top1_behavior_gate": "fail",
+    "width512_capacity_gate": "fail",
+    "next_iteration": "optimize_heterogeneous_expert_width_and_codec_under_whole_model_byte_budget"
+  },
+  "limitations": [
+    "single layer and WikiText only",
+    "106 combined live scored tokens",
+    "offline router weights reconstructed from BF16 checkpoint",
+    "residual rank selected on one heldout slice",
+    "diagnostic F32 expert and residual execution"
+  ]
+}
