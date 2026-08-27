@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-layer2-resident-quality-frontier",
+  "promotion_evidence": false,
+  "date": "2026-08-27",
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "scope": {
+    "layer": 2,
+    "scored_tokens": 47,
+    "transformed_experts": 79,
+    "teacher_width_exceptions": 49,
+    "student_width": 768,
+    "teacher_width": 768
+  },
+  "live_quality_frontier": [
+    {
+      "name": "uniform_q2s4",
+      "projection_codecs": {
+        "gate": "q2s4",
+        "up": "q2s4",
+        "down": "q2s4"
+      },
+      "exact_mean_nll": 3.644960676136605,
+      "student_mean_nll": 3.6174208810896626,
+      "nll_delta": -0.027539795046942483,
+      "relative_perplexity_delta": -0.027164032269873184,
+      "top1_agreement": 0.6595744680851063,
+      "decision": "reject_for_product_quality"
+    },
+    {
+      "name": "selective_q3_up",
+      "selection_rule": "general-calibration route frequency multiplied by expert-local Q2 error",
+      "promoted_experts": 29,
+      "calibration_route_coverage": 0.57001,
+      "promoted_expert_ids": [
+        47, 50, 125, 76, 40, 49, 4, 88, 16, 6, 67, 121, 15, 53, 119,
+        65, 123, 23, 116, 45, 84, 44, 122, 90, 115, 69, 64, 52, 59
+      ],
+      "projection_codecs": {
+        "gate": "q2s4",
+        "up": "q3",
+        "down": "q2s4"
+      },
+      "exact_mean_nll": 3.644960676136605,
+      "student_mean_nll": 3.6524201400758836,
+      "nll_delta": 0.007459463939278432,
+      "relative_perplexity_delta": 0.007487355048184652,
+      "top1_agreement": 0.6170212765957447,
+      "projected_added_installed_bytes_for_48_layers": 273678336,
+      "projected_complete_installed_weight_gib": 9.500389099121094,
+      "decision": "reject_selection_rule"
+    },
+    {
+      "name": "uniform_q2s4_plus_rank64_shared_residual",
+      "residual_rank": 64,
+      "residual_parameters_per_layer": 262144,
+      "residual_fp16_bytes_per_layer": 524288,
+      "exact_mean_nll": 3.644960676136605,
+      "student_mean_nll": 10.220738915686912,
+      "nll_delta": 6.575778239550306,
+      "relative_perplexity_delta": 716.503796960157,
+      "top1_agreement": 0.0425531914893617,
+      "projected_added_installed_bytes_for_48_layers": 25165824,
+      "projected_complete_installed_weight_gib": 9.268943786621094,
+      "offline_warning": {
+        "uncorrected_normalized_mse": 0.6855459809303284,
+        "corrected_normalized_mse": 0.02779955230653286,
+        "corrected_mean_relative_l2": 22.699045181274414,
+        "corrected_mean_cosine": 0.19555146992206573
+      },
+      "decision": "reject_catastrophic_live_regression"
+    }
+  ],
+  "memory_path_status": {
+    "installed_weight_gib": 9.245506286621094,
+    "expert_cache_gib": 4.5,
+    "projected_total_resident_gib_range": [6.433006286621094, 6.933006286621094],
+    "decision": "capacity_mechanism_remains_plausible_but_artifact_quality_is_blocked"
+  },
+  "decision": {
+    "stop_local_reconstruction_tuning": true,
+    "do_not_expand_current_codec_to_all_layers": true,
+    "next_experiment": "downstream-logit-impact selection with exact or higher-precision paging, followed by logits-aware global distillation if necessary",
+    "quality_gate": "at least 90 percent top1 agreement with no material NLL regression on a larger disjoint replay"
+  },
+  "limitations": [
+    "one transformed layer rather than a complete 48-layer artifact",
+    "47 teacher-forced WikiText tokens rather than a broad product evaluation",
+    "79 transformed experts and 49 exact teacher-width exceptions",
+    "macOS validation rather than measured iPhone execution",
+    "the resident-memory projection is simulated and excludes a complete iOS application measurement",
+    "top1 agreement is a strict diagnostic rather than a complete model-quality metric"
+  ]
+}
