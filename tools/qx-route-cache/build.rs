@@ -68,5 +68,6 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", llama_bin.display());
     println!("cargo:rustc-link-lib=dylib=llama");
     println!("cargo:rustc-link-lib=dylib=ggml-base");
+    println!("cargo:rustc-link-lib=framework=Accelerate");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", llama_bin.display());
 }

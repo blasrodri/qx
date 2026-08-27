@@ -350,6 +350,9 @@ enum Command {
         corpora: Vec<PathBuf>,
         #[arg(long = "student", required = true)]
         students: Vec<PathBuf>,
+        /// Cumulatively replace matching baseline students, freeing the old matrices in place.
+        #[arg(long = "replacement-student")]
+        replacement_students: Vec<PathBuf>,
         /// Optional low-rank correction injected after aggregated MoE output.
         #[arg(long)]
         layer_residual: Option<PathBuf>,
@@ -930,6 +933,8 @@ struct MultiJointExpertStudentNllReport {
     top1_agreement: f64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     prefix_results: Vec<MultiJointExpertStudentPrefixResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    replacement_results: Vec<MultiJointExpertStudentReplacementResult>,
 }
 
 #[derive(Debug, Serialize)]
@@ -950,6 +955,20 @@ struct MultiJointExpertStudentResult {
     sidecar: String,
     exact_route_hits: usize,
     student_route_hits: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct MultiJointExpertStudentReplacementResult {
+    cumulative_replacements: usize,
+    layer: usize,
+    expert: u16,
+    width: usize,
+    sidecar: String,
+    scored_tokens: usize,
+    student_mean_nll: f64,
+    nll_delta: f64,
+    relative_perplexity_delta: f64,
+    top1_agreement: f64,
 }
 
 #[derive(Default)]
@@ -1299,6 +1318,7 @@ fn main() -> Result<()> {
             model,
             corpora,
             students,
+            replacement_students,
             layer_residual,
             active_prefixes,
             skip_sequences,
@@ -1318,6 +1338,7 @@ fn main() -> Result<()> {
             model,
             corpora,
             students,
+            replacement_students,
             layer_residual,
             active_prefixes,
             skip_sequences,
@@ -1499,6 +1520,7 @@ struct MultiJointExpertStudentNllArgs {
     model: PathBuf,
     corpora: Vec<PathBuf>,
     students: Vec<PathBuf>,
+    replacement_students: Vec<PathBuf>,
     layer_residual: Option<PathBuf>,
     active_prefixes: Vec<usize>,
     skip_sequences: usize,
@@ -2309,6 +2331,7 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         || args.corpora.iter().any(|path| !path.is_file())
         || args.students.is_empty()
         || args.students.iter().any(|path| !path.is_file())
+        || args.replacement_students.iter().any(|path| !path.is_file())
         || args
             .layer_residual
             .as_ref()
@@ -2351,6 +2374,34 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
             );
         }
         students.push((path.clone(), student.layer, student.expert, student.width));
+    }
+    let mut replacements = Vec::new();
+    let mut replaced_targets = HashSet::new();
+    for path in &args.replacement_students {
+        let student = read_joint_expert_student(path)?;
+        let target = (student.layer, student.expert);
+        if student.layer >= args.layers
+            || usize::from(student.expert) >= args.experts
+            || student.hidden != args.hidden_size
+            || student.teacher_width != args.expert_neurons
+            || !targets.contains(&target)
+        {
+            bail!(
+                "replacement student {} does not match one baseline model target",
+                path.display()
+            );
+        }
+        if !replaced_targets.insert(target) {
+            bail!(
+                "replacement target {}:{} occurs more than once",
+                student.layer,
+                student.expert
+            );
+        }
+        replacements.push((path.clone(), student.layer, student.expert, student.width));
+    }
+    if !replacements.is_empty() && !args.active_prefixes.is_empty() {
+        bail!("replacement students require the complete baseline, without --active-prefixes");
     }
     let active_prefixes = if args.active_prefixes.is_empty() {
         vec![students.len()]
@@ -2444,10 +2495,37 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         }
         prefix_measurements.push((prefix, measurement));
     }
-    let (_, student_measurement) = prefix_measurements
-        .last()
-        .expect("at least one active prefix is always evaluated");
     let exact_mean_nll = exact.mean_nll();
+    let mut replacement_measurements = Vec::new();
+    for (path, layer, expert, width) in &replacements {
+        let replacement = read_joint_expert_student(path)?;
+        if replacement.layer != *layer
+            || replacement.expert != *expert
+            || replacement.width != *width
+        {
+            bail!(
+                "replacement student changed while evaluating: {}",
+                path.display()
+            );
+        }
+        capture.replace_joint_expert_student(&replacement)?;
+        let measurement = measure_multi_corpus_nll(&mut capture, &sequences, &target_pairs)?;
+        if exact.scored_tokens != measurement.scored_tokens
+            || exact.top1_tokens.len() != measurement.top1_tokens.len()
+        {
+            bail!("exact and replacement-student passes produced incompatible measurements");
+        }
+        replacement_measurements.push((path, layer, expert, width, measurement));
+    }
+    let student_measurement = replacement_measurements
+        .last()
+        .map(|(_, _, _, _, measurement)| measurement)
+        .unwrap_or_else(|| {
+            &prefix_measurements
+                .last()
+                .expect("at least one active prefix is always evaluated")
+                .1
+        });
     let student_mean_nll = student_measurement.mean_nll();
     let top1_matches = exact
         .top1_tokens
@@ -2506,6 +2584,31 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
                     .count();
                 MultiJointExpertStudentPrefixResult {
                     active_students: *active_students,
+                    scored_tokens: measurement.scored_tokens,
+                    student_mean_nll: mean_nll,
+                    nll_delta: mean_nll - exact_mean_nll,
+                    relative_perplexity_delta: (mean_nll - exact_mean_nll).exp() - 1.0,
+                    top1_agreement: matches as f64 / exact.top1_tokens.len().max(1) as f64,
+                }
+            })
+            .collect(),
+        replacement_results: replacement_measurements
+            .iter()
+            .enumerate()
+            .map(|(index, (path, layer, expert, width, measurement))| {
+                let mean_nll = measurement.mean_nll();
+                let matches = exact
+                    .top1_tokens
+                    .iter()
+                    .zip(&measurement.top1_tokens)
+                    .filter(|(exact, student)| exact == student)
+                    .count();
+                MultiJointExpertStudentReplacementResult {
+                    cumulative_replacements: index + 1,
+                    layer: **layer,
+                    expert: **expert,
+                    width: **width,
+                    sidecar: path.display().to_string(),
                     scored_tokens: measurement.scored_tokens,
                     student_mean_nll: mean_nll,
                     nll_delta: mean_nll - exact_mean_nll,
@@ -5354,6 +5457,18 @@ mod llama_capture {
             down_weights: *const f32,
             down_count: c_int,
         ) -> c_int;
+        fn qx_llama_route_replace_joint_expert_student(
+            route: *mut c_void,
+            layer: c_int,
+            expert: c_int,
+            width: c_int,
+            gate_weights: *const f32,
+            gate_count: c_int,
+            up_weights: *const f32,
+            up_count: c_int,
+            down_weights: *const f32,
+            down_count: c_int,
+        ) -> c_int;
         fn qx_llama_route_set_joint_active_prefix(route: *mut c_void, count: c_int) -> c_int;
         fn qx_llama_route_set_layer_residual(
             route: *mut c_void,
@@ -5636,6 +5751,27 @@ mod llama_capture {
             };
             if status != 0 {
                 bail!("llama bridge rejected joint expert student with status {status}");
+            }
+            Ok(())
+        }
+
+        pub fn replace_joint_expert_student(&mut self, student: &JointExpertStudent) -> Result<()> {
+            let status = unsafe {
+                qx_llama_route_replace_joint_expert_student(
+                    self.raw,
+                    student.layer.try_into()?,
+                    c_int::from(student.expert),
+                    student.width.try_into()?,
+                    student.gate.as_ptr(),
+                    student.gate.len().try_into()?,
+                    student.up.as_ptr(),
+                    student.up.len().try_into()?,
+                    student.down.as_ptr(),
+                    student.down.len().try_into()?,
+                )
+            };
+            if status != 0 {
+                bail!("llama bridge rejected joint expert replacement with status {status}");
             }
             Ok(())
         }

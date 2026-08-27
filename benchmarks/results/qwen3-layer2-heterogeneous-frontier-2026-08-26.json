@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-layer2-live-heterogeneous-width-frontier",
+  "promotion_evidence": false,
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "layer": 2,
+  "scored_tokens": 47,
+  "exact_mean_nll": 3.644960676136605,
+  "baseline": {
+    "policy": "79-width640-all-q3-students-plus-rank64-residual",
+    "student_mean_nll": 3.625566,
+    "relative_perplexity_delta": -0.019207,
+    "top1_agreement": 0.8936170212765957
+  },
+  "frontier": [
+    {
+      "width512_experts": [63, 18],
+      "student_mean_nll": 3.66458818987272,
+      "relative_perplexity_delta": 0.01982139980684794,
+      "top1_agreement": 0.8936170212765957,
+      "gate": "boundary"
+    },
+    {
+      "width512_experts": [63, 18, 118, 113],
+      "student_mean_nll": 3.6663464609375027,
+      "relative_perplexity_delta": 0.02161609958735955,
+      "top1_agreement": 0.8723404255319149,
+      "gate": "fail"
+    }
+  ],
+  "packed_capacity_projection": {
+    "width640_all_q3_weight_gib": 10.651756286621094,
+    "bytes_saved_per_width512_mixed_replacement": 606208,
+    "two_replacements_per_layer_saved_mib": 55.5,
+    "two_replacements_per_layer_weight_gib": 10.597557067871094
+  },
+  "evaluator": {
+    "accelerate_baseline_wall_seconds": 123.12,
+    "single_process_repeated_pass_outcome": "metal_out_of_memory",
+    "durable_frontier_semantics": "one_fresh_process_per_checkpoint",
+    "limitations": [
+      "diagnostic F32 students rather than packed native execution",
+      "Accelerate callback is not bit-identical to the earlier scalar callback",
+      "one layer and one 47-token WikiText slice",
+      "candidate order seeded by local expert error despite that proxy being known weak"
+    ]
+  },
+  "decision": {
+    "heterogeneous_width640_to_width512_policy": "reject_for_iphone_capacity",
+    "reason": "the live quality boundary saves only 55.5 MiB across 48 layers from a 10.652 GiB starting point",
+    "next_iteration": "full-width-768-Q2S4-experts"
+  }
+}

@@ -2,6 +2,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <Accelerate/Accelerate.h>
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
@@ -526,31 +527,26 @@ static bool qx_apply_joint_expert_students(
         }
         const int32_t width = route->joint_widths[student];
         float * activation = route->joint_activations[student];
+        cblas_sgemv(
+            CblasRowMajor, CblasNoTrans, width, route->hidden, 1.0f,
+            route->joint_gate_weights[student], route->hidden, route->sample_input, 1,
+            0.0f, activation, 1);
+        cblas_sgemv(
+            CblasRowMajor, CblasNoTrans, width, route->hidden, 1.0f,
+            route->joint_up_weights[student], route->hidden, route->sample_input, 1,
+            0.0f, route->joint_output, 1);
         for (int32_t neuron = 0; neuron < width; ++neuron) {
-            float gate = 0.0f;
-            float up = 0.0f;
-            const float * gate_row = route->joint_gate_weights[student] +
-                (size_t) neuron * route->hidden;
-            const float * up_row = route->joint_up_weights[student] +
-                (size_t) neuron * route->hidden;
-            for (int32_t input = 0; input < route->hidden; ++input) {
-                gate += gate_row[input] * route->sample_input[input];
-                up += up_row[input] * route->sample_input[input];
-            }
+            const float gate = activation[neuron];
+            const float up = route->joint_output[neuron];
             const float sigmoid = gate >= 0.0f
                 ? 1.0f / (1.0f + expf(-gate))
                 : expf(gate) / (1.0f + expf(gate));
             activation[neuron] = gate * sigmoid * up;
         }
-        for (int32_t output = 0; output < route->hidden; ++output) {
-            float value = 0.0f;
-            const float * row = route->joint_down_weights[student] +
-                (size_t) output * width;
-            for (int32_t neuron = 0; neuron < width; ++neuron) {
-                value += row[neuron] * activation[neuron];
-            }
-            route->joint_output[output] = value;
-        }
+        cblas_sgemv(
+            CblasRowMajor, CblasNoTrans, route->hidden, width, 1.0f,
+            route->joint_down_weights[student], width, activation, 1,
+            0.0f, route->joint_output, 1);
         ggml_backend_tensor_set(
             tensor,
             route->joint_output,
@@ -569,27 +565,19 @@ static bool qx_apply_layer_residual(
         qx_set_error(route, "unexpected layer residual tensor state, shape, or type");
         return false;
     }
-    for (int32_t rank = 0; rank < route->residual_rank; ++rank) {
-        float value = 0.0f;
-        const float * row = route->residual_down + (size_t) rank * route->hidden;
-        for (int32_t input = 0; input < route->hidden; ++input) {
-            value += row[input] * route->sample_input[input];
-        }
-        route->residual_hidden[rank] = value;
-    }
+    cblas_sgemv(
+        CblasRowMajor, CblasNoTrans, route->residual_rank, route->hidden, 1.0f,
+        route->residual_down, route->hidden, route->sample_input, 1,
+        0.0f, route->residual_hidden, 1);
     ggml_backend_tensor_get(
         tensor,
         route->residual_output,
         0,
         (size_t) route->hidden * sizeof(float));
-    for (int32_t output = 0; output < route->hidden; ++output) {
-        const float * row = route->residual_up + (size_t) output * route->residual_rank;
-        float correction = 0.0f;
-        for (int32_t rank = 0; rank < route->residual_rank; ++rank) {
-            correction += row[rank] * route->residual_hidden[rank];
-        }
-        route->residual_output[output] += correction;
-    }
+    cblas_sgemv(
+        CblasRowMajor, CblasNoTrans, route->hidden, route->residual_rank, 1.0f,
+        route->residual_up, route->residual_rank, route->residual_hidden, 1,
+        1.0f, route->residual_output, 1);
     ggml_backend_tensor_set(
         tensor,
         route->residual_output,
@@ -1251,6 +1239,61 @@ int qx_llama_route_set_joint_active_prefix(qx_llama_route * route, int32_t count
         return -1;
     }
     route->joint_active_count = count;
+    return 0;
+}
+
+int qx_llama_route_replace_joint_expert_student(
+        qx_llama_route * route,
+        int32_t layer,
+        int32_t expert,
+        int32_t width,
+        const float * gate_weights,
+        int32_t gate_count,
+        const float * up_weights,
+        int32_t up_count,
+        const float * down_weights,
+        int32_t down_count) {
+    const size_t matrix_values = route && width > 0 ? (size_t) width * route->hidden : 0;
+    if (!route || layer < 0 || layer >= route->layers || expert < 0 ||
+        expert >= route->experts || width <= 0 || width > route->intermediate ||
+        !gate_weights || !up_weights || !down_weights || gate_count < 0 || up_count < 0 ||
+        down_count < 0 || (size_t) gate_count != matrix_values ||
+        (size_t) up_count != matrix_values || (size_t) down_count != matrix_values) {
+        return -1;
+    }
+    int32_t index = -1;
+    for (int32_t candidate = 0; candidate < route->joint_count; ++candidate) {
+        if (route->joint_layers[candidate] == layer && route->joint_experts[candidate] == expert) {
+            index = candidate;
+            break;
+        }
+    }
+    if (index < 0) {
+        return -2;
+    }
+    float * gate = malloc(matrix_values * sizeof(float));
+    float * up = malloc(matrix_values * sizeof(float));
+    float * down = malloc(matrix_values * sizeof(float));
+    float * activation = malloc((size_t) width * sizeof(float));
+    if (!gate || !up || !down || !activation) {
+        free(gate);
+        free(up);
+        free(down);
+        free(activation);
+        return -3;
+    }
+    memcpy(gate, gate_weights, matrix_values * sizeof(float));
+    memcpy(up, up_weights, matrix_values * sizeof(float));
+    memcpy(down, down_weights, matrix_values * sizeof(float));
+    free(route->joint_gate_weights[index]);
+    free(route->joint_up_weights[index]);
+    free(route->joint_down_weights[index]);
+    free(route->joint_activations[index]);
+    route->joint_widths[index] = width;
+    route->joint_gate_weights[index] = gate;
+    route->joint_up_weights[index] = up;
+    route->joint_down_weights[index] = down;
+    route->joint_activations[index] = activation;
     return 0;
 }
 

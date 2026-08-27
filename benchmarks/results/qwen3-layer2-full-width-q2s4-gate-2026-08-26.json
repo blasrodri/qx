@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-layer2-full-width-q2s4-live-gate",
+  "promotion_evidence": false,
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "layer": 2,
+  "expert_policy": {
+    "teacher_width": 768,
+    "student_width": 768,
+    "gate_codec": "q2s4",
+    "up_codec": "q2s4",
+    "down_codec": "q2s4",
+    "transformed_experts": 79,
+    "teacher_width_exceptions": 49,
+    "heldout_route_coverage": 0.9737302977232924,
+    "training_seconds": 754.8837307919748
+  },
+  "local_heldout": {
+    "weighted_mean_relative_l2": 0.43811395968035827,
+    "weighted_mean_cosine": 0.8970281109749842,
+    "maximum_expert_mean_relative_l2": 1.1045926809310913
+  },
+  "live_replay": {
+    "skipped_sequences": 4,
+    "sequences": 1,
+    "scored_tokens": 47,
+    "exact_mean_nll": 3.644960676136605,
+    "student_mean_nll": 3.6174208810896626,
+    "relative_perplexity_delta": -0.027164032269873184,
+    "top1_agreement": 0.6595744680851063
+  },
+  "packed_capacity_projection": {
+    "bytes_per_full_width_q2s4_expert": 1474560,
+    "complete_weight_gib": 9.245506286621094,
+    "fp16_kv_gib_at_context_4096": 0.375,
+    "weights_plus_kv_gib": 9.620506286621094
+  },
+  "decision": {
+    "nll_gate": "pass_on_small_replay",
+    "top1_behavior_gate": "fail",
+    "uniform_full_width_q2s4": "reject",
+    "next_iteration": "selective_q3_projection_promotion_if_residency_replay_is_feasible"
+  },
+  "limitations": [
+    "single layer and one 47-token WikiText slice",
+    "diagnostic F32 student execution",
+    "79 transformed experts plus 49 exact teacher exceptions",
+    "Accelerate callback is not bit-identical to the earlier scalar callback"
+  ]
+}
