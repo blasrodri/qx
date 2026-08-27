@@ -1,7 +1,7 @@
 # Qwen Q2S4 bounded residency feasibility
 
 Date: 2026-08-27  
-Status: conditional decode pass; broader general-purpose gate pending
+Status: conditional product pass; native iPhone validation pending
 
 ## Result
 
@@ -40,10 +40,21 @@ it is never uploaded as one Metal allocation.
 - Full Q3 experts averaged 112 MiB/token with the 4.5 GiB cache. Q3 cannot be
   the bulk resident representation; it must be selective.
 
+## Disjoint general-purpose validation
+
+QX then captured compact all-layer routes from 12 calibration and 12 held-out
+prompts spanning explanations, business writing, Rust/Python/TypeScript, math,
+science, history, planning, security, and data analysis. The texts and requests
+were disjoint.
+
+At 4.5 GiB with 50% pinned, the held-out 355-token trace reached 94.80% byte
+hit rate, 28.09 MiB/token mean fetch, and 81.56 MiB/token p95. Synthetic I/O
+was 19.44 ms/token mean and 56.22 ms/token p95. This narrowly misses a 95% hit
+threshold but passes the mean traffic target on broader data.
+
 ## Next gate
 
-Capture route-only traces from multiple general-purpose domains, train the
-pinned set on disjoint calibration requests, and score held-out prompt and
-generation phases separately. The residency path advances only if warmed
-held-out generation remains near or above 95% byte hit rate and below roughly
-30 MiB/token mean fetch at a 4.0–4.5 GiB expert cache.
+Residency advances as a conditional product path. The next experiment keeps
+Q2S4 as the bulk format and promotes only sensitive, frequently routed up
+projections to Q3. The cache planner must account for their larger byte sizes;
+bulk Q3 is already rejected by the replay.

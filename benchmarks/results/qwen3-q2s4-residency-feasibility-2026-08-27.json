@@ -63,6 +63,23 @@
       "p95_missing_mib_per_token": 226.40625
     }
   },
+  "disjoint_general_prompt_validation": {
+    "calibration_requests": 12,
+    "calibration_tokens": 366,
+    "heldout_requests": 12,
+    "heldout_tokens": 355,
+    "expert_cache_gib": 4.5,
+    "pinned_fraction": 0.5,
+    "byte_hit_rate": 0.9479826877934272,
+    "mean_missing_mib_per_token": 28.089348591549296,
+    "p50_missing_mib_per_token": 18.28125,
+    "p95_missing_mib_per_token": 81.5625,
+    "p99_missing_mib_per_token": 167.34375,
+    "mean_shaped_io_ms_per_token": 19.442429577464797,
+    "p95_shaped_io_ms_per_token": 56.224999999999966,
+    "mean_layers_with_miss_per_token": 14.12112676056338,
+    "p95_layers_with_miss_per_token": 34
+  },
   "resident_memory_projection": {
     "expert_cache_gib": 4.5,
     "shared_weight_gib": 0.8080062866210938,
@@ -71,15 +88,17 @@
     "total_gib_range": [6.433006286621094, 6.933006286621094]
   },
   "decision": {
-    "resident_memory_gate": "conditional_pass",
+    "resident_memory_gate": "conditional_product_pass",
     "decode_mean_io_gate": "pass_on_64-token-generation-smoke",
-    "cold_and_cross_domain_gate": "not_yet_passed",
+    "disjoint_general_mean_io_gate": "pass",
+    "disjoint_general_hit_rate_gate": "borderline_at_94.80_percent",
     "bulk_q3_residency": "reject",
-    "next_iteration": "capture_diverse_route_only_calibration_and_heldout_traces_then_validate_hot-lru"
+    "next_iteration": "selective_q3_up_projection_quality_repair_with_byte-capacity_residency"
   },
   "limitations": [
     "synthetic I/O shape rather than measured iPhone storage",
     "one 64-token generation trace for decode metrics",
+    "general heldout validation contains prompt tokens rather than generated responses",
     "available code/math stress trace contains only 22 tokens",
     "cache replay excludes GPU compute time",
     "uniform expert sizes; selective precision requires a byte-capacity cache planner"

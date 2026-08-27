@@ -87,10 +87,15 @@ enum Command {
         output: PathBuf,
         #[arg(long)]
         sample_weights_output: Option<PathBuf>,
+        /// Layer to sample. Omit for a compact all-layer route-only trace.
         #[arg(long)]
-        sample_layer: usize,
+        sample_layer: Option<usize>,
         /// Selected experts to retain, repeated or comma-delimited. Empty captures every routed expert.
-        #[arg(long = "sample-expert", value_delimiter = ',')]
+        #[arg(
+            long = "sample-expert",
+            value_delimiter = ',',
+            requires = "sample_layer"
+        )]
         sample_experts: Vec<u16>,
         /// Maximum retained samples per expert. Zero retains every routed hit.
         #[arg(long, default_value_t = 0)]
@@ -1452,7 +1457,7 @@ struct CaptureCorpusArgs {
     corpora: Vec<PathBuf>,
     output: PathBuf,
     sample_weights_output: Option<PathBuf>,
-    sample_layer: usize,
+    sample_layer: Option<usize>,
     sample_experts: Vec<u16>,
     max_samples_per_expert: usize,
     max_sequences: usize,
@@ -1468,11 +1473,14 @@ struct CaptureCorpusArgs {
     model_sha256: Option<String>,
 }
 
-fn corpus_sample_modes(layer: usize, experts: &[u16]) -> (Option<(usize, u16)>, Option<usize>) {
-    if let [expert] = experts {
-        (Some((layer, *expert)), None)
-    } else {
-        (None, Some(layer))
+fn corpus_sample_modes(
+    layer: Option<usize>,
+    experts: &[u16],
+) -> (Option<(usize, u16)>, Option<usize>) {
+    match (layer, experts) {
+        (Some(layer), [expert]) => (Some((layer, *expert)), None),
+        (Some(layer), _) => (None, Some(layer)),
+        (None, _) => (None, None),
     }
 }
 
@@ -1822,7 +1830,7 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
     {
         bail!("corpus capture requires positive sequences and 2..=context tokens per sequence");
     }
-    if args.sample_layer >= args.layers
+    if args.sample_layer.is_some_and(|layer| layer >= args.layers)
         || args
             .sample_experts
             .iter()
@@ -1834,7 +1842,9 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
     if selected_experts.len() != args.sample_experts.len() {
         bail!("sample expert selection contains duplicates");
     }
-    if args.sample_weights_output.is_some() && args.sample_experts.len() != 1 {
+    if args.sample_weights_output.is_some()
+        && (args.sample_layer.is_none() || args.sample_experts.len() != 1)
+    {
         bail!("sample weights output requires exactly one selected expert");
     }
     let model_hash = match args.model_sha256.as_ref() {
@@ -1844,6 +1854,7 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
         }
         None => sha256_file(&args.model)?,
     };
+    let routes_only = args.sample_layer.is_none();
     let (sample, sample_all_layer) = corpus_sample_modes(args.sample_layer, &args.sample_experts);
     let mut llama = llama_capture::Capture::open(
         &args.model,
@@ -1854,11 +1865,11 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
             top_k: args.top_k,
             gpu_layers: args.gpu_layers,
             threads: args.threads,
-            intermediate: Some(args.expert_neurons),
+            intermediate: (!routes_only).then_some(args.expert_neurons),
             hidden: args.hidden_size,
             sample,
             sample_all_layer,
-            capture_all_routes: false,
+            capture_all_routes: routes_only,
             capture_all_activations: false,
             contribution_packet_neurons: &[],
         },
@@ -1886,7 +1897,11 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
             layers: args.layers,
             experts: args.experts,
             top_k: args.top_k,
-            source: "llama.cpp-eval-callback-selected-expert-batch-corpus-reset".to_owned(),
+            source: if routes_only {
+                "llama.cpp-eval-callback-route-only-corpus-reset".to_owned()
+            } else {
+                "llama.cpp-eval-callback-selected-expert-batch-corpus-reset".to_owned()
+            },
         }),
     )?;
 
@@ -1920,24 +1935,29 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
                 expert_samples,
                 expert_down_weights,
             } = llama.step(token)?;
-            validate_sample_route(
-                &routes,
-                args.layers,
-                args.top_k,
-                args.experts,
-                args.sample_layer,
-            )?;
+            if let Some(sample_layer) = args.sample_layer {
+                validate_sample_route(
+                    &routes,
+                    args.layers,
+                    args.top_k,
+                    args.experts,
+                    sample_layer,
+                )?;
+            } else {
+                validate_routes(&routes, args.layers, args.top_k, args.experts)?;
+            }
             if let Some(weights) = expert_down_weights
                 && let Some(path) = &args.sample_weights_output
             {
                 write_expert_down_weights(path, args.expert_neurons, args.hidden_size, &weights)?;
                 wrote_weights = true;
             }
+            let sample_layer = args.sample_layer.unwrap_or(0);
             let mut samples = expert_samples
                 .into_iter()
                 .map(
                     |(expert, input, activation, teacher_down_output)| ExpertDistillSample {
-                        layer: args.sample_layer,
+                        layer: sample_layer,
                         expert,
                         input,
                         activation,
@@ -1947,7 +1967,7 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
                 .collect::<Vec<_>>();
             if let Some((input, activation, teacher_down_output)) = expert_sample {
                 samples.push(ExpertDistillSample {
-                    layer: args.sample_layer,
+                    layer: sample_layer,
                     expert: args.sample_experts[0],
                     input,
                     activation,
@@ -1992,7 +2012,7 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
         sequences += 1;
     }
     writer.flush()?;
-    if sequences == 0 || expert_hits == 0 || !wrote_weights {
+    if sequences == 0 || (!routes_only && expert_hits == 0) || !wrote_weights {
         bail!(
             "corpus capture produced sequences {sequences}, expert hits {expert_hits}, weights {wrote_weights}"
         );
@@ -6330,9 +6350,10 @@ mod tests {
 
     #[test]
     fn corpus_capture_uses_batch_mode_for_zero_or_multiple_experts() {
-        assert_eq!(corpus_sample_modes(8, &[]), (None, Some(8)));
-        assert_eq!(corpus_sample_modes(8, &[11]), (Some((8, 11)), None));
-        assert_eq!(corpus_sample_modes(8, &[11, 38]), (None, Some(8)));
+        assert_eq!(corpus_sample_modes(None, &[]), (None, None));
+        assert_eq!(corpus_sample_modes(Some(8), &[]), (None, Some(8)));
+        assert_eq!(corpus_sample_modes(Some(8), &[11]), (Some((8, 11)), None));
+        assert_eq!(corpus_sample_modes(Some(8), &[11, 38]), (None, Some(8)));
     }
 
     #[test]
