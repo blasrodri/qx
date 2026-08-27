@@ -71,6 +71,35 @@
       "decision": "reject_catastrophic_live_regression"
     }
   ],
+  "causal_q3_up_scan": {
+    "candidate_count": 29,
+    "replacement_semantics": "each Q3 up projection measured independently against the same complete Q2S4 baseline",
+    "wikitext_47_token_scan": {
+      "baseline_nll": 3.6174208810896626,
+      "baseline_top1_agreement": 0.6595744680851063,
+      "candidates_improving_nll": 9,
+      "candidates_improving_nll_and_top1": 3,
+      "best_joint_prefix_experts": [122, 76, 40],
+      "best_joint_prefix_nll": 3.609498233920486,
+      "best_joint_prefix_relative_perplexity_delta_vs_exact": -0.034841017218225523,
+      "best_joint_prefix_top1_agreement": 0.702127659574468,
+      "projected_added_installed_bytes_for_48_layers": 28311552,
+      "projected_complete_installed_weight_gib": 9.271873474121094
+    },
+    "disjoint_general_prompt_validation": {
+      "sequences": 4,
+      "scored_tokens": 125,
+      "exact_nll": 3.841413171317137,
+      "q2s4_baseline_nll": 3.9343471293721706,
+      "q2s4_baseline_relative_perplexity_delta": 0.09738925915381658,
+      "q2s4_baseline_top1_agreement": 0.776,
+      "best_q3_prefix_experts": [122, 76],
+      "best_q3_prefix_nll": 3.9321874148572826,
+      "best_q3_prefix_relative_perplexity_delta": 0.09502176911387838,
+      "best_q3_prefix_top1_agreement": 0.784,
+      "decision": "reject_q3_as_insufficient_quality_repair"
+    }
+  },
   "memory_path_status": {
     "installed_weight_gib": 9.245506286621094,
     "expert_cache_gib": 4.5,
@@ -80,12 +109,13 @@
   "decision": {
     "stop_local_reconstruction_tuning": true,
     "do_not_expand_current_codec_to_all_layers": true,
-    "next_experiment": "downstream-logit-impact selection with exact or higher-precision paging, followed by logits-aware global distillation if necessary",
+    "q3_causal_selection": "directionally_valid_but_insufficient_and_not_generalizable_to_the_quality_gate",
+    "next_experiment": "independent downstream-impact scan using exact Q4 fallback, followed by logits-aware global distillation if a small exact exception set cannot pass",
     "quality_gate": "at least 90 percent top1 agreement with no material NLL regression on a larger disjoint replay"
   },
   "limitations": [
     "one transformed layer rather than a complete 48-layer artifact",
-    "47 teacher-forced WikiText tokens rather than a broad product evaluation",
+    "the causal selector used 47 teacher-forced WikiText tokens and only 125 disjoint general-prompt tokens",
     "79 transformed experts and 49 exact teacher-width exceptions",
     "macOS validation rather than measured iPhone execution",
     "the resident-memory projection is simulated and excludes a complete iOS application measurement",

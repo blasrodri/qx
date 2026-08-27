@@ -364,6 +364,9 @@ enum Command {
         /// Cumulatively replace matching baseline students, freeing the old matrices in place.
         #[arg(long = "replacement-student")]
         replacement_students: Vec<PathBuf>,
+        /// Measure every replacement against the same complete baseline instead of cumulatively.
+        #[arg(long)]
+        independent_replacements: bool,
         /// Optional low-rank correction injected after aggregated MoE output.
         #[arg(long)]
         layer_residual: Option<PathBuf>,
@@ -948,6 +951,7 @@ struct MultiJointExpertStudentNllReport {
     nll_delta: f64,
     relative_perplexity_delta: f64,
     top1_agreement: f64,
+    replacement_semantics: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     prefix_results: Vec<MultiJointExpertStudentPrefixResult>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -976,7 +980,9 @@ struct MultiJointExpertStudentResult {
 
 #[derive(Debug, Serialize)]
 struct MultiJointExpertStudentReplacementResult {
-    cumulative_replacements: usize,
+    active_replacements: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cumulative_replacements: Option<usize>,
     layer: usize,
     expert: u16,
     width: usize,
@@ -1340,6 +1346,7 @@ fn main() -> Result<()> {
             corpora,
             students,
             replacement_students,
+            independent_replacements,
             layer_residual,
             active_prefixes,
             skip_sequences,
@@ -1360,6 +1367,7 @@ fn main() -> Result<()> {
             corpora,
             students,
             replacement_students,
+            independent_replacements,
             layer_residual,
             active_prefixes,
             skip_sequences,
@@ -1545,6 +1553,7 @@ struct MultiJointExpertStudentNllArgs {
     corpora: Vec<PathBuf>,
     students: Vec<PathBuf>,
     replacement_students: Vec<PathBuf>,
+    independent_replacements: bool,
     layer_residual: Option<PathBuf>,
     active_prefixes: Vec<usize>,
     skip_sequences: usize,
@@ -2441,6 +2450,9 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
     if !replacements.is_empty() && !args.active_prefixes.is_empty() {
         bail!("replacement students require the complete baseline, without --active-prefixes");
     }
+    if args.independent_replacements && replacements.is_empty() {
+        bail!("--independent-replacements requires at least one --replacement-student");
+    }
     let active_prefixes = if args.active_prefixes.is_empty() {
         vec![students.len()]
     } else {
@@ -2554,16 +2566,34 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
             bail!("exact and replacement-student passes produced incompatible measurements");
         }
         replacement_measurements.push((path, layer, expert, width, measurement));
+        if args.independent_replacements {
+            let baseline_path = students
+                .iter()
+                .find(|(_, baseline_layer, baseline_expert, _)| {
+                    baseline_layer == layer && baseline_expert == expert
+                })
+                .map(|(baseline_path, _, _, _)| baseline_path)
+                .expect("replacement targets were validated against baseline students");
+            let baseline = read_joint_expert_student(baseline_path)?;
+            capture.replace_joint_expert_student(&baseline)?;
+        }
     }
-    let student_measurement = replacement_measurements
-        .last()
-        .map(|(_, _, _, _, measurement)| measurement)
-        .unwrap_or_else(|| {
-            &prefix_measurements
-                .last()
-                .expect("at least one active prefix is always evaluated")
-                .1
-        });
+    let student_measurement = if args.independent_replacements {
+        &prefix_measurements
+            .last()
+            .expect("at least one active prefix is always evaluated")
+            .1
+    } else {
+        replacement_measurements
+            .last()
+            .map(|(_, _, _, _, measurement)| measurement)
+            .unwrap_or_else(|| {
+                &prefix_measurements
+                    .last()
+                    .expect("at least one active prefix is always evaluated")
+                    .1
+            })
+    };
     let student_mean_nll = student_measurement.mean_nll();
     let top1_matches = exact
         .top1_tokens
@@ -2610,6 +2640,13 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         nll_delta: student_mean_nll - exact_mean_nll,
         relative_perplexity_delta: (student_mean_nll - exact_mean_nll).exp() - 1.0,
         top1_agreement: top1_matches as f64 / exact.top1_tokens.len().max(1) as f64,
+        replacement_semantics: if replacements.is_empty() {
+            "none"
+        } else if args.independent_replacements {
+            "independent-against-complete-baseline"
+        } else {
+            "cumulative-in-command-line-order"
+        },
         prefix_results: prefix_measurements
             .iter()
             .map(|(active_students, measurement)| {
@@ -2642,7 +2679,12 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
                     .filter(|(exact, student)| exact == student)
                     .count();
                 MultiJointExpertStudentReplacementResult {
-                    cumulative_replacements: index + 1,
+                    active_replacements: if args.independent_replacements {
+                        1
+                    } else {
+                        index + 1
+                    },
+                    cumulative_replacements: (!args.independent_replacements).then_some(index + 1),
                     layer: **layer,
                     expert: **expert,
                     width: **width,
