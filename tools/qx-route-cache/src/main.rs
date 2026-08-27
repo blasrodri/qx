@@ -367,6 +367,12 @@ enum Command {
         /// Measure every replacement against the same complete baseline instead of cumulatively.
         #[arg(long)]
         independent_replacements: bool,
+        /// Disable a QX student and execute the exact GGUF expert, formatted as layer:expert.
+        #[arg(long = "exact-fallback", value_parser = parse_layer_expert)]
+        exact_fallbacks: Vec<(usize, u16)>,
+        /// Measure every exact fallback against the same complete student baseline.
+        #[arg(long)]
+        independent_exact_fallbacks: bool,
         /// Optional low-rank correction injected after aggregated MoE output.
         #[arg(long)]
         layer_residual: Option<PathBuf>,
@@ -952,10 +958,13 @@ struct MultiJointExpertStudentNllReport {
     relative_perplexity_delta: f64,
     top1_agreement: f64,
     replacement_semantics: &'static str,
+    exact_fallback_semantics: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     prefix_results: Vec<MultiJointExpertStudentPrefixResult>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     replacement_results: Vec<MultiJointExpertStudentReplacementResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    exact_fallback_results: Vec<MultiJointExpertStudentExactFallbackResult>,
 }
 
 #[derive(Debug, Serialize)]
@@ -987,6 +996,20 @@ struct MultiJointExpertStudentReplacementResult {
     expert: u16,
     width: usize,
     sidecar: String,
+    scored_tokens: usize,
+    student_mean_nll: f64,
+    nll_delta: f64,
+    relative_perplexity_delta: f64,
+    top1_agreement: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct MultiJointExpertStudentExactFallbackResult {
+    active_exact_fallbacks: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cumulative_exact_fallbacks: Option<usize>,
+    layer: usize,
+    expert: u16,
     scored_tokens: usize,
     student_mean_nll: f64,
     nll_delta: f64,
@@ -1347,6 +1370,8 @@ fn main() -> Result<()> {
             students,
             replacement_students,
             independent_replacements,
+            exact_fallbacks,
+            independent_exact_fallbacks,
             layer_residual,
             active_prefixes,
             skip_sequences,
@@ -1368,6 +1393,8 @@ fn main() -> Result<()> {
             students,
             replacement_students,
             independent_replacements,
+            exact_fallbacks,
+            independent_exact_fallbacks,
             layer_residual,
             active_prefixes,
             skip_sequences,
@@ -1554,6 +1581,8 @@ struct MultiJointExpertStudentNllArgs {
     students: Vec<PathBuf>,
     replacement_students: Vec<PathBuf>,
     independent_replacements: bool,
+    exact_fallbacks: Vec<(usize, u16)>,
+    independent_exact_fallbacks: bool,
     layer_residual: Option<PathBuf>,
     active_prefixes: Vec<usize>,
     skip_sequences: usize,
@@ -2447,11 +2476,31 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         }
         replacements.push((path.clone(), student.layer, student.expert, student.width));
     }
-    if !replacements.is_empty() && !args.active_prefixes.is_empty() {
-        bail!("replacement students require the complete baseline, without --active-prefixes");
+    let mut exact_fallback_targets = HashSet::new();
+    for &(layer, expert) in &args.exact_fallbacks {
+        if layer >= args.layers
+            || usize::from(expert) >= args.experts
+            || !targets.contains(&(layer, expert))
+        {
+            bail!("exact fallback target {layer}:{expert} is not a baseline student");
+        }
+        if !exact_fallback_targets.insert((layer, expert)) {
+            bail!("exact fallback target {layer}:{expert} occurs more than once");
+        }
+    }
+    if !replacements.is_empty() && !args.exact_fallbacks.is_empty() {
+        bail!("replacement students and exact fallbacks are mutually exclusive");
+    }
+    if (!replacements.is_empty() || !args.exact_fallbacks.is_empty())
+        && !args.active_prefixes.is_empty()
+    {
+        bail!("replacement students and exact fallbacks require the complete baseline");
     }
     if args.independent_replacements && replacements.is_empty() {
         bail!("--independent-replacements requires at least one --replacement-student");
+    }
+    if args.independent_exact_fallbacks && args.exact_fallbacks.is_empty() {
+        bail!("--independent-exact-fallbacks requires at least one --exact-fallback");
     }
     let active_prefixes = if args.active_prefixes.is_empty() {
         vec![students.len()]
@@ -2578,20 +2627,39 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
             capture.replace_joint_expert_student(&baseline)?;
         }
     }
-    let student_measurement = if args.independent_replacements {
+    let mut exact_fallback_measurements = Vec::new();
+    for &(layer, expert) in &args.exact_fallbacks {
+        capture.set_joint_expert_student_enabled(layer, expert, false)?;
+        let measurement = measure_multi_corpus_nll(&mut capture, &sequences, &target_pairs)?;
+        if exact.scored_tokens != measurement.scored_tokens
+            || exact.top1_tokens.len() != measurement.top1_tokens.len()
+        {
+            bail!("exact and fallback passes produced incompatible measurements");
+        }
+        exact_fallback_measurements.push((layer, expert, measurement));
+        if args.independent_exact_fallbacks {
+            capture.set_joint_expert_student_enabled(layer, expert, true)?;
+        }
+    }
+    let student_measurement = if args.independent_replacements || args.independent_exact_fallbacks {
         &prefix_measurements
             .last()
             .expect("at least one active prefix is always evaluated")
             .1
     } else {
-        replacement_measurements
+        exact_fallback_measurements
             .last()
-            .map(|(_, _, _, _, measurement)| measurement)
+            .map(|(_, _, measurement)| measurement)
             .unwrap_or_else(|| {
-                &prefix_measurements
+                replacement_measurements
                     .last()
-                    .expect("at least one active prefix is always evaluated")
-                    .1
+                    .map(|(_, _, _, _, measurement)| measurement)
+                    .unwrap_or_else(|| {
+                        &prefix_measurements
+                            .last()
+                            .expect("at least one active prefix is always evaluated")
+                            .1
+                    })
             })
     };
     let student_mean_nll = student_measurement.mean_nll();
@@ -2605,7 +2673,7 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         schema_version: 1,
         classification: "simultaneous-joint-expert-student-corpus-nll-control",
         promotion_evidence: false,
-        quality_semantics: "teacher-forced-corpus-nll-with-multiple-gate-up-down-experts-replaced",
+        quality_semantics: "teacher-forced-corpus-nll-with-student-overrides-and-optional-exact-fallbacks",
         model_sha256: model_hash,
         corpora: args
             .corpora
@@ -2644,6 +2712,13 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
             "none"
         } else if args.independent_replacements {
             "independent-against-complete-baseline"
+        } else {
+            "cumulative-in-command-line-order"
+        },
+        exact_fallback_semantics: if args.exact_fallbacks.is_empty() {
+            "none"
+        } else if args.independent_exact_fallbacks {
+            "independent-against-complete-student-baseline"
         } else {
             "cumulative-in-command-line-order"
         },
@@ -2689,6 +2764,35 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
                     expert: **expert,
                     width: **width,
                     sidecar: path.display().to_string(),
+                    scored_tokens: measurement.scored_tokens,
+                    student_mean_nll: mean_nll,
+                    nll_delta: mean_nll - exact_mean_nll,
+                    relative_perplexity_delta: (mean_nll - exact_mean_nll).exp() - 1.0,
+                    top1_agreement: matches as f64 / exact.top1_tokens.len().max(1) as f64,
+                }
+            })
+            .collect(),
+        exact_fallback_results: exact_fallback_measurements
+            .iter()
+            .enumerate()
+            .map(|(index, (layer, expert, measurement))| {
+                let mean_nll = measurement.mean_nll();
+                let matches = exact
+                    .top1_tokens
+                    .iter()
+                    .zip(&measurement.top1_tokens)
+                    .filter(|(exact, student)| exact == student)
+                    .count();
+                MultiJointExpertStudentExactFallbackResult {
+                    active_exact_fallbacks: if args.independent_exact_fallbacks {
+                        1
+                    } else {
+                        index + 1
+                    },
+                    cumulative_exact_fallbacks: (!args.independent_exact_fallbacks)
+                        .then_some(index + 1),
+                    layer: *layer,
+                    expert: *expert,
                     scored_tokens: measurement.scored_tokens,
                     student_mean_nll: mean_nll,
                     nll_delta: mean_nll - exact_mean_nll,
@@ -5382,6 +5486,19 @@ fn percentile_f64(values: &[f64], quantile: f64) -> Option<f64> {
     Some(sorted[index.min(sorted.len() - 1)])
 }
 
+fn parse_layer_expert(value: &str) -> std::result::Result<(usize, u16), String> {
+    let (layer, expert) = value
+        .split_once(':')
+        .ok_or_else(|| "expected layer:expert".to_owned())?;
+    let layer = layer
+        .parse::<usize>()
+        .map_err(|_| format!("invalid layer in {value:?}"))?;
+    let expert = expert
+        .parse::<u16>()
+        .map_err(|_| format!("invalid expert in {value:?}"))?;
+    Ok((layer, expert))
+}
+
 fn parse_bytes(value: &str) -> std::result::Result<u64, String> {
     let normalized = value.trim().to_ascii_lowercase();
     let suffixes = [
@@ -5636,6 +5753,12 @@ mod llama_capture {
             down_count: c_int,
         ) -> c_int;
         fn qx_llama_route_set_joint_active_prefix(route: *mut c_void, count: c_int) -> c_int;
+        fn qx_llama_route_set_joint_expert_student_enabled(
+            route: *mut c_void,
+            layer: c_int,
+            expert: c_int,
+            enabled: c_int,
+        ) -> c_int;
         fn qx_llama_route_set_layer_residual(
             route: *mut c_void,
             layer: c_int,
@@ -5947,6 +6070,28 @@ mod llama_capture {
                 unsafe { qx_llama_route_set_joint_active_prefix(self.raw, count.try_into()?) };
             if status != 0 {
                 bail!("llama bridge rejected joint active prefix with status {status}");
+            }
+            Ok(())
+        }
+
+        pub fn set_joint_expert_student_enabled(
+            &mut self,
+            layer: usize,
+            expert: u16,
+            enabled: bool,
+        ) -> Result<()> {
+            let status = unsafe {
+                qx_llama_route_set_joint_expert_student_enabled(
+                    self.raw,
+                    layer.try_into()?,
+                    c_int::from(expert),
+                    c_int::from(enabled),
+                )
+            };
+            if status != 0 {
+                bail!(
+                    "llama bridge rejected joint expert enabled state for {layer}:{expert} with status {status}"
+                );
             }
             Ok(())
         }
@@ -6293,6 +6438,14 @@ mod tests {
         assert_eq!(parse_bytes("3GiB").unwrap(), 3 * 1024u64.pow(3));
         assert_eq!(parse_bytes("3gb").unwrap(), 3_000_000_000);
         assert_eq!(parse_bytes("2048").unwrap(), 2048);
+    }
+
+    #[test]
+    fn layer_expert_parser_requires_two_bounded_integers() {
+        assert_eq!(parse_layer_expert("2:122").unwrap(), (2, 122));
+        assert!(parse_layer_expert("2").is_err());
+        assert!(parse_layer_expert("layer:3").is_err());
+        assert!(parse_layer_expert("2:70000").is_err());
     }
 
     #[test]

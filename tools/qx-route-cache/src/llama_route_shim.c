@@ -54,6 +54,7 @@ typedef struct qx_llama_route {
     int32_t * joint_layers;
     int32_t * joint_experts;
     int32_t * joint_widths;
+    uint8_t * joint_enabled;
     float ** joint_gate_weights;
     float ** joint_up_weights;
     float ** joint_down_weights;
@@ -494,7 +495,7 @@ static bool qx_has_student_layer(const qx_llama_route * route, int32_t layer) {
 
 static bool qx_has_joint_student_layer(const qx_llama_route * route, int32_t layer) {
     for (int32_t index = 0; index < route->joint_active_count; ++index) {
-        if (route->joint_layers[index] == layer) {
+        if (route->joint_enabled[index] && route->joint_layers[index] == layer) {
             return true;
         }
     }
@@ -511,7 +512,7 @@ static bool qx_apply_joint_expert_students(
         return false;
     }
     for (int32_t student = 0; student < route->joint_active_count; ++student) {
-        if (route->joint_layers[student] != layer) {
+        if (!route->joint_enabled[student] || route->joint_layers[student] != layer) {
             continue;
         }
         int32_t slot = -1;
@@ -953,6 +954,7 @@ void qx_llama_route_close(qx_llama_route * route) {
     free(route->joint_layers);
     free(route->joint_experts);
     free(route->joint_widths);
+    free(route->joint_enabled);
     free(route->joint_gate_weights);
     free(route->joint_up_weights);
     free(route->joint_down_weights);
@@ -1160,6 +1162,7 @@ int qx_llama_route_add_joint_expert_student(
     int32_t * layers = malloc(count * sizeof(int32_t));
     int32_t * experts = malloc(count * sizeof(int32_t));
     int32_t * widths = malloc(count * sizeof(int32_t));
+    uint8_t * enabled = malloc(count * sizeof(uint8_t));
     float ** gates = malloc(count * sizeof(float *));
     float ** ups = malloc(count * sizeof(float *));
     float ** downs = malloc(count * sizeof(float *));
@@ -1172,11 +1175,12 @@ int qx_llama_route_add_joint_expert_student(
         malloc((size_t) route->hidden * sizeof(float));
     float * output = route->joint_output ? route->joint_output :
         malloc((size_t) route->hidden * sizeof(float));
-    if (!layers || !experts || !widths || !gates || !ups || !downs || !activations ||
+    if (!layers || !experts || !widths || !enabled || !gates || !ups || !downs || !activations ||
         !gate || !up || !down || !activation || !input || !output) {
         free(layers);
         free(experts);
         free(widths);
+        free(enabled);
         free(gates);
         free(ups);
         free(downs);
@@ -1198,6 +1202,7 @@ int qx_llama_route_add_joint_expert_student(
         memcpy(layers, route->joint_layers, previous * sizeof(int32_t));
         memcpy(experts, route->joint_experts, previous * sizeof(int32_t));
         memcpy(widths, route->joint_widths, previous * sizeof(int32_t));
+        memcpy(enabled, route->joint_enabled, previous * sizeof(uint8_t));
         memcpy(gates, route->joint_gate_weights, previous * sizeof(float *));
         memcpy(ups, route->joint_up_weights, previous * sizeof(float *));
         memcpy(downs, route->joint_down_weights, previous * sizeof(float *));
@@ -1209,6 +1214,7 @@ int qx_llama_route_add_joint_expert_student(
     layers[route->joint_count] = layer;
     experts[route->joint_count] = expert;
     widths[route->joint_count] = width;
+    enabled[route->joint_count] = 1;
     gates[route->joint_count] = gate;
     ups[route->joint_count] = up;
     downs[route->joint_count] = down;
@@ -1216,6 +1222,7 @@ int qx_llama_route_add_joint_expert_student(
     free(route->joint_layers);
     free(route->joint_experts);
     free(route->joint_widths);
+    free(route->joint_enabled);
     free(route->joint_gate_weights);
     free(route->joint_up_weights);
     free(route->joint_down_weights);
@@ -1223,6 +1230,7 @@ int qx_llama_route_add_joint_expert_student(
     route->joint_layers = layers;
     route->joint_experts = experts;
     route->joint_widths = widths;
+    route->joint_enabled = enabled;
     route->joint_gate_weights = gates;
     route->joint_up_weights = ups;
     route->joint_down_weights = downs;
@@ -1240,6 +1248,24 @@ int qx_llama_route_set_joint_active_prefix(qx_llama_route * route, int32_t count
     }
     route->joint_active_count = count;
     return 0;
+}
+
+int qx_llama_route_set_joint_expert_student_enabled(
+        qx_llama_route * route,
+        int32_t layer,
+        int32_t expert,
+        int32_t enabled) {
+    if (!route || layer < 0 || layer >= route->layers || expert < 0 ||
+        expert >= route->experts || (enabled != 0 && enabled != 1)) {
+        return -1;
+    }
+    for (int32_t index = 0; index < route->joint_count; ++index) {
+        if (route->joint_layers[index] == layer && route->joint_experts[index] == expert) {
+            route->joint_enabled[index] = (uint8_t) enabled;
+            return 0;
+        }
+    }
+    return -2;
 }
 
 int qx_llama_route_replace_joint_expert_student(

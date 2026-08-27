@@ -1,7 +1,7 @@
 # Qwen resident quality frontier
 
 Date: 2026-08-27
-Status: memory architecture plausible; current compressed artifact rejected
+Status: layer-2 heterogeneous policy passes provisionally; whole model pending
 
 ## Result
 
@@ -18,6 +18,7 @@ justify building the remaining 47 layers.
 | Uniform Q2S4 | 3.6174 | -2.72% | 65.96% | reject quality |
 | Q2S4 + selective Q3 up | 3.6524 | +0.75% | 61.70% | reject selector |
 | Q2S4 + rank-64 shared residual | 10.2207 | +71,650% | 4.26% | catastrophic reject |
+| Q2S4 + exact GGUF expert 92 | 3.6276 | -1.72% | **93.62%** | provisional pass |
 
 The exact control NLL was 3.6450 in all three runs.
 
@@ -53,6 +54,33 @@ perplexity penalty. The best causal Q3 prefix, experts 122 and 76, reached
 impact selection, but not a quality pass and not justification for more Q3
 tuning.
 
+## Exact fallback breakthrough
+
+QX then scanned exact fallbacks by disabling one Q2S4 student at a time while
+leaving every other replacement active. This executes the original GGUF expert
+for that target. Of 66 routed candidates on the WikiText gate, expert 92 alone
+raised top-1 agreement from 65.96% to 93.62% while retaining better NLL than
+the exact control.
+
+The result survived two broader 12-prompt corpora without reselection:
+
+| Corpus | Tokens | Q2S4 top-1 | + exact expert 92 | Q2S4 PPL penalty | Fallback penalty |
+|---|---:|---:|---:|---:|---:|
+| General holdout | 343 | 81.05% | **96.50%** | +3.42% | +2.15% |
+| Second general set | 348 | 81.32% | **94.83%** | +4.30% | -0.16% |
+| Combined | 691 | 81.19% | **95.66%** | +3.86% | **+0.98%** |
+
+This is a provisional layer-2 quality pass. It proves that the damaging Q2S4
+error is highly concentrated and that local reconstruction error was the wrong
+selection signal.
+
+The evaluator uses the original Q4_K_M payload, not a generic uniform Q4
+estimate. Layer-2 expert 92 occupies 2.918 MiB: Q4_K gate/up plus Q6_K down.
+Replacing its 1.406 MiB Q2S4 payload costs only 1.512 MiB. If the eventual
+whole-model policy averaged one original expert per layer, the installed
+premium would be 63.28 MiB. Reserving that above the 4.5 GiB cache would move
+the conservative resident range from 6.433–6.933 GiB to 6.495–6.995 GiB.
+
 ## Decision
 
 Stop tuning this artifact with expert-local reconstruction objectives. Do not
@@ -60,16 +88,15 @@ expand it to all 48 layers. The result avoids a costly false-positive build:
 small NLL movement on one teacher-forced slice did not mean behavior was
 preserved.
 
-The downstream-impact machinery now exists and has rejected Q3-up as an
-adequate repair. The next bounded experiment should use it for *exact Q4
-fallback*:
+The downstream-impact machinery has rejected Q3-up and validated sparse exact
+fallback for layer 2. The next bounded experiment is a multi-layer frontier:
 
-1. Keep bulk Q2S4 and independently restore one expert at a time to exact Q4.
-2. Rank exceptions by NLL and top-logit recovery on disjoint prompts.
-3. Jointly validate the smallest exact set that approaches the gate, and feed
-   its true byte sizes into the residency simulator.
+1. Transform representative early, middle, and late layers to Q2S4.
+2. Independently rank original-GGUF exceptions within each transformed layer.
+3. Replay the selected exceptions jointly, then feed their actual mixed
+   Q4_K/Q6_K byte sizes into the residency simulator.
 4. Require at least 90% top-1 agreement with no material NLL regression on a
-   larger, disjoint multi-domain replay before expanding beyond a few layers.
+   larger, disjoint multi-domain replay before building all 48 layers.
 
 If a small precision exception set cannot pass that gate, the remaining viable
 route is logits-aware global distillation/QAT. That is a model-training project,
@@ -77,7 +104,7 @@ not another runtime codec tweak.
 
 ## Product interpretation
 
-QX has demonstrated a credible storage/residency mechanism for fitting the
-working set under 7 GiB. It has **not** yet demonstrated a quality-preserving
-Qwen3-30B-A3B mobile artifact or iPhone token rate. The capacity result and the
-model-quality result must remain separate until both pass on-device.
+QX now has both a credible sub-7 GiB residency mechanism and a quality-preserving
+heterogeneous policy for one transformed layer. It has **not** yet demonstrated
+a complete 48-layer Qwen3-30B-A3B mobile artifact or iPhone token rate. The
+layer-2 result must be reproduced across the network and then measured on-device.

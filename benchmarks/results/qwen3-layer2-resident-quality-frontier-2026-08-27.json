@@ -100,21 +100,83 @@
       "decision": "reject_q3_as_insufficient_quality_repair"
     }
   },
+  "exact_gguf_fallback_frontier": {
+    "evaluator_semantics": "disable one Q2S4 student while retaining every other student, allowing the original GGUF expert to execute",
+    "wikitext_independent_scan": {
+      "routed_candidates": 66,
+      "scored_tokens": 47,
+      "candidates_improving_nll": 24,
+      "candidates_improving_top1": 27,
+      "candidates_improving_nll_and_top1": 9,
+      "best_top1_expert": 92,
+      "baseline_top1_agreement": 0.6595744680851063,
+      "expert92_top1_agreement": 0.9361702127659575,
+      "expert92_student_nll": 3.627634051737643,
+      "expert92_relative_perplexity_delta_vs_exact": -0.017178081806920944
+    },
+    "disjoint_general_holdout_12_prompts": {
+      "scored_tokens": 343,
+      "expert92_route_hits": 13,
+      "exact_nll": 3.8843578101205707,
+      "q2s4_baseline_nll": 3.9179543277362656,
+      "q2s4_baseline_relative_perplexity_delta": 0.03416725426707501,
+      "q2s4_baseline_top1_agreement": 0.8104956268221575,
+      "expert92_fallback_nll": 3.90565530901662,
+      "expert92_fallback_relative_perplexity_delta": 0.02152590926692577,
+      "expert92_fallback_top1_agreement": 0.9650145772594753
+    },
+    "second_general_corpus_12_prompts": {
+      "scored_tokens": 348,
+      "expert92_route_hits": 13,
+      "exact_nll": 3.505272891446719,
+      "q2s4_baseline_nll": 3.5474049466831254,
+      "q2s4_baseline_relative_perplexity_delta": 0.043032207521404464,
+      "q2s4_baseline_top1_agreement": 0.8132183908045977,
+      "expert92_fallback_nll": 3.5037004201539883,
+      "expert92_fallback_relative_perplexity_delta": -0.0015712356075253675,
+      "expert92_fallback_top1_agreement": 0.9482758620689655
+    },
+    "combined_general_result": {
+      "scored_tokens": 691,
+      "q2s4_baseline_relative_perplexity_delta": 0.03862234582707558,
+      "q2s4_baseline_top1_agreement": 0.8118668596237337,
+      "expert92_fallback_relative_perplexity_delta": 0.009827749750434656,
+      "expert92_fallback_top1_agreement": 0.9565846599131693,
+      "decision": "provisional_layer2_quality_pass"
+    },
+    "payload_accounting": {
+      "layer2_q2s4_bytes_per_expert": 1474560,
+      "layer2_original_gguf_bytes_per_expert": 3059712,
+      "layer2_original_gguf_projection_types": {
+        "gate": "Q4_K",
+        "up": "Q4_K",
+        "down": "Q6_K"
+      },
+      "incremental_bytes_for_layer2_expert92": 1585152,
+      "hypothetical_incremental_bytes_for_one_original_expert_per_layer": 66355200,
+      "hypothetical_complete_installed_weight_gib": 9.307304382324219
+    }
+  },
   "memory_path_status": {
     "installed_weight_gib": 9.245506286621094,
     "expert_cache_gib": 4.5,
     "projected_total_resident_gib_range": [6.433006286621094, 6.933006286621094],
-    "decision": "capacity_mechanism_remains_plausible_but_artifact_quality_is_blocked"
+    "one_exact_expert_per_layer_resident_gib_range_if_reserved_above_cache": [
+      6.494804382324219,
+      6.994804382324219
+    ],
+    "decision": "capacity_mechanism_and_sparse_exact_exception_policy_are_jointly_plausible"
   },
   "decision": {
     "stop_local_reconstruction_tuning": true,
     "do_not_expand_current_codec_to_all_layers": true,
     "q3_causal_selection": "directionally_valid_but_insufficient_and_not_generalizable_to_the_quality_gate",
-    "next_experiment": "independent downstream-impact scan using exact Q4 fallback, followed by logits-aware global distillation if a small exact exception set cannot pass",
+    "exact_gguf_causal_selection": "provisional_layer2_pass_at_95.66_percent_combined_general_top1",
+    "next_experiment": "transform representative early middle and late layers, select exact GGUF exceptions independently per layer, and replay the combined heterogeneous layer set",
     "quality_gate": "at least 90 percent top1 agreement with no material NLL regression on a larger disjoint replay"
   },
   "limitations": [
-    "one transformed layer rather than a complete 48-layer artifact",
+    "one transformed layer rather than a complete 48-layer heterogeneous artifact",
     "the causal selector used 47 teacher-forced WikiText tokens and only 125 disjoint general-prompt tokens",
     "79 transformed experts and 49 exact teacher-width exceptions",
     "macOS validation rather than measured iPhone execution",
