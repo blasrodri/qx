@@ -127,6 +127,9 @@ enum Command {
         calibration: Option<PathBuf>,
         #[arg(long, value_delimiter = ',', default_value = "lru")]
         policies: Vec<CachePolicy>,
+        /// Fractions pinned by hot-lru; the remainder is an adaptive LRU cache.
+        #[arg(long, value_delimiter = ',', default_value = "0.25,0.5,0.75")]
+        hot_fractions: Vec<f64>,
         #[arg(long, value_delimiter = ',', value_parser = parse_bytes)]
         budgets: Vec<u64>,
         #[arg(long, default_value_t = DEFAULT_Q3_EXPERT_BYTES)]
@@ -151,6 +154,9 @@ enum Command {
         io_parallelism: usize,
         #[arg(long)]
         reset_between_requests: bool,
+        /// Only score these phases while still using earlier phases to warm the cache.
+        #[arg(long = "measure-phase", value_delimiter = ',')]
+        measure_phases: Vec<String>,
         #[arg(long)]
         output: PathBuf,
     },
@@ -428,6 +434,7 @@ enum Command {
 enum CachePolicy {
     Lru,
     StaticHot,
+    HotLru,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum)]
@@ -473,6 +480,7 @@ impl CachePolicy {
         match self {
             Self::Lru => "lru",
             Self::StaticHot => "static-hot",
+            Self::HotLru => "hot-lru",
         }
     }
 }
@@ -559,6 +567,8 @@ struct SimulationReport {
     expert_bytes: u64,
     expert_neurons: usize,
     packet_neurons: Vec<usize>,
+    hot_fractions: Vec<f64>,
+    measure_phases: Vec<String>,
     layouts: Vec<PhysicalLayout>,
     io_shape: Option<IoShape>,
     results: Vec<SimulationResult>,
@@ -574,6 +584,8 @@ struct IoShape {
 #[derive(Debug, Serialize)]
 struct SimulationResult {
     policy: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hot_fraction: Option<f64>,
     physical_layout: String,
     budget_bytes: u64,
     packet_neurons: usize,
@@ -1119,6 +1131,7 @@ fn main() -> Result<()> {
             trace,
             calibration,
             policies,
+            hot_fractions,
             budgets,
             expert_bytes,
             expert_neurons,
@@ -1128,11 +1141,13 @@ fn main() -> Result<()> {
             io_fixed_us,
             io_parallelism,
             reset_between_requests,
+            measure_phases,
             output,
         } => simulate(SimulateArgs {
             trace,
             calibration,
             policies,
+            hot_fractions,
             budgets,
             expert_bytes,
             expert_neurons,
@@ -1142,6 +1157,7 @@ fn main() -> Result<()> {
             io_fixed_us,
             io_parallelism,
             reset_between_requests,
+            measure_phases,
             output,
         }),
         Command::Oracle {
@@ -1549,6 +1565,7 @@ struct SimulateArgs {
     trace: PathBuf,
     calibration: Option<PathBuf>,
     policies: Vec<CachePolicy>,
+    hot_fractions: Vec<f64>,
     budgets: Vec<u64>,
     expert_bytes: u64,
     expert_neurons: usize,
@@ -1558,6 +1575,7 @@ struct SimulateArgs {
     io_fixed_us: f64,
     io_parallelism: usize,
     reset_between_requests: bool,
+    measure_phases: Vec<String>,
     output: PathBuf,
 }
 
@@ -4514,6 +4532,7 @@ fn simulate(args: SimulateArgs) -> Result<()> {
         trace,
         calibration,
         policies,
+        hot_fractions,
         budgets,
         expert_bytes,
         expert_neurons,
@@ -4523,12 +4542,21 @@ fn simulate(args: SimulateArgs) -> Result<()> {
         io_fixed_us,
         io_parallelism,
         reset_between_requests,
+        measure_phases,
         output,
     } = args;
+    let measured_phase_set = measure_phases.iter().cloned().collect::<HashSet<_>>();
     let calibration = calibration.as_deref();
     if policies.is_empty() || budgets.is_empty() || packet_neurons.is_empty() || layouts.is_empty()
     {
         bail!("provide at least one cache policy, budget, packet size, and layout");
+    }
+    if hot_fractions.is_empty()
+        || hot_fractions
+            .iter()
+            .any(|fraction| !fraction.is_finite() || *fraction <= 0.0 || *fraction >= 1.0)
+    {
+        bail!("hot fractions must be finite and strictly between zero and one");
     }
     if expert_bytes == 0 || expert_neurons == 0 {
         bail!("expert-bytes and expert-neurons must be positive");
@@ -4552,6 +4580,7 @@ fn simulate(args: SimulateArgs) -> Result<()> {
         bail!("io-fixed-us requires io-bandwidth-mib-s");
     }
     let trace_header = read_trace_header(&trace)?;
+    let tokens = load_simulation_tokens(&trace, &trace_header)?;
     let hot_frequency = calibration
         .map(|path| collect_frequency(path, &trace_header))
         .transpose()?;
@@ -4575,8 +4604,10 @@ fn simulate(args: SimulateArgs) -> Result<()> {
                 bail!("co-selection layouts require a disjoint --calibration trace");
             }
             for &policy in &policies {
-                if matches!(policy, CachePolicy::StaticHot) && hot_frequency.is_none() {
-                    bail!("static-hot requires a disjoint --calibration trace");
+                if matches!(policy, CachePolicy::StaticHot | CachePolicy::HotLru)
+                    && hot_frequency.is_none()
+                {
+                    bail!("static-hot and hot-lru require a disjoint --calibration trace");
                 }
                 for &budget in &budgets {
                     let capacity = usize::try_from(budget / packet_bytes)
@@ -4584,30 +4615,42 @@ fn simulate(args: SimulateArgs) -> Result<()> {
                     if capacity == 0 {
                         bail!("budget {budget} is smaller than one neuron packet");
                     }
-                    let hot = hot_frequency.as_ref().map(|frequency| {
-                        hottest_packet_keys(
-                            frequency,
+                    let fractions = match policy {
+                        CachePolicy::Lru => vec![None],
+                        CachePolicy::StaticHot => vec![Some(1.0)],
+                        CachePolicy::HotLru => hot_fractions.iter().copied().map(Some).collect(),
+                    };
+                    for hot_fraction in fractions {
+                        let hot_capacity = hot_fraction
+                            .map(|fraction| (capacity as f64 * fraction).floor() as usize)
+                            .unwrap_or(0);
+                        let hot = hot_frequency.as_ref().map(|frequency| {
+                            hottest_packet_keys(
+                                frequency,
+                                hot_capacity,
+                                trace_header.layers,
+                                trace_header.experts,
+                                packets_per_expert,
+                            )
+                        });
+                        results.push(simulate_cell(SimulationCellConfig {
+                            tokens: &tokens,
+                            expected_header: &trace_header,
+                            policy,
+                            hot_fraction: hot_fraction.filter(|fraction| *fraction < 1.0),
+                            layout,
+                            co_selection_ranks: co_selection_ranks.as_deref(),
+                            budget_bytes: budget,
                             capacity,
-                            trace_header.layers,
-                            trace_header.experts,
+                            packet_neurons: neurons,
                             packets_per_expert,
-                        )
-                    });
-                    results.push(simulate_cell(SimulationCellConfig {
-                        trace: &trace,
-                        expected_header: &trace_header,
-                        policy,
-                        layout,
-                        co_selection_ranks: co_selection_ranks.as_deref(),
-                        budget_bytes: budget,
-                        capacity,
-                        packet_neurons: neurons,
-                        packets_per_expert,
-                        packet_bytes,
-                        io_shape,
-                        reset_between_requests,
-                        static_hot: hot.as_ref(),
-                    })?);
+                            packet_bytes,
+                            io_shape,
+                            reset_between_requests,
+                            measure_phases: &measured_phase_set,
+                            static_hot: hot.as_ref(),
+                        })?);
+                    }
                 }
             }
         }
@@ -4620,6 +4663,8 @@ fn simulate(args: SimulateArgs) -> Result<()> {
         expert_bytes,
         expert_neurons,
         packet_neurons,
+        hot_fractions,
+        measure_phases,
         layouts,
         io_shape,
         results,
@@ -4650,9 +4695,10 @@ type ExpertKey = (u16, u16);
 type PacketKey = (u16, u16, u16);
 
 struct SimulationCellConfig<'a> {
-    trace: &'a Path,
+    tokens: &'a [SimulationToken],
     expected_header: &'a TraceHeader,
     policy: CachePolicy,
+    hot_fraction: Option<f64>,
     layout: PhysicalLayout,
     co_selection_ranks: Option<&'a [Vec<u16>]>,
     budget_bytes: u64,
@@ -4662,7 +4708,14 @@ struct SimulationCellConfig<'a> {
     packet_bytes: u64,
     io_shape: Option<IoShape>,
     reset_between_requests: bool,
+    measure_phases: &'a HashSet<String>,
     static_hot: Option<&'a HashSet<PacketKey>>,
+}
+
+struct SimulationToken {
+    request_id: String,
+    phase: String,
+    routes: Vec<Vec<u16>>,
 }
 
 fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
@@ -4674,6 +4727,16 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("missing static hot set"))?,
         ),
+        CachePolicy::HotLru => {
+            let hot = config
+                .static_hot
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing hybrid hot set"))?;
+            CacheState::HotLru {
+                dynamic: LruCache::new(config.capacity.saturating_sub(hot.len())),
+                hot,
+            }
+        }
     };
     let mut seen_ever = HashSet::new();
     let mut token_records = 0usize;
@@ -4698,7 +4761,9 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
     let mut previous_request = None::<String>;
     let mut previous_keys = HashSet::new();
 
-    visit_trace(config.trace, config.expected_header, |token| {
+    for token in config.tokens {
+        let measured = config.measure_phases.is_empty()
+            || config.measure_phases.contains(token.phase.as_str());
         if config.reset_between_requests
             && previous_request
                 .as_ref()
@@ -4710,7 +4775,10 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
         }
         let mut current_keys =
             HashSet::with_capacity(config.expected_header.layers * config.expected_header.top_k);
+        let mut token_hits = 0u64;
         let mut token_misses = 0u64;
+        let mut token_compulsory_misses = 0u64;
+        let mut token_evictions = 0u64;
         let mut token_transfer_runs = 0u64;
         let mut token_miss_layers = 0u64;
         let mut token_serial_io_ms = 0.0f64;
@@ -4725,14 +4793,15 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
                 for packet in 0..config.packets_per_expert {
                     let key = (layer as u16, expert, packet as u16);
                     if let Some(previous) = last_access.insert(key, access_clock) {
-                        reuse_distances.push(access_clock.saturating_sub(previous + 1));
+                        if measured {
+                            reuse_distances.push(access_clock.saturating_sub(previous + 1));
+                        }
                     }
                     access_clock += 1;
-                    let hit = state.access(key, &mut evictions);
+                    let hit = state.access(key, &mut token_evictions);
                     if hit {
-                        hits += 1;
+                        token_hits += 1;
                     } else {
-                        misses += 1;
                         token_misses += 1;
                         layer_missing_packets += 1;
                         layer_missed = true;
@@ -4746,7 +4815,7 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
                             config.co_selection_ranks,
                         ));
                         if seen_ever.insert(key) {
-                            compulsory_misses += 1;
+                            token_compulsory_misses += 1;
                         }
                     }
                 }
@@ -4755,14 +4824,18 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
             let layer_runs = run_lengths.len() as u64;
             token_transfer_runs += layer_runs;
             let layer_missing_bytes = layer_missing_packets.saturating_mul(config.packet_bytes);
-            missing_bytes_per_layer.push(layer_missing_bytes);
+            if measured {
+                missing_bytes_per_layer.push(layer_missing_bytes);
+            }
             let layer_run_bytes = run_lengths
                 .into_iter()
                 .map(|run_packets| (run_packets as u64).saturating_mul(config.packet_bytes))
                 .collect::<Vec<_>>();
             for &run_bytes in &layer_run_bytes {
-                maximum_contiguous_burst_bytes = maximum_contiguous_burst_bytes.max(run_bytes);
-                contiguous_bytes_per_fetch.push(run_bytes);
+                if measured {
+                    maximum_contiguous_burst_bytes = maximum_contiguous_burst_bytes.max(run_bytes);
+                    contiguous_bytes_per_fetch.push(run_bytes);
+                }
             }
             if let Some(io_shape) = config.io_shape {
                 token_serial_io_ms += transfer_time_ms(layer_missing_bytes, layer_runs, io_shape);
@@ -4773,7 +4846,8 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
             }
             token_miss_layers += u64::from(layer_missed);
         }
-        if previous_request.as_deref() == Some(token.request_id.as_str())
+        if measured
+            && previous_request.as_deref() == Some(token.request_id.as_str())
             && !previous_keys.is_empty()
         {
             let shared = current_keys.intersection(&previous_keys).count();
@@ -4782,17 +4856,22 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
         }
         previous_request = Some(token.request_id.clone());
         previous_keys = current_keys;
-        missing_bytes.push(token_misses.saturating_mul(config.packet_bytes));
-        transfer_runs.push(token_transfer_runs);
-        miss_layers.push(token_miss_layers);
-        if config.io_shape.is_some() {
-            serial_io_ms.push(token_serial_io_ms);
-            ideal_layer_parallel_io_ms.push(token_parallel_io_ms);
-            shaped_io_ms.push(token_shaped_io_ms);
+        if measured {
+            hits += token_hits;
+            misses += token_misses;
+            compulsory_misses += token_compulsory_misses;
+            evictions += token_evictions;
+            missing_bytes.push(token_misses.saturating_mul(config.packet_bytes));
+            transfer_runs.push(token_transfer_runs);
+            miss_layers.push(token_miss_layers);
+            if config.io_shape.is_some() {
+                serial_io_ms.push(token_serial_io_ms);
+                ideal_layer_parallel_io_ms.push(token_parallel_io_ms);
+                shaped_io_ms.push(token_shaped_io_ms);
+            }
+            token_records += 1;
         }
-        token_records += 1;
-        Ok(())
-    })?;
+    }
     if token_records == 0 {
         bail!("trace contains no token records");
     }
@@ -4800,6 +4879,7 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
     let total_missing_bytes = misses.saturating_mul(config.packet_bytes);
     Ok(SimulationResult {
         policy: config.policy.label().to_owned(),
+        hot_fraction: config.hot_fraction,
         physical_layout: config.layout.label().to_owned(),
         budget_bytes: config.budget_bytes,
         packet_neurons: config.packet_neurons,
@@ -4857,9 +4937,29 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
     })
 }
 
+fn load_simulation_tokens(
+    path: &Path,
+    expected_header: &TraceHeader,
+) -> Result<Vec<SimulationToken>> {
+    let mut tokens = Vec::new();
+    visit_trace(path, expected_header, |token| {
+        tokens.push(SimulationToken {
+            request_id: token.request_id,
+            phase: token.phase,
+            routes: token.routes,
+        });
+        Ok(())
+    })?;
+    Ok(tokens)
+}
+
 enum CacheState {
     Lru(LruCache),
     Static(HashSet<PacketKey>),
+    HotLru {
+        hot: HashSet<PacketKey>,
+        dynamic: LruCache,
+    },
 }
 
 impl CacheState {
@@ -4867,12 +4967,16 @@ impl CacheState {
         match self {
             Self::Lru(cache) => cache.access(key, evictions),
             Self::Static(keys) => keys.contains(&key),
+            Self::HotLru { hot, dynamic } => hot.contains(&key) || dynamic.access(key, evictions),
         }
     }
 
     fn clear(&mut self) {
         if let Self::Lru(cache) = self {
             cache.clear();
+        }
+        if let Self::HotLru { dynamic, .. } = self {
+            dynamic.clear();
         }
     }
 }
@@ -6143,6 +6247,68 @@ mod tests {
     }
 
     #[test]
+    fn hot_lru_pins_calibrated_packets_and_adapts_the_remainder() {
+        let mut cache = CacheState::HotLru {
+            hot: HashSet::from([(0, 1, 0)]),
+            dynamic: LruCache::new(1),
+        };
+        let mut evictions = 0;
+        assert!(cache.access((0, 1, 0), &mut evictions));
+        assert!(!cache.access((0, 2, 0), &mut evictions));
+        assert!(cache.access((0, 2, 0), &mut evictions));
+        assert!(!cache.access((0, 3, 0), &mut evictions));
+        assert!(cache.access((0, 1, 0), &mut evictions));
+        assert_eq!(evictions, 1);
+    }
+
+    #[test]
+    fn phase_filter_uses_prompt_to_warm_generation_cache() {
+        let header = TraceHeader {
+            schema_version: SCHEMA_VERSION,
+            model_sha256: "0".repeat(64),
+            llama_revision: "test".to_owned(),
+            layers: 1,
+            experts: 2,
+            top_k: 1,
+            source: "synthetic".to_owned(),
+        };
+        let tokens = [
+            SimulationToken {
+                request_id: "test".to_owned(),
+                phase: "prompt".to_owned(),
+                routes: vec![vec![0]],
+            },
+            SimulationToken {
+                request_id: "test".to_owned(),
+                phase: "generation".to_owned(),
+                routes: vec![vec![0]],
+            },
+        ];
+        let measured = HashSet::from(["generation".to_owned()]);
+        let result = simulate_cell(SimulationCellConfig {
+            tokens: &tokens,
+            expected_header: &header,
+            policy: CachePolicy::Lru,
+            hot_fraction: None,
+            layout: PhysicalLayout::ExpertContiguous,
+            co_selection_ranks: None,
+            budget_bytes: 100,
+            capacity: 1,
+            packet_neurons: 1,
+            packets_per_expert: 1,
+            packet_bytes: 100,
+            io_shape: None,
+            reset_between_requests: false,
+            measure_phases: &measured,
+            static_hot: None,
+        })
+        .unwrap();
+        assert_eq!(result.token_records, 1);
+        assert_eq!(result.hits, 1);
+        assert_eq!(result.misses, 0);
+    }
+
+    #[test]
     fn hottest_keys_are_selected_by_frequency() {
         let frequency = HashMap::from([((0, 1), 4), ((0, 2), 9), ((1, 0), 6)]);
         let hot = hottest_packet_keys(&frequency, 2, 2, 3, 1);
@@ -6368,10 +6534,12 @@ mod tests {
             .unwrap();
         }
         writer.flush().unwrap();
+        let tokens = load_simulation_tokens(&path, &header).unwrap();
         let result = simulate_cell(SimulationCellConfig {
-            trace: &path,
+            tokens: &tokens,
             expected_header: &header,
             policy: CachePolicy::Lru,
+            hot_fraction: None,
             layout: PhysicalLayout::ExpertContiguous,
             co_selection_ranks: None,
             budget_bytes: 200,
@@ -6381,6 +6549,7 @@ mod tests {
             packet_bytes: 100,
             io_shape: None,
             reset_between_requests: false,
+            measure_phases: &HashSet::new(),
             static_hot: None,
         })
         .unwrap();
@@ -6390,9 +6559,10 @@ mod tests {
         assert_eq!(result.p95_missing_bytes_per_token, 200);
         assert_eq!(result.p99_layers_with_miss_per_token, 2);
         let packetized = simulate_cell(SimulationCellConfig {
-            trace: &path,
+            tokens: &tokens,
             expected_header: &header,
             policy: CachePolicy::Lru,
+            hot_fraction: None,
             layout: PhysicalLayout::ExpertContiguous,
             co_selection_ranks: None,
             budget_bytes: 200,
@@ -6406,6 +6576,7 @@ mod tests {
                 max_inflight_fetches: 2,
             }),
             reset_between_requests: false,
+            measure_phases: &HashSet::new(),
             static_hot: None,
         })
         .unwrap();

@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-q2s4-bounded-residency-feasibility",
+  "promotion_evidence": false,
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "representation": {
+    "expert_codec": "full-width-Q2S4",
+    "bytes_per_expert": 1474560,
+    "installed_weight_gib": 9.245506286621094,
+    "shared_weight_gib": 0.8080062866210938,
+    "fp16_kv_gib_at_context_4096": 0.375
+  },
+  "simulation": {
+    "trace": "qwen3-30b-a3b-route-smoke-64.jsonl",
+    "calibration": "qwen3-30b-a3b-route-calibration-64.jsonl",
+    "prompt_tokens": 14,
+    "measured_generation_tokens": 64,
+    "synthetic_io": {
+      "bandwidth_mib_s": 1500.0,
+      "fixed_latency_us": 50.0,
+      "parallelism": 4
+    }
+  },
+  "decode_frontier": [
+    {
+      "expert_cache_gib": 4.0,
+      "pinned_fraction": 0.25,
+      "byte_hit_rate": 0.9468180338541666,
+      "mean_missing_mib_per_token": 28.71826171875,
+      "p50_missing_mib_per_token": 22.5,
+      "p95_missing_mib_per_token": 67.5,
+      "mean_shaped_io_ms_per_token": 19.92050781249999,
+      "p95_shaped_io_ms_per_token": 46.79999999999998
+    },
+    {
+      "expert_cache_gib": 4.5,
+      "pinned_fraction": 0.5,
+      "byte_hit_rate": 0.9560139973958334,
+      "mean_missing_mib_per_token": 23.75244140625,
+      "p50_missing_mib_per_token": 16.875,
+      "p95_missing_mib_per_token": 61.875,
+      "mean_shaped_io_ms_per_token": 16.4974609375,
+      "p95_shaped_io_ms_per_token": 42.99999999999999
+    }
+  ],
+  "cold_and_domain_stress": {
+    "full_request_generation_calibrated_4_5g": {
+      "pinned_fraction": 0.5,
+      "byte_hit_rate": 0.9284521901709402,
+      "mean_missing_mib_per_token": 38.63581730769231,
+      "p95_missing_mib_per_token": 143.4375
+    },
+    "code_math_with_wikitext_calibration_4_5g": {
+      "pinned_fraction": 0.75,
+      "byte_hit_rate": 0.8392518939393939,
+      "mean_missing_mib_per_token": 86.80397727272727,
+      "p95_missing_mib_per_token": 140.625
+    },
+    "full_q3_wikitext_4_5g": {
+      "bytes_per_expert": 2064384,
+      "byte_hit_rate": 0.8518469887955182,
+      "mean_missing_mib_per_token": 112.00367647058823,
+      "p95_missing_mib_per_token": 226.40625
+    }
+  },
+  "resident_memory_projection": {
+    "expert_cache_gib": 4.5,
+    "shared_weight_gib": 0.8080062866210938,
+    "kv_gib": 0.375,
+    "runtime_and_app_gib_range": [0.75, 1.25],
+    "total_gib_range": [6.433006286621094, 6.933006286621094]
+  },
+  "decision": {
+    "resident_memory_gate": "conditional_pass",
+    "decode_mean_io_gate": "pass_on_64-token-generation-smoke",
+    "cold_and_cross_domain_gate": "not_yet_passed",
+    "bulk_q3_residency": "reject",
+    "next_iteration": "capture_diverse_route_only_calibration_and_heldout_traces_then_validate_hot-lru"
+  },
+  "limitations": [
+    "synthetic I/O shape rather than measured iPhone storage",
+    "one 64-token generation trace for decode metrics",
+    "available code/math stress trace contains only 22 tokens",
+    "cache replay excludes GPU compute time",
+    "uniform expert sizes; selective precision requires a byte-capacity cache planner"
+  ]
+}
