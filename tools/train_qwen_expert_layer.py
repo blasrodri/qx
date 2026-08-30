@@ -8,11 +8,14 @@ reported as explicit full-width exceptions instead of being silently trained.
 """
 
 import argparse
+import array
 import collections
 import gc
 import hashlib
 import json
 import pathlib
+import struct
+import sys
 import time
 
 import torch
@@ -65,12 +68,92 @@ def parse_args():
     return parser.parse_args()
 
 
+def read_exact(stream, count, context):
+    values = stream.read(count)
+    if len(values) != count:
+        raise ValueError(f"truncated compact trace while reading {context}")
+    return values
+
+
+def read_f32_array(stream, count, context):
+    values = array.array("f")
+    values.frombytes(read_exact(stream, count * 4, context))
+    if sys.byteorder != "little":
+        values.byteswap()
+    return values.tolist()
+
+
+def load_compact_trace(path, expected_layer, experts):
+    grouped_inputs = collections.defaultdict(list)
+    grouped_outputs = collections.defaultdict(list)
+    positions = 0
+    samples = 0
+    with path.open("rb") as stream:
+        header = read_exact(stream, 84, f"{path} header")
+        magic, version, layer, top_k, hidden = struct.unpack("<8sIHHI", header[:20])
+        if magic != b"QXDS0001" or version != 1:
+            raise ValueError(f"unsupported compact expert trace: {path}")
+        if layer != expected_layer:
+            raise ValueError(
+                f"compact trace layer {layer} does not match requested layer {expected_layer}"
+            )
+        model_sha256 = header[20:].decode("ascii")
+        if len(model_sha256) != 64:
+            raise ValueError(f"invalid compact trace model identity: {path}")
+        while True:
+            record = stream.read(12)
+            if not record:
+                break
+            if len(record) != 12:
+                raise ValueError(f"truncated compact record header: {path}")
+            sequence, position, sample_count, reserved = struct.unpack("<IIHH", record)
+            if reserved != 0 or sample_count > top_k:
+                raise ValueError(
+                    f"invalid compact record at sequence {sequence}, position {position}"
+                )
+            if sample_count == 0:
+                continue
+            values = read_f32_array(stream, hidden, f"{path} shared input")
+            positions += 1
+            for _ in range(sample_count):
+                expert, reserved = struct.unpack(
+                    "<HH", read_exact(stream, 4, f"{path} expert header")
+                )
+                if reserved != 0 or expert >= experts:
+                    raise ValueError(f"invalid expert {expert} in compact trace {path}")
+                output = read_f32_array(stream, hidden, f"{path} teacher output")
+                grouped_inputs[expert].append(values)
+                grouped_outputs[expert].append(output)
+                samples += 1
+    return grouped_inputs, grouped_outputs, {
+        "positions": positions,
+        "samples": samples,
+        "model_sha256": model_sha256,
+        "format": "qxds-v1",
+    }
+
+
 def load_grouped_trace(paths, layer, experts):
     grouped_inputs = collections.defaultdict(list)
     grouped_outputs = collections.defaultdict(list)
     positions = 0
     samples = 0
+    model_sha256 = None
     for path in paths:
+        if path.suffix == ".qxds":
+            local_inputs, local_outputs, capture = load_compact_trace(
+                path, layer, experts
+            )
+            for expert, values in local_inputs.items():
+                grouped_inputs[expert].extend(values)
+                grouped_outputs[expert].extend(local_outputs[expert])
+            positions += capture["positions"]
+            samples += capture["samples"]
+            if model_sha256 is None:
+                model_sha256 = capture["model_sha256"]
+            elif model_sha256 != capture["model_sha256"]:
+                raise ValueError("compact traces were captured from different models")
+            continue
         with path.open() as stream:
             for line_number, line in enumerate(stream, 1):
                 record = json.loads(line)
@@ -96,7 +179,10 @@ def load_grouped_trace(paths, layer, experts):
                     grouped_inputs[expert].append(values)
                     grouped_outputs[expert].append(sample["teacher_down_output"])
                     samples += 1
-    return grouped_inputs, grouped_outputs, {"positions": positions, "samples": samples}
+    capture = {"positions": positions, "samples": samples}
+    if model_sha256 is not None:
+        capture.update({"model_sha256": model_sha256, "format": "qxds-v1"})
+    return grouped_inputs, grouped_outputs, capture
 
 
 def as_tensors(grouped_inputs, grouped_outputs, expert):

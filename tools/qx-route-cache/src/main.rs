@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, OsString, c_char, c_int, c_void};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,8 @@ const DEFAULT_EXPERT_NEURONS: usize = 768;
 const MAX_GREEDY_CONTRIBUTION_PACKETS: usize = 64;
 const EXPERT_DOWN_WEIGHTS_MAGIC: &[u8; 8] = b"QXEDW001";
 const JOINT_EXPERT_STUDENT_MAGIC: &[u8; 8] = b"QXEJS001";
+const EXPERT_DISTILL_TRACE_MAGIC: &[u8; 8] = b"QXDS0001";
+const POSTGRAPH_DISTILL_TRACE_MAGIC: &[u8; 8] = b"QXDRAW01";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -91,6 +93,23 @@ enum Command {
         /// Layer to sample. Omit for a compact all-layer route-only trace.
         #[arg(long)]
         sample_layer: Option<usize>,
+        /// Capture every routed expert in every layer during one model replay.
+        #[arg(long, conflicts_with = "sample_layer")]
+        sample_all_layers: bool,
+        /// Write one sample trace per layer while keeping `output` route-only.
+        #[arg(
+            long,
+            requires = "sample_all_layers",
+            conflicts_with = "split_layer_binary_dir"
+        )]
+        split_layer_output_dir: Option<PathBuf>,
+        /// Write compact binary training samples per layer while keeping `output` route-only.
+        #[arg(
+            long,
+            requires = "sample_all_layers",
+            conflicts_with = "split_layer_output_dir"
+        )]
+        split_layer_binary_dir: Option<PathBuf>,
         /// Selected experts to retain, repeated or comma-delimited. Empty captures every routed expert.
         #[arg(
             long = "sample-expert",
@@ -101,6 +120,9 @@ enum Command {
         /// Maximum retained samples per expert. Zero retains every routed hit.
         #[arg(long, default_value_t = 0)]
         max_samples_per_expert: usize,
+        /// Skip this many scoreable corpus paragraphs before capture.
+        #[arg(long, default_value_t = 0)]
+        skip_sequences: usize,
         #[arg(long, default_value_t = 64)]
         max_sequences: usize,
         #[arg(long, default_value_t = 96)]
@@ -1148,8 +1170,12 @@ fn main() -> Result<()> {
             output,
             sample_weights_output,
             sample_layer,
+            sample_all_layers,
+            split_layer_output_dir,
+            split_layer_binary_dir,
             sample_experts,
             max_samples_per_expert,
+            skip_sequences,
             max_sequences,
             max_tokens_per_sequence,
             context,
@@ -1167,8 +1193,12 @@ fn main() -> Result<()> {
             output,
             sample_weights_output,
             sample_layer,
+            sample_all_layers,
+            split_layer_output_dir,
+            split_layer_binary_dir,
             sample_experts,
             max_samples_per_expert,
+            skip_sequences,
             max_sequences,
             max_tokens_per_sequence,
             context,
@@ -1515,8 +1545,12 @@ struct CaptureCorpusArgs {
     output: PathBuf,
     sample_weights_output: Option<PathBuf>,
     sample_layer: Option<usize>,
+    sample_all_layers: bool,
+    split_layer_output_dir: Option<PathBuf>,
+    split_layer_binary_dir: Option<PathBuf>,
     sample_experts: Vec<u16>,
     max_samples_per_expert: usize,
+    skip_sequences: usize,
     max_sequences: usize,
     max_tokens_per_sequence: usize,
     context: usize,
@@ -1528,6 +1562,42 @@ struct CaptureCorpusArgs {
     expert_neurons: usize,
     hidden_size: usize,
     model_sha256: Option<String>,
+}
+
+struct PostgraphToken {
+    request_id: String,
+    sequence: usize,
+    token_position: usize,
+    input_token: i32,
+    predicted_token: i32,
+}
+
+struct ScopedEnvironment {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl ScopedEnvironment {
+    fn set(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(key);
+        // Capture is a single-threaded command during environment setup and
+        // the value remains immutable until the llama context is destroyed.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvironment {
+    fn drop(&mut self) {
+        // The llama context and its worker threads are gone before this guard.
+        unsafe {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 }
 
 fn corpus_sample_modes(
@@ -1720,6 +1790,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
             hidden: args.hidden_size,
             sample: args.sample,
             sample_all_layer: None,
+            sample_all_layers: false,
             capture_all_routes: true,
             capture_all_activations: !args.activation_packet_neurons.is_empty()
                 || !args.contribution_packet_neurons.is_empty(),
@@ -1899,6 +1970,11 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
     {
         bail!("expert sample target is outside the model shape");
     }
+    if args.sample_all_layers
+        && (!args.sample_experts.is_empty() || args.sample_weights_output.is_some())
+    {
+        bail!("all-layer capture cannot select experts or emit one expert weight matrix");
+    }
     let selected_experts: HashSet<u16> = args.sample_experts.iter().copied().collect();
     if selected_experts.len() != args.sample_experts.len() {
         bail!("sample expert selection contains duplicates");
@@ -1915,7 +1991,20 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
         }
         None => sha256_file(&args.model)?,
     };
-    let routes_only = args.sample_layer.is_none();
+    let postgraph_distill = args.sample_all_layers && args.split_layer_binary_dir.is_some();
+    let postgraph_raw_path = args
+        .split_layer_binary_dir
+        .as_ref()
+        .filter(|_| postgraph_distill)
+        .map(|directory| directory.join(".all-layers.qxdraw"));
+    if let Some(directory) = args.split_layer_binary_dir.as_ref() {
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("create {}", directory.display()))?;
+    }
+    let postgraph_environment = postgraph_raw_path
+        .as_deref()
+        .map(|path| ScopedEnvironment::set("QX_DISTILL_TRACE_PATH", path));
+    let routes_only = args.sample_layer.is_none() && !args.sample_all_layers;
     let (sample, sample_all_layer) = corpus_sample_modes(args.sample_layer, &args.sample_experts);
     let mut llama = llama_capture::Capture::open(
         &args.model,
@@ -1926,12 +2015,14 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
             top_k: args.top_k,
             gpu_layers: args.gpu_layers,
             threads: args.threads,
-            intermediate: (!routes_only).then_some(args.expert_neurons),
+            intermediate: (!routes_only && !postgraph_distill).then_some(args.expert_neurons),
             hidden: args.hidden_size,
-            sample,
-            sample_all_layer,
+            sample: (!postgraph_distill).then_some(sample).flatten(),
+            sample_all_layer: (!postgraph_distill).then_some(sample_all_layer).flatten(),
+            sample_all_layers: args.sample_all_layers && !postgraph_distill,
             capture_all_routes: routes_only,
-            capture_all_activations: false,
+            capture_all_activations: args.sample_all_layers
+                && args.split_layer_binary_dir.is_none(),
             contribution_packet_neurons: &[],
         },
     )?;
@@ -1947,31 +2038,78 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
     let file =
         File::create(&args.output).with_context(|| format!("create {}", args.output.display()))?;
     let mut writer = BufWriter::new(file);
-    write_trace_line(
-        &mut writer,
-        &TraceLine::Header(TraceHeader {
-            schema_version: SCHEMA_VERSION,
-            model_sha256: model_hash,
-            llama_revision: option_env!("QX_LLAMA_REVISION")
-                .unwrap_or("unknown")
-                .to_owned(),
-            layers: args.layers,
-            experts: args.experts,
-            top_k: args.top_k,
-            source: if routes_only {
-                "llama.cpp-eval-callback-route-only-corpus-reset".to_owned()
-            } else {
-                "llama.cpp-eval-callback-selected-expert-batch-corpus-reset".to_owned()
-            },
-        }),
-    )?;
+    let header = TraceHeader {
+        schema_version: SCHEMA_VERSION,
+        model_sha256: model_hash,
+        llama_revision: option_env!("QX_LLAMA_REVISION")
+            .unwrap_or("unknown")
+            .to_owned(),
+        layers: args.layers,
+        experts: args.experts,
+        top_k: args.top_k,
+        source: if postgraph_distill {
+            "llama.cpp-postgraph-all-layer-expert-corpus-reset".to_owned()
+        } else if args.sample_all_layers {
+            "llama.cpp-eval-callback-all-layer-expert-batch-corpus-reset".to_owned()
+        } else if routes_only {
+            "llama.cpp-eval-callback-route-only-corpus-reset".to_owned()
+        } else {
+            "llama.cpp-eval-callback-selected-expert-batch-corpus-reset".to_owned()
+        },
+    };
+    write_trace_line(&mut writer, &TraceLine::Header(header.clone()))?;
+    let mut layer_writers = if let Some(directory) = &args.split_layer_output_dir {
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("create {}", directory.display()))?;
+        let mut writers = Vec::with_capacity(args.layers);
+        for layer in 0..args.layers {
+            let path = directory.join(format!("layer{layer}.jsonl"));
+            let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
+            let mut layer_writer = BufWriter::new(file);
+            write_trace_line(&mut layer_writer, &TraceLine::Header(header.clone()))?;
+            writers.push(layer_writer);
+        }
+        Some(writers)
+    } else {
+        None
+    };
+    let mut layer_binary_writers = if !postgraph_distill {
+        args.split_layer_binary_dir.as_ref()
+    } else {
+        None
+    }
+    .map(|directory| -> Result<Vec<BufWriter<File>>> {
+        let mut writers = Vec::with_capacity(args.layers);
+        for layer in 0..args.layers {
+            let path = directory.join(format!("layer{layer}.qxds"));
+            let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
+            let mut layer_writer = BufWriter::new(file);
+            write_expert_distill_binary_header(
+                &mut layer_writer,
+                layer,
+                args.top_k,
+                args.hidden_size,
+                &header.model_sha256,
+            )?;
+            writers.push(layer_writer);
+        }
+        Ok(writers)
+    })
+    .transpose()?;
 
     let mut sequences = 0usize;
     let mut token_positions = 0usize;
     let mut expert_hits = 0usize;
-    let mut observed_hit_counts = vec![0usize; args.experts];
-    let mut retained_hit_counts = vec![0usize; args.experts];
+    let mut scoreable_seen = 0usize;
+    let sample_targets = if args.sample_all_layers {
+        args.layers * args.experts
+    } else {
+        args.experts
+    };
+    let mut observed_hit_counts = vec![0usize; sample_targets];
+    let mut retained_hit_counts = vec![0usize; sample_targets];
     let mut wrote_weights = args.sample_weights_output.is_none();
+    let mut postgraph_tokens = Vec::new();
     for paragraph in paragraphs {
         if sequences >= args.max_sequences {
             break;
@@ -1979,6 +2117,10 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
         let mut tokens = llama.tokenize(&paragraph)?;
         tokens.truncate(args.max_tokens_per_sequence);
         if tokens.len() < 2 {
+            continue;
+        }
+        if scoreable_seen < args.skip_sequences {
+            scoreable_seen += 1;
             continue;
         }
         if sequences > 0 {
@@ -1996,6 +2138,17 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
                 expert_samples,
                 expert_down_weights,
             } = llama.step(token)?;
+            if postgraph_distill {
+                postgraph_tokens.push(PostgraphToken {
+                    request_id: request_id.clone(),
+                    sequence: sequences,
+                    token_position: position,
+                    input_token: token,
+                    predicted_token: predicted,
+                });
+                token_positions += 1;
+                continue;
+            }
             if let Some(sample_layer) = args.sample_layer {
                 validate_sample_route(
                     &routes,
@@ -2013,20 +2166,20 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
                 write_expert_down_weights(path, args.expert_neurons, args.hidden_size, &weights)?;
                 wrote_weights = true;
             }
-            let sample_layer = args.sample_layer.unwrap_or(0);
             let mut samples = expert_samples
                 .into_iter()
-                .map(
-                    |(expert, input, activation, teacher_down_output)| ExpertDistillSample {
-                        layer: sample_layer,
+                .map(|(layer, expert, input, activation, teacher_down_output)| {
+                    ExpertDistillSample {
+                        layer,
                         expert,
                         input,
                         activation,
                         teacher_down_output,
-                    },
-                )
+                    }
+                })
                 .collect::<Vec<_>>();
             if let Some((input, activation, teacher_down_output)) = expert_sample {
+                let sample_layer = args.sample_layer.expect("single expert sample has a layer");
                 samples.push(ExpertDistillSample {
                     layer: sample_layer,
                     expert: args.sample_experts[0],
@@ -2039,10 +2192,19 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
                 selected_experts.is_empty() || selected_experts.contains(&sample.expert)
             });
             for sample in &samples {
-                observed_hit_counts[usize::from(sample.expert)] += 1;
+                let target = if args.sample_all_layers {
+                    sample.layer * args.experts + usize::from(sample.expert)
+                } else {
+                    usize::from(sample.expert)
+                };
+                observed_hit_counts[target] += 1;
             }
             samples.retain(|sample| {
-                let expert = usize::from(sample.expert);
+                let expert = if args.sample_all_layers {
+                    sample.layer * args.experts + usize::from(sample.expert)
+                } else {
+                    usize::from(sample.expert)
+                };
                 if args.max_samples_per_expert > 0
                     && retained_hit_counts[expert] >= args.max_samples_per_expert
                 {
@@ -2053,26 +2215,131 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
                 }
             });
             expert_hits += samples.len();
-            write_trace_line(
-                &mut writer,
-                &TraceLine::Token(TokenRoutes {
-                    request_id: request_id.clone(),
-                    token_position: position,
-                    phase: "corpus".to_owned(),
-                    input_token: token,
-                    predicted_token: predicted,
-                    routes,
-                    packet_activation_energy: None,
-                    packet_down_contribution: None,
-                    expert_distill_sample: None,
-                    expert_distill_samples: samples,
-                }),
-            )?;
+            if let Some(writers) = layer_binary_writers.as_mut() {
+                let mut samples_by_layer = vec![Vec::new(); args.layers];
+                for sample in samples {
+                    let layer = sample.layer;
+                    samples_by_layer[layer].push(sample);
+                }
+                write_trace_line(
+                    &mut writer,
+                    &TraceLine::Token(TokenRoutes {
+                        request_id: request_id.clone(),
+                        token_position: position,
+                        phase: "corpus".to_owned(),
+                        input_token: token,
+                        predicted_token: predicted,
+                        routes,
+                        packet_activation_energy: None,
+                        packet_down_contribution: None,
+                        expert_distill_sample: None,
+                        expert_distill_samples: Vec::new(),
+                    }),
+                )?;
+                for (layer, layer_samples) in samples_by_layer.into_iter().enumerate() {
+                    write_expert_distill_binary_record(
+                        &mut writers[layer],
+                        sequences,
+                        position,
+                        layer,
+                        args.hidden_size,
+                        &layer_samples,
+                    )?;
+                }
+            } else if let Some(writers) = layer_writers.as_mut() {
+                let mut samples_by_layer = vec![Vec::new(); args.layers];
+                for sample in samples {
+                    let layer = sample.layer;
+                    samples_by_layer[layer].push(sample);
+                }
+                write_trace_line(
+                    &mut writer,
+                    &TraceLine::Token(TokenRoutes {
+                        request_id: request_id.clone(),
+                        token_position: position,
+                        phase: "corpus".to_owned(),
+                        input_token: token,
+                        predicted_token: predicted,
+                        routes: routes.clone(),
+                        packet_activation_energy: None,
+                        packet_down_contribution: None,
+                        expert_distill_sample: None,
+                        expert_distill_samples: Vec::new(),
+                    }),
+                )?;
+                for (layer, layer_samples) in samples_by_layer.into_iter().enumerate() {
+                    write_trace_line(
+                        &mut writers[layer],
+                        &TraceLine::Token(TokenRoutes {
+                            request_id: request_id.clone(),
+                            token_position: position,
+                            phase: "corpus".to_owned(),
+                            input_token: token,
+                            predicted_token: predicted,
+                            routes: routes.clone(),
+                            packet_activation_energy: None,
+                            packet_down_contribution: None,
+                            expert_distill_sample: None,
+                            expert_distill_samples: layer_samples,
+                        }),
+                    )?;
+                }
+            } else {
+                write_trace_line(
+                    &mut writer,
+                    &TraceLine::Token(TokenRoutes {
+                        request_id: request_id.clone(),
+                        token_position: position,
+                        phase: "corpus".to_owned(),
+                        input_token: token,
+                        predicted_token: predicted,
+                        routes,
+                        packet_activation_energy: None,
+                        packet_down_contribution: None,
+                        expert_distill_sample: None,
+                        expert_distill_samples: samples,
+                    }),
+                )?;
+            }
             token_positions += 1;
         }
         sequences += 1;
     }
+    drop(llama);
+    drop(postgraph_environment);
+    if postgraph_distill {
+        let raw_path = postgraph_raw_path
+            .as_deref()
+            .expect("postgraph capture has a raw path");
+        let output_directory = args
+            .split_layer_binary_dir
+            .as_deref()
+            .expect("postgraph capture has an output directory");
+        let result = split_postgraph_distill_trace(
+            raw_path,
+            output_directory,
+            &header,
+            &postgraph_tokens,
+            args.max_samples_per_expert,
+            &mut writer,
+        )?;
+        expert_hits = result.0;
+        observed_hit_counts = result.1;
+        retained_hit_counts = result.2;
+        std::fs::remove_file(raw_path)
+            .with_context(|| format!("remove temporary {}", raw_path.display()))?;
+    }
     writer.flush()?;
+    if let Some(writers) = layer_writers.as_mut() {
+        for layer_writer in writers {
+            layer_writer.flush()?;
+        }
+    }
+    if let Some(writers) = layer_binary_writers.as_mut() {
+        for layer_writer in writers {
+            layer_writer.flush()?;
+        }
+    }
     if sequences == 0 || (!routes_only && expert_hits == 0) || !wrote_weights {
         bail!(
             "corpus capture produced sequences {sequences}, expert hits {expert_hits}, weights {wrote_weights}"
@@ -2082,23 +2349,38 @@ fn capture_corpus(args: CaptureCorpusArgs) -> Result<()> {
     println!(
         "sequences: {sequences}, routed token positions: {token_positions}, expert hits: {expert_hits}"
     );
-    let populated = retained_hit_counts
-        .iter()
-        .enumerate()
-        .filter(|(_, count)| **count > 0)
-        .map(|(expert, count)| format!("{expert}:{count}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    println!("retained expert hit counts: {populated}");
-    if args.max_samples_per_expert > 0 {
+    if args.sample_all_layers {
+        let populated = retained_hit_counts
+            .iter()
+            .filter(|&&count| count > 0)
+            .count();
         let observed = observed_hit_counts
+            .iter()
+            .filter(|&&count| count > 0)
+            .count();
+        println!(
+            "populated layer-experts: retained {populated}, observed {observed} of {}",
+            args.layers * args.experts
+        );
+    } else {
+        let populated = retained_hit_counts
             .iter()
             .enumerate()
             .filter(|(_, count)| **count > 0)
             .map(|(expert, count)| format!("{expert}:{count}"))
             .collect::<Vec<_>>()
             .join(",");
-        println!("observed expert hit counts: {observed}");
+        println!("retained expert hit counts: {populated}");
+        if args.max_samples_per_expert > 0 {
+            let observed = observed_hit_counts
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .map(|(expert, count)| format!("{expert}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("observed expert hit counts: {observed}");
+        }
     }
     Ok(())
 }
@@ -2181,6 +2463,7 @@ fn expert_student_nll(args: ExpertStudentNllArgs) -> Result<()> {
             hidden: args.hidden_size,
             sample: Some((args.layer, args.expert)),
             sample_all_layer: None,
+            sample_all_layers: false,
             capture_all_routes: false,
             capture_all_activations: false,
             contribution_packet_neurons: &[],
@@ -2311,6 +2594,7 @@ fn joint_expert_student_nll(args: JointExpertStudentNllArgs) -> Result<()> {
             hidden: args.hidden_size,
             sample: Some((joint.layer, joint.expert)),
             sample_all_layer: None,
+            sample_all_layers: false,
             capture_all_routes: false,
             capture_all_activations: false,
             contribution_packet_neurons: &[],
@@ -2556,6 +2840,7 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
             hidden: args.hidden_size,
             sample: None,
             sample_all_layer: None,
+            sample_all_layers: false,
             capture_all_routes: true,
             capture_all_activations: true,
             contribution_packet_neurons: &[],
@@ -2968,6 +3253,7 @@ fn multi_expert_student_nll(args: MultiExpertStudentNllArgs) -> Result<()> {
             hidden: args.hidden_size,
             sample: None,
             sample_all_layer: None,
+            sample_all_layers: false,
             capture_all_routes: true,
             capture_all_activations: true,
             contribution_packet_neurons: &[],
@@ -4182,6 +4468,7 @@ fn open_structured_capture(args: &StructuredNllArgs) -> Result<llama_capture::Ca
             hidden: args.hidden_size,
             sample: None,
             sample_all_layer: None,
+            sample_all_layers: false,
             capture_all_routes: true,
             capture_all_activations: true,
             contribution_packet_neurons: &[],
@@ -5538,6 +5825,219 @@ fn write_trace_line(writer: &mut impl Write, line: &TraceLine) -> Result<()> {
     Ok(())
 }
 
+fn write_expert_distill_binary_header(
+    writer: &mut impl Write,
+    layer: usize,
+    top_k: usize,
+    hidden: usize,
+    model_sha256: &str,
+) -> Result<()> {
+    if model_sha256.len() != 64 || !model_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("compact expert trace requires a 64-character model SHA-256");
+    }
+    writer.write_all(EXPERT_DISTILL_TRACE_MAGIC)?;
+    writer.write_all(&1_u32.to_le_bytes())?;
+    writer.write_all(&u16::try_from(layer)?.to_le_bytes())?;
+    writer.write_all(&u16::try_from(top_k)?.to_le_bytes())?;
+    writer.write_all(&u32::try_from(hidden)?.to_le_bytes())?;
+    writer.write_all(model_sha256.as_bytes())?;
+    Ok(())
+}
+
+fn append_f32_slice_le(output: &mut Vec<u8>, values: &[f32]) {
+    output.reserve(values.len() * std::mem::size_of::<f32>());
+    for value in values {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn write_expert_distill_binary_record(
+    writer: &mut impl Write,
+    sequence: usize,
+    position: usize,
+    layer: usize,
+    hidden: usize,
+    samples: &[ExpertDistillSample],
+) -> Result<()> {
+    let sample_count = u16::try_from(samples.len())?;
+    let mut bytes = Vec::with_capacity(
+        12 + usize::from(sample_count) * (4 + hidden * std::mem::size_of::<f32>())
+            + usize::from(sample_count > 0) * hidden * std::mem::size_of::<f32>(),
+    );
+    bytes.extend_from_slice(&u32::try_from(sequence)?.to_le_bytes());
+    bytes.extend_from_slice(&u32::try_from(position)?.to_le_bytes());
+    bytes.extend_from_slice(&sample_count.to_le_bytes());
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    if let Some(first) = samples.first() {
+        if first.layer != layer || first.input.len() != hidden {
+            bail!("compact expert trace sample does not match its layer or hidden width");
+        }
+        if samples.iter().any(|sample| {
+            sample.layer != layer
+                || sample.input != first.input
+                || sample.teacher_down_output.len() != hidden
+        }) {
+            bail!("compact expert trace samples do not share one valid layer input");
+        }
+        append_f32_slice_le(&mut bytes, &first.input);
+        for sample in samples {
+            bytes.extend_from_slice(&sample.expert.to_le_bytes());
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+            append_f32_slice_le(&mut bytes, &sample.teacher_down_output);
+        }
+    }
+    writer.write_all(&bytes)?;
+    Ok(())
+}
+
+fn read_u16_le(reader: &mut impl Read) -> Result<u16> {
+    let mut bytes = [0u8; 2];
+    reader.read_exact(&mut bytes)?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_u32_le(reader: &mut impl Read) -> Result<u32> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64_le(reader: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_f32s_le(reader: &mut impl Read, count: usize) -> Result<Vec<f32>> {
+    let mut bytes = vec![0u8; count.checked_mul(4).context("F32 byte count overflow")?];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+        .collect())
+}
+
+fn split_postgraph_distill_trace(
+    raw_path: &Path,
+    output_directory: &Path,
+    header: &TraceHeader,
+    tokens: &[PostgraphToken],
+    max_samples_per_expert: usize,
+    route_writer: &mut impl Write,
+) -> Result<(usize, Vec<usize>, Vec<usize>)> {
+    let file = File::open(raw_path)
+        .with_context(|| format!("open postgraph trace {}", raw_path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic)?;
+    let version = read_u32_le(&mut reader)?;
+    let layers = read_u32_le(&mut reader)? as usize;
+    let top_k = read_u32_le(&mut reader)? as usize;
+    let hidden = read_u32_le(&mut reader)? as usize;
+    let records = read_u64_le(&mut reader)? as usize;
+    if &magic != POSTGRAPH_DISTILL_TRACE_MAGIC
+        || version != 1
+        || layers != header.layers
+        || top_k != header.top_k
+        || records != tokens.len() * layers
+    {
+        bail!(
+            "postgraph trace contract mismatch: version {version}, layers {layers}, top-k {top_k}, records {records}"
+        );
+    }
+    let mut writers = Vec::with_capacity(layers);
+    for layer in 0..layers {
+        let path = output_directory.join(format!("layer{layer}.qxds"));
+        let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
+        let mut writer = BufWriter::new(file);
+        write_expert_distill_binary_header(
+            &mut writer,
+            layer,
+            top_k,
+            hidden,
+            &header.model_sha256,
+        )?;
+        writers.push(writer);
+    }
+    let targets = layers * header.experts;
+    let mut observed_hit_counts = vec![0usize; targets];
+    let mut retained_hit_counts = vec![0usize; targets];
+    let mut expert_hits = 0usize;
+    for token in tokens {
+        let mut routes = vec![Vec::new(); layers];
+        for (expected_layer, layer_writer) in writers.iter_mut().enumerate() {
+            let layer = usize::from(read_u16_le(&mut reader)?);
+            let sample_count = usize::from(read_u16_le(&mut reader)?);
+            let batch_token = read_u16_le(&mut reader)?;
+            let reserved = read_u16_le(&mut reader)?;
+            if layer != expected_layer || sample_count != top_k || batch_token != 0 || reserved != 0
+            {
+                bail!(
+                    "invalid postgraph record for token {}, expected layer {expected_layer}",
+                    token.token_position
+                );
+            }
+            let input = read_f32s_le(&mut reader, hidden)?;
+            let mut samples = Vec::with_capacity(top_k);
+            for _ in 0..top_k {
+                let expert = read_u16_le(&mut reader)?;
+                let reserved = read_u16_le(&mut reader)?;
+                if usize::from(expert) >= header.experts || reserved != 0 {
+                    bail!("invalid expert {expert} in postgraph layer {layer}");
+                }
+                let teacher_down_output = read_f32s_le(&mut reader, hidden)?;
+                routes[layer].push(expert);
+                let target = layer * header.experts + usize::from(expert);
+                observed_hit_counts[target] += 1;
+                if max_samples_per_expert == 0
+                    || retained_hit_counts[target] < max_samples_per_expert
+                {
+                    retained_hit_counts[target] += 1;
+                    samples.push(ExpertDistillSample {
+                        layer,
+                        expert,
+                        input: input.clone(),
+                        activation: Vec::new(),
+                        teacher_down_output,
+                    });
+                }
+            }
+            expert_hits += samples.len();
+            write_expert_distill_binary_record(
+                layer_writer,
+                token.sequence,
+                token.token_position,
+                layer,
+                hidden,
+                &samples,
+            )?;
+        }
+        write_trace_line(
+            route_writer,
+            &TraceLine::Token(TokenRoutes {
+                request_id: token.request_id.clone(),
+                token_position: token.token_position,
+                phase: "corpus".to_owned(),
+                input_token: token.input_token,
+                predicted_token: token.predicted_token,
+                routes,
+                packet_activation_energy: None,
+                packet_down_contribution: None,
+                expert_distill_sample: None,
+                expert_distill_samples: Vec::new(),
+            }),
+        )?;
+    }
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        bail!("postgraph trace has trailing bytes");
+    }
+    for writer in &mut writers {
+        writer.flush()?;
+    }
+    Ok((expert_hits, observed_hit_counts, retained_hit_counts))
+}
+
 fn percentile(values: &[u64], quantile: f64) -> u64 {
     if values.is_empty() {
         return 0;
@@ -5830,6 +6330,7 @@ mod llama_capture {
             hidden: c_int,
             sample_layer: c_int,
             sample_expert: c_int,
+            sample_all_layers: c_int,
             capture_all_routes: c_int,
             capture_all_activations: c_int,
             contribution_packet_neurons: *const c_int,
@@ -5936,6 +6437,13 @@ mod llama_capture {
             down_outputs: *mut f32,
             down_output_count: c_int,
         ) -> c_int;
+        fn qx_llama_route_take_all_layer_expert_samples(
+            route: *mut c_void,
+            inputs: *mut f32,
+            input_count: c_int,
+            down_outputs: *mut f32,
+            down_output_count: c_int,
+        ) -> c_int;
         fn qx_llama_route_take_expert_weights(
             route: *mut c_void,
             weights: *mut f32,
@@ -5980,7 +6488,9 @@ mod llama_capture {
         contribution_total_packets: usize,
         sample: Option<(usize, u16)>,
         sample_all_layer: Option<usize>,
+        sample_all_layers: bool,
         capture_all_routes: bool,
+        capture_all_activations: bool,
         hidden: usize,
     }
 
@@ -5991,7 +6501,7 @@ mod llama_capture {
         pub activations: Option<Vec<f32>>,
         pub down_contribution: Option<PacketDownContribution>,
         pub expert_sample: Option<(Vec<f32>, Vec<f32>, Vec<f32>)>,
-        pub expert_samples: Vec<(u16, Vec<f32>, Vec<f32>, Vec<f32>)>,
+        pub expert_samples: Vec<(usize, u16, Vec<f32>, Vec<f32>, Vec<f32>)>,
         pub expert_down_weights: Option<Vec<f32>>,
     }
 
@@ -6006,6 +6516,7 @@ mod llama_capture {
         pub hidden: usize,
         pub sample: Option<(usize, u16)>,
         pub sample_all_layer: Option<usize>,
+        pub sample_all_layers: bool,
         pub capture_all_routes: bool,
         pub capture_all_activations: bool,
         pub contribution_packet_neurons: &'a [usize],
@@ -6024,12 +6535,17 @@ mod llama_capture {
                 hidden,
                 sample,
                 sample_all_layer,
+                sample_all_layers,
                 capture_all_routes,
                 capture_all_activations,
                 contribution_packet_neurons,
             } = config;
-            if sample.is_some() && sample_all_layer.is_some() {
-                bail!("single-expert and all-expert capture modes are mutually exclusive");
+            if usize::from(sample.is_some())
+                + usize::from(sample_all_layer.is_some())
+                + usize::from(sample_all_layers)
+                > 1
+            {
+                bail!("expert capture modes are mutually exclusive");
             }
             let sample_layer = sample.map(|(layer, _)| layer).or(sample_all_layer);
             let path = CString::new(path.to_string_lossy().as_bytes())?;
@@ -6054,6 +6570,7 @@ mod llama_capture {
                     hidden.try_into()?,
                     sample_layer.map_or(-1, |layer| layer as c_int),
                     sample.map_or(-1, |(_, expert)| c_int::from(expert)),
+                    c_int::from(sample_all_layers),
                     c_int::from(capture_all_routes),
                     c_int::from(capture_all_activations),
                     contribution_packet_neurons_i32.as_ptr(),
@@ -6079,7 +6596,9 @@ mod llama_capture {
                 contribution_packet_neurons: contribution_packet_neurons.to_vec(),
                 sample,
                 sample_all_layer,
+                sample_all_layers,
                 capture_all_routes,
+                capture_all_activations,
                 hidden,
             })
         }
@@ -6473,10 +6992,61 @@ mod llama_capture {
                         let activation_start = (layer * self.top_k + slot) * intermediate;
                         let output_start = slot * self.hidden;
                         expert_samples.push((
+                            layer,
                             routes[layer][slot],
                             input.clone(),
                             all_activations[activation_start..activation_start + intermediate]
                                 .to_vec(),
+                            down_outputs[output_start..output_start + self.hidden].to_vec(),
+                        ));
+                    }
+                }
+            }
+            if self.sample_all_layers {
+                let intermediate = self
+                    .intermediate
+                    .expect("all-layer expert samples have activation width");
+                let mut inputs = vec![0.0f32; self.layers * self.hidden];
+                let mut down_outputs = vec![0.0f32; self.layers * self.top_k * self.hidden];
+                let status = unsafe {
+                    qx_llama_route_take_all_layer_expert_samples(
+                        self.raw,
+                        inputs.as_mut_ptr(),
+                        inputs.len().try_into()?,
+                        down_outputs.as_mut_ptr(),
+                        down_outputs.len().try_into()?,
+                    )
+                };
+                if status < 0 {
+                    bail!(
+                        "llama all-layer expert sample read failed ({status}): {}",
+                        self.error()
+                    );
+                }
+                if usize::try_from(status)? != self.layers {
+                    bail!(
+                        "llama all-layer expert sample batch returned {status} of {} layers",
+                        self.layers
+                    );
+                }
+                let all_activations = activations
+                    .as_ref()
+                    .expect("all-layer expert sample batch has activation storage");
+                for layer in 0..self.layers {
+                    let input_start = layer * self.hidden;
+                    for slot in 0..self.top_k {
+                        let activation_start = (layer * self.top_k + slot) * intermediate;
+                        let output_start = (layer * self.top_k + slot) * self.hidden;
+                        expert_samples.push((
+                            layer,
+                            routes[layer][slot],
+                            inputs[input_start..input_start + self.hidden].to_vec(),
+                            if self.capture_all_activations {
+                                all_activations[activation_start..activation_start + intermediate]
+                                    .to_vec()
+                            } else {
+                                Vec::new()
+                            },
                             down_outputs[output_start..output_start + self.hidden].to_vec(),
                         ));
                     }
@@ -6608,6 +7178,40 @@ mod tests {
         assert_eq!(
             split_corpus_paragraphs(" first line\nsecond line\n \t\n third \n\n"),
             vec!["first line\nsecond line", "third"]
+        );
+    }
+
+    #[test]
+    fn compact_expert_trace_stores_one_shared_input_per_layer_token() {
+        let samples = vec![
+            ExpertDistillSample {
+                layer: 3,
+                expert: 7,
+                input: vec![1.0, 2.0],
+                activation: vec![99.0],
+                teacher_down_output: vec![3.0, 4.0],
+            },
+            ExpertDistillSample {
+                layer: 3,
+                expert: 9,
+                input: vec![1.0, 2.0],
+                activation: vec![98.0],
+                teacher_down_output: vec![5.0, 6.0],
+            },
+        ];
+        let mut bytes = Vec::new();
+        write_expert_distill_binary_header(&mut bytes, 3, 8, 2, &"a".repeat(64)).unwrap();
+        write_expert_distill_binary_record(&mut bytes, 4, 5, 3, 2, &samples).unwrap();
+        assert_eq!(&bytes[..8], EXPERT_DISTILL_TRACE_MAGIC);
+        assert_eq!(bytes.len(), 84 + 12 + 2 * 4 + 2 * (4 + 2 * 4));
+        assert_eq!(u16::from_le_bytes(bytes[92..94].try_into().unwrap()), 2);
+        assert_eq!(f32::from_le_bytes(bytes[96..100].try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(bytes[100..104].try_into().unwrap()), 2.0);
+        assert_eq!(u16::from_le_bytes(bytes[104..106].try_into().unwrap()), 7);
+        assert!(
+            !bytes
+                .windows(4)
+                .any(|window| window == 99.0_f32.to_le_bytes())
         );
     }
 
