@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-three-layer-q2s4-exact-backbone",
+  "promotion_evidence": false,
+  "date": "2026-08-30",
+  "model_sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+  "representation": {
+    "student_width": 768,
+    "teacher_width": 768,
+    "projection_codecs": {
+      "gate": "q2s4",
+      "up": "q2s4",
+      "down": "q2s4"
+    },
+    "representative_layers": [2, 24, 44],
+    "transformed_experts": {
+      "2": 79,
+      "24": 63,
+      "44": 64,
+      "total": 206
+    },
+    "heldout_route_coverage": {
+      "24": 0.9809782608695652,
+      "44": 0.9864130434782609
+    },
+    "untransformed_or_under_evidenced_experts_execute_original_gguf": true
+  },
+  "isolated_layer_scans": {
+    "layer24": {
+      "sequences": 4,
+      "scored_tokens": 125,
+      "q2s4_mean_nll": 3.8527466178732137,
+      "q2s4_relative_perplexity_delta": 0.011397913375056135,
+      "q2s4_top1_agreement": 0.992,
+      "independent_exact_candidates": 53,
+      "candidates_improving_nll": 28,
+      "candidates_improving_top1": 5,
+      "candidates_improving_nll_and_top1": 4,
+      "best_top1_expert": 79,
+      "best_top1_agreement": 1.0,
+      "best_top1_mean_nll": 3.849912153300569,
+      "decision": "exact_fallback_optional_because_uniform_q2s4_already_passes"
+    },
+    "layer44": {
+      "sequences": 4,
+      "scored_tokens": 125,
+      "q2s4_mean_nll": 3.845015366067928,
+      "q2s4_relative_perplexity_delta": 0.0036086904515535423,
+      "q2s4_top1_agreement": 0.976,
+      "bounded_exact_candidates": 12,
+      "candidates_improving_nll": 7,
+      "candidates_improving_top1": 0,
+      "best_nll_expert": 98,
+      "best_nll_mean_nll": 3.8371831131411236,
+      "best_nll_top1_agreement": 0.976,
+      "decision": "no_exact_fallback_required_for_top1"
+    }
+  },
+  "joint_four_prompt_frontier": {
+    "sequences": 4,
+    "scored_tokens": 125,
+    "exact_mean_nll": 3.841413171317137,
+    "steps": [
+      {
+        "policy": "all_206_q2s4_students",
+        "student_mean_nll": 3.9664911479778766,
+        "relative_perplexity_delta": 0.13323681564438328,
+        "top1_agreement": 0.784
+      },
+      {
+        "policy": "plus_exact_2_92",
+        "student_mean_nll": 3.8749979013579305,
+        "relative_perplexity_delta": 0.034155064014951497,
+        "top1_agreement": 0.96
+      },
+      {
+        "policy": "plus_exact_2_92_and_24_79",
+        "student_mean_nll": 3.8760201469985733,
+        "relative_perplexity_delta": 0.035212765043915573,
+        "top1_agreement": 0.96
+      },
+      {
+        "policy": "plus_exact_2_92_24_79_and_44_98",
+        "student_mean_nll": 3.866617236061076,
+        "relative_perplexity_delta": 0.02552437254170914,
+        "top1_agreement": 0.952
+      }
+    ],
+    "pareto_policy": ["2:92"]
+  },
+  "broad_general_holdout": {
+    "execution": "three independent four-prompt shards to bound unified-memory failure scope",
+    "context": 64,
+    "gpu_layers": -1,
+    "student_storage": "packed-q2s4-with-routed-scratch-expansion",
+    "shards": [
+      {
+        "skipped_sequences": 0,
+        "scored_tokens": 125,
+        "exact_mean_nll": 3.841413171317137,
+        "q2s4_baseline_mean_nll": 3.9664911479778766,
+        "q2s4_baseline_top1_agreement": 0.784,
+        "exact_2_92_mean_nll": 3.8749979013579305,
+        "exact_2_92_relative_perplexity_delta": 0.034155064014951497,
+        "exact_2_92_top1_agreement": 0.96
+      },
+      {
+        "skipped_sequences": 4,
+        "scored_tokens": 99,
+        "exact_mean_nll": 3.916717763282044,
+        "q2s4_baseline_mean_nll": 3.8710205635976638,
+        "q2s4_baseline_top1_agreement": 0.8686868686868688,
+        "exact_2_92_mean_nll": 3.9115943058217213,
+        "exact_2_92_relative_perplexity_delta": -0.005110354938437256,
+        "exact_2_92_top1_agreement": 0.9595959595959596
+      },
+      {
+        "skipped_sequences": 8,
+        "scored_tokens": 119,
+        "exact_mean_nll": 3.90254641925875,
+        "q2s4_baseline_mean_nll": 3.9507369705414237,
+        "q2s4_baseline_top1_agreement": 0.7563025210084034,
+        "exact_2_92_mean_nll": 3.964668323679513,
+        "exact_2_92_relative_perplexity_delta": 0.06409205434730869,
+        "exact_2_92_top1_agreement": 0.9243697478991597
+      }
+    ],
+    "aggregate": {
+      "scored_tokens": 343,
+      "exact_mean_nll": 3.8843578101205707,
+      "q2s4_baseline_mean_nll": 3.9334697632298328,
+      "q2s4_baseline_relative_perplexity_delta": 0.0503379327554172,
+      "q2s4_baseline_top1_matches": 274,
+      "q2s4_baseline_top1_agreement": 0.7988338192419825,
+      "exact_2_92_mean_nll": 3.916670858495492,
+      "exact_2_92_relative_perplexity_delta": 0.032840783830500264,
+      "exact_2_92_top1_matches": 325,
+      "exact_2_92_top1_agreement": 0.9475218658892129,
+      "recovered_top1_decisions": 51,
+      "decision": "representative_three_layer_quality_gate_pass"
+    }
+  },
+  "validation_harness_memory": {
+    "previous_f32_bytes_per_student": 18874368,
+    "packed_q2s4_bytes_per_student": 1769472,
+    "compression_ratio": 10.666666666666666,
+    "students": 206,
+    "previous_f32_student_bytes": 3888119808,
+    "packed_q2s4_student_bytes": 364511232,
+    "resident_bytes_avoided": 3523608576,
+    "semantic_equivalence_control": {
+      "layer": 44,
+      "scored_tokens": 125,
+      "f32_student_mean_nll": 3.845015366067928,
+      "packed_student_mean_nll": 3.845015366067928,
+      "f32_top1_agreement": 0.976,
+      "packed_top1_agreement": 0.976
+    }
+  },
+  "payload_accounting": {
+    "selected_exact_experts": ["2:92"],
+    "layer2_q2s4_bytes_per_expert": 1474560,
+    "layer2_original_gguf_bytes_per_expert": 3059712,
+    "incremental_bytes": 1585152,
+    "incremental_mib": 1.51171875,
+    "projected_complete_installed_weight_gib_with_selected_anchor": 9.24698257446289,
+    "projected_resident_gib_range_with_selected_anchor": [
+      6.434482574462891,
+      6.934482574462891
+    ],
+    "illustrative_one_anchor_per_three_layers": {
+      "anchors": 16,
+      "incremental_bytes_if_layer2_sized": 25362432,
+      "classification": "illustrative_extrapolation_not_promotion_evidence"
+    }
+  },
+  "decision": {
+    "representative_layer_gate": "pass",
+    "selected_exact_backbone": ["2:92"],
+    "selected_exact_policy_reason": "highest top1 and lowest byte premium on the joint frontier",
+    "expand_to_complete_48_layer_artifact": true,
+    "next_gate": "train all remaining layers with stronger evidence for cold experts, causally select sparse exact anchors, pack the complete artifact, then measure quality and iPhone residency"
+  },
+  "limitations": [
+    "three representative layers rather than all 48 layers",
+    "206 transformed experts; under-evidenced experts in those layers still execute original GGUF weights",
+    "teacher-forced next-token agreement is not an instruction-following or benchmark-quality score",
+    "the 343-token broad result was aggregated from three independent shards after an all-at-once run exceeded Metal memory",
+    "packed validation expands routed experts to F32 scratch and is not the native Metal product execution path",
+    "no iPhone memory or tokens-per-second measurement yet"
+  ]
+}

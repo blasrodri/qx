@@ -55,11 +55,13 @@ typedef struct qx_llama_route {
     int32_t * joint_experts;
     int32_t * joint_widths;
     uint8_t * joint_enabled;
+    uint8_t * joint_formats;
     float ** joint_gate_weights;
     float ** joint_up_weights;
     float ** joint_down_weights;
     float ** joint_activations;
     float * joint_output;
+    float * joint_matrix_scratch;
     int32_t residual_layer;
     int32_t residual_rank;
     float * residual_down;
@@ -502,6 +504,21 @@ static bool qx_has_joint_student_layer(const qx_llama_route * route, int32_t lay
     return false;
 }
 
+static void qx_unpack_q2s4_matrix(
+        const float * packed,
+        size_t values,
+        float * output) {
+    const size_t groups = values / 32;
+    const float * scales = packed;
+    const uint8_t * codes = (const uint8_t *) (packed + groups);
+    for (size_t index = 0; index < values; ++index) {
+        const uint8_t code = (codes[index / 4] >> ((index % 4) * 2)) & 0x03;
+        const float level = code == 0 ? -1.0f :
+            code == 1 ? -0.32f : code == 2 ? 0.32f : 1.0f;
+        output[index] = scales[index / 32] * level;
+    }
+}
+
 static bool qx_apply_joint_expert_students(
         qx_llama_route * route,
         struct ggml_tensor * tensor,
@@ -527,14 +544,36 @@ static bool qx_apply_joint_expert_students(
             continue;
         }
         const int32_t width = route->joint_widths[student];
+        const size_t matrix_values = (size_t) width * route->hidden;
+        const float * gate_weights = route->joint_gate_weights[student];
+        const float * up_weights = route->joint_up_weights[student];
+        const float * down_weights = route->joint_down_weights[student];
+        if (route->joint_formats[student] == 1) {
+            if (!route->joint_matrix_scratch) {
+                qx_set_error(route, "packed Q2S4 student is missing matrix scratch");
+                return false;
+            }
+            gate_weights = route->joint_matrix_scratch;
+            up_weights = gate_weights + matrix_values;
+            down_weights = up_weights + matrix_values;
+            qx_unpack_q2s4_matrix(
+                route->joint_gate_weights[student], matrix_values,
+                route->joint_matrix_scratch);
+            qx_unpack_q2s4_matrix(
+                route->joint_up_weights[student], matrix_values,
+                route->joint_matrix_scratch + matrix_values);
+            qx_unpack_q2s4_matrix(
+                route->joint_down_weights[student], matrix_values,
+                route->joint_matrix_scratch + matrix_values * 2);
+        }
         float * activation = route->joint_activations[student];
         cblas_sgemv(
             CblasRowMajor, CblasNoTrans, width, route->hidden, 1.0f,
-            route->joint_gate_weights[student], route->hidden, route->sample_input, 1,
+            gate_weights, route->hidden, route->sample_input, 1,
             0.0f, activation, 1);
         cblas_sgemv(
             CblasRowMajor, CblasNoTrans, width, route->hidden, 1.0f,
-            route->joint_up_weights[student], route->hidden, route->sample_input, 1,
+            up_weights, route->hidden, route->sample_input, 1,
             0.0f, route->joint_output, 1);
         for (int32_t neuron = 0; neuron < width; ++neuron) {
             const float gate = activation[neuron];
@@ -546,7 +585,7 @@ static bool qx_apply_joint_expert_students(
         }
         cblas_sgemv(
             CblasRowMajor, CblasNoTrans, route->hidden, width, 1.0f,
-            route->joint_down_weights[student], width, activation, 1,
+            down_weights, width, activation, 1,
             0.0f, route->joint_output, 1);
         ggml_backend_tensor_set(
             tensor,
@@ -955,11 +994,13 @@ void qx_llama_route_close(qx_llama_route * route) {
     free(route->joint_experts);
     free(route->joint_widths);
     free(route->joint_enabled);
+    free(route->joint_formats);
     free(route->joint_gate_weights);
     free(route->joint_up_weights);
     free(route->joint_down_weights);
     free(route->joint_activations);
     free(route->joint_output);
+    free(route->joint_matrix_scratch);
     free(route->residual_down);
     free(route->residual_up);
     free(route->residual_hidden);
@@ -1163,6 +1204,7 @@ int qx_llama_route_add_joint_expert_student(
     int32_t * experts = malloc(count * sizeof(int32_t));
     int32_t * widths = malloc(count * sizeof(int32_t));
     uint8_t * enabled = malloc(count * sizeof(uint8_t));
+    uint8_t * formats = malloc(count * sizeof(uint8_t));
     float ** gates = malloc(count * sizeof(float *));
     float ** ups = malloc(count * sizeof(float *));
     float ** downs = malloc(count * sizeof(float *));
@@ -1175,12 +1217,13 @@ int qx_llama_route_add_joint_expert_student(
         malloc((size_t) route->hidden * sizeof(float));
     float * output = route->joint_output ? route->joint_output :
         malloc((size_t) route->hidden * sizeof(float));
-    if (!layers || !experts || !widths || !enabled || !gates || !ups || !downs || !activations ||
+    if (!layers || !experts || !widths || !enabled || !formats || !gates || !ups || !downs || !activations ||
         !gate || !up || !down || !activation || !input || !output) {
         free(layers);
         free(experts);
         free(widths);
         free(enabled);
+        free(formats);
         free(gates);
         free(ups);
         free(downs);
@@ -1203,6 +1246,7 @@ int qx_llama_route_add_joint_expert_student(
         memcpy(experts, route->joint_experts, previous * sizeof(int32_t));
         memcpy(widths, route->joint_widths, previous * sizeof(int32_t));
         memcpy(enabled, route->joint_enabled, previous * sizeof(uint8_t));
+        memcpy(formats, route->joint_formats, previous * sizeof(uint8_t));
         memcpy(gates, route->joint_gate_weights, previous * sizeof(float *));
         memcpy(ups, route->joint_up_weights, previous * sizeof(float *));
         memcpy(downs, route->joint_down_weights, previous * sizeof(float *));
@@ -1215,6 +1259,7 @@ int qx_llama_route_add_joint_expert_student(
     experts[route->joint_count] = expert;
     widths[route->joint_count] = width;
     enabled[route->joint_count] = 1;
+    formats[route->joint_count] = 0;
     gates[route->joint_count] = gate;
     ups[route->joint_count] = up;
     downs[route->joint_count] = down;
@@ -1223,6 +1268,7 @@ int qx_llama_route_add_joint_expert_student(
     free(route->joint_experts);
     free(route->joint_widths);
     free(route->joint_enabled);
+    free(route->joint_formats);
     free(route->joint_gate_weights);
     free(route->joint_up_weights);
     free(route->joint_down_weights);
@@ -1231,12 +1277,160 @@ int qx_llama_route_add_joint_expert_student(
     route->joint_experts = experts;
     route->joint_widths = widths;
     route->joint_enabled = enabled;
+    route->joint_formats = formats;
     route->joint_gate_weights = gates;
     route->joint_up_weights = ups;
     route->joint_down_weights = downs;
     route->joint_activations = activations;
     route->sample_input = input;
     route->joint_output = output;
+    route->joint_count += 1;
+    route->joint_active_count = route->joint_count;
+    return 0;
+}
+
+static float * qx_copy_q2s4_matrix(
+        const float * scales,
+        size_t scale_count,
+        const uint8_t * codes,
+        size_t code_count) {
+    const size_t scale_bytes = scale_count * sizeof(float);
+    uint8_t * packed = malloc(scale_bytes + code_count);
+    if (!packed) {
+        return NULL;
+    }
+    memcpy(packed, scales, scale_bytes);
+    memcpy(packed + scale_bytes, codes, code_count);
+    return (float *) packed;
+}
+
+int qx_llama_route_add_joint_expert_student_q2s4(
+        qx_llama_route * route,
+        int32_t layer,
+        int32_t expert,
+        int32_t width,
+        const float * gate_scales,
+        int32_t gate_scale_count,
+        const uint8_t * gate_codes,
+        int32_t gate_code_count,
+        const float * up_scales,
+        int32_t up_scale_count,
+        const uint8_t * up_codes,
+        int32_t up_code_count,
+        const float * down_scales,
+        int32_t down_scale_count,
+        const uint8_t * down_codes,
+        int32_t down_code_count) {
+    const size_t matrix_values = route && width > 0 ? (size_t) width * route->hidden : 0;
+    const size_t scale_count = matrix_values / 32;
+    const size_t code_count = matrix_values / 4;
+    if (!route || layer < 0 || layer >= route->layers || expert < 0 ||
+        expert >= route->experts || width <= 0 || width > route->intermediate ||
+        matrix_values % 32 != 0 || !gate_scales || !gate_codes || !up_scales || !up_codes ||
+        !down_scales || !down_codes || gate_scale_count < 0 || gate_code_count < 0 ||
+        up_scale_count < 0 || up_code_count < 0 || down_scale_count < 0 ||
+        down_code_count < 0 || (size_t) gate_scale_count != scale_count ||
+        (size_t) up_scale_count != scale_count || (size_t) down_scale_count != scale_count ||
+        (size_t) gate_code_count != code_count || (size_t) up_code_count != code_count ||
+        (size_t) down_code_count != code_count) {
+        return -1;
+    }
+    for (int32_t index = 0; index < route->joint_count; ++index) {
+        if (route->joint_layers[index] == layer && route->joint_experts[index] == expert) {
+            return -2;
+        }
+    }
+    const size_t count = (size_t) route->joint_count + 1;
+    int32_t * layers = malloc(count * sizeof(int32_t));
+    int32_t * experts = malloc(count * sizeof(int32_t));
+    int32_t * widths = malloc(count * sizeof(int32_t));
+    uint8_t * enabled = malloc(count * sizeof(uint8_t));
+    uint8_t * formats = malloc(count * sizeof(uint8_t));
+    float ** gates = malloc(count * sizeof(float *));
+    float ** ups = malloc(count * sizeof(float *));
+    float ** downs = malloc(count * sizeof(float *));
+    float ** activations = malloc(count * sizeof(float *));
+    float * gate = qx_copy_q2s4_matrix(
+        gate_scales, scale_count, gate_codes, code_count);
+    float * up = qx_copy_q2s4_matrix(
+        up_scales, scale_count, up_codes, code_count);
+    float * down = qx_copy_q2s4_matrix(
+        down_scales, scale_count, down_codes, code_count);
+    float * activation = malloc((size_t) width * sizeof(float));
+    float * input = route->sample_input ? route->sample_input :
+        malloc((size_t) route->hidden * sizeof(float));
+    float * output = route->joint_output ? route->joint_output :
+        malloc((size_t) route->hidden * sizeof(float));
+    float * scratch = route->joint_matrix_scratch ? route->joint_matrix_scratch :
+        malloc((size_t) 3 * route->intermediate * route->hidden * sizeof(float));
+    if (!layers || !experts || !widths || !enabled || !formats || !gates || !ups || !downs ||
+        !activations || !gate || !up || !down || !activation || !input || !output || !scratch) {
+        free(layers);
+        free(experts);
+        free(widths);
+        free(enabled);
+        free(formats);
+        free(gates);
+        free(ups);
+        free(downs);
+        free(activations);
+        free(gate);
+        free(up);
+        free(down);
+        free(activation);
+        if (!route->sample_input) {
+            free(input);
+        }
+        if (!route->joint_output) {
+            free(output);
+        }
+        if (!route->joint_matrix_scratch) {
+            free(scratch);
+        }
+        return -3;
+    }
+    if (route->joint_count > 0) {
+        const size_t previous = (size_t) route->joint_count;
+        memcpy(layers, route->joint_layers, previous * sizeof(int32_t));
+        memcpy(experts, route->joint_experts, previous * sizeof(int32_t));
+        memcpy(widths, route->joint_widths, previous * sizeof(int32_t));
+        memcpy(enabled, route->joint_enabled, previous * sizeof(uint8_t));
+        memcpy(formats, route->joint_formats, previous * sizeof(uint8_t));
+        memcpy(gates, route->joint_gate_weights, previous * sizeof(float *));
+        memcpy(ups, route->joint_up_weights, previous * sizeof(float *));
+        memcpy(downs, route->joint_down_weights, previous * sizeof(float *));
+        memcpy(activations, route->joint_activations, previous * sizeof(float *));
+    }
+    layers[route->joint_count] = layer;
+    experts[route->joint_count] = expert;
+    widths[route->joint_count] = width;
+    enabled[route->joint_count] = 1;
+    formats[route->joint_count] = 1;
+    gates[route->joint_count] = gate;
+    ups[route->joint_count] = up;
+    downs[route->joint_count] = down;
+    activations[route->joint_count] = activation;
+    free(route->joint_layers);
+    free(route->joint_experts);
+    free(route->joint_widths);
+    free(route->joint_enabled);
+    free(route->joint_formats);
+    free(route->joint_gate_weights);
+    free(route->joint_up_weights);
+    free(route->joint_down_weights);
+    free(route->joint_activations);
+    route->joint_layers = layers;
+    route->joint_experts = experts;
+    route->joint_widths = widths;
+    route->joint_enabled = enabled;
+    route->joint_formats = formats;
+    route->joint_gate_weights = gates;
+    route->joint_up_weights = ups;
+    route->joint_down_weights = downs;
+    route->joint_activations = activations;
+    route->sample_input = input;
+    route->joint_output = output;
+    route->joint_matrix_scratch = scratch;
     route->joint_count += 1;
     route->joint_active_count = route->joint_count;
     return 0;
@@ -1316,6 +1510,7 @@ int qx_llama_route_replace_joint_expert_student(
     free(route->joint_down_weights[index]);
     free(route->joint_activations[index]);
     route->joint_widths[index] = width;
+    route->joint_formats[index] = 0;
     route->joint_gate_weights[index] = gate;
     route->joint_up_weights[index] = up;
     route->joint_down_weights[index] = down;

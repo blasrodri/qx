@@ -8,6 +8,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const SCHEMA_VERSION: u32 = 1;
 const SIMULATION_SCHEMA_VERSION: u32 = 2;
@@ -373,6 +374,9 @@ enum Command {
         /// Measure every exact fallback against the same complete student baseline.
         #[arg(long)]
         independent_exact_fallbacks: bool,
+        /// Repack dequantized Q2S4 sidecars in memory and expand only routed experts.
+        #[arg(long)]
+        compact_q2s4_students: bool,
         /// Optional low-rank correction injected after aggregated MoE output.
         #[arg(long)]
         layer_residual: Option<PathBuf>,
@@ -904,6 +908,21 @@ struct JointExpertStudent {
     down: Vec<f32>,
 }
 
+struct PackedQ2S4Matrix {
+    scales: Vec<f32>,
+    codes: Vec<u8>,
+}
+
+struct PackedQ2S4JointExpertStudent {
+    layer: usize,
+    expert: u16,
+    hidden: usize,
+    width: usize,
+    gate: PackedQ2S4Matrix,
+    up: PackedQ2S4Matrix,
+    down: PackedQ2S4Matrix,
+}
+
 struct LayerResidual {
     layer: usize,
     rank: usize,
@@ -945,6 +964,7 @@ struct MultiJointExpertStudentNllReport {
     classification: &'static str,
     promotion_evidence: bool,
     quality_semantics: &'static str,
+    student_storage: &'static str,
     model_sha256: String,
     corpora: Vec<String>,
     students: Vec<MultiJointExpertStudentResult>,
@@ -1372,6 +1392,7 @@ fn main() -> Result<()> {
             independent_replacements,
             exact_fallbacks,
             independent_exact_fallbacks,
+            compact_q2s4_students,
             layer_residual,
             active_prefixes,
             skip_sequences,
@@ -1395,6 +1416,7 @@ fn main() -> Result<()> {
             independent_replacements,
             exact_fallbacks,
             independent_exact_fallbacks,
+            compact_q2s4_students,
             layer_residual,
             active_prefixes,
             skip_sequences,
@@ -1583,6 +1605,7 @@ struct MultiJointExpertStudentNllArgs {
     independent_replacements: bool,
     exact_fallbacks: Vec<(usize, u16)>,
     independent_exact_fallbacks: bool,
+    compact_q2s4_students: bool,
     layer_residual: Option<PathBuf>,
     active_prefixes: Vec<usize>,
     skip_sequences: usize,
@@ -2421,6 +2444,9 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
     {
         bail!("multi-joint-student corpus arguments are invalid");
     }
+    if args.compact_q2s4_students && !args.replacement_students.is_empty() {
+        bail!("compact Q2S4 students do not yet support replacement sidecars");
+    }
     let model_hash = match args.model_sha256.as_ref() {
         Some(value) => {
             validate_sha256(value)?;
@@ -2565,13 +2591,28 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         .iter()
         .map(|(_, layer, expert, _)| (*layer, *expert))
         .collect::<Vec<_>>();
+    let total_passes = 1 + active_prefixes.len() + replacements.len() + args.exact_fallbacks.len();
+    let mut completed_passes = 0_usize;
+    let mut pass_started = Instant::now();
+    eprintln!("multi-joint pass 1/{total_passes}: exact teacher");
     let exact = measure_multi_corpus_nll(&mut capture, &sequences, &target_pairs)?;
+    completed_passes += 1;
+    eprintln!(
+        "multi-joint pass {completed_passes}/{total_passes} complete in {:.2}s",
+        pass_started.elapsed().as_secs_f64()
+    );
     for (path, layer, expert, width) in &students {
         let student = read_joint_expert_student(path)?;
         if student.layer != *layer || student.expert != *expert || student.width != *width {
             bail!("joint student changed while evaluating: {}", path.display());
         }
-        capture.add_joint_expert_student(&student)?;
+        if args.compact_q2s4_students {
+            let packed = pack_dequantized_q2s4_student(&student)
+                .with_context(|| format!("pack Q2S4 joint expert student {}", path.display()))?;
+            capture.add_packed_q2s4_joint_expert_student(&packed)?;
+        } else {
+            capture.add_joint_expert_student(&student)?;
+        }
     }
     if let Some(path) = &args.layer_residual {
         let residual = read_layer_residual(path)?;
@@ -2585,6 +2626,11 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
     }
     let mut prefix_measurements = Vec::new();
     for &prefix in &active_prefixes {
+        pass_started = Instant::now();
+        eprintln!(
+            "multi-joint pass {}/{total_passes}: student prefix {prefix}",
+            completed_passes + 1
+        );
         capture.set_joint_active_prefix(prefix)?;
         let measurement = measure_multi_corpus_nll(&mut capture, &sequences, &target_pairs)?;
         if exact.scored_tokens != measurement.scored_tokens
@@ -2593,10 +2639,20 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
             bail!("exact and multi-joint-student passes produced incompatible measurements");
         }
         prefix_measurements.push((prefix, measurement));
+        completed_passes += 1;
+        eprintln!(
+            "multi-joint pass {completed_passes}/{total_passes} complete in {:.2}s",
+            pass_started.elapsed().as_secs_f64()
+        );
     }
     let exact_mean_nll = exact.mean_nll();
     let mut replacement_measurements = Vec::new();
     for (path, layer, expert, width) in &replacements {
+        pass_started = Instant::now();
+        eprintln!(
+            "multi-joint pass {}/{total_passes}: replacement {layer}:{expert}",
+            completed_passes + 1
+        );
         let replacement = read_joint_expert_student(path)?;
         if replacement.layer != *layer
             || replacement.expert != *expert
@@ -2615,6 +2671,11 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
             bail!("exact and replacement-student passes produced incompatible measurements");
         }
         replacement_measurements.push((path, layer, expert, width, measurement));
+        completed_passes += 1;
+        eprintln!(
+            "multi-joint pass {completed_passes}/{total_passes} complete in {:.2}s",
+            pass_started.elapsed().as_secs_f64()
+        );
         if args.independent_replacements {
             let baseline_path = students
                 .iter()
@@ -2629,6 +2690,11 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
     }
     let mut exact_fallback_measurements = Vec::new();
     for &(layer, expert) in &args.exact_fallbacks {
+        pass_started = Instant::now();
+        eprintln!(
+            "multi-joint pass {}/{total_passes}: exact fallback {layer}:{expert}",
+            completed_passes + 1
+        );
         capture.set_joint_expert_student_enabled(layer, expert, false)?;
         let measurement = measure_multi_corpus_nll(&mut capture, &sequences, &target_pairs)?;
         if exact.scored_tokens != measurement.scored_tokens
@@ -2637,6 +2703,11 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
             bail!("exact and fallback passes produced incompatible measurements");
         }
         exact_fallback_measurements.push((layer, expert, measurement));
+        completed_passes += 1;
+        eprintln!(
+            "multi-joint pass {completed_passes}/{total_passes} complete in {:.2}s",
+            pass_started.elapsed().as_secs_f64()
+        );
         if args.independent_exact_fallbacks {
             capture.set_joint_expert_student_enabled(layer, expert, true)?;
         }
@@ -2674,6 +2745,11 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         classification: "simultaneous-joint-expert-student-corpus-nll-control",
         promotion_evidence: false,
         quality_semantics: "teacher-forced-corpus-nll-with-student-overrides-and-optional-exact-fallbacks",
+        student_storage: if args.compact_q2s4_students {
+            "packed-q2s4-with-routed-scratch-expansion"
+        } else {
+            "resident-f32"
+        },
         model_sha256: model_hash,
         corpora: args
             .corpora
@@ -5642,6 +5718,57 @@ fn read_joint_expert_student(path: &Path) -> Result<JointExpertStudent> {
     })
 }
 
+fn pack_dequantized_q2s4_matrix(values: &[f32]) -> Result<PackedQ2S4Matrix> {
+    const GROUP_SIZE: usize = 32;
+    const INNER_RATIO: f32 = 0.32;
+    if values.is_empty() || !values.len().is_multiple_of(GROUP_SIZE) {
+        bail!("Q2S4 matrix values must contain complete group-32 blocks");
+    }
+    let mut scales = Vec::with_capacity(values.len() / GROUP_SIZE);
+    let mut codes = vec![0_u8; values.len().div_ceil(4)];
+    for (group_index, group) in values.chunks_exact(GROUP_SIZE).enumerate() {
+        let scale = group.iter().copied().map(f32::abs).fold(0.0, f32::max);
+        scales.push(scale);
+        let inner = scale * INNER_RATIO;
+        let tolerance = scale.max(f32::MIN_POSITIVE) * f32::EPSILON * 8.0;
+        for (local, &value) in group.iter().enumerate() {
+            let magnitude = value.abs();
+            let inner_error = (magnitude - inner).abs();
+            let outer_error = (magnitude - scale).abs();
+            let is_inner = inner_error < outer_error;
+            let reconstructed = if is_inner { inner } else { scale };
+            if (magnitude - reconstructed).abs() > tolerance {
+                bail!(
+                    "matrix is not dequantized Q2S4 at group {group_index}, element {local}: {value}"
+                );
+            }
+            let code = match (value.is_sign_negative(), is_inner) {
+                (true, false) => 0_u8,
+                (true, true) => 1_u8,
+                (false, true) => 2_u8,
+                (false, false) => 3_u8,
+            };
+            let index = group_index * GROUP_SIZE + local;
+            codes[index / 4] |= code << ((index % 4) * 2);
+        }
+    }
+    Ok(PackedQ2S4Matrix { scales, codes })
+}
+
+fn pack_dequantized_q2s4_student(
+    student: &JointExpertStudent,
+) -> Result<PackedQ2S4JointExpertStudent> {
+    Ok(PackedQ2S4JointExpertStudent {
+        layer: student.layer,
+        expert: student.expert,
+        hidden: student.hidden,
+        width: student.width,
+        gate: pack_dequantized_q2s4_matrix(&student.gate)?,
+        up: pack_dequantized_q2s4_matrix(&student.up)?,
+        down: pack_dequantized_q2s4_matrix(&student.down)?,
+    })
+}
+
 fn read_layer_residual(path: &Path) -> Result<LayerResidual> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut magic = [0u8; 8];
@@ -5739,6 +5866,24 @@ mod llama_capture {
             up_count: c_int,
             down_weights: *const f32,
             down_count: c_int,
+        ) -> c_int;
+        fn qx_llama_route_add_joint_expert_student_q2s4(
+            route: *mut c_void,
+            layer: c_int,
+            expert: c_int,
+            width: c_int,
+            gate_scales: *const f32,
+            gate_scale_count: c_int,
+            gate_codes: *const u8,
+            gate_code_count: c_int,
+            up_scales: *const f32,
+            up_scale_count: c_int,
+            up_codes: *const u8,
+            up_code_count: c_int,
+            down_scales: *const f32,
+            down_scale_count: c_int,
+            down_codes: *const u8,
+            down_code_count: c_int,
         ) -> c_int;
         fn qx_llama_route_replace_joint_expert_student(
             route: *mut c_void,
@@ -6040,6 +6185,39 @@ mod llama_capture {
             };
             if status != 0 {
                 bail!("llama bridge rejected joint expert student with status {status}");
+            }
+            Ok(())
+        }
+
+        pub fn add_packed_q2s4_joint_expert_student(
+            &mut self,
+            student: &PackedQ2S4JointExpertStudent,
+        ) -> Result<()> {
+            if student.hidden == 0 || student.width == 0 {
+                bail!("packed Q2S4 joint expert student has invalid dimensions");
+            }
+            let status = unsafe {
+                qx_llama_route_add_joint_expert_student_q2s4(
+                    self.raw,
+                    student.layer.try_into()?,
+                    c_int::from(student.expert),
+                    student.width.try_into()?,
+                    student.gate.scales.as_ptr(),
+                    student.gate.scales.len().try_into()?,
+                    student.gate.codes.as_ptr(),
+                    student.gate.codes.len().try_into()?,
+                    student.up.scales.as_ptr(),
+                    student.up.scales.len().try_into()?,
+                    student.up.codes.as_ptr(),
+                    student.up.codes.len().try_into()?,
+                    student.down.scales.as_ptr(),
+                    student.down.scales.len().try_into()?,
+                    student.down.codes.as_ptr(),
+                    student.down.codes.len().try_into()?,
+                )
+            };
+            if status != 0 {
+                bail!("llama bridge rejected packed Q2S4 joint expert with status {status}");
             }
             Ok(())
         }
@@ -6676,6 +6854,42 @@ mod tests {
         assert_eq!(student.up, values[6..12]);
         assert_eq!(student.down, values[12..18]);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dequantized_q2s4_matrix_packs_losslessly() {
+        let mut values = Vec::new();
+        for _ in 0..8 {
+            values.extend_from_slice(&[-2.0, -0.64, 0.64, 2.0]);
+        }
+        for index in 0_usize..32 {
+            values.push(if index.is_multiple_of(2) { -0.25 } else { 0.25 });
+        }
+        let packed = pack_dequantized_q2s4_matrix(&values).unwrap();
+        assert_eq!(packed.scales, vec![2.0, 0.25]);
+        let decoded = values
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let code = (packed.codes[index / 4] >> ((index % 4) * 2)) & 3;
+                let level = match code {
+                    0 => -1.0,
+                    1 => -0.32,
+                    2 => 0.32,
+                    3 => 1.0,
+                    _ => unreachable!(),
+                };
+                packed.scales[index / 32] * level
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn q2s4_packer_rejects_non_codebook_values() {
+        let mut values = vec![1.0; 32];
+        values[7] = 0.5;
+        assert!(pack_dequantized_q2s4_matrix(&values).is_err());
     }
 
     #[test]
