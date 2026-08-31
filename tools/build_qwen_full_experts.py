@@ -87,6 +87,11 @@ def parse_args():
     parser.add_argument("--min-train-samples", type=int, default=4)
     parser.add_argument("--min-heldout-samples", type=int, default=2)
     parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument(
+        "--heldout-gpu-layers",
+        type=int,
+        help="Override GPU offload only for held-out capture; default keeps all layers on GPU.",
+    )
     parser.add_argument("--nice", type=int, default=15)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -149,6 +154,8 @@ def validate_args(args):
         raise ValueError("per-expert evidence caps must be positive")
     if args.nice < 0 or args.nice > 20:
         raise ValueError("nice level must be within 0..20")
+    if args.heldout_gpu_layers is not None and not 0 <= args.heldout_gpu_layers <= MODEL_LAYERS:
+        raise ValueError("held-out GPU layers must be within 0..48")
 
 
 def stable_fingerprint(value):
@@ -189,6 +196,8 @@ def shard_specs(kind, corpora, sequences, sequences_per_shard, sample_cap, args)
             "hidden_size": HIDDEN_SIZE,
             "sample_format": "qxds-v1",
         }
+        if kind == "heldout" and args.heldout_gpu_layers is not None:
+            contract["gpu_layers"] = args.heldout_gpu_layers
         contract["fingerprint"] = stable_fingerprint(contract)
         specs.append((directory, contract))
     return specs
@@ -256,7 +265,7 @@ def capture_command(directory, contract, corpora, args):
             str(MODEL_EXPERTS),
             "--top-k",
             str(MODEL_TOP_K),
-            "--gpu-layers=-1",
+            f"--gpu-layers={contract.get('gpu_layers', -1)}",
             "--threads",
             str(args.threads),
             "--expert-neurons",
