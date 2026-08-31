@@ -108,9 +108,31 @@ actually recovered deployable capacity:
 
 The extension recovered 24 experts while also improving aggregate error and
 cosine. At the measured 1,585,152-byte premium of an exact Q4/Q6 expert over
-Q2S4, that avoids 36.3 MiB of installed payload for layer 3. The comparison was
-written outside the canonical layer directory, so the original manifest and
-sidecars remain intact until model-level replay promotes the broader policy.
+Q2S4, that avoids 36.3 MiB of installed payload for layer 3.
+
+## Layer-3 causal promotion
+
+Full-model replay on four selection prompts showed that the evidence extension
+was storage-positive but not itself a quality fix: the 88- and 112-student
+policies both retained 80% top-1 agreement, with respective perplexity deltas
+of +10.99% and +10.83%. An independent 12-expert exact-fallback panel found one
+dominant causal anchor, `3:82`. Restoring only that original GGUF expert raised
+the selection shard to 100% top-1 and reduced the perplexity delta to +1.21%.
+
+The anchor was then frozen and evaluated without reselection on the remaining
+eight general prompts. It was neutral on both shards because those prompts did
+not route through the damaging path. Across all 343 scored tokens:
+
+| Layer-3 policy | PPL delta | Top-1 agreement | Exact premium |
+|---|---:|---:|---:|
+| 112 Q2S4 students | +4.77% | 90.67% | 0 |
+| + exact `3:82` | **+1.36%** | **97.96%** | 1.512 MiB |
+
+The broader evidence therefore removes 36.3 MiB of avoidable exact payload and
+adds back only 1.512 MiB for the causally demonstrated anchor, a net layer-3
+saving of 34.77 MiB. The 112-student manifest is now canonical; the previous
+88-student manifest and sidecars remain in the external build archive for
+rollback. This promotes the layer-3 policy, not the unfinished 48-layer model.
 
 The canonical invocation uses the existing Torch/MPS environment:
 

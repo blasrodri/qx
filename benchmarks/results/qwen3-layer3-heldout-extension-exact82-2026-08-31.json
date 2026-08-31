@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-layer3-heldout-extension-exact-anchor",
+  "promotion_evidence": false,
+  "date": "2026-08-31",
+  "model_sha256": "0d003f48c75bd2f6448692cfe917e64f253f4e0e9b6fa89a50fc8c9f88f5f8f5",
+  "representation": {
+    "layer": 3,
+    "teacher_width": 768,
+    "student_width": 768,
+    "projection_codecs": {
+      "gate": "q2s4",
+      "up": "q2s4",
+      "down": "q2s4"
+    },
+    "base_transformed_experts": 88,
+    "extended_transformed_experts": 112,
+    "extended_exact_retained_experts": 16,
+    "selected_exact_anchors": [
+      "3:82"
+    ]
+  },
+  "evidence_extension": {
+    "corpus": "external/corpora/wikitext-2/test.txt",
+    "sequences": 8,
+    "routed_positions": 335,
+    "expert_hits": 29265,
+    "capture_seconds": 350.9045364999911,
+    "transformed_experts_recovered": 24,
+    "exact_payload_bytes_avoided": 38043648,
+    "exact_payload_mib_avoided": 36.28125
+  },
+  "selection_shard": {
+    "skipped_sequences": 0,
+    "scored_tokens": 125,
+    "exact_mean_nll": 3.841413171317137,
+    "base_student_mean_nll": 3.945638170459193,
+    "base_relative_perplexity_delta": 0.10985014215461741,
+    "base_top1_agreement": 0.8,
+    "extended_student_mean_nll": 3.944227386081396,
+    "extended_relative_perplexity_delta": 0.10828548686750028,
+    "extended_top1_agreement": 0.8,
+    "exact_3_82_mean_nll": 3.8534092258582366,
+    "exact_3_82_relative_perplexity_delta": 0.012068295784334993,
+    "exact_3_82_top1_agreement": 1.0,
+    "independent_exact_candidates": 12
+  },
+  "broad_general_holdout": {
+    "execution": "three independent four-prompt shards",
+    "scored_tokens": 343,
+    "exact_mean_nll": 3.8843578101205707,
+    "extended_student_mean_nll": 3.9309383473247625,
+    "extended_relative_perplexity_delta": 0.047682453086516974,
+    "extended_top1_matches": 311,
+    "extended_top1_agreement": 0.9067055393586005,
+    "exact_3_82_mean_nll": 3.897841350158888,
+    "exact_3_82_relative_perplexity_delta": 0.013574852909659985,
+    "exact_3_82_top1_matches": 336,
+    "exact_3_82_top1_agreement": 0.9795918367346939,
+    "recovered_top1_decisions": 25
+  },
+  "payload_accounting": {
+    "q2s4_bytes_per_expert": 1474560,
+    "original_gguf_bytes_per_expert": 3059712,
+    "incremental_exact_bytes": 1585152,
+    "incremental_exact_mib": 1.51171875,
+    "net_layer3_installed_bytes_avoided_after_anchor": 36458496,
+    "net_layer3_installed_mib_avoided_after_anchor": 34.76953125
+  },
+  "decision": {
+    "layer3_representative_gate": "pass",
+    "promote_extended_evidence_policy": true,
+    "selected_exact_backbone": [
+      "3:82"
+    ],
+    "next_gate": "train remaining layers with both heldout shards and perform the same causal exact-anchor selection"
+  },
+  "limitations": [
+    "one transformed layer rather than a complete 48-layer policy",
+    "teacher-forced next-token agreement is not an instruction-following benchmark",
+    "packed validation expands routed experts to F32 scratch rather than using the native Metal product path",
+    "no physical iPhone measurement yet"
+  ]
+}
