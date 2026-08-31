@@ -134,6 +134,19 @@ saving of 34.77 MiB. The 112-student manifest is now canonical; the previous
 88-student manifest and sidecars remain in the external build archive for
 rollback. This promotes the layer-3 policy, not the unfinished 48-layer model.
 
+## Layer-4 confirmation
+
+The next layer trained directly against both held-out shards. It transformed
+107 of 128 experts and covered 98.54% of routed held-out positions, leaving 21
+mostly training-cold experts exact. Across the same 343-token general replay,
+the unanchored layer scored **+0.34% perplexity and 96.79% top-1 agreement**.
+
+Expert `4:16` had an alarming local relative L2 of 3.70, but restoring it to
+the original GGUF payload was exactly neutral on all three prompt shards. It is
+therefore not an exact anchor. This is a useful negative control: expert-local
+error ranks candidates, while full-model causal replay alone authorizes the
+memory premium.
+
 The canonical invocation uses the existing Torch/MPS environment:
 
 ```sh
