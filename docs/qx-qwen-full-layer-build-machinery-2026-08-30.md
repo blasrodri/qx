@@ -92,10 +92,25 @@ trainer input only after its own atomic completion marker exists:
   --heldout-gpu-layers 40
 ```
 
-With this extension enabled, a dry run recognizes the five existing shards,
-schedules only `captures/heldout-extension/000`, and blocks further training
-until that sixth shard is complete. The reduced held-out GPU residency avoids
-the Metal out-of-memory failure observed with all 48 layers offloaded.
+The first extension shard captured 335 routed positions and 29,265 expert hits
+from eight WikiText test sequences in 350.9 seconds. The completed build now
+contains six atomic markers, 288 non-empty QXDS files, and no transient raw
+traces. The reduced held-out GPU residency avoided the Metal out-of-memory
+failure observed with all 48 layers offloaded.
+
+An isolated layer-3 retrain measured whether the extension merely added data or
+actually recovered deployable capacity:
+
+| Layer-3 evidence | Transformed | Exact retained | Route coverage | Mean relative L2 | Mean cosine |
+|---|---:|---:|---:|---:|---:|
+| curated held-out | 88 | 40 | 98.38% | 0.475 | 0.879 |
+| + WikiText extension | 112 | 16 | 99.40% | 0.462 | 0.884 |
+
+The extension recovered 24 experts while also improving aggregate error and
+cosine. At the measured 1,585,152-byte premium of an exact Q4/Q6 expert over
+Q2S4, that avoids 36.3 MiB of installed payload for layer 3. The comparison was
+written outside the canonical layer directory, so the original manifest and
+sidecars remain intact until model-level replay promotes the broader policy.
 
 The canonical invocation uses the existing Torch/MPS environment:
 
