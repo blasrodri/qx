@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-layer5-extended-evidence-causal-gate",
+  "promotion_evidence": false,
+  "date": "2026-08-31",
+  "model_sha256": "0d003f48c75bd2f6448692cfe917e64f253f4e0e9b6fa89a50fc8c9f88f5f8f5",
+  "representation": {
+    "layer": 5,
+    "teacher_width": 768,
+    "student_width": 768,
+    "projection_codecs": {
+      "gate": "q2s4",
+      "up": "q2s4",
+      "down": "q2s4"
+    },
+    "transformed_experts": 111,
+    "evidence_retained_experts": 17,
+    "heldout_route_coverage": 0.9771554900515844,
+    "selected_exact_anchors": []
+  },
+  "local_diagnostics": {
+    "weighted_mean_relative_l2": 0.4573729079817934,
+    "weighted_mean_cosine": 0.8858960628689324,
+    "maximum_expert_mean_relative_l2": 0.9845257997512817,
+    "maximum_error_expert": 8,
+    "training_seconds": 522.1818942499813
+  },
+  "validation_execution": {
+    "gpu_layers": 40,
+    "reason": "all-48-layer validation reached Metal OOM when starting the exact fallback pass",
+    "comparison_rule": "compare every student and fallback only with the exact pass from the same residency configuration"
+  },
+  "broad_general_holdout": {
+    "execution": "three independent four-prompt shards",
+    "scored_tokens": 343,
+    "exact_mean_nll": 3.87451800709708,
+    "student_mean_nll": 3.8806873816815877,
+    "relative_perplexity_delta": 0.006188444371940438,
+    "top1_matches": 332,
+    "top1_agreement": 0.967930029154519
+  },
+  "exact_candidate_control": {
+    "candidate": "5:8",
+    "reason": "largest local heldout relative L2",
+    "causal_result": "neutral_on_all_343_tokens",
+    "selected": false,
+    "incremental_exact_bytes_avoided": 1585152,
+    "incremental_exact_mib_avoided": 1.51171875
+  },
+  "decision": {
+    "layer5_representative_gate": "pass",
+    "selected_exact_backbone": [],
+    "validation_gpu_layers": 40,
+    "next_gate": "continue remaining layers with both heldout shards"
+  },
+  "limitations": [
+    "one transformed layer rather than a complete 48-layer policy",
+    "17 under-evidenced experts still execute original GGUF weights",
+    "partial and full GPU offload have different exact numerical controls",
+    "teacher-forced next-token agreement is not an instruction-following benchmark",
+    "no physical iPhone measurement yet"
+  ]
+}

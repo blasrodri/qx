@@ -147,6 +147,19 @@ therefore not an exact anchor. This is a useful negative control: expert-local
 error ranks candidates, while full-model causal replay alone authorizes the
 memory premium.
 
+Layer 5 repeated that result with 111 transformed experts and 17 evidence
+exceptions. Expert `5:8` had the largest local error but was causally neutral
+on every prompt shard. The unanchored layer reached **+0.62% perplexity and
+96.79% top-1 agreement** across 343 tokens.
+
+The first layer-5 scan exposed a validator residency boundary: all 48 GPU
+layers completed exact and student passes but hit Metal OOM when starting the
+fallback. Replaying with 40 GPU layers completed all shards reliably. Partial
+offload changes the exact numerical control slightly, so QX must compare each
+student/fallback policy only against the exact pass from the same residency
+configuration. GPU40 is the canonical multi-pass validation setting on this
+24 GiB machine unless a later memory optimization restores safe full offload.
+
 The canonical invocation uses the existing Torch/MPS environment:
 
 ```sh
