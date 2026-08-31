@@ -1,7 +1,7 @@
 # Qwen full-layer build machinery
 
-Date: 2026-08-30  
-Status: capture path validated; first of five evidence shards complete
+Date: 2026-08-31
+Status: five base evidence shards complete; six of 48 layers trained or reused
 
 ## Outcome
 
@@ -66,15 +66,36 @@ resumable:
 - layers 2, 24, and 44 reuse the already validated full-width Q2S4 manifests,
   leaving 45 layers to train.
 
-The first shard is complete and occupies 316 MiB. Its 48 files passed direct
-trainer reads at representative layers 0, 24, and 47. The transient combined
-post-graph file is removed only after all per-layer artifacts and route records
-are written successfully.
+All five base shards are complete: four training shards and one held-out shard
+contain exactly 240 non-empty QXDS files and occupy 1.6 GiB. Their transient
+combined post-graph files were removed only after all per-layer artifacts and
+route records were written successfully. Layers 0, 1, and 3 have since been
+trained locally; layers 2, 24, and 44 are recognized through reused manifests.
 
 The training corpus is the 12 curated general prompts followed by WikiText
 paragraphs. The driver now rejects a requested sequence count larger than the
 available reset paragraphs, preventing a late empty-shard failure. Held-out
 evidence uses eight distinct curated general prompts.
+
+Those eight held-out prompts cover roughly 98–99% of routed positions in the
+first newly trained layers, but leave 28–40 experts per early layer without the
+minimum independent evidence. Extrapolating that exact-retained density would
+erase several GiB of installed-weight savings. The driver therefore supports
+append-only held-out extensions. An extension uses a separate corpus and
+directory, preserves every base-shard fingerprint, and becomes an additional
+trainer input only after its own atomic completion marker exists:
+
+```sh
+  --heldout-extension-corpus external/corpora/wikitext-2/test.txt \
+  --heldout-extension-sequences 8 \
+  --heldout-extension-samples-per-expert 8 \
+  --heldout-gpu-layers 40
+```
+
+With this extension enabled, a dry run recognizes the five existing shards,
+schedules only `captures/heldout-extension/000`, and blocks further training
+until that sixth shard is complete. The reduced held-out GPU residency avoids
+the Metal out-of-memory failure observed with all 48 layers offloaded.
 
 The canonical invocation uses the existing Torch/MPS environment:
 

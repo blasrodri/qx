@@ -56,6 +56,13 @@ def parse_args():
     parser.add_argument(
         "--heldout-corpus", type=pathlib.Path, action="append", required=True
     )
+    parser.add_argument(
+        "--heldout-extension-corpus",
+        type=pathlib.Path,
+        action="append",
+        default=[],
+        help="Additional held-out corpus captured in append-only shards.",
+    )
     parser.add_argument("--work-dir", type=pathlib.Path, required=True)
     parser.add_argument(
         "--route-cache",
@@ -79,11 +86,13 @@ def parse_args():
     parser.add_argument("--max-work-units", type=int, default=1)
     parser.add_argument("--train-sequences", type=int, default=32)
     parser.add_argument("--heldout-sequences", type=int, default=8)
+    parser.add_argument("--heldout-extension-sequences", type=int, default=0)
     parser.add_argument("--sequences-per-shard", type=int, default=8)
     parser.add_argument("--max-tokens-per-sequence", type=int, default=96)
     parser.add_argument("--context", type=int, default=128)
     parser.add_argument("--train-samples-per-expert", type=int, default=32)
     parser.add_argument("--heldout-samples-per-expert", type=int, default=8)
+    parser.add_argument("--heldout-extension-samples-per-expert", type=int, default=8)
     parser.add_argument("--min-train-samples", type=int, default=4)
     parser.add_argument("--min-heldout-samples", type=int, default=2)
     parser.add_argument("--threads", type=int, default=4)
@@ -121,6 +130,7 @@ def validate_args(args):
         args.trainer,
         *args.train_corpus,
         *args.heldout_corpus,
+        *args.heldout_extension_corpus,
         *args.reuse_manifest,
     ]
     missing = [str(path) for path in inputs if not path.exists()]
@@ -134,8 +144,17 @@ def validate_args(args):
         raise ValueError("max work units cannot be negative; zero means unlimited")
     if args.train_sequences <= 0 or args.heldout_sequences <= 0:
         raise ValueError("train and held-out sequence counts must be positive")
+    if args.heldout_extension_sequences < 0:
+        raise ValueError("held-out extension sequence count cannot be negative")
+    if bool(args.heldout_extension_corpus) != bool(args.heldout_extension_sequences):
+        raise ValueError(
+            "held-out extension corpus and positive sequence count must be provided together"
+        )
     train_paragraphs = count_corpus_paragraphs(args.train_corpus)
     heldout_paragraphs = count_corpus_paragraphs(args.heldout_corpus)
+    heldout_extension_paragraphs = count_corpus_paragraphs(
+        args.heldout_extension_corpus
+    )
     if args.train_sequences > train_paragraphs:
         raise ValueError(
             f"requested {args.train_sequences} train sequences from only "
@@ -146,11 +165,20 @@ def validate_args(args):
             f"requested {args.heldout_sequences} held-out sequences from only "
             f"{heldout_paragraphs} corpus paragraphs"
         )
+    if args.heldout_extension_sequences > heldout_extension_paragraphs:
+        raise ValueError(
+            f"requested {args.heldout_extension_sequences} held-out extension sequences "
+            f"from only {heldout_extension_paragraphs} corpus paragraphs"
+        )
     if args.sequences_per_shard <= 0:
         raise ValueError("sequences per shard must be positive")
     if not 2 <= args.max_tokens_per_sequence <= args.context:
         raise ValueError("max tokens per sequence must be within 2..context")
-    if args.train_samples_per_expert <= 0 or args.heldout_samples_per_expert <= 0:
+    if (
+        args.train_samples_per_expert <= 0
+        or args.heldout_samples_per_expert <= 0
+        or args.heldout_extension_samples_per_expert <= 0
+    ):
         raise ValueError("per-expert evidence caps must be positive")
     if args.nice < 0 or args.nice > 20:
         raise ValueError("nice level must be within 0..20")
@@ -196,7 +224,7 @@ def shard_specs(kind, corpora, sequences, sequences_per_shard, sample_cap, args)
             "hidden_size": HIDDEN_SIZE,
             "sample_format": "qxds-v1",
         }
-        if kind == "heldout" and args.heldout_gpu_layers is not None:
+        if kind.startswith("heldout") and args.heldout_gpu_layers is not None:
             contract["gpu_layers"] = args.heldout_gpu_layers
         contract["fingerprint"] = stable_fingerprint(contract)
         specs.append((directory, contract))
@@ -386,9 +414,24 @@ def main():
         args.heldout_samples_per_expert,
         args,
     )
+    heldout_extension_specs = []
+    if args.heldout_extension_sequences:
+        heldout_extension_specs = shard_specs(
+            "heldout-extension",
+            args.heldout_extension_corpus,
+            args.heldout_extension_sequences,
+            args.sequences_per_shard,
+            args.heldout_extension_samples_per_expert,
+            args,
+        )
+    all_heldout_specs = [*heldout_specs, *heldout_extension_specs]
     all_specs = [
         *((directory, contract, args.train_corpus) for directory, contract in train_specs),
         *((directory, contract, args.heldout_corpus) for directory, contract in heldout_specs),
+        *(
+            (directory, contract, args.heldout_extension_corpus)
+            for directory, contract in heldout_extension_specs
+        ),
     ]
     capture_complete = []
     capture_pending = []
@@ -438,7 +481,9 @@ def main():
         for layer in pending_layers:
             if not unlimited and units >= args.max_work_units:
                 break
-            run_command(training_command(layer, train_specs, heldout_specs, args), args.dry_run)
+            run_command(
+                training_command(layer, train_specs, all_heldout_specs, args), args.dry_run
+            )
             units += 1
 
     remaining_captures = sum(
