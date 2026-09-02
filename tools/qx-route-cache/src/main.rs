@@ -382,8 +382,14 @@ enum Command {
         model: PathBuf,
         #[arg(long = "corpus", required = true)]
         corpora: Vec<PathBuf>,
-        #[arg(long = "student", required = true)]
+        #[arg(long = "student")]
         students: Vec<PathBuf>,
+        /// Add a sidecar using packed Q2S4 validation storage.
+        #[arg(long = "q2s4-student")]
+        q2s4_students: Vec<PathBuf>,
+        /// Add a sidecar using packed Q3 validation storage.
+        #[arg(long = "q3-student")]
+        q3_students: Vec<PathBuf>,
         /// Cumulatively replace matching baseline students, freeing the old matrices in place.
         #[arg(long = "replacement-student")]
         replacement_students: Vec<PathBuf>,
@@ -1436,6 +1442,8 @@ fn main() -> Result<()> {
             model,
             corpora,
             students,
+            q2s4_students,
+            q3_students,
             replacement_students,
             independent_replacements,
             exact_fallbacks,
@@ -1461,6 +1469,8 @@ fn main() -> Result<()> {
             model,
             corpora,
             students,
+            q2s4_students,
+            q3_students,
             replacement_students,
             independent_replacements,
             exact_fallbacks,
@@ -1691,6 +1701,8 @@ struct MultiJointExpertStudentNllArgs {
     model: PathBuf,
     corpora: Vec<PathBuf>,
     students: Vec<PathBuf>,
+    q2s4_students: Vec<PathBuf>,
+    q3_students: Vec<PathBuf>,
     replacement_students: Vec<PathBuf>,
     independent_replacements: bool,
     exact_fallbacks: Vec<(usize, u16)>,
@@ -1712,6 +1724,13 @@ struct MultiJointExpertStudentNllArgs {
     hidden_size: usize,
     model_sha256: Option<String>,
     output: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JointStudentStorage {
+    ResidentF32,
+    PackedQ2S4,
+    PackedQ3,
 }
 
 struct ExpertStudentSpec {
@@ -2733,8 +2752,12 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
     if !args.model.is_file()
         || args.corpora.is_empty()
         || args.corpora.iter().any(|path| !path.is_file())
-        || args.students.is_empty()
+        || (args.students.is_empty()
+            && args.q2s4_students.is_empty()
+            && args.q3_students.is_empty())
         || args.students.iter().any(|path| !path.is_file())
+        || args.q2s4_students.iter().any(|path| !path.is_file())
+        || args.q3_students.iter().any(|path| !path.is_file())
         || args.replacement_students.iter().any(|path| !path.is_file())
         || args
             .layer_residual
@@ -2752,7 +2775,10 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
     if args.compact_q2s4_students && args.compact_q3_students {
         bail!("compact Q2S4 and Q3 student modes are mutually exclusive");
     }
-    if (args.compact_q2s4_students || args.compact_q3_students)
+    if (args.compact_q2s4_students
+        || args.compact_q3_students
+        || !args.q2s4_students.is_empty()
+        || !args.q3_students.is_empty())
         && !args.replacement_students.is_empty()
     {
         bail!("compact students do not yet support replacement sidecars");
@@ -2766,7 +2792,27 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
     };
     let mut targets = HashSet::new();
     let mut students = Vec::new();
-    for path in &args.students {
+    let default_storage = if args.compact_q2s4_students {
+        JointStudentStorage::PackedQ2S4
+    } else if args.compact_q3_students {
+        JointStudentStorage::PackedQ3
+    } else {
+        JointStudentStorage::ResidentF32
+    };
+    let mut requested_students =
+        Vec::with_capacity(args.students.len() + args.q2s4_students.len() + args.q3_students.len());
+    requested_students.extend(args.students.iter().map(|path| (path, default_storage)));
+    requested_students.extend(
+        args.q2s4_students
+            .iter()
+            .map(|path| (path, JointStudentStorage::PackedQ2S4)),
+    );
+    requested_students.extend(
+        args.q3_students
+            .iter()
+            .map(|path| (path, JointStudentStorage::PackedQ3)),
+    );
+    for (path, storage) in requested_students {
         let student = read_joint_expert_student(path)?;
         if student.layer >= args.layers
             || usize::from(student.expert) >= args.experts
@@ -2785,7 +2831,13 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
                 student.expert
             );
         }
-        students.push((path.clone(), student.layer, student.expert, student.width));
+        students.push((
+            path.clone(),
+            student.layer,
+            student.expert,
+            student.width,
+            storage,
+        ));
     }
     let mut replacements = Vec::new();
     let mut replaced_targets = HashSet::new();
@@ -2900,7 +2952,7 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
     }
     let target_pairs = students
         .iter()
-        .map(|(_, layer, expert, _)| (*layer, *expert))
+        .map(|(_, layer, expert, _, _)| (*layer, *expert))
         .collect::<Vec<_>>();
     let total_passes = 1 + active_prefixes.len() + replacements.len() + args.exact_fallbacks.len();
     let mut completed_passes = 0_usize;
@@ -2912,21 +2964,24 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         "multi-joint pass {completed_passes}/{total_passes} complete in {:.2}s",
         pass_started.elapsed().as_secs_f64()
     );
-    for (path, layer, expert, width) in &students {
+    for (path, layer, expert, width, storage) in &students {
         let student = read_joint_expert_student(path)?;
         if student.layer != *layer || student.expert != *expert || student.width != *width {
             bail!("joint student changed while evaluating: {}", path.display());
         }
-        if args.compact_q2s4_students {
-            let packed = pack_dequantized_q2s4_student(&student)
-                .with_context(|| format!("pack Q2S4 joint expert student {}", path.display()))?;
-            capture.add_packed_q2s4_joint_expert_student(&packed)?;
-        } else if args.compact_q3_students {
-            let packed = pack_dequantized_q3_student(&student)
-                .with_context(|| format!("pack Q3 joint expert student {}", path.display()))?;
-            capture.add_packed_q3_joint_expert_student(&packed)?;
-        } else {
-            capture.add_joint_expert_student(&student)?;
+        match storage {
+            JointStudentStorage::ResidentF32 => capture.add_joint_expert_student(&student)?,
+            JointStudentStorage::PackedQ2S4 => {
+                let packed = pack_dequantized_q2s4_student(&student).with_context(|| {
+                    format!("pack Q2S4 joint expert student {}", path.display())
+                })?;
+                capture.add_packed_q2s4_joint_expert_student(&packed)?;
+            }
+            JointStudentStorage::PackedQ3 => {
+                let packed = pack_dequantized_q3_student(&student)
+                    .with_context(|| format!("pack Q3 joint expert student {}", path.display()))?;
+                capture.add_packed_q3_joint_expert_student(&packed)?;
+            }
         }
     }
     if let Some(path) = &args.layer_residual {
@@ -2994,10 +3049,10 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         if args.independent_replacements {
             let baseline_path = students
                 .iter()
-                .find(|(_, baseline_layer, baseline_expert, _)| {
+                .find(|(_, baseline_layer, baseline_expert, _, _)| {
                     baseline_layer == layer && baseline_expert == expert
                 })
-                .map(|(baseline_path, _, _, _)| baseline_path)
+                .map(|(baseline_path, _, _, _, _)| baseline_path)
                 .expect("replacement targets were validated against baseline students");
             let baseline = read_joint_expert_student(baseline_path)?;
             capture.replace_joint_expert_student(&baseline)?;
@@ -3055,18 +3110,28 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         .zip(&student_measurement.top1_tokens)
         .filter(|(exact, student)| exact == student)
         .count();
+    let has_resident_f32 = students
+        .iter()
+        .any(|(_, _, _, _, storage)| *storage == JointStudentStorage::ResidentF32);
+    let has_q2s4 = students
+        .iter()
+        .any(|(_, _, _, _, storage)| *storage == JointStudentStorage::PackedQ2S4);
+    let has_q3 = students
+        .iter()
+        .any(|(_, _, _, _, storage)| *storage == JointStudentStorage::PackedQ3);
+    let student_storage = match (has_resident_f32, has_q2s4, has_q3) {
+        (true, false, false) => "resident-f32",
+        (false, true, false) => "packed-q2s4-with-routed-scratch-expansion",
+        (false, false, true) => "packed-q3-with-routed-scratch-expansion",
+        (false, true, true) => "codec-tagged-packed-q2s4-q3-with-routed-scratch-expansion",
+        _ => "codec-tagged-mixed-with-routed-scratch-expansion",
+    };
     let report = MultiJointExpertStudentNllReport {
         schema_version: 1,
         classification: "simultaneous-joint-expert-student-corpus-nll-control",
         promotion_evidence: false,
         quality_semantics: "teacher-forced-corpus-nll-with-student-overrides-and-optional-exact-fallbacks",
-        student_storage: if args.compact_q2s4_students {
-            "packed-q2s4-with-routed-scratch-expansion"
-        } else if args.compact_q3_students {
-            "packed-q3-with-routed-scratch-expansion"
-        } else {
-            "resident-f32"
-        },
+        student_storage,
         model_sha256: model_hash,
         corpora: args
             .corpora
@@ -3077,7 +3142,7 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
             .iter()
             .zip(exact.route_hits.iter().zip(&student_measurement.route_hits))
             .map(
-                |((path, layer, expert, width), (&exact_route_hits, &student_route_hits))| {
+                |((path, layer, expert, width, _), (&exact_route_hits, &student_route_hits))| {
                     MultiJointExpertStudentResult {
                         layer: *layer,
                         expert: *expert,

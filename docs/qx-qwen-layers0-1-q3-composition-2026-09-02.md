@@ -59,7 +59,9 @@ The large evidence and sidecar files remain outside Git. Their model identity is
 
 ## Next constraint
 
-Layers 2 and 3 currently use Q2S4 policies with exact causal anchors. Composing
-them with layers 0 and 1 requires codec-tagged validator inputs so Q3 and Q2S4
-students can remain packed in the same session. That mixed packed-validation
-mechanism is the next implementation step before the layers 0-3 causal gate.
+Codec-tagged validator inputs are now implemented and have executed Q3 and
+Q2S4 students in one live session. The structural smoke rejected the old
+layer-3 Q2S4 candidate before a long layers 0-3 replay: adding it to layer 0
+Q3 raised the seven-token probe from +5.40% to +14.13% perplexity. The next
+step is the same bounded Q3 escalation for layers 2 and 3 that repaired layers
+0 and 1, followed by isolated and composed causal gates.
