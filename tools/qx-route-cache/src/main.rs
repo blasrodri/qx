@@ -399,6 +399,9 @@ enum Command {
         /// Repack dequantized Q2S4 sidecars in memory and expand only routed experts.
         #[arg(long)]
         compact_q2s4_students: bool,
+        /// Repack dequantized Q3 sidecars in memory and expand only routed experts.
+        #[arg(long)]
+        compact_q3_students: bool,
         /// Optional low-rank correction injected after aggregated MoE output.
         #[arg(long)]
         layer_residual: Option<PathBuf>,
@@ -945,6 +948,21 @@ struct PackedQ2S4JointExpertStudent {
     down: PackedQ2S4Matrix,
 }
 
+struct PackedQ3Matrix {
+    scales: Vec<f32>,
+    codes: Vec<u8>,
+}
+
+struct PackedQ3JointExpertStudent {
+    layer: usize,
+    expert: u16,
+    hidden: usize,
+    width: usize,
+    gate: PackedQ3Matrix,
+    up: PackedQ3Matrix,
+    down: PackedQ3Matrix,
+}
+
 struct LayerResidual {
     layer: usize,
     rank: usize,
@@ -1423,6 +1441,7 @@ fn main() -> Result<()> {
             exact_fallbacks,
             independent_exact_fallbacks,
             compact_q2s4_students,
+            compact_q3_students,
             layer_residual,
             active_prefixes,
             skip_sequences,
@@ -1447,6 +1466,7 @@ fn main() -> Result<()> {
             exact_fallbacks,
             independent_exact_fallbacks,
             compact_q2s4_students,
+            compact_q3_students,
             layer_residual,
             active_prefixes,
             skip_sequences,
@@ -1676,6 +1696,7 @@ struct MultiJointExpertStudentNllArgs {
     exact_fallbacks: Vec<(usize, u16)>,
     independent_exact_fallbacks: bool,
     compact_q2s4_students: bool,
+    compact_q3_students: bool,
     layer_residual: Option<PathBuf>,
     active_prefixes: Vec<usize>,
     skip_sequences: usize,
@@ -2728,8 +2749,13 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
     {
         bail!("multi-joint-student corpus arguments are invalid");
     }
-    if args.compact_q2s4_students && !args.replacement_students.is_empty() {
-        bail!("compact Q2S4 students do not yet support replacement sidecars");
+    if args.compact_q2s4_students && args.compact_q3_students {
+        bail!("compact Q2S4 and Q3 student modes are mutually exclusive");
+    }
+    if (args.compact_q2s4_students || args.compact_q3_students)
+        && !args.replacement_students.is_empty()
+    {
+        bail!("compact students do not yet support replacement sidecars");
     }
     let model_hash = match args.model_sha256.as_ref() {
         Some(value) => {
@@ -2895,6 +2921,10 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
             let packed = pack_dequantized_q2s4_student(&student)
                 .with_context(|| format!("pack Q2S4 joint expert student {}", path.display()))?;
             capture.add_packed_q2s4_joint_expert_student(&packed)?;
+        } else if args.compact_q3_students {
+            let packed = pack_dequantized_q3_student(&student)
+                .with_context(|| format!("pack Q3 joint expert student {}", path.display()))?;
+            capture.add_packed_q3_joint_expert_student(&packed)?;
         } else {
             capture.add_joint_expert_student(&student)?;
         }
@@ -3032,6 +3062,8 @@ fn multi_joint_expert_student_nll(args: MultiJointExpertStudentNllArgs) -> Resul
         quality_semantics: "teacher-forced-corpus-nll-with-student-overrides-and-optional-exact-fallbacks",
         student_storage: if args.compact_q2s4_students {
             "packed-q2s4-with-routed-scratch-expansion"
+        } else if args.compact_q3_students {
+            "packed-q3-with-routed-scratch-expansion"
         } else {
             "resident-f32"
         },
@@ -6269,6 +6301,60 @@ fn pack_dequantized_q2s4_student(
     })
 }
 
+fn pack_dequantized_q3_matrix(values: &[f32]) -> Result<PackedQ3Matrix> {
+    const GROUP_SIZE: usize = 32;
+    const QMAX: i32 = 3;
+    if values.is_empty() || !values.len().is_multiple_of(GROUP_SIZE) {
+        bail!("Q3 matrix values must contain complete group-32 blocks");
+    }
+    let mut scales = Vec::with_capacity(values.len() / GROUP_SIZE);
+    let mut codes = vec![0_u8; values.len() * 3 / 8];
+    for (group_index, group) in values.chunks_exact(GROUP_SIZE).enumerate() {
+        if group.iter().any(|value| !value.is_finite()) {
+            bail!("Q3 matrix group {group_index} contains a non-finite value");
+        }
+        let max_abs = group.iter().copied().map(f32::abs).fold(0.0, f32::max);
+        let scale = if max_abs == 0.0 {
+            1.0
+        } else {
+            max_abs / QMAX as f32
+        };
+        scales.push(scale);
+        let tolerance = scale.max(f32::MIN_POSITIVE) * f32::EPSILON * 16.0;
+        for (local, &value) in group.iter().enumerate() {
+            let quantized = (value / scale).round().clamp(-(QMAX as f32), QMAX as f32) as i32;
+            let reconstructed = quantized as f32 * scale;
+            if (value - reconstructed).abs() > tolerance {
+                bail!(
+                    "matrix is not dequantized Q3 at group {group_index}, element {local}: {value}"
+                );
+            }
+            let code = (quantized + QMAX) as u8;
+            let index = group_index * GROUP_SIZE + local;
+            let bit = index * 3;
+            let byte = bit / 8;
+            let shift = bit % 8;
+            codes[byte] |= code << shift;
+            if shift > 5 {
+                codes[byte + 1] |= code >> (8 - shift);
+            }
+        }
+    }
+    Ok(PackedQ3Matrix { scales, codes })
+}
+
+fn pack_dequantized_q3_student(student: &JointExpertStudent) -> Result<PackedQ3JointExpertStudent> {
+    Ok(PackedQ3JointExpertStudent {
+        layer: student.layer,
+        expert: student.expert,
+        hidden: student.hidden,
+        width: student.width,
+        gate: pack_dequantized_q3_matrix(&student.gate)?,
+        up: pack_dequantized_q3_matrix(&student.up)?,
+        down: pack_dequantized_q3_matrix(&student.down)?,
+    })
+}
+
 fn read_layer_residual(path: &Path) -> Result<LayerResidual> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut magic = [0u8; 8];
@@ -6369,6 +6455,24 @@ mod llama_capture {
             down_count: c_int,
         ) -> c_int;
         fn qx_llama_route_add_joint_expert_student_q2s4(
+            route: *mut c_void,
+            layer: c_int,
+            expert: c_int,
+            width: c_int,
+            gate_scales: *const f32,
+            gate_scale_count: c_int,
+            gate_codes: *const u8,
+            gate_code_count: c_int,
+            up_scales: *const f32,
+            up_scale_count: c_int,
+            up_codes: *const u8,
+            up_code_count: c_int,
+            down_scales: *const f32,
+            down_scale_count: c_int,
+            down_codes: *const u8,
+            down_code_count: c_int,
+        ) -> c_int;
+        fn qx_llama_route_add_joint_expert_student_q3(
             route: *mut c_void,
             layer: c_int,
             expert: c_int,
@@ -6737,6 +6841,39 @@ mod llama_capture {
             };
             if status != 0 {
                 bail!("llama bridge rejected packed Q2S4 joint expert with status {status}");
+            }
+            Ok(())
+        }
+
+        pub fn add_packed_q3_joint_expert_student(
+            &mut self,
+            student: &PackedQ3JointExpertStudent,
+        ) -> Result<()> {
+            if student.hidden == 0 || student.width == 0 {
+                bail!("packed Q3 joint expert student has invalid dimensions");
+            }
+            let status = unsafe {
+                qx_llama_route_add_joint_expert_student_q3(
+                    self.raw,
+                    student.layer.try_into()?,
+                    c_int::from(student.expert),
+                    student.width.try_into()?,
+                    student.gate.scales.as_ptr(),
+                    student.gate.scales.len().try_into()?,
+                    student.gate.codes.as_ptr(),
+                    student.gate.codes.len().try_into()?,
+                    student.up.scales.as_ptr(),
+                    student.up.scales.len().try_into()?,
+                    student.up.codes.as_ptr(),
+                    student.up.codes.len().try_into()?,
+                    student.down.scales.as_ptr(),
+                    student.down.scales.len().try_into()?,
+                    student.down.codes.as_ptr(),
+                    student.down.codes.len().try_into()?,
+                )
+            };
+            if status != 0 {
+                bail!("llama bridge rejected packed Q3 joint expert with status {status}");
             }
             Ok(())
         }
@@ -7494,6 +7631,42 @@ mod tests {
         let mut values = vec![1.0; 32];
         values[7] = 0.5;
         assert!(pack_dequantized_q2s4_matrix(&values).is_err());
+    }
+
+    #[test]
+    fn dequantized_q3_matrix_packs_losslessly() {
+        let scale = 0.25_f32;
+        let values = (0..32)
+            .map(|index| ((index % 7) - 3) as f32 * scale)
+            .collect::<Vec<_>>();
+        let packed = pack_dequantized_q3_matrix(&values).unwrap();
+        assert_eq!(packed.scales, vec![scale]);
+        assert_eq!(packed.codes.len(), 12);
+        let decoded = values
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let bit = index * 3;
+                let byte = bit / 8;
+                let shift = bit % 8;
+                let mut code = (packed.codes[byte] >> shift) & 7;
+                if shift > 5 {
+                    code |= (packed.codes[byte + 1] << (8 - shift)) & 7;
+                }
+                packed.scales[index / 32] * (i32::from(code) - 3) as f32
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn q3_packer_rejects_non_codebook_values() {
+        let mut values = vec![0.0; 32];
+        for (index, value) in values.iter_mut().enumerate() {
+            *value = (index % 7) as f32 - 3.0;
+        }
+        values[7] = 0.5;
+        assert!(pack_dequantized_q3_matrix(&values).is_err());
     }
 
     #[test]
