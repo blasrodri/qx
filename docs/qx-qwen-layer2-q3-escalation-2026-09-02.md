@@ -1,7 +1,7 @@
 # Qwen layer-2 Q3 escalation
 
 Date: 2026-09-02
-Status: representation improvement confirmed; strict causal gate not met
+Status: isolated gate not met; later promoted by composition-aware selection
 
 ## Outcome
 
@@ -65,3 +65,12 @@ layer 2 in the composed promotion policy yet. Validate layer 3 Q3 independently.
 For layer 2, the next bounded escalation must use downstream/logits-aware
 attribution under the Q3 baseline or a higher-precision layer policy; local
 reconstruction error and inherited codec rankings are insufficient.
+
+## Follow-up
+
+The required composition-aware experiment was completed on 2026-09-03.
+Independent exact fallbacks inside the promoted layers-0/1/3 composition found
+`2:76`, which was not selected by the isolated Q3 policy, as the missing causal
+anchor. Layer 2 is promoted only as part of the four-layer policy documented in
+`qx-qwen-layers0-1-2-3-q3-composition-2026-09-03.md`; this document's isolated
+rejection remains valid.
