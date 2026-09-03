@@ -13,3 +13,4 @@ qx-quant.workspace = true
 qx-safetensors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true

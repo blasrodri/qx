@@ -1,16 +1,24 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use qx_format::{
-    AttentionTopology, CompiledTensor, ExecutionPlanManifest, ExpertRepresentation, KvPrecision,
-    MemoryPlan, MoeTopology, QkvTopology, RawTensor, RepresentationPlan, RmsTopology,
-    RopeKvTopology, SparseExpertPolicy, TensorKind, WeightStorage,
-    write_artifact_with_raw_and_plan,
+    AttentionTopology, CompiledTensor, ExecutionPlanManifest, ExpertLayerWeightPlan,
+    ExpertRepresentation, ExpertWeightPlan, KvPrecision, MemoryPlan, MoeTopology, QkvTopology,
+    RawTensor, RepresentationPlan, RmsTopology, RopeKvTopology, SparseExpertPolicy, TensorKind,
+    WeightStorage, write_artifact_with_raw_and_plan,
 };
 use qx_model::{ModelShape, QWEN3_30B_A3B_MODEL_ID, Qwen3MoeConfig};
 use qx_quant::{PackingLayout, QuantType, QuantizedTensor};
 use qx_safetensors::{Checkpoint, TensorInfo};
 use serde::Deserialize;
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File},
+    io::{BufReader, Read},
+    path::{Path, PathBuf},
+};
+
+const JOINT_EXPERT_STUDENT_MAGIC: &[u8; 8] = b"QXEJS001";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -23,12 +31,21 @@ struct Args {
     /// Successful qx-inspect release audit for the exact source directory.
     #[arg(long)]
     source_audit: PathBuf,
-    #[arg(long)]
-    output: PathBuf,
+    #[arg(long, required_unless_present = "check_expert_policy")]
+    output: Option<PathBuf>,
     #[arg(long, default_value_t = 4096)]
     context: usize,
     #[arg(long, value_parser = parse_expert_bits, default_value = "q2_s4")]
     expert_bits: QuantType,
+    /// Checkpoint-specific Qwen expert policy. Requires --expert-build-dir.
+    #[arg(long, requires = "expert_build_dir")]
+    expert_policy: Option<PathBuf>,
+    /// Completed full-layer student build containing manifests and sidecars.
+    #[arg(long, requires = "expert_policy")]
+    expert_build_dir: Option<PathBuf>,
+    /// Validate and summarize a heterogeneous expert policy without compiling weights.
+    #[arg(long, requires = "expert_policy", conflicts_with = "output")]
+    check_expert_policy: bool,
     #[arg(long, default_value = "qwen3-a19pro-provisional")]
     plan_id: String,
 }
@@ -40,6 +57,92 @@ struct SourceAudit {
     model_revision: Option<String>,
     source_files_verified: bool,
     shape: ModelShape,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+struct ExpertTarget {
+    layer: u16,
+    expert: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QwenExpertPolicy {
+    schema_version: u32,
+    classification: String,
+    policy_id: String,
+    model_id: String,
+    screening_reference_sha256: String,
+    selection_evidence: PathBuf,
+    selection_evidence_sha256: String,
+    frozen_evidence: PathBuf,
+    frozen_evidence_sha256: String,
+    student_width: u16,
+    default_student_codec: String,
+    q3_layers: Vec<u16>,
+    validated_layers: Vec<u16>,
+    causal_anchors: Vec<ExpertTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectionCodecs {
+    gate: String,
+    up: String,
+    down: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StudentManifestEntry {
+    layer: u16,
+    expert: u8,
+    sidecar: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct LayerStudentManifest {
+    classification: String,
+    layer: u16,
+    student_width: u16,
+    teacher_target: String,
+    projection_codecs: ProjectionCodecs,
+    students: Vec<StudentManifestEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CausalEvidenceStudent {
+    layer: u16,
+    expert: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct CausalEvidence {
+    model_sha256: String,
+    scored_tokens: usize,
+    relative_perplexity_delta: f64,
+    students: Vec<CausalEvidenceStudent>,
+}
+
+#[derive(Clone, Debug)]
+struct StudentSpec {
+    codec: QuantType,
+    sidecar: PathBuf,
+}
+
+#[derive(Debug)]
+struct ResolvedExpertPolicy {
+    plan: ExpertWeightPlan,
+    students: BTreeMap<(u16, u8), StudentSpec>,
+}
+
+struct JointExpertStudent {
+    layer: u16,
+    expert: u8,
+    hidden: usize,
+    width: usize,
+    teacher_width: usize,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    down: Vec<f32>,
 }
 
 #[derive(Default)]
@@ -66,15 +169,60 @@ fn main() -> Result<()> {
     )?;
     let shape = config.validate_30b_a3b().map_err(anyhow::Error::msg)?;
     validate_source_audit(&args.source_audit, &shape)?;
+    let expert_policy = match (&args.expert_policy, &args.expert_build_dir) {
+        (Some(policy), Some(build_dir)) => Some(resolve_expert_policy(policy, build_dir, &shape)?),
+        (None, None) => None,
+        _ => unreachable!("clap enforces paired expert policy arguments"),
+    };
 
     println!("compiling {QWEN3_30B_A3B_MODEL_ID}");
-    println!("expert representation: {}", args.expert_bits);
+    if let Some(policy) = &expert_policy {
+        println!("expert policy: {}", policy.plan.policy_id);
+        println!("student experts: {}", policy.students.len());
+    } else {
+        println!("expert representation: {}", args.expert_bits);
+    }
     println!("context: {}", args.context);
+    if args.check_expert_policy {
+        let policy = expert_policy
+            .as_ref()
+            .expect("clap requires an expert policy for policy checking");
+        let q3_students = policy
+            .students
+            .values()
+            .filter(|student| student.codec == QuantType::Q3)
+            .count();
+        let q2s4_students = policy.students.len() - q3_students;
+        let source_experts = policy
+            .plan
+            .layers
+            .iter()
+            .map(|layer| layer.source_experts.len())
+            .sum::<usize>();
+        let causal_anchors = policy
+            .plan
+            .layers
+            .iter()
+            .map(|layer| layer.causal_anchors.len())
+            .sum::<usize>();
+        println!("Q2S4 students: {q2s4_students}");
+        println!("Q3 students: {q3_students}");
+        println!("source experts: {source_experts}");
+        println!("causal anchors: {causal_anchors}");
+        println!("validated layers: {:?}", policy.plan.validated_layers);
+        println!("expert policy is internally consistent");
+        return Ok(());
+    }
+    let output = args
+        .output
+        .as_ref()
+        .expect("clap requires output unless policy checking");
 
     let checkpoint = Checkpoint::open(&args.model)?;
     let mut compiled = Vec::<CompiledTensor>::with_capacity(18_700);
     let mut raw = Vec::<RawTensor>::with_capacity(256);
     let mut pending = PendingGateUp::default();
+    let mut compiled_students = BTreeSet::new();
     let mut visited = 0usize;
     checkpoint.visit_tensors_f32(|info, values| {
         compile_tensor(
@@ -82,9 +230,11 @@ fn main() -> Result<()> {
             values,
             &shape,
             args.expert_bits,
+            expert_policy.as_ref(),
             &mut compiled,
             &mut raw,
             &mut pending,
+            &mut compiled_students,
         )?;
         visited += 1;
         if visited.is_multiple_of(512) {
@@ -101,6 +251,15 @@ fn main() -> Result<()> {
     }
     if visited != 18_867 {
         bail!("expected 18867 source tensors, visited {visited}");
+    }
+    if let Some(policy) = &expert_policy
+        && compiled_students.len() != policy.students.len()
+    {
+        bail!(
+            "compiled {} of {} policy students",
+            compiled_students.len(),
+            policy.students.len()
+        );
     }
 
     let weight_bytes = compiled
@@ -131,10 +290,19 @@ fn main() -> Result<()> {
         _ => unreachable!(),
     };
     execution_plan.representations = RepresentationPlan {
-        gate_up: expert_representation,
-        down: expert_representation,
+        gate_up: if expert_policy.is_some() {
+            ExpertRepresentation::MixedQ2Q3Q4
+        } else {
+            expert_representation
+        },
+        down: if expert_policy.is_some() {
+            ExpertRepresentation::MixedQ2Q3Q4
+        } else {
+            expert_representation
+        },
         dense: ExpertRepresentation::Group32Q4RowMajor,
     };
+    execution_plan.expert_weights = expert_policy.as_ref().map(|policy| policy.plan.clone());
     execution_plan.topology.qkv = QkvTopology::Split;
     execution_plan.topology.input_rms = RmsTopology::Materialized;
     execution_plan.topology.post_attention_rms = RmsTopology::Materialized;
@@ -158,9 +326,9 @@ fn main() -> Result<()> {
         "predicted logical bytes at context {}: {}",
         args.context, memory_plan.total_bytes
     );
-    println!("writing {}", args.output.display());
+    println!("writing {}", output.display());
     write_artifact_with_raw_and_plan(
-        &args.output,
+        output,
         QWEN3_30B_A3B_MODEL_ID,
         "apple-a19-pro",
         args.context as u32,
@@ -169,7 +337,7 @@ fn main() -> Result<()> {
         &raw,
         &execution_plan,
     )?;
-    println!("artifact ready: {}", args.output.display());
+    println!("artifact ready: {}", output.display());
     Ok(())
 }
 
@@ -189,15 +357,408 @@ fn validate_source_audit(path: &std::path::Path, shape: &ModelShape) -> Result<(
     Ok(())
 }
 
+fn validate_sha256(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{label} must contain exactly 64 hexadecimal characters");
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut reader =
+        BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn resolve_build_path(build_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        build_dir.join(path)
+    }
+}
+
+fn resolve_sidecar_path(
+    build_dir: &Path,
+    manifest_path: &Path,
+    declared: &Path,
+) -> Result<PathBuf> {
+    if declared.is_file() {
+        return Ok(declared.to_path_buf());
+    }
+    if let Some(file_name) = declared.file_name() {
+        let local = manifest_path
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(build_dir)
+            .join(
+                if manifest_path
+                    .parent()
+                    .is_some_and(|path| path.ends_with("manifests-q3"))
+                {
+                    "students-q3"
+                } else {
+                    "students"
+                },
+            )
+            .join(
+                declared
+                    .parent()
+                    .and_then(Path::file_name)
+                    .unwrap_or_default(),
+            )
+            .join(file_name);
+        if local.is_file() {
+            return Ok(local);
+        }
+    }
+    bail!("student sidecar does not exist: {}", declared.display())
+}
+
+fn validate_causal_evidence(
+    path: &Path,
+    expected_sha256: &str,
+    reference_sha256: &str,
+    expected_students: &BTreeSet<(u16, u8)>,
+    label: &str,
+) -> Result<()> {
+    validate_sha256(expected_sha256, &format!("{label} evidence SHA-256"))?;
+    let actual_sha256 = sha256_file(path)?;
+    if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+        bail!("{label} evidence SHA-256 does not match {}", path.display());
+    }
+    let evidence: CausalEvidence = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    )?;
+    if !evidence.model_sha256.eq_ignore_ascii_case(reference_sha256) {
+        bail!("{label} evidence uses a different screening reference");
+    }
+    if evidence.scored_tokens == 0 || evidence.relative_perplexity_delta > 0.01 {
+        bail!("{label} evidence does not pass the 1% screening gate");
+    }
+    let actual_students = evidence
+        .students
+        .into_iter()
+        .map(|student| (student.layer, student.expert))
+        .collect::<BTreeSet<_>>();
+    if actual_students != *expected_students {
+        bail!("{label} evidence student set does not match the validated policy scope");
+    }
+    Ok(())
+}
+
+fn resolve_expert_policy(
+    path: &Path,
+    build_dir: &Path,
+    shape: &ModelShape,
+) -> Result<ResolvedExpertPolicy> {
+    let policy: QwenExpertPolicy = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    )?;
+    if policy.schema_version != 1
+        || policy.classification != "qx-qwen-expert-weight-policy"
+        || policy.model_id != QWEN3_30B_A3B_MODEL_ID
+    {
+        bail!("expert policy schema, classification, or model identity is invalid");
+    }
+    if policy.policy_id.trim().is_empty() {
+        bail!("expert policy ID cannot be empty");
+    }
+    validate_sha256(
+        &policy.screening_reference_sha256,
+        "screening reference SHA-256",
+    )?;
+    if usize::from(policy.student_width) != shape.expert_intermediate {
+        bail!("expert policy student width does not match the model");
+    }
+    let default_codec = QuantType::parse(&policy.default_student_codec)
+        .filter(|codec| *codec == QuantType::Q2S4)
+        .ok_or_else(|| anyhow::anyhow!("expert policy default codec must be q2_s4"))?;
+    let q3_layers = policy.q3_layers.iter().copied().collect::<BTreeSet<_>>();
+    if q3_layers.len() != policy.q3_layers.len()
+        || q3_layers
+            .iter()
+            .any(|layer| usize::from(*layer) >= shape.layers)
+    {
+        bail!("expert policy Q3 layers must be unique and within the model");
+    }
+    let validated_layers = policy
+        .validated_layers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if validated_layers.len() != policy.validated_layers.len()
+        || validated_layers.is_empty()
+        || validated_layers
+            .iter()
+            .any(|layer| usize::from(*layer) >= shape.layers)
+    {
+        bail!("expert policy validated layers must be unique and within the model");
+    }
+    if !validated_layers.is_subset(&q3_layers) {
+        bail!("validated layers must be a subset of Q3 layers");
+    }
+    let anchors = policy
+        .causal_anchors
+        .iter()
+        .map(|target| (target.layer, target.expert))
+        .collect::<BTreeSet<_>>();
+    if anchors.len() != policy.causal_anchors.len()
+        || anchors.iter().any(|(layer, expert)| {
+            usize::from(*layer) >= shape.layers || usize::from(*expert) >= shape.experts
+        })
+    {
+        bail!("expert policy causal anchors must be unique and within the model");
+    }
+
+    let mut students = BTreeMap::new();
+    let mut layer_plans = Vec::with_capacity(shape.layers);
+    for layer_index in 0..shape.layers {
+        let layer = u16::try_from(layer_index).context("Qwen layer exceeds u16")?;
+        let codec = if q3_layers.contains(&layer) {
+            QuantType::Q3
+        } else {
+            default_codec
+        };
+        let manifest_dir = if codec == QuantType::Q3 {
+            "manifests-q3"
+        } else {
+            "manifests"
+        };
+        let manifest_path = build_dir
+            .join(manifest_dir)
+            .join(format!("layer{layer}.json"));
+        let manifest: LayerStudentManifest = serde_json::from_slice(
+            &fs::read(&manifest_path)
+                .with_context(|| format!("read {}", manifest_path.display()))?,
+        )?;
+        let expected_codec = if codec == QuantType::Q3 { "q3" } else { "q2s4" };
+        if manifest.classification != "qwen-layer-batched-width-transformation"
+            || manifest.layer != layer
+            || manifest.student_width != policy.student_width
+            || manifest.teacher_target != "captured-q4"
+            || manifest.projection_codecs.gate != expected_codec
+            || manifest.projection_codecs.up != expected_codec
+            || manifest.projection_codecs.down != expected_codec
+        {
+            bail!("incompatible student manifest {}", manifest_path.display());
+        }
+        let layer_anchors = anchors
+            .iter()
+            .filter_map(|(anchor_layer, expert)| (*anchor_layer == layer).then_some(*expert))
+            .collect::<BTreeSet<_>>();
+        let mut manifest_students = BTreeMap::new();
+        for entry in manifest.students {
+            if entry.layer != layer || usize::from(entry.expert) >= shape.experts {
+                bail!("student manifest contains an invalid target");
+            }
+            let sidecar = resolve_sidecar_path(build_dir, &manifest_path, &entry.sidecar)?;
+            if manifest_students.insert(entry.expert, sidecar).is_some() {
+                bail!(
+                    "student manifest contains duplicate expert {}",
+                    entry.expert
+                );
+            }
+        }
+        if !layer_anchors
+            .iter()
+            .all(|expert| manifest_students.contains_key(expert))
+        {
+            bail!("causal anchor is not a transformed student in layer {layer}");
+        }
+        for expert in &layer_anchors {
+            manifest_students.remove(expert);
+        }
+        let student_experts = manifest_students.keys().copied().collect::<Vec<_>>();
+        let student_set = student_experts.iter().copied().collect::<BTreeSet<_>>();
+        let source_experts = (0..shape.experts)
+            .map(|expert| u8::try_from(expert).expect("validated Qwen expert count fits u8"))
+            .filter(|expert| !student_set.contains(expert))
+            .collect::<Vec<_>>();
+        for (expert, sidecar) in manifest_students {
+            students.insert((layer, expert), StudentSpec { codec, sidecar });
+        }
+        layer_plans.push(ExpertLayerWeightPlan {
+            layer,
+            student_representation: match codec {
+                QuantType::Q2S4 => ExpertRepresentation::Group32Q2S4RowMajor,
+                QuantType::Q3 => ExpertRepresentation::Group32Q3RowMajor,
+                _ => unreachable!(),
+            },
+            source_representation: ExpertRepresentation::Group32Q4RowMajor,
+            student_experts,
+            source_experts,
+            causal_anchors: layer_anchors.into_iter().collect(),
+            training_manifest_sha256: sha256_file(&manifest_path)?,
+        });
+    }
+    if !anchors.iter().all(|(layer, expert)| {
+        layer_plans[usize::from(*layer)]
+            .causal_anchors
+            .contains(expert)
+    }) {
+        bail!("expert policy contains an unresolved causal anchor");
+    }
+    let expected_evidence_students = students
+        .keys()
+        .filter(|(layer, _)| validated_layers.contains(layer))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let selection_path = resolve_build_path(build_dir, &policy.selection_evidence);
+    let frozen_path = resolve_build_path(build_dir, &policy.frozen_evidence);
+    validate_causal_evidence(
+        &selection_path,
+        &policy.selection_evidence_sha256,
+        &policy.screening_reference_sha256,
+        &expected_evidence_students,
+        "selection",
+    )?;
+    validate_causal_evidence(
+        &frozen_path,
+        &policy.frozen_evidence_sha256,
+        &policy.screening_reference_sha256,
+        &expected_evidence_students,
+        "frozen",
+    )?;
+
+    Ok(ResolvedExpertPolicy {
+        plan: ExpertWeightPlan {
+            policy_id: policy.policy_id,
+            screening_reference_sha256: policy.screening_reference_sha256.to_ascii_lowercase(),
+            selection_evidence_sha256: policy.selection_evidence_sha256.to_ascii_lowercase(),
+            frozen_evidence_sha256: policy.frozen_evidence_sha256.to_ascii_lowercase(),
+            student_width: policy.student_width,
+            validated_layers: validated_layers.into_iter().collect(),
+            layers: layer_plans,
+        },
+        students,
+    })
+}
+
+fn read_joint_expert_student(path: &Path) -> Result<JointExpertStudent> {
+    let mut reader =
+        BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
+    let mut magic = [0_u8; 8];
+    reader.read_exact(&mut magic)?;
+    if &magic != JOINT_EXPERT_STUDENT_MAGIC {
+        bail!("joint expert student has invalid magic: {}", path.display());
+    }
+    let mut dimensions = [0_u32; 5];
+    for value in &mut dimensions {
+        let mut bytes = [0_u8; 4];
+        reader.read_exact(&mut bytes)?;
+        *value = u32::from_le_bytes(bytes);
+    }
+    let [layer, expert, hidden, width, teacher_width] = dimensions.map(|value| value as usize);
+    let values = hidden
+        .checked_mul(width)
+        .ok_or_else(|| anyhow::anyhow!("joint expert student dimensions overflow"))?;
+    let mut read_matrix = || -> Result<Vec<f32>> {
+        let mut bytes = vec![0_u8; values * std::mem::size_of::<f32>()];
+        reader.read_exact(&mut bytes)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect())
+    };
+    let gate = read_matrix()?;
+    let up = read_matrix()?;
+    let down = read_matrix()?;
+    let mut trailing = [0_u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        bail!(
+            "joint expert student contains trailing bytes: {}",
+            path.display()
+        );
+    }
+    Ok(JointExpertStudent {
+        layer: u16::try_from(layer).context("student layer exceeds u16")?,
+        expert: u8::try_from(expert).context("student expert exceeds u8")?,
+        hidden,
+        width,
+        teacher_width,
+        gate,
+        up,
+        down,
+    })
+}
+
+fn quantize_student_matrix(
+    values: &[f32],
+    rows: usize,
+    cols: usize,
+    codec: QuantType,
+) -> Result<QuantizedTensor> {
+    if values.iter().any(|value| !value.is_finite()) {
+        bail!("student matrix contains a non-finite value");
+    }
+    let tensor = QuantizedTensor::quantize(values, rows, cols, codec, 32);
+    let decoded = tensor.dequantize();
+    let scale = values.iter().copied().map(f32::abs).fold(0.0, f32::max);
+    let tolerance = scale.max(1.0) * 2.0e-3;
+    if values
+        .iter()
+        .zip(decoded.iter())
+        .any(|(source, packed)| (source - packed).abs() > tolerance)
+    {
+        bail!("student matrix does not lie on the declared {codec} codec");
+    }
+    Ok(tensor)
+}
+
+fn compile_joint_expert_student(
+    student: &JointExpertStudent,
+    key: (u16, u8),
+    codec: QuantType,
+    shape: &ModelShape,
+    compiled: &mut Vec<CompiledTensor>,
+    pending: &mut PendingGateUp,
+) -> Result<()> {
+    if (student.layer, student.expert) != key
+        || student.hidden != shape.hidden_size
+        || student.width != shape.expert_intermediate
+        || student.teacher_width != shape.expert_intermediate
+    {
+        bail!("joint expert student dimensions or target do not match the policy");
+    }
+    pending.gate.insert(
+        key,
+        quantize_student_matrix(&student.gate, student.width, student.hidden, codec)?,
+    );
+    pending.up.insert(
+        key,
+        quantize_student_matrix(&student.up, student.width, student.hidden, codec)?,
+    );
+    finish_gate_up(key, compiled, pending)?;
+    compiled.push(CompiledTensor {
+        layer: key.0,
+        expert: key.1,
+        kind: TensorKind::Down,
+        tensor: quantize_student_matrix(&student.down, student.hidden, student.width, codec)?,
+    });
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_tensor(
     info: &TensorInfo,
     values: &[f32],
     shape: &ModelShape,
     expert_bits: QuantType,
+    expert_policy: Option<&ResolvedExpertPolicy>,
     compiled: &mut Vec<CompiledTensor>,
     raw: &mut Vec<RawTensor>,
     pending: &mut PendingGateUp,
+    compiled_students: &mut BTreeSet<(u16, u8)>,
 ) -> Result<()> {
     if let Some((layer, expert, projection)) = parse_expert_name(&info.name) {
         let expected = match projection {
@@ -206,8 +767,20 @@ fn compile_tensor(
             _ => bail!("unknown expert projection {projection}"),
         };
         require_shape(info, &expected)?;
-        let tensor = QuantizedTensor::quantize(values, expected[0], expected[1], expert_bits, 32);
         let key = (layer, expert);
+        if let Some(spec) = expert_policy.and_then(|policy| policy.students.get(&key)) {
+            if compiled_students.insert(key) {
+                let student = read_joint_expert_student(&spec.sidecar)?;
+                compile_joint_expert_student(&student, key, spec.codec, shape, compiled, pending)?;
+            }
+            return Ok(());
+        }
+        let expert_bits = if expert_policy.is_some() {
+            QuantType::Q4
+        } else {
+            expert_bits
+        };
+        let tensor = QuantizedTensor::quantize(values, expected[0], expected[1], expert_bits, 32);
         match projection {
             "gate_proj" => {
                 pending.gate.insert(key, tensor);
@@ -439,5 +1012,48 @@ mod tests {
         assert_eq!(output[0].tensor.cols, 32);
         assert_eq!(output[0].tensor.dequantize()[0], 1.0);
         assert_eq!(output[0].tensor.dequantize()[64], 2.0);
+    }
+
+    #[test]
+    fn canonical_policy_fixture_seals_the_four_causal_anchors() {
+        let policy: QwenExpertPolicy = serde_json::from_str(include_str!(
+            "../../../benchmarks/qwen3-30b-a3b-four-layer-q3-policy.json"
+        ))
+        .unwrap();
+        assert_eq!(policy.q3_layers, vec![0, 1, 2, 3]);
+        assert_eq!(policy.validated_layers, vec![0, 1, 2, 3]);
+        assert_eq!(
+            policy.causal_anchors,
+            vec![
+                ExpertTarget {
+                    layer: 1,
+                    expert: 68
+                },
+                ExpertTarget {
+                    layer: 2,
+                    expert: 76
+                },
+                ExpertTarget {
+                    layer: 2,
+                    expert: 92
+                },
+                ExpertTarget {
+                    layer: 3,
+                    expert: 82
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dequantized_student_values_survive_codec_ingestion() {
+        for codec in [QuantType::Q2S4, QuantType::Q3] {
+            let source = (0..64)
+                .map(|index| ((index as f32 * 0.37).sin() * 3.0) + 0.25)
+                .collect::<Vec<_>>();
+            let trained = QuantizedTensor::quantize(&source, 2, 32, codec, 32).dequantize();
+            let compiled = quantize_student_matrix(&trained, 2, 32, codec).unwrap();
+            assert_eq!(compiled.dequantize(), trained);
+        }
     }
 }

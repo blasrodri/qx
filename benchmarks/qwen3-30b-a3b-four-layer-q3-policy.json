@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "classification": "qx-qwen-expert-weight-policy",
+  "policy_id": "qwen3-30b-a3b-a19pro-q2s4-q3-early4-v1",
+  "model_id": "Qwen/Qwen3-30B-A3B",
+  "screening_reference_sha256": "0d003f48c75bd2f6448692cfe917e64f253f4e0e9b6fa89a50fc8c9f88f5f8f5",
+  "selection_evidence": "causal-layers00-01-02-03-q3-anchors68-92-76-82-general4-packed-gpu20.json",
+  "selection_evidence_sha256": "4ce7ae49f8c83d04ecb320339ec380f2135e38eb7b7e171ece2e83f1a3a7164d",
+  "frozen_evidence": "causal-layers00-01-02-03-q3-anchors68-92-76-82-untouched8-packed-gpu20.json",
+  "frozen_evidence_sha256": "06f59cc34a84293cb58abb2853a44ff4d190708fa500204f60127c0dd028cb67",
+  "student_width": 768,
+  "default_student_codec": "q2_s4",
+  "q3_layers": [0, 1, 2, 3],
+  "validated_layers": [0, 1, 2, 3],
+  "causal_anchors": [
+    { "layer": 1, "expert": 68 },
+    { "layer": 2, "expert": 76 },
+    { "layer": 2, "expert": 92 },
+    { "layer": 3, "expert": 82 }
+  ]
+}

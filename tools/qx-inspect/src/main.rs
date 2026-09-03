@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use qx_format::{ExpertRepresentation, ExpertWeightPlan, TensorDirectoryEntry, TensorKind};
 use qx_model::{
     Granite3A400M, ModelArchitecture, ModelShape, QWEN3_30B_A3B_MODEL_ID, Qwen3MoeConfig,
 };
@@ -138,6 +139,7 @@ struct ArtifactAudit {
     tensor_entries: usize,
     q2_entries: usize,
     q2s4_entries: usize,
+    q3_entries: usize,
     q4_entries: usize,
     raw_entries: usize,
     gate_up_entries: usize,
@@ -146,6 +148,8 @@ struct ArtifactAudit {
     memory_plan: ArtifactMemoryAudit,
     model_shape: Option<ModelShape>,
     plan_id: Option<String>,
+    expert_policy_id: Option<String>,
+    expert_policy_validated_layers: Vec<u16>,
     limitations: Vec<&'static str>,
 }
 
@@ -191,7 +195,7 @@ fn main() -> Result<()> {
             println!("artifact audit: {}", output.display());
         }
         if !audit.capacity_baseline_complete {
-            bail!("artifact failed the Qwen capacity-baseline contract");
+            bail!("artifact failed the Qwen capacity-artifact contract");
         }
         return Ok(());
     }
@@ -267,6 +271,11 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
         .iter()
         .filter(|entry| entry.group_size != 0 && entry.quant_type == QuantType::Q2S4)
         .count();
+    let q3_entries = info
+        .entries
+        .iter()
+        .filter(|entry| entry.group_size != 0 && entry.quant_type == QuantType::Q3)
+        .count();
     let q4_entries = info
         .entries
         .iter()
@@ -288,12 +297,22 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
         .filter(|entry| entry.kind == qx_format::TensorKind::Down)
         .count();
     let plan = info.execution_plan.as_ref();
-    let complete = info.header.model_id == QWEN3_30B_A3B_MODEL_ID
+    let expert_entries = info
+        .entries
+        .iter()
+        .filter(|entry| entry.is_expert())
+        .count();
+    let dense_quantized_entries = info
+        .entries
+        .iter()
+        .filter(|entry| entry.group_size != 0 && !entry.is_expert())
+        .count();
+    let common_complete = info.header.model_id == QWEN3_30B_A3B_MODEL_ID
         && info.header.target_id == "apple-a19-pro"
         && info.header.context_limit == 4096
         && info.entries.len() == 12_723
-        && q2_entries + q2s4_entries == 12_288
-        && q4_entries == 242
+        && expert_entries == 12_288
+        && dense_quantized_entries == 242
         && raw_entries == 193
         && gate_up_entries == 6_144
         && down_entries == 6_144
@@ -304,6 +323,14 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
                     && shape.expert_intermediate == 768
             })
         && plan.is_some_and(|plan| plan.schedule.expected_dispatches_per_token == 0);
+    let homogeneous_complete =
+        q3_entries == 0 && q4_entries == 242 && q2_entries + q2s4_entries == 12_288;
+    let heterogeneous_complete = plan
+        .and_then(|plan| plan.expert_weights.as_ref())
+        .is_some_and(|policy| {
+            heterogeneous_policy_matches(&info.entries, policy, &info.header.model_id)
+        });
+    let complete = common_complete && (homogeneous_complete || heterogeneous_complete);
     let memory = info.memory_plan;
     let runtime_bytes = memory.total_bytes - memory.weights_bytes - memory.kv_cache_bytes;
     let file_bytes = fs::metadata(path)?.len();
@@ -324,7 +351,9 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
         .saturating_sub(info.header.weights_length);
     Ok(ArtifactAudit {
         schema_version: 2,
-        classification: if q2s4_entries == 12_288 {
+        classification: if plan.and_then(|plan| plan.expert_weights.as_ref()).is_some() {
+            "qwen3-a19pro-heterogeneous-capacity-candidate-artifact"
+        } else if q2s4_entries == 12_288 {
             "qwen3-a19pro-q2s4-capacity-candidate-artifact"
         } else {
             "qwen3-a19pro-q2-capacity-baseline-artifact"
@@ -339,6 +368,7 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
         tensor_entries: info.entries.len(),
         q2_entries,
         q2s4_entries,
+        q3_entries,
         q4_entries,
         raw_entries,
         gate_up_entries,
@@ -358,12 +388,101 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
         },
         model_shape: plan.and_then(|plan| plan.model_shape.clone()),
         plan_id: plan.map(|plan| plan.plan_id.clone()),
+        expert_policy_id: plan
+            .and_then(|plan| plan.expert_weights.as_ref())
+            .map(|policy| policy.policy_id.clone()),
+        expert_policy_validated_layers: plan
+            .and_then(|plan| plan.expert_weights.as_ref())
+            .map(|policy| policy.validated_layers.clone())
+            .unwrap_or_default(),
         limitations: vec![
             "the expert codec has not passed end-to-end perplexity and task quality gates",
             "the Qwen Metal runtime and physical iPhone memory gate are not implemented",
             "this artifact validates capacity and conversion only; it is not an app release model",
         ],
     })
+}
+
+fn heterogeneous_policy_matches(
+    entries: &[TensorDirectoryEntry],
+    policy: &ExpertWeightPlan,
+    model_id: &str,
+) -> bool {
+    if model_id != QWEN3_30B_A3B_MODEL_ID || policy.layers.len() != 48 {
+        return false;
+    }
+    let expert_tensors = entries
+        .iter()
+        .filter(|entry| entry.is_expert() && entry.group_size != 0)
+        .map(|entry| {
+            (
+                (entry.layer, entry.expert, entry.kind as u8),
+                entry.quant_type,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if expert_tensors.len() != 12_288 {
+        return false;
+    }
+    for (expected_layer, layer) in policy.layers.iter().enumerate() {
+        if usize::from(layer.layer) != expected_layer {
+            return false;
+        }
+        let students = layer
+            .student_experts
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let sources = layer
+            .source_experts
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let anchors = layer
+            .causal_anchors
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if students.len() != layer.student_experts.len()
+            || sources.len() != layer.source_experts.len()
+            || anchors.len() != layer.causal_anchors.len()
+            || !students.is_disjoint(&sources)
+            || !anchors.is_subset(&sources)
+            || students.union(&sources).copied().ne(0_u8..128)
+        {
+            return false;
+        }
+        let Some(student_quant) = representation_quant_type(layer.student_representation) else {
+            return false;
+        };
+        let Some(source_quant) = representation_quant_type(layer.source_representation) else {
+            return false;
+        };
+        for (experts, quant_type) in [(&students, student_quant), (&sources, source_quant)] {
+            for expert in experts {
+                for kind in [TensorKind::GateUp, TensorKind::Down] {
+                    if expert_tensors.get(&(layer.layer, *expert, kind as u8)) != Some(&quant_type)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    policy
+        .validated_layers
+        .iter()
+        .all(|layer| usize::from(*layer) < policy.layers.len())
+}
+
+fn representation_quant_type(representation: ExpertRepresentation) -> Option<QuantType> {
+    match representation {
+        ExpertRepresentation::Group32Q2RowMajor => Some(QuantType::Q2),
+        ExpertRepresentation::Group32Q2S4RowMajor => Some(QuantType::Q2S4),
+        ExpertRepresentation::Group32Q3RowMajor => Some(QuantType::Q3),
+        ExpertRepresentation::Group32Q4RowMajor => Some(QuantType::Q4),
+        _ => None,
+    }
 }
 
 fn unique_entry_payload_bytes<'a>(
@@ -388,8 +507,8 @@ fn print_artifact_audit(audit: &ArtifactAudit) {
     println!("file bytes:         {}", audit.file_bytes);
     println!("tensor entries:     {}", audit.tensor_entries);
     println!(
-        "Q2/Q2S4/Q4/raw:    {}/{}/{}/{}",
-        audit.q2_entries, audit.q2s4_entries, audit.q4_entries, audit.raw_entries
+        "Q2/Q2S4/Q3/Q4/raw: {}/{}/{}/{}/{}",
+        audit.q2_entries, audit.q2s4_entries, audit.q3_entries, audit.q4_entries, audit.raw_entries
     );
     println!(
         "gate-up/down:       {}/{}",
@@ -413,6 +532,13 @@ fn print_artifact_audit(audit: &ArtifactAudit) {
     println!("logical total:      {}", audit.memory_plan.total_bytes);
     println!("capacity complete:  {}", audit.capacity_baseline_complete);
     println!("execution promoted: {}", audit.execution_promoted);
+    if let Some(policy_id) = &audit.expert_policy_id {
+        println!("expert policy:      {policy_id}");
+        println!(
+            "validated layers:   {:?}",
+            audit.expert_policy_validated_layers
+        );
+    }
 }
 
 fn inspect_config(root: &std::path::Path) -> Result<InspectedModel> {
@@ -904,5 +1030,64 @@ mod tests {
             expected["model.layers.47.mlp.experts.127.down_proj.weight"],
             vec![2048, 768]
         );
+    }
+
+    #[test]
+    fn heterogeneous_policy_must_match_every_expert_tensor() {
+        let mut entries = Vec::with_capacity(12_288);
+        let mut layers = Vec::with_capacity(48);
+        for layer in 0_u16..48 {
+            for expert in 0_u8..128 {
+                for kind in [TensorKind::GateUp, TensorKind::Down] {
+                    entries.push(TensorDirectoryEntry {
+                        layer,
+                        expert,
+                        quant_type: if expert == 127 {
+                            QuantType::Q4
+                        } else {
+                            QuantType::Q2S4
+                        },
+                        layout: qx_quant::PackingLayout::RowMajor,
+                        kind,
+                        rows: 1,
+                        cols: 32,
+                        group_size: 32,
+                        scale_offset: 0,
+                        scale_length: 2,
+                        data_offset: 0,
+                        data_length: 8,
+                    });
+                }
+            }
+            layers.push(qx_format::ExpertLayerWeightPlan {
+                layer,
+                student_representation: ExpertRepresentation::Group32Q2S4RowMajor,
+                source_representation: ExpertRepresentation::Group32Q4RowMajor,
+                student_experts: (0_u8..127).collect(),
+                source_experts: vec![127],
+                causal_anchors: vec![127],
+                training_manifest_sha256: "a".repeat(64),
+            });
+        }
+        let policy = ExpertWeightPlan {
+            policy_id: "test-policy".to_owned(),
+            screening_reference_sha256: "b".repeat(64),
+            selection_evidence_sha256: "c".repeat(64),
+            frozen_evidence_sha256: "d".repeat(64),
+            student_width: 768,
+            validated_layers: vec![0],
+            layers,
+        };
+        assert!(heterogeneous_policy_matches(
+            &entries,
+            &policy,
+            QWEN3_30B_A3B_MODEL_ID
+        ));
+        entries[0].quant_type = QuantType::Q3;
+        assert!(!heterogeneous_policy_matches(
+            &entries,
+            &policy,
+            QWEN3_30B_A3B_MODEL_ID
+        ));
     }
 }

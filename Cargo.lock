@@ -418,6 +418,7 @@ dependencies = [
  "qx-safetensors",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

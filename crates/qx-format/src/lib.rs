@@ -203,6 +203,38 @@ pub struct RepresentationPlan {
     pub dense: ExpertRepresentation,
 }
 
+/// One layer of a compiler-selected heterogeneous expert-weight policy.
+///
+/// Student and source expert IDs are explicit and exhaustive so artifact
+/// inspection can prove which payload was selected without reopening the
+/// training manifests. Causal anchors are a subset of `source_experts`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExpertLayerWeightPlan {
+    pub layer: u16,
+    pub student_representation: ExpertRepresentation,
+    pub source_representation: ExpertRepresentation,
+    pub student_experts: Vec<u8>,
+    pub source_experts: Vec<u8>,
+    pub causal_anchors: Vec<u8>,
+    pub training_manifest_sha256: String,
+}
+
+/// Checkpoint-specific model transformation sealed into an artifact.
+///
+/// `validated_layers` records the scope of the causal screening evidence. It
+/// must not be interpreted as a release-quality claim for layers outside that
+/// set or for the complete composed model.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExpertWeightPlan {
+    pub policy_id: String,
+    pub screening_reference_sha256: String,
+    pub selection_evidence_sha256: String,
+    pub frozen_evidence_sha256: String,
+    pub student_width: u16,
+    pub validated_layers: Vec<u16>,
+    pub layers: Vec<ExpertLayerWeightPlan>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExpertTraversalKind {
@@ -361,6 +393,11 @@ pub struct ExecutionPlanManifest {
     pub quality_budget: QualityBudget,
     pub memory: CompiledMemoryPlan,
     pub representations: RepresentationPlan,
+    /// Optional checkpoint-specific expert precision and source-fallback map.
+    /// Tensor directory tags remain the executable source of truth; this plan
+    /// preserves the compiler decision and its screening provenance.
+    #[serde(default)]
+    pub expert_weights: Option<ExpertWeightPlan>,
     pub topology: TopologyPlan,
     /// Optional compiler-selected MoE mapping. Older artifacts omit this and
     /// retain the runtime default; new factorial candidates persist the
@@ -473,6 +510,7 @@ impl ExecutionPlanManifest {
                 down: ExpertRepresentation::Group32Q4RowMajor,
                 dense: ExpertRepresentation::Group32Q4RowMajor,
             },
+            expert_weights: None,
             topology: TopologyPlan {
                 qkv: QkvTopology::Fused,
                 input_rms: RmsTopology::ScalarConsumer,
@@ -2107,6 +2145,36 @@ mod tests {
             tile_rows: 8,
             expert_count: 32,
             active_k: 8,
+        });
+        let encoded = serde_json::to_vec(&manifest).unwrap();
+        let decoded: ExecutionPlanManifest = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn manifest_round_trip_records_heterogeneous_expert_weights() {
+        let mut manifest = ExecutionPlanManifest::granite_m5_canonical(
+            "qwen",
+            "apple-a19-pro",
+            4096,
+            MemoryPlan::default(),
+        );
+        manifest.expert_weights = Some(ExpertWeightPlan {
+            policy_id: "qwen-test".to_owned(),
+            screening_reference_sha256: "a".repeat(64),
+            selection_evidence_sha256: "b".repeat(64),
+            frozen_evidence_sha256: "c".repeat(64),
+            student_width: 768,
+            validated_layers: vec![0],
+            layers: vec![ExpertLayerWeightPlan {
+                layer: 0,
+                student_representation: ExpertRepresentation::Group32Q3RowMajor,
+                source_representation: ExpertRepresentation::Group32Q4RowMajor,
+                student_experts: vec![0, 2],
+                source_experts: vec![1],
+                causal_anchors: vec![1],
+                training_manifest_sha256: "d".repeat(64),
+            }],
         });
         let encoded = serde_json::to_vec(&manifest).unwrap();
         let decoded: ExecutionPlanManifest = serde_json::from_slice(&encoded).unwrap();

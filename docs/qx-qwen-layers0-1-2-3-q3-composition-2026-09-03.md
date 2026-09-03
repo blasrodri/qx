@@ -74,9 +74,63 @@ At product FP16-scale Q3 density, the 454 transformed experts occupy about
 893.81 MiB. Moving layer 2 from its Q2S4 policy to 106 Q3 students costs about
 59.63 MiB; preserving `2:76` exact costs another approximately 0.95 MiB over
 Q3. The layer-2 increment is therefore about 60.57 MiB, and the estimated Q3
-precision premium across layers 0-3 is about 259.34 MiB. This remains compatible
-with the 7-8 GiB installed-weight target, which still requires a complete
-compiled artifact measurement.
+precision premium across layers 0-3 is about 259.34 MiB. The complete compiled
+artifact measurement below supersedes the earlier 7-8 GiB projection: retaining
+all under-evidenced experts at source Q4 costs substantially more than that
+projection allowed.
+
+## Compiled artifact result
+
+The compiler now accepts a checkpoint-specific expert policy plus the completed
+student-build directory. It validates both causal evidence hashes, every layer
+manifest, every student target and shape, and the declared quantization lattice.
+It then writes Q2S4, Q3, and exact Q4 expert tensors into their native typed
+artifact slabs. The execution plan records the explicit per-layer student and
+source-exact sets, causal anchors, manifest hashes, evidence hashes, and policy
+ID. `qx-inspect` verifies that plan against every expert tensor-directory entry.
+
+The first complete encode produced:
+
+| Measurement | Result |
+|---|---:|
+| Artifact file | 11,538,169,856 bytes (10.746 GiB) |
+| Logical weights | 11,537,506,304 bytes (10.745 GiB) |
+| Modeled total at context 4096 | 11,941,398,016 bytes (11.121 GiB) |
+| Q2S4 tensor entries | 9,104 |
+| Q3 tensor entries | 908 |
+| Q4 tensor entries | 2,518 (2,276 expert + 242 dense) |
+| Raw vectors | 193 |
+| Artifact SHA-256 | `32be704346b44573da7cd5e218bd60e2f13f33be174d3048a0c5528a29f9b7e2` |
+
+The artifact contains 4,552 Q2S4 students, 454 Q3 students, and 1,138
+source-exact experts. It is 1,610,252,288 bytes (1.500 GiB) larger than the
+uniform Q2S4 capacity candidate. This result is mechanically complete but
+**misses the 7-8 GiB installed-weight target** and is not safe to claim as a
+12 GiB iPhone deployment: iOS, Metal allocations, and application memory need
+headroom beyond the modeled 11.121 GiB total.
+
+The artifact is at
+`external/models/qwen3-30b-a3b-a19pro-q2s4-q3-early4-v1.qx`; its audit is next
+to it as `.audit.json`. Both large outputs remain outside Git. Reproduce the
+policy preflight and encode with:
+
+```sh
+cargo run --release -p qx-compile-qwen -- \
+  external/models/qwen3-30b-a3b-hf-ad44e777 \
+  --source-audit benchmarks/results/qwen3-30b-a3b-bf16-source-audit-2026-08-25.json \
+  --expert-policy benchmarks/qwen3-30b-a3b-four-layer-q3-policy.json \
+  --expert-build-dir external/results/qwen3-full-q2s4-build \
+  --output external/models/qwen3-30b-a3b-a19pro-q2s4-q3-early4-v1.qx \
+  --context 4096 \
+  --plan-id qwen3-30b-a3b-a19pro-q2s4-q3-early4-v1
+```
+
+This is a capacity artifact, not an execution promotion. The Qwen runtime still
+needs consumer-native mixed Q2S4/Q3/Q4 dispatch, and the complete composed model
+still needs a much broader quality gate. Reaching the phone memory target now
+requires reducing the exact-Q4 fallback population and/or a validated narrower
+student tier; further packaging optimization cannot recover the missing 2.7+
+GiB by itself.
 
 ## Evidence
 
@@ -100,6 +154,7 @@ evidence-retained source experts. This promotion is specific to the composed
 policy: do not infer that the isolated layer-2 Q3 policy passes, and do not
 choose exact experts from reconstruction error alone.
 
-The next bounded step is to encode this heterogeneous policy in the compiler's
-artifact plan and measure the complete installed artifact rather than opening
-another early-layer expert scan.
+The heterogeneous policy is now encoded and measured. The next bounded step is
+not another early-layer scan: it is to attack the 1,138 source-exact experts as
+a distinct memory frontier, while preserving this artifact as the reproducible
+quality/capacity control.
