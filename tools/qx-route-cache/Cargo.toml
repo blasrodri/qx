@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+libc.workspace = true
 qx-format.workspace = true
 qx-quant.workspace = true
 serde.workspace = true

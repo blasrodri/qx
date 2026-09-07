@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-30b-a3b-tiered-residency-physical-io-screen",
+  "promotion_evidence": false,
+  "measurement_semantics": "serial-positional-artifact-reads-into-bounded-ram-lru",
+  "device": {
+    "model": "MacBook Pro",
+    "identifier": "Mac17,9",
+    "chip": "Apple M5 Pro",
+    "memory_gib": 24,
+    "os_kernel": "Darwin 25.5.0"
+  },
+  "artifact": {
+    "policy_id": "qwen3-30b-a3b-a19pro-q2s4-q3-early4-v1",
+    "sha256": "32be704346b44573da7cd5e218bd60e2f13f33be174d3048a0c5528a29f9b7e2",
+    "file_bytes": 11538169856,
+    "source_exact_expert_bytes": 2654208,
+    "physical_ranges_per_source_exact_expert": 4
+  },
+  "configuration": {
+    "cache_mib": 128,
+    "cache_capacity_experts": 50,
+    "modeled_resident_gib": 8.433244228363037,
+    "tokens": 567,
+    "expert_route_lookups": 217728,
+    "streamed_expert_lookups": 1830,
+    "streamed_expert_route_fraction": 0.008404982363315697,
+    "read_mode": "macos-f-nocache",
+    "reads_are_serial": true
+  },
+  "persistent_cache": {
+    "passes": 5,
+    "cache_misses_per_pass": 639,
+    "hit_rate": 0.6508196721311476,
+    "physical_read_bytes_per_pass": 1696038912,
+    "median_mean_io_ms_per_token": 0.3671696754850083,
+    "median_p95_io_ms_per_token": 1.771875,
+    "median_p99_io_ms_per_token": 3.949542,
+    "median_mean_miss_ms": 0.3219994084507043,
+    "median_p95_miss_ms": 0.602,
+    "median_p99_miss_ms": 0.658459,
+    "median_elapsed_ms": 208.284208,
+    "maximum_io_ms_in_four_clean_passes": 7.142416000000001,
+    "maximum_io_ms_all_passes": 503.998167,
+    "outlier_passes": 1
+  },
+  "request_reset_cache": {
+    "passes": 3,
+    "cache_misses_per_pass": 705,
+    "hit_rate": 0.6147540983606558,
+    "physical_read_bytes_per_pass": 1871216640,
+    "median_mean_io_ms_per_token": 0.38203216225749576,
+    "median_p95_io_ms_per_token": 1.812708,
+    "median_p99_io_ms_per_token": 4.004125,
+    "median_mean_miss_ms": 0.3040546609929078,
+    "median_p95_miss_ms": 0.596125,
+    "median_p99_miss_ms": 0.6300840000000001,
+    "median_elapsed_ms": 216.714084,
+    "maximum_io_ms_all_passes": 6.634792
+  },
+  "raw_report_sha256": {
+    "persistent_1": "62e41d9546fc11f2b5ddf1ae630102153d2bca0129032df055244854466d4c78",
+    "persistent_2": "c678d19f3789437db5689fcd5109de503645dedb4787aedebd45abb5691269c5",
+    "persistent_3": "c4b956500869ca98e25bb7b168f6e9acc95e2832a56207ddb0b300df3444a1de",
+    "persistent_4": "27972cfbf7e167b827341eecc3c3bb9337b8f2d3c09a54f18196b144fa750740",
+    "persistent_5": "6cb3f18b4332c84d4579a2388ca810b39716d8f9b412d29d53ed87af2299ade3",
+    "request_reset_1": "df10a3f2aa223a016644331e7981de5b6ff8bd9faa0abc178b5cafcfadf1322c",
+    "request_reset_2": "81b37f1f0da02e2b06452c799757ce8b22cf3a5aa85a55c7e3237812796a0b3d",
+    "request_reset_3": "b502d00bb2c3890d7a3df803c00e94111fccdf40ce16fe303b89a113df24b27c"
+  },
+  "decision": {
+    "physical_read_feasibility": "pass-on-m5-pro",
+    "current_four-range-layout": "not-a-typical-tail-blocker",
+    "runtime_direction": "implement-router-triggered-asynchronous-prefetch-with-bounded-whole-expert-cache",
+    "stall_policy_required": true,
+    "claim_boundary": "this is Mac storage replay without Metal compute or upload, not iPhone throughput evidence"
+  },
+  "limitations": [
+    "F_NOCACHE prevents new unified-buffer-cache retention for the replay descriptor but does not emulate iPhone NAND, controller, or OS behavior",
+    "reads are serial and land in CPU RAM; Metal binding, upload, overlap, and contention are not measured",
+    "the route screen covers 567 teacher-forced tokens and only four layers have causal student-quality validation",
+    "one of five persistent-cache passes contained a 503.998 ms token stall, so direct synchronous storage remains unsafe",
+    "application, allocator, GPU, and jetsam memory are not measured"
+  ]
+}

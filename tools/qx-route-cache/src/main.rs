@@ -7,11 +7,14 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ffi::{CStr, CString, OsString, c_char, c_int, c_void};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const SCHEMA_VERSION: u32 = 1;
 const SIMULATION_SCHEMA_VERSION: u32 = 3;
+const IO_REPLAY_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_Q3_EXPERT_BYTES: u64 = 2_064_384;
 const DEFAULT_EXPERT_NEURONS: usize = 768;
 const MAX_GREEDY_CONTRIBUTION_PACKETS: usize = 64;
@@ -188,6 +191,29 @@ enum Command {
         #[arg(long)]
         reset_between_requests: bool,
         /// Only score these phases while still using earlier phases to warm the cache.
+        #[arg(long = "measure-phase", value_delimiter = ',')]
+        measure_phases: Vec<String>,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Replay the cold expert tier through real artifact reads and a bounded RAM cache.
+    ReplayArtifactIo {
+        /// Route traces to replay as one ordered evaluation set.
+        #[arg(long, required = true)]
+        trace: Vec<PathBuf>,
+        /// Compiled heterogeneous artifact whose source-exact tier is fetched.
+        #[arg(long)]
+        artifact: PathBuf,
+        /// Maximum bytes retained by the whole-expert RAM cache.
+        #[arg(long, value_parser = parse_bytes, default_value = "128MiB")]
+        budget: u64,
+        /// Bypass the macOS unified file cache with F_NOCACHE.
+        #[arg(long)]
+        uncached_reads: bool,
+        /// Empty the expert cache at every request boundary.
+        #[arg(long)]
+        reset_between_requests: bool,
+        /// Only score these phases while earlier phases still warm the cache.
         #[arg(long = "measure-phase", value_delimiter = ',')]
         measure_phases: Vec<String>,
         #[arg(long)]
@@ -641,6 +667,47 @@ struct ArtifactResidencyReport {
     kv_cache_bytes: u64,
     runtime_bytes: u64,
     resident_total_without_cache_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ArtifactReadRange {
+    offset: u64,
+    length: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactIoReplayReport {
+    schema_version: u32,
+    traces: Vec<String>,
+    artifact_residency: ArtifactResidencyReport,
+    cache_budget_bytes: u64,
+    modeled_resident_total_bytes: u64,
+    cache_capacity_experts: usize,
+    cache_mode: String,
+    reset_between_requests: bool,
+    measure_phases: Vec<String>,
+    token_records: usize,
+    expert_route_lookups: u64,
+    streamed_expert_lookups: u64,
+    streamed_expert_route_fraction: f64,
+    cache_hits: u64,
+    cache_misses: u64,
+    hit_rate: f64,
+    evictions: u64,
+    physical_read_calls: u64,
+    physical_read_bytes: u64,
+    mean_read_calls_per_miss: f64,
+    mean_io_ms_per_token: f64,
+    p50_io_ms_per_token: f64,
+    p95_io_ms_per_token: f64,
+    p99_io_ms_per_token: f64,
+    maximum_io_ms_per_token: f64,
+    mean_miss_ms: f64,
+    p50_miss_ms: f64,
+    p95_miss_ms: f64,
+    p99_miss_ms: f64,
+    elapsed_ms: f64,
+    checksum: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -1294,6 +1361,23 @@ fn main() -> Result<()> {
             measure_phases,
             output,
         }),
+        Command::ReplayArtifactIo {
+            trace,
+            artifact,
+            budget,
+            uncached_reads,
+            reset_between_requests,
+            measure_phases,
+            output,
+        } => replay_artifact_io(ReplayArtifactIoArgs {
+            trace,
+            artifact,
+            budget,
+            uncached_reads,
+            reset_between_requests,
+            measure_phases,
+            output,
+        }),
         Command::Oracle {
             trace,
             thresholds,
@@ -1780,6 +1864,16 @@ struct SimulateArgs {
     io_bandwidth_mib_s: Option<f64>,
     io_fixed_us: f64,
     io_parallelism: usize,
+    reset_between_requests: bool,
+    measure_phases: Vec<String>,
+    output: PathBuf,
+}
+
+struct ReplayArtifactIoArgs {
+    trace: Vec<PathBuf>,
+    artifact: PathBuf,
+    budget: u64,
+    uncached_reads: bool,
     reset_between_requests: bool,
     measure_phases: Vec<String>,
     output: PathBuf,
@@ -5182,6 +5276,7 @@ fn select_contribution_packets(curve: &[f32], target: f64) -> Result<(usize, f64
 
 struct ResolvedArtifactTier {
     streamed_experts: HashSet<ExpertKey>,
+    read_ranges: HashMap<ExpertKey, Vec<ArtifactReadRange>>,
     expert_bytes: u64,
     report: ArtifactResidencyReport,
 }
@@ -5244,6 +5339,7 @@ fn resolve_artifact_tier(path: &Path, trace_header: &TraceHeader) -> Result<Reso
 
     let mut expert_bytes = None;
     let mut streamed_weight_bytes = 0_u64;
+    let mut read_ranges = HashMap::with_capacity(streamed_experts.len());
     for &(layer, expert) in &streamed_experts {
         let entries = info
             .entries
@@ -5270,6 +5366,30 @@ fn resolve_artifact_tier(path: &Path, trace_header: &TraceHeader) -> Result<Reso
         if expert_bytes.is_some_and(|expected| expected != bytes) {
             bail!("source-exact expert payloads are not uniformly sized");
         }
+        let mut ranges = entries
+            .iter()
+            .flat_map(|entry| {
+                [
+                    ArtifactReadRange {
+                        offset: entry.scale_offset,
+                        length: entry.scale_length,
+                    },
+                    ArtifactReadRange {
+                        offset: entry.data_offset,
+                        length: entry.data_length,
+                    },
+                ]
+            })
+            .filter(|range| range.length > 0)
+            .collect::<Vec<_>>();
+        ranges.sort_unstable_by_key(|range| range.offset);
+        if ranges
+            .windows(2)
+            .any(|pair| pair[0].offset.saturating_add(pair[0].length) > pair[1].offset)
+        {
+            bail!("source-exact tensor ranges overlap at {layer}:{expert}");
+        }
+        read_ranges.insert((layer, expert), ranges);
         expert_bytes = Some(bytes);
         streamed_weight_bytes = streamed_weight_bytes
             .checked_add(bytes)
@@ -5293,6 +5413,7 @@ fn resolve_artifact_tier(path: &Path, trace_header: &TraceHeader) -> Result<Reso
     let resident_experts = trace_header.layers * trace_header.experts - streamed_experts.len();
     Ok(ResolvedArtifactTier {
         streamed_experts,
+        read_ranges,
         expert_bytes,
         report: ArtifactResidencyReport {
             artifact: path.display().to_string(),
@@ -5310,6 +5431,227 @@ fn resolve_artifact_tier(path: &Path, trace_header: &TraceHeader) -> Result<Reso
             resident_total_without_cache_bytes,
         },
     })
+}
+
+fn replay_artifact_io(args: ReplayArtifactIoArgs) -> Result<()> {
+    let ReplayArtifactIoArgs {
+        trace,
+        artifact,
+        budget,
+        uncached_reads,
+        reset_between_requests,
+        measure_phases,
+        output,
+    } = args;
+    if budget == 0 {
+        bail!("cache budget must be positive");
+    }
+    let first_trace = trace.first().context("provide at least one route trace")?;
+    let trace_header = read_trace_header(first_trace)?;
+    let tier = resolve_artifact_tier(&artifact, &trace_header)?;
+    let capacity =
+        usize::try_from(budget / tier.expert_bytes).context("cache capacity does not fit usize")?;
+    if capacity == 0 {
+        bail!(
+            "cache budget is smaller than one source-exact expert ({} bytes)",
+            tier.expert_bytes
+        );
+    }
+    let mut tokens = Vec::new();
+    for path in &trace {
+        tokens.extend(load_simulation_tokens(path, &trace_header)?);
+    }
+    if tokens.is_empty() {
+        bail!("trace contains no token records");
+    }
+    let measured_phase_set = measure_phases.iter().cloned().collect::<HashSet<_>>();
+    let file = File::open(&artifact)
+        .with_context(|| format!("open artifact payload {}", artifact.display()))?;
+    configure_uncached_reads(&file, uncached_reads)?;
+    let expert_buffer_bytes = usize::try_from(tier.expert_bytes)
+        .context("source-exact expert payload does not fit usize")?;
+    let mut cache = ArtifactIoCache::new(capacity, expert_buffer_bytes);
+    let replay_started = Instant::now();
+    let mut previous_request = None::<String>;
+    let mut token_io_ms = Vec::new();
+    let mut miss_ms = Vec::new();
+    let mut token_records = 0usize;
+    let mut streamed_expert_lookups = 0u64;
+    let mut cache_hits = 0u64;
+    let mut cache_misses = 0u64;
+    let mut evictions = 0u64;
+    let mut physical_read_calls = 0u64;
+    let mut physical_read_bytes = 0u64;
+    let mut checksum = 0u64;
+
+    for token in &tokens {
+        if reset_between_requests
+            && previous_request
+                .as_ref()
+                .is_some_and(|previous| previous != &token.request_id)
+        {
+            cache.clear();
+        }
+        previous_request = Some(token.request_id.clone());
+        let measured =
+            measured_phase_set.is_empty() || measured_phase_set.contains(token.phase.as_str());
+        let token_started = Instant::now();
+        let mut token_hits = 0u64;
+        let mut token_misses = 0u64;
+        let mut token_evictions = 0u64;
+        let mut token_read_calls = 0u64;
+        let mut token_read_bytes = 0u64;
+        let mut token_miss_ms = Vec::new();
+        for (layer, experts) in token.routes.iter().enumerate() {
+            for &expert in experts {
+                let key = (layer as u16, expert);
+                if !tier.streamed_experts.contains(&key) {
+                    continue;
+                }
+                if cache.touch(key) {
+                    token_hits += 1;
+                    continue;
+                }
+                token_misses += 1;
+                let ranges = tier
+                    .read_ranges
+                    .get(&key)
+                    .with_context(|| format!("missing artifact ranges for {layer}:{expert}"))?;
+                let (mut buffer, evicted) = cache.acquire_buffer();
+                token_evictions += u64::from(evicted);
+                let miss_started = Instant::now();
+                let (read_calls, read_bytes, read_checksum) =
+                    read_artifact_ranges(&file, ranges, &mut buffer)?;
+                let elapsed = miss_started.elapsed().as_secs_f64() * 1_000.0;
+                token_miss_ms.push(elapsed);
+                token_read_calls += read_calls;
+                token_read_bytes += read_bytes;
+                checksum = checksum.wrapping_add(read_checksum);
+                cache.insert(key, buffer);
+            }
+        }
+        if measured {
+            token_records += 1;
+            cache_hits += token_hits;
+            cache_misses += token_misses;
+            evictions += token_evictions;
+            physical_read_calls += token_read_calls;
+            physical_read_bytes += token_read_bytes;
+            streamed_expert_lookups += token_hits + token_misses;
+            miss_ms.extend(token_miss_ms);
+            token_io_ms.push(token_started.elapsed().as_secs_f64() * 1_000.0);
+        }
+    }
+    if token_records == 0 {
+        bail!("selected measurement phases contain no token records");
+    }
+    let expert_route_lookups =
+        token_records as u64 * trace_header.layers as u64 * trace_header.top_k as u64;
+    let modeled_resident_total_bytes = tier
+        .report
+        .resident_total_without_cache_bytes
+        .checked_add(budget)
+        .context("modeled resident total overflow")?;
+    let report = ArtifactIoReplayReport {
+        schema_version: IO_REPLAY_SCHEMA_VERSION,
+        traces: trace
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        artifact_residency: tier.report,
+        cache_budget_bytes: budget,
+        modeled_resident_total_bytes,
+        cache_capacity_experts: capacity,
+        cache_mode: if uncached_reads {
+            "macos-f-nocache".to_owned()
+        } else {
+            "buffered".to_owned()
+        },
+        reset_between_requests,
+        measure_phases,
+        token_records,
+        expert_route_lookups,
+        streamed_expert_lookups,
+        streamed_expert_route_fraction: streamed_expert_lookups as f64
+            / expert_route_lookups.max(1) as f64,
+        cache_hits,
+        cache_misses,
+        hit_rate: cache_hits as f64 / streamed_expert_lookups.max(1) as f64,
+        evictions,
+        physical_read_calls,
+        physical_read_bytes,
+        mean_read_calls_per_miss: physical_read_calls as f64 / cache_misses.max(1) as f64,
+        mean_io_ms_per_token: mean_f64(&token_io_ms).unwrap_or(0.0),
+        p50_io_ms_per_token: percentile_f64(&token_io_ms, 0.50).unwrap_or(0.0),
+        p95_io_ms_per_token: percentile_f64(&token_io_ms, 0.95).unwrap_or(0.0),
+        p99_io_ms_per_token: percentile_f64(&token_io_ms, 0.99).unwrap_or(0.0),
+        maximum_io_ms_per_token: token_io_ms.iter().copied().fold(0.0, f64::max),
+        mean_miss_ms: mean_f64(&miss_ms).unwrap_or(0.0),
+        p50_miss_ms: percentile_f64(&miss_ms, 0.50).unwrap_or(0.0),
+        p95_miss_ms: percentile_f64(&miss_ms, 0.95).unwrap_or(0.0),
+        p99_miss_ms: percentile_f64(&miss_ms, 0.99).unwrap_or(0.0),
+        elapsed_ms: replay_started.elapsed().as_secs_f64() * 1_000.0,
+        checksum,
+    };
+    let mut writer = BufWriter::new(
+        File::create(&output).with_context(|| format!("create {}", output.display()))?,
+    );
+    serde_json::to_writer_pretty(&mut writer, &report).context("write artifact I/O report")?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn configure_uncached_reads(file: &File, enabled: bool) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: F_NOCACHE only changes caching policy for this valid descriptor.
+        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error()).context("enable F_NOCACHE");
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file;
+        bail!("uncached artifact reads are currently implemented only on macOS")
+    }
+}
+
+fn read_artifact_ranges(
+    file: &File,
+    ranges: &[ArtifactReadRange],
+    buffer: &mut [u8],
+) -> Result<(u64, u64, u64)> {
+    let mut cursor = 0usize;
+    let mut checksum = 0u64;
+    for range in ranges {
+        let length = usize::try_from(range.length).context("artifact range does not fit usize")?;
+        let end = cursor
+            .checked_add(length)
+            .context("artifact read buffer length overflow")?;
+        let destination = buffer
+            .get_mut(cursor..end)
+            .context("artifact read ranges exceed expert buffer")?;
+        #[cfg(unix)]
+        file.read_exact_at(destination, range.offset)
+            .with_context(|| format!("read artifact range at byte {}", range.offset))?;
+        #[cfg(not(unix))]
+        compile_error!("artifact I/O replay requires positional file reads");
+        checksum = checksum
+            .wrapping_add(destination.first().copied().unwrap_or(0) as u64)
+            .wrapping_add(destination.last().copied().unwrap_or(0) as u64);
+        cursor = end;
+    }
+    if cursor != buffer.len() {
+        bail!("artifact read ranges do not fill the expert buffer");
+    }
+    Ok((ranges.len() as u64, cursor as u64, checksum))
 }
 
 fn simulate(args: SimulateArgs) -> Result<()> {
@@ -5776,6 +6118,79 @@ fn load_simulation_tokens(
         Ok(())
     })?;
     Ok(tokens)
+}
+
+struct ArtifactIoCacheEntry {
+    bytes: Vec<u8>,
+    last_access: u64,
+}
+
+struct ArtifactIoCache {
+    capacity: usize,
+    expert_bytes: usize,
+    clock: u64,
+    entries: HashMap<ExpertKey, ArtifactIoCacheEntry>,
+    free: Vec<Vec<u8>>,
+}
+
+impl ArtifactIoCache {
+    fn new(capacity: usize, expert_bytes: usize) -> Self {
+        Self {
+            capacity,
+            expert_bytes,
+            clock: 0,
+            entries: HashMap::with_capacity(capacity),
+            free: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn touch(&mut self, key: ExpertKey) -> bool {
+        self.clock = self.clock.wrapping_add(1);
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return false;
+        };
+        entry.last_access = self.clock;
+        true
+    }
+
+    fn acquire_buffer(&mut self) -> (Vec<u8>, bool) {
+        if self.entries.len() < self.capacity {
+            let buffer = self
+                .free
+                .pop()
+                .unwrap_or_else(|| vec![0_u8; self.expert_bytes]);
+            return (buffer, false);
+        }
+        let oldest = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(&key, _)| key)
+            .expect("positive cache capacity is never empty when full");
+        let entry = self
+            .entries
+            .remove(&oldest)
+            .expect("oldest cache entry exists");
+        (entry.bytes, true)
+    }
+
+    fn insert(&mut self, key: ExpertKey, bytes: Vec<u8>) {
+        debug_assert_eq!(bytes.len(), self.expert_bytes);
+        self.clock = self.clock.wrapping_add(1);
+        self.entries.insert(
+            key,
+            ArtifactIoCacheEntry {
+                bytes,
+                last_access: self.clock,
+            },
+        );
+    }
+
+    fn clear(&mut self) {
+        self.free
+            .extend(self.entries.drain().map(|(_, entry)| entry.bytes));
+        self.clock = 0;
+    }
 }
 
 enum CacheState {
@@ -7654,6 +8069,27 @@ mod tests {
         assert!(cache.access((0, 1, 0), &mut evictions));
         assert!(!cache.access((0, 2, 0), &mut evictions));
         assert_eq!(evictions, 2);
+    }
+
+    #[test]
+    fn artifact_io_cache_reuses_the_evicted_buffer() {
+        let mut cache = ArtifactIoCache::new(2, 4);
+        assert!(!cache.touch((0, 1)));
+        let (mut first, evicted) = cache.acquire_buffer();
+        assert!(!evicted);
+        first.copy_from_slice(&[1, 2, 3, 4]);
+        cache.insert((0, 1), first);
+        let (second, evicted) = cache.acquire_buffer();
+        assert!(!evicted);
+        cache.insert((0, 2), second);
+        assert!(cache.touch((0, 1)));
+        let (reused, evicted) = cache.acquire_buffer();
+        assert!(evicted);
+        assert_eq!(reused, vec![0; 4]);
+        cache.insert((0, 3), reused);
+        assert!(cache.touch((0, 1)));
+        assert!(!cache.touch((0, 2)));
+        assert!(cache.touch((0, 3)));
     }
 
     #[test]

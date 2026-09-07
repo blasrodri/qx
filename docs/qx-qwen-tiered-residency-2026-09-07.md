@@ -50,6 +50,44 @@ in-flight fetches. It is not an iPhone storage measurement.
 The 128 MiB point is the first useful knee. Doubling it does not improve p95,
 and 512 MiB buys only 2.63 ms at p95 while consuming another 384 MiB.
 
+## Physical artifact-read control
+
+`qx-route-cache replay-artifact-io` turns the candidate into a real bounded
+RAM cache and reads the existing artifact at its actual tensor-directory
+offsets. A source-exact miss performs four positional reads: scale and data for
+gate-up, then scale and data for down. The macOS control enables `F_NOCACHE` so
+the replay descriptor does not retain newly read payloads in the unified file
+cache.
+
+Five persistent-cache passes on the 24 GiB M5 Pro produced the following
+median pass:
+
+| Metric | Physical result |
+|---|---:|
+| cold-tier cache hit rate | 65.08% |
+| bytes read per pass | 1,696,038,912 |
+| mean storage work per token | 0.367 ms |
+| p95 storage work per token | 1.772 ms |
+| p99 storage work per token | 3.950 ms |
+| mean time per missed expert | 0.322 ms |
+| p95 time per missed expert | 0.602 ms |
+
+Resetting the cache at every request boundary remains close: across three
+passes the median p95 is 1.813 ms/token and p99 is 4.004 ms/token. Therefore
+the current four-range physical layout is not a typical-read blocker on this
+machine, even without coalescing or concurrent reads.
+
+One persistent pass did contain a single 503.998 ms token stall; the other
+four passes had maxima at or below 7.143 ms. This is important architecture
+evidence, not noise to discard. Storage cannot synchronously gate every token.
+Router-triggered asynchronous prefetch, GPU work overlap, and a bounded stall
+fallback are required even though ordinary reads are fast.
+
+This remains a Mac storage result. It does not measure iPhone storage, Metal
+buffer binding, GPU contention, or delivered model throughput. The committed
+aggregate is
+`benchmarks/results/qwen3-30b-a3b-tiered-residency-physical-io-2026-09-07.json`.
+
 ## Cold-request control
 
 Resetting the LRU between every corpus paragraph prevents cross-request warming.
@@ -108,10 +146,22 @@ Add `--reset-between-requests` for the cold-request control. The committed
 aggregate is
 `benchmarks/results/qwen3-30b-a3b-tiered-residency-screen-2026-09-07.json`.
 
+The physical Mac control is:
+
+```sh
+target/release/qx-route-cache replay-artifact-io \
+  --trace external/results/qwen3-full-q2s4-build/captures/heldout/000/routes.jsonl \
+  --trace external/results/qwen3-full-q2s4-build/captures/heldout-extension/000/routes.jsonl \
+  --artifact external/models/qwen3-30b-a3b-a19pro-q2s4-q3-early4-v1.qx \
+  --budget 128MiB \
+  --uncached-reads \
+  --output external/results/qwen3-full-q2s4-build/tiered-residency-physical.json
+```
+
 ## Remaining gates
 
-1. Measure actual random and concurrent reads from the artifact on the target
-   iPhone, including the current split scale/data and gate-up/down slabs.
+1. Port the physical read replay to the target iPhone and repeat under storage,
+   thermal, and application-memory contention.
 2. Implement source-exact cache buffers and router-triggered prefetch in the
    Qwen runtime, with page-fault and GPU-wait instrumentation.
 3. Replace the tiny provisional scratch ledger with measured peak Metal,
