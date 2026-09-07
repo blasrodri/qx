@@ -58,6 +58,9 @@ pub enum ExpertRepresentation {
     /// Exact-Q4 256-weight blocks with contiguous code payload followed by
     /// eight FP16 group scales.
     Group32Q4Superblock144,
+    /// Exact-Q3 256-weight blocks with 96 contiguous code bytes followed by
+    /// eight FP16 group scales.
+    Group32Q3Superblock112,
     Q4K,
 }
 

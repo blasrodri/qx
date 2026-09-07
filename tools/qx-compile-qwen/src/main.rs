@@ -591,7 +591,7 @@ fn resolve_expert_policy(
             layer,
             student_representation: match codec {
                 QuantType::Q2S4 => ExpertRepresentation::Group32Q2S4RowMajor,
-                QuantType::Q3 => ExpertRepresentation::Group32Q3RowMajor,
+                QuantType::Q3 => ExpertRepresentation::Group32Q3Superblock112,
                 _ => unreachable!(),
             },
             source_representation: ExpertRepresentation::Group32Q4RowMajor,
@@ -701,7 +701,7 @@ fn quantize_student_matrix(
     if values.iter().any(|value| !value.is_finite()) {
         bail!("student matrix contains a non-finite value");
     }
-    let tensor = QuantizedTensor::quantize(values, rows, cols, codec, 32);
+    let mut tensor = QuantizedTensor::quantize(values, rows, cols, codec, 32);
     let decoded = tensor.dequantize();
     let scale = values.iter().copied().map(f32::abs).fold(0.0, f32::max);
     let tolerance = scale.max(1.0) * 2.0e-3;
@@ -711,6 +711,11 @@ fn quantize_student_matrix(
         .any(|(source, packed)| (source - packed).abs() > tolerance)
     {
         bail!("student matrix does not lie on the declared {codec} codec");
+    }
+    if codec == QuantType::Q3 {
+        tensor
+            .repack(PackingLayout::Q3Superblock112)
+            .map_err(anyhow::Error::msg)?;
     }
     Ok(tensor)
 }
@@ -866,7 +871,7 @@ fn finish_gate_up(
         kind: TensorKind::GateUp,
         tensor: QuantizedTensor {
             quant_type: gate.quant_type,
-            layout: PackingLayout::RowMajor,
+            layout: gate.layout,
             rows: gate.rows + up.rows,
             cols: gate.cols,
             group_size: gate.group_size,
@@ -1048,12 +1053,20 @@ mod tests {
     #[test]
     fn dequantized_student_values_survive_codec_ingestion() {
         for codec in [QuantType::Q2S4, QuantType::Q3] {
-            let source = (0..64)
+            let source = (0..512)
                 .map(|index| ((index as f32 * 0.37).sin() * 3.0) + 0.25)
                 .collect::<Vec<_>>();
-            let trained = QuantizedTensor::quantize(&source, 2, 32, codec, 32).dequantize();
-            let compiled = quantize_student_matrix(&trained, 2, 32, codec).unwrap();
+            let trained = QuantizedTensor::quantize(&source, 2, 256, codec, 32).dequantize();
+            let compiled = quantize_student_matrix(&trained, 2, 256, codec).unwrap();
             assert_eq!(compiled.dequantize(), trained);
+            assert_eq!(
+                compiled.layout,
+                if codec == QuantType::Q3 {
+                    PackingLayout::Q3Superblock112
+                } else {
+                    PackingLayout::RowMajor
+                }
+            );
         }
     }
 }

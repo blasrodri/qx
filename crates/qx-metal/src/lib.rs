@@ -14072,8 +14072,11 @@ pub mod platform {
                     return Err(format!("Qwen dynamic MoE {name} offset exceeds the slab"));
                 }
             }
-            if codecs.len() != EXPERTS || codecs.iter().any(|codec| !matches!(codec, 2 | 3 | 4)) {
-                return Err("Qwen dynamic MoE codecs must contain 128 Q2S4/Q3/Q4 IDs".to_owned());
+            if codecs.len() != EXPERTS || codecs.iter().any(|codec| !matches!(codec, 2 | 3 | 4 | 5))
+            {
+                return Err(
+                    "Qwen dynamic MoE codecs must contain 128 Q2S4/Q3/Q4/Q3-112 IDs".to_owned(),
+                );
             }
             let offset_buffer = |offsets: &[u64]| {
                 let bytes = unsafe {

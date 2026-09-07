@@ -290,6 +290,83 @@ inline float qx_qwen_q4_dot_device(
     return sum;
 }
 
+inline float qx_qwen_q3_dot8(uint packet, float4 x0, float4 x1, float scale) {
+    uint4 codes0 = (uint4(packet) >> uint4(0u, 3u, 6u, 9u)) & 0x7u;
+    uint4 codes1 = (uint4(packet) >> uint4(12u, 15u, 18u, 21u)) & 0x7u;
+    float4 weights0 = float4(int4(codes0) - 3) * scale;
+    float4 weights1 = float4(int4(codes1) - 3) * scale;
+    return dot(weights0, x0) + dot(weights1, x1);
+}
+
+inline uint qx_qwen_q3_packet24(device const uchar* stream, uint offset) {
+    packed_uchar4 bytes = *reinterpret_cast<device const packed_uchar4*>(stream + offset);
+    return as_type<uint>(bytes) & 0x00ffffffu;
+}
+
+inline float qx_qwen_q3_112_dot_device(
+    device const uchar* stream,
+    uint row,
+    uint blocks,
+    device const half* input) {
+    constexpr uint block_values = 256;
+    constexpr uint block_bytes = 112;
+    constexpr uint code_bytes = 96;
+    float sum = 0.0f;
+    uint row_base = row * blocks * block_bytes;
+    for (uint block = 0; block < blocks; ++block) {
+        uint block_base = row_base + block * block_bytes;
+        device const half* scales =
+            reinterpret_cast<device const half*>(stream + block_base + code_bytes);
+        for (uint group = 0; group < 8; ++group) {
+            float scale = float(scales[group]);
+            uint group_column = block * block_values + group * 32;
+            uint group_base = block_base + group * 12;
+            for (uint packet_index = 0; packet_index < 4; ++packet_index) {
+                uint column = group_column + packet_index * 8;
+                float4 x0 = float4(
+                    input[column], input[column + 1], input[column + 2], input[column + 3]);
+                float4 x1 = float4(input[column + 4], input[column + 5],
+                    input[column + 6], input[column + 7]);
+                uint packet = qx_qwen_q3_packet24(stream, group_base + packet_index * 3);
+                sum += qx_qwen_q3_dot8(packet, x0, x1, scale);
+            }
+        }
+    }
+    return sum;
+}
+
+inline float qx_qwen_q3_112_dot_threadgroup(
+    device const uchar* stream,
+    uint row,
+    uint blocks,
+    threadgroup const half* input) {
+    constexpr uint block_values = 256;
+    constexpr uint block_bytes = 112;
+    constexpr uint code_bytes = 96;
+    float sum = 0.0f;
+    uint row_base = row * blocks * block_bytes;
+    for (uint block = 0; block < blocks; ++block) {
+        uint block_base = row_base + block * block_bytes;
+        device const half* scales =
+            reinterpret_cast<device const half*>(stream + block_base + code_bytes);
+        for (uint group = 0; group < 8; ++group) {
+            float scale = float(scales[group]);
+            uint group_column = block * block_values + group * 32;
+            uint group_base = block_base + group * 12;
+            for (uint packet_index = 0; packet_index < 4; ++packet_index) {
+                uint column = group_column + packet_index * 8;
+                float4 x0 = float4(
+                    input[column], input[column + 1], input[column + 2], input[column + 3]);
+                float4 x1 = float4(input[column + 4], input[column + 5],
+                    input[column + 6], input[column + 7]);
+                uint packet = qx_qwen_q3_packet24(stream, group_base + packet_index * 3);
+                sum += qx_qwen_q3_dot8(packet, x0, x1, scale);
+            }
+        }
+    }
+    return sum;
+}
+
 kernel void qx_qwen_moe_dynamic(
     device const uchar* slab [[buffer(0)]],
     device const ulong* gate_data_offsets [[buffer(1)]],
@@ -340,6 +417,9 @@ kernel void qx_qwen_moe_dynamic(
                 }
             }
         }
+    } else if (codec == 5) {
+        gate = qx_qwen_q3_112_dot_device(gate_data, lane, gate_groups / 8, input);
+        up = qx_qwen_q3_112_dot_device(gate_data, up_row, gate_groups / 8, input);
     } else {
         for (uint column = 0; column < hidden; ++column) {
             float value = float(input[column]);
@@ -372,6 +452,9 @@ kernel void qx_qwen_moe_dynamic(
                     }
                 }
             }
+        } else if (codec == 5) {
+            down = qx_qwen_q3_112_dot_threadgroup(
+                down_data, row, down_groups / 8, activated);
         } else {
             for (uint column = 0; column < intermediate; ++column) {
                 down += qx_qwen_mixed_weight(
@@ -433,6 +516,9 @@ kernel void qx_qwen_moe_gate_dynamic(
             up += qx_qwen_mixed_weight(gate_data, gate_scales, up_row, column, groups, codec)
                 * value;
         }
+    } else if (codec == 5) {
+        gate = qx_qwen_q3_112_dot_device(gate_data, lane, groups / 8, input);
+        up = qx_qwen_q3_112_dot_device(gate_data, up_row, groups / 8, input);
     } else {
         gate = qx_qwen_q4_dot_device(gate_data, gate_scales, lane, groups, input);
         up = qx_qwen_q4_dot_device(gate_data, gate_scales, up_row, groups, input);
@@ -491,6 +577,8 @@ kernel void qx_qwen_moe_down_tiled_dynamic(
             down += qx_qwen_mixed_weight(down_data, down_scales, row, column, groups, codec)
                 * float(activated[column]);
         }
+    } else if (codec == 5) {
+        down = qx_qwen_q3_112_dot_device(down_data, row, groups / 8, activated);
     } else {
         down = qx_qwen_q4_dot_device(down_data, down_scales, row, groups, activated);
     }

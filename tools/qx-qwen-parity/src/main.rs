@@ -57,6 +57,7 @@ fn run() -> Result<()> {
     validate_artifact(&artifact, &args)?;
     let gate_index = find_expert(&artifact, args.layer, args.expert, TensorKind::GateUp)?;
     let down_index = find_expert(&artifact, args.layer, args.expert, TensorKind::Down)?;
+    let gate_layout = artifact.info().entries[gate_index].layout;
     let gate = artifact.quantized_tensor(gate_index)?;
     let down = artifact.quantized_tensor(down_index)?;
 
@@ -493,6 +494,7 @@ fn run() -> Result<()> {
     println!("gate/up:       {} x {}", gate.rows, gate.cols);
     println!("down:          {} x {}", down.rows, down.cols);
     println!("selected codec:{:?}", gate.quant_type);
+    println!("stored layout:  {gate_layout:?}");
     if let Some(metrics) = metrics.as_ref() {
         println!("max abs error: {:.8}", metrics.max_abs);
         println!("RMSE:          {:.8}", metrics.rmse);
@@ -870,7 +872,10 @@ fn find_expert(
         entry.quant_type,
         QuantType::Q2S4 | QuantType::Q3 | QuantType::Q4
     ) || entry.group_size != 32
-        || entry.layout != qx_quant::PackingLayout::RowMajor
+        || !matches!(
+            entry.layout,
+            qx_quant::PackingLayout::RowMajor | qx_quant::PackingLayout::Q3Superblock112
+        )
         || (entry.rows as usize, entry.cols as usize) != expected
     {
         bail!("unsupported Qwen expert entry {entry:?}");

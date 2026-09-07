@@ -4,7 +4,7 @@ use qx_format::{ExpertRepresentation, ExpertWeightPlan, TensorDirectoryEntry, Te
 use qx_model::{
     Granite3A400M, ModelArchitecture, ModelShape, QWEN3_30B_A3B_MODEL_ID, Qwen3MoeConfig,
 };
-use qx_quant::{QuantType, QuantizedTensor, q2_symmetric4_metrics};
+use qx_quant::{PackingLayout, QuantType, QuantizedTensor, q2_symmetric4_metrics};
 use qx_safetensors::{Checkpoint, TensorInfo};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -397,8 +397,8 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
             .unwrap_or_default(),
         limitations: vec![
             "the expert codec has not passed end-to-end perplexity and task quality gates",
-            "the Qwen Metal runtime and physical iPhone memory gate are not implemented",
-            "this artifact validates capacity and conversion only; it is not an app release model",
+            "bounded expert-cache residency and the physical iPhone memory gate are not implemented",
+            "the Mac Metal runtime passes sampled parity, but this is not an app release model",
         ],
     })
 }
@@ -417,7 +417,7 @@ fn heterogeneous_policy_matches(
         .map(|entry| {
             (
                 (entry.layer, entry.expert, entry.kind as u8),
-                entry.quant_type,
+                (entry.quant_type, entry.layout),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -452,17 +452,16 @@ fn heterogeneous_policy_matches(
         {
             return false;
         }
-        let Some(student_quant) = representation_quant_type(layer.student_representation) else {
+        let Some(student_encoding) = representation_encoding(layer.student_representation) else {
             return false;
         };
-        let Some(source_quant) = representation_quant_type(layer.source_representation) else {
+        let Some(source_encoding) = representation_encoding(layer.source_representation) else {
             return false;
         };
-        for (experts, quant_type) in [(&students, student_quant), (&sources, source_quant)] {
+        for (experts, encoding) in [(&students, student_encoding), (&sources, source_encoding)] {
             for expert in experts {
                 for kind in [TensorKind::GateUp, TensorKind::Down] {
-                    if expert_tensors.get(&(layer.layer, *expert, kind as u8)) != Some(&quant_type)
-                    {
+                    if expert_tensors.get(&(layer.layer, *expert, kind as u8)) != Some(&encoding) {
                         return false;
                     }
                 }
@@ -475,12 +474,19 @@ fn heterogeneous_policy_matches(
         .all(|layer| usize::from(*layer) < policy.layers.len())
 }
 
-fn representation_quant_type(representation: ExpertRepresentation) -> Option<QuantType> {
+fn representation_encoding(
+    representation: ExpertRepresentation,
+) -> Option<(QuantType, PackingLayout)> {
     match representation {
-        ExpertRepresentation::Group32Q2RowMajor => Some(QuantType::Q2),
-        ExpertRepresentation::Group32Q2S4RowMajor => Some(QuantType::Q2S4),
-        ExpertRepresentation::Group32Q3RowMajor => Some(QuantType::Q3),
-        ExpertRepresentation::Group32Q4RowMajor => Some(QuantType::Q4),
+        ExpertRepresentation::Group32Q2RowMajor => Some((QuantType::Q2, PackingLayout::RowMajor)),
+        ExpertRepresentation::Group32Q2S4RowMajor => {
+            Some((QuantType::Q2S4, PackingLayout::RowMajor))
+        }
+        ExpertRepresentation::Group32Q3RowMajor => Some((QuantType::Q3, PackingLayout::RowMajor)),
+        ExpertRepresentation::Group32Q3Superblock112 => {
+            Some((QuantType::Q3, PackingLayout::Q3Superblock112))
+        }
+        ExpertRepresentation::Group32Q4RowMajor => Some((QuantType::Q4, PackingLayout::RowMajor)),
         _ => None,
     }
 }

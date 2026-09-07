@@ -5315,6 +5315,7 @@ fn resolve_artifact_tier(path: &Path, trace_header: &TraceHeader) -> Result<Reso
                 layer.student_representation,
                 qx_format::ExpertRepresentation::Group32Q2S4RowMajor
                     | qx_format::ExpertRepresentation::Group32Q3RowMajor
+                    | qx_format::ExpertRepresentation::Group32Q3Superblock112
             )
             || layer.source_representation != qx_format::ExpertRepresentation::Group32Q4RowMajor
             || students.len() != layer.student_experts.len()

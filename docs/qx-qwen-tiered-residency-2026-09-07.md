@@ -191,7 +191,9 @@ target/release/qx-route-cache replay-artifact-io \
 5. Run physical iPhone jetsam, throughput, energy, and thermal gates before any
    product claim.
 
-The candidate should remain trace-emulated until those gates pass.
+The bounded-residency policy should remain trace-emulated until those gates
+pass; the heterogeneous Metal execution path itself is now physically proven
+on the Mac control.
 
 ## Heterogeneous GPU execution
 
@@ -220,6 +222,24 @@ is 55.147 ms. The next representation/runtime experiment is the existing
 lossless Q3Superblock112 transport: 96 contiguous code bytes plus eight FP16
 scales per 256 weights, consumed with packet-vector decoding. It changes no Q3
 quantized values and requires no student retraining.
+
+That experiment now passes. The compiler emits all 908 Q3 tensors in the four
+early layers as Q3Superblock112, while legacy row-major Q3 remains readable.
+The new artifact has the same 11,537,506,304 logical weight bytes and the Q3
+directory views alias each single 112-byte-block stream. Its SHA-256 is
+`9ddc646bcffa05626073ff46c0bc0adf2d18e16680e5f6a69c47e2f0f1d33711`.
+
+In a three-pair same-session matrix of ten warm complete tokens per process,
+legacy Q3 averaged 54.124 ms GPU/token (18.48 tok/s) and Q3-112 averaged
+50.346 ms (19.86 tok/s). That is 6.98% lower complete-token latency and 7.50%
+higher throughput. MoE time fell by 3.725 ms/token, from 24.991 to 21.266 ms;
+attention and head time stayed effectively flat. Layer-0 dynamic parity passes
+at relative L2 0.00004507. Sampled dynamic and complete-layer parity also pass
+for layers 1, 2, and 3, with worst relative L2 0.00024783. Q3-112 is therefore
+promoted for Qwen Q3 students, not merely retained as an experiment.
+
+Machine-readable evidence is in
+`benchmarks/results/qwen3-30b-a3b-q3-superblock112-runtime-2026-09-07.json`.
 
 The committed runtime result is
 `benchmarks/results/qwen3-30b-a3b-heterogeneous-gpu-runtime-2026-09-07.json`.

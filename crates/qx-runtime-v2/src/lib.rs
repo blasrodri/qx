@@ -446,6 +446,7 @@ pub fn activate_artifact_execution_plan(
     }
     match plan.representations.gate_up {
         qx_format::ExpertRepresentation::Group32Q3RowMajor
+        | qx_format::ExpertRepresentation::Group32Q3Superblock112
         | qx_format::ExpertRepresentation::Group32Q2RowMajor
         | qx_format::ExpertRepresentation::Group32Q2S4RowMajor => {
             return Err("Q2/Q2S4/Q3 row-major plans require the Qwen runtime backend".to_owned());
@@ -755,13 +756,19 @@ impl PreparedQwenLayer {
             let down_index =
                 qwen_entry_index(&artifact, layer, expert, qx_format::TensorKind::Down)?;
             let down_entry = &artifact.info().entries[down_index];
+            let supported_layout = match gate_entry.quant_type {
+                qx_quant::QuantType::Q2S4 | qx_quant::QuantType::Q4 => {
+                    gate_entry.layout == qx_quant::PackingLayout::RowMajor
+                }
+                qx_quant::QuantType::Q3 => matches!(
+                    gate_entry.layout,
+                    qx_quant::PackingLayout::RowMajor | qx_quant::PackingLayout::Q3Superblock112
+                ),
+                _ => false,
+            };
             if gate_entry.quant_type != down_entry.quant_type
-                || !matches!(
-                    gate_entry.quant_type,
-                    qx_quant::QuantType::Q2S4 | qx_quant::QuantType::Q3 | qx_quant::QuantType::Q4
-                )
-                || gate_entry.layout != qx_quant::PackingLayout::RowMajor
-                || down_entry.layout != qx_quant::PackingLayout::RowMajor
+                || gate_entry.layout != down_entry.layout
+                || !supported_layout
                 || gate_entry.group_size != 32
                 || down_entry.group_size != 32
                 || (gate_entry.rows, gate_entry.cols) != (1536, 2048)
@@ -773,10 +780,22 @@ impl PreparedQwenLayer {
             }
             let (down_scales_range, down_data_range) =
                 qwen_entry_ranges(&artifact, &slab, slab_file_offset, down_index)?;
+            if !qwen_expert_payload_is_exact(gate_entry, &gate_scales_range, &gate_data_range)
+                || !qwen_expert_payload_is_exact(down_entry, &down_scales_range, &down_data_range)
+            {
+                return Err(format!(
+                    "invalid heterogeneous Qwen expert payload {layer}:{expert}"
+                ));
+            }
             down_data_offsets.push(down_data_range.start as u64);
             down_scale_offsets.push(down_scales_range.start as u64);
             let codec = match gate_entry.quant_type {
                 qx_quant::QuantType::Q2S4 => 2,
+                qx_quant::QuantType::Q3
+                    if gate_entry.layout == qx_quant::PackingLayout::Q3Superblock112 =>
+                {
+                    5
+                }
                 qx_quant::QuantType::Q3 => 3,
                 qx_quant::QuantType::Q4 => 4,
                 _ => unreachable!("validated Qwen codec"),
@@ -1309,6 +1328,32 @@ fn qwen_entry_ranges(
         relative(entry.scale_offset, entry.scale_length)?,
         relative(entry.data_offset, entry.data_length)?,
     ))
+}
+
+#[cfg(target_os = "macos")]
+fn qwen_expert_payload_is_exact(
+    entry: &qx_format::TensorDirectoryEntry,
+    scales: &std::ops::Range<usize>,
+    data: &std::ops::Range<usize>,
+) -> bool {
+    let rows = entry.rows as usize;
+    let columns = entry.cols as usize;
+    let groups = columns / 32;
+    if entry.layout == qx_quant::PackingLayout::Q3Superblock112 {
+        return entry.quant_type == qx_quant::QuantType::Q3
+            && columns.is_multiple_of(256)
+            && scales == data
+            && data.len() == rows * (groups / 8) * 112;
+    }
+    let bytes_per_group = match entry.quant_type {
+        qx_quant::QuantType::Q2S4 => 8,
+        qx_quant::QuantType::Q3 => 12,
+        qx_quant::QuantType::Q4 => 16,
+        _ => return false,
+    };
+    entry.layout == qx_quant::PackingLayout::RowMajor
+        && scales.len() == rows * groups * std::mem::size_of::<u16>()
+        && data.len() == rows * groups * bytes_per_group
 }
 
 #[cfg(target_os = "macos")]
