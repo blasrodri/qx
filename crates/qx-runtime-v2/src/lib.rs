@@ -619,7 +619,7 @@ pub struct PreparedQwenLayer {
     pub v_proj: qx_metal::platform::PreparedQ4Stage,
     pub o_proj: qx_metal::platform::PreparedQ4Stage,
     pub router: qx_metal::platform::PreparedQ4Stage,
-    pub experts: Vec<qx_metal::platform::PreparedQwenQ2S4Expert>,
+    pub experts: Vec<Option<qx_metal::platform::PreparedQwenQ2S4Expert>>,
     pub dynamic_moe: qx_metal::platform::PreparedQwenDynamicMoe,
     artifact: Arc<qx_format::MappedArtifact>,
     slab: qx_metal::platform::RuntimeBuffer,
@@ -743,47 +743,72 @@ impl PreparedQwenLayer {
         let mut gate_scale_offsets = Vec::with_capacity(128);
         let mut down_data_offsets = Vec::with_capacity(128);
         let mut down_scale_offsets = Vec::with_capacity(128);
+        let mut codecs = Vec::with_capacity(128);
         for expert in 0..128_u8 {
             let gate_index =
                 qwen_entry_index(&artifact, layer, expert, qx_format::TensorKind::GateUp)?;
+            let gate_entry = &artifact.info().entries[gate_index];
             let (gate_scales_range, gate_data_range) =
                 qwen_entry_ranges(&artifact, &slab, slab_file_offset, gate_index)?;
             gate_data_offsets.push(gate_data_range.start as u64);
             gate_scale_offsets.push(gate_scales_range.start as u64);
-            let (gate_scales, gate_data) = qwen_entry_buffers(
-                &artifact,
-                &slab,
-                slab_file_offset,
-                layer,
-                expert,
-                qx_format::TensorKind::GateUp,
-                qx_quant::QuantType::Q2S4,
-                1536,
-                2048,
-            )?;
             let down_index =
                 qwen_entry_index(&artifact, layer, expert, qx_format::TensorKind::Down)?;
+            let down_entry = &artifact.info().entries[down_index];
+            if gate_entry.quant_type != down_entry.quant_type
+                || !matches!(
+                    gate_entry.quant_type,
+                    qx_quant::QuantType::Q2S4 | qx_quant::QuantType::Q3 | qx_quant::QuantType::Q4
+                )
+                || gate_entry.layout != qx_quant::PackingLayout::RowMajor
+                || down_entry.layout != qx_quant::PackingLayout::RowMajor
+                || gate_entry.group_size != 32
+                || down_entry.group_size != 32
+                || (gate_entry.rows, gate_entry.cols) != (1536, 2048)
+                || (down_entry.rows, down_entry.cols) != (2048, 768)
+            {
+                return Err(format!(
+                    "unsupported heterogeneous Qwen expert {layer}:{expert}"
+                ));
+            }
             let (down_scales_range, down_data_range) =
                 qwen_entry_ranges(&artifact, &slab, slab_file_offset, down_index)?;
             down_data_offsets.push(down_data_range.start as u64);
             down_scale_offsets.push(down_scales_range.start as u64);
-            let (down_scales, down_data) = qwen_entry_buffers(
-                &artifact,
-                &slab,
-                slab_file_offset,
-                layer,
-                expert,
-                qx_format::TensorKind::Down,
-                qx_quant::QuantType::Q2S4,
-                2048,
-                768,
-            )?;
-            experts.push(context.prepare_qwen_q2s4_expert_buffers(
-                gate_data,
-                gate_scales,
-                down_data,
-                down_scales,
-            )?);
+            let codec = match gate_entry.quant_type {
+                qx_quant::QuantType::Q2S4 => 2,
+                qx_quant::QuantType::Q3 => 3,
+                qx_quant::QuantType::Q4 => 4,
+                _ => unreachable!("validated Qwen codec"),
+            };
+            codecs.push(codec);
+            let prepared = if gate_entry.quant_type == qx_quant::QuantType::Q2S4 {
+                let gate_scales = slab.subregion(
+                    gate_scales_range.start,
+                    gate_scales_range.end - gate_scales_range.start,
+                )?;
+                let gate_data = slab.subregion(
+                    gate_data_range.start,
+                    gate_data_range.end - gate_data_range.start,
+                )?;
+                let down_scales = slab.subregion(
+                    down_scales_range.start,
+                    down_scales_range.end - down_scales_range.start,
+                )?;
+                let down_data = slab.subregion(
+                    down_data_range.start,
+                    down_data_range.end - down_data_range.start,
+                )?;
+                Some(context.prepare_qwen_q2s4_expert_buffers(
+                    gate_data,
+                    gate_scales,
+                    down_data,
+                    down_scales,
+                )?)
+            } else {
+                None
+            };
+            experts.push(prepared);
         }
         let dynamic_moe = context.prepare_qwen_dynamic_moe(
             slab.clone(),
@@ -791,6 +816,7 @@ impl PreparedQwenLayer {
             &gate_scale_offsets,
             &down_data_offsets,
             &down_scale_offsets,
+            &codecs,
         )?;
         Ok(Self {
             layer,

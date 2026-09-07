@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-30b-a3b-heterogeneous-gpu-runtime",
+  "promotion_evidence": true,
+  "device": {
+    "identifier": "Mac17,9",
+    "chip": "Apple M5 Pro",
+    "memory_gib": 24
+  },
+  "artifact": {
+    "path": "external/models/qwen3-30b-a3b-a19pro-q2s4-q3-early4-v1.qx",
+    "installed_bytes": 11537629184,
+    "representation": "heterogeneous-q2s4-q3-q4-row-major"
+  },
+  "runtime": {
+    "routing": "gpu-resident-top8",
+    "expert_selection_readback": false,
+    "weight_mapping": "layer-local-file-backed",
+    "command_buffers_per_token": 1
+  },
+  "layer_controls": [
+    {
+      "layer": 0,
+      "route_codecs": [3, 4],
+      "mapped_slab_bytes": 280313856,
+      "dynamic_moe_relative_l2": 0.00005393,
+      "warm_layer_wall_ms": 2.342,
+      "warm_layer_gpu_ms": 2.020,
+      "parity": "pass"
+    },
+    {
+      "layer": 4,
+      "artifact_expert_counts": {
+        "q2s4": 107,
+        "q4": 21
+      },
+      "route_codecs": [2],
+      "dynamic_moe_relative_l2": 0.00010793,
+      "dynamic_moe_gpu_ms": 0.563,
+      "warm_layer_gpu_ms": 0.924,
+      "parity": "pass"
+    },
+    {
+      "layer": 5,
+      "route_experts": [26, 81, 57, 126, 125, 35, 92, 82],
+      "route_codecs": [2, 4],
+      "dynamic_moe_relative_l2": 0.00022831,
+      "dynamic_moe_gpu_ms": 0.648,
+      "warm_layer_gpu_ms": 1.255,
+      "parity": "pass"
+    }
+  ],
+  "uniform_q2s4_control": {
+    "dynamic_moe_relative_l2": 0.000134,
+    "dynamic_moe_wall_ms": 0.763,
+    "dynamic_moe_gpu_ms": 0.544,
+    "complete_layer_relative_l2": 0.00008352,
+    "warm_layer_wall_ms": 1.160,
+    "warm_layer_gpu_ms": 0.981,
+    "parity": "pass"
+  },
+  "complete_model": {
+    "prepared_layers": 48,
+    "preparation_ms": 31.151,
+    "state_context": 2,
+    "runtime_state_bytes": 592968,
+    "metal_logical_weight_bytes": 11259314176,
+    "first_token_wall_ms": 2936.0,
+    "first_token_gpu_ms": 63.968,
+    "warm_token_wall_ms": 55.608,
+    "warm_token_gpu_ms": 55.147,
+    "warm_tokens_per_second": 18.13335267557619,
+    "stage_gpu_ms": {
+      "embedding": 0.005,
+      "attention": 21.877,
+      "moe": 25.787,
+      "head": 8.254
+    },
+    "deterministic_replay": true
+  },
+  "same_build_revalidation": {
+    "layer_0_dynamic_moe_relative_l2": 0.00005393,
+    "layer_0_warm_gpu_ms": 1.966,
+    "first_token_wall_ms": 2097.619,
+    "first_token_gpu_ms": 65.404,
+    "warm_token_wall_ms": 54.324,
+    "warm_token_gpu_ms": 53.787,
+    "warm_tokens_per_second": 18.591109747700373,
+    "stage_gpu_ms": {
+      "embedding": 0.005,
+      "attention": 21.466,
+      "moe": 24.856,
+      "head": 8.360
+    },
+    "deterministic_replay": true
+  },
+  "q4_specialization_delta": {
+    "before_warm_gpu_ms": 68.577,
+    "after_warm_gpu_ms": 55.147,
+    "before_moe_gpu_ms": 39.061,
+    "after_moe_gpu_ms": 25.787,
+    "before_tokens_per_second": 14.582147367631133,
+    "after_tokens_per_second": 18.13335267557619,
+    "throughput_gain_percent": 24.357203389830516
+  },
+  "claim_boundary": "Mixed-codec layer CPU/GPU parity on sampled deterministic routes and deterministic complete-model replay on M5 Pro. This is not complete-model CPU semantic parity, physical resident-cache enforcement, iPhone throughput, or a quality claim."
+}

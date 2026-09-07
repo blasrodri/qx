@@ -921,6 +921,7 @@ pub mod platform {
         gate_scale_offsets: RuntimeBuffer,
         down_data_offsets: RuntimeBuffer,
         down_scale_offsets: RuntimeBuffer,
+        codecs: RuntimeBuffer,
     }
 
     pub struct PreparedQwenQ4Embedding {
@@ -2116,9 +2117,10 @@ pub mod platform {
                         (&prepared.slab, 0),
                         (&prepared.gate_data_offsets, 1),
                         (&prepared.gate_scale_offsets, 2),
-                        (input, 3),
-                        (ids, 4),
-                        (expert_activations, 5),
+                        (&prepared.codecs, 3),
+                        (input, 4),
+                        (ids, 5),
+                        (expert_activations, 6),
                     ] {
                         self.encoder.setBuffer_offset_atIndex(
                             Some(&buffer.buffer),
@@ -2148,9 +2150,10 @@ pub mod platform {
                         (&prepared.slab, 0),
                         (&prepared.down_data_offsets, 1),
                         (&prepared.down_scale_offsets, 2),
-                        (expert_activations, 3),
-                        (ids, 4),
-                        (expert_outputs, 5),
+                        (&prepared.codecs, 3),
+                        (expert_activations, 4),
+                        (ids, 5),
+                        (expert_outputs, 6),
                     ] {
                         self.encoder.setBuffer_offset_atIndex(
                             Some(&buffer.buffer),
@@ -2182,9 +2185,10 @@ pub mod platform {
                         (&prepared.gate_scale_offsets, 2),
                         (&prepared.down_data_offsets, 3),
                         (&prepared.down_scale_offsets, 4),
-                        (input, 5),
-                        (ids, 6),
-                        (expert_outputs, 7),
+                        (&prepared.codecs, 5),
+                        (input, 6),
+                        (ids, 7),
+                        (expert_outputs, 8),
                     ] {
                         self.encoder.setBuffer_offset_atIndex(
                             Some(&buffer.buffer),
@@ -9672,7 +9676,7 @@ pub mod platform {
             self.qwen_named_pipeline(
                 &self.qwen_dynamic_moe_pipeline,
                 Q2_KERNEL_SOURCE,
-                "qx_q2s4_qwen_moe_dynamic",
+                "qx_qwen_moe_dynamic",
             )
         }
 
@@ -9680,7 +9684,7 @@ pub mod platform {
             self.qwen_named_pipeline(
                 &self.qwen_dynamic_gate_pipeline,
                 Q2_KERNEL_SOURCE,
-                "qx_q2s4_qwen_moe_gate_dynamic",
+                "qx_qwen_moe_gate_dynamic",
             )
         }
 
@@ -9688,7 +9692,7 @@ pub mod platform {
             self.qwen_named_pipeline(
                 &self.qwen_dynamic_down_tiled_pipeline,
                 Q2_KERNEL_SOURCE,
-                "qx_q2s4_qwen_moe_down_tiled_dynamic",
+                "qx_qwen_moe_down_tiled_dynamic",
             )
         }
 
@@ -14041,7 +14045,7 @@ pub mod platform {
         }
 
         /// Bind all 128 Qwen experts through byte offsets into one mapped
-        /// artifact slab. Only the four compact offset tables are copied.
+        /// artifact slab. Only the compact offset and codec tables are copied.
         pub fn prepare_qwen_dynamic_moe(
             &self,
             slab: RuntimeBuffer,
@@ -14049,6 +14053,7 @@ pub mod platform {
             gate_scale_offsets: &[u64],
             down_data_offsets: &[u64],
             down_scale_offsets: &[u64],
+            codecs: &[u8],
         ) -> Result<PreparedQwenDynamicMoe, String> {
             const EXPERTS: usize = 128;
             for (name, offsets) in [
@@ -14066,6 +14071,9 @@ pub mod platform {
                 if offsets.iter().any(|offset| *offset as usize >= slab.len()) {
                     return Err(format!("Qwen dynamic MoE {name} offset exceeds the slab"));
                 }
+            }
+            if codecs.len() != EXPERTS || codecs.iter().any(|codec| !matches!(codec, 2 | 3 | 4)) {
+                return Err("Qwen dynamic MoE codecs must contain 128 Q2S4/Q3/Q4 IDs".to_owned());
             }
             let offset_buffer = |offsets: &[u64]| {
                 let bytes = unsafe {
@@ -14086,6 +14094,7 @@ pub mod platform {
                 gate_scale_offsets: offset_buffer(gate_scale_offsets)?,
                 down_data_offsets: offset_buffer(down_data_offsets)?,
                 down_scale_offsets: offset_buffer(down_scale_offsets)?,
+                codecs: self.input_runtime_buffer(codecs)?,
             })
         }
 
@@ -14757,9 +14766,9 @@ mod tests {
             assert!(kernel_source(quant_type).contains("kernel"));
         }
         for name in [
-            "qx_q2s4_qwen_moe_dynamic",
-            "qx_q2s4_qwen_moe_gate_dynamic",
-            "qx_q2s4_qwen_moe_down_tiled_dynamic",
+            "qx_qwen_moe_dynamic",
+            "qx_qwen_moe_gate_dynamic",
+            "qx_qwen_moe_down_tiled_dynamic",
             "qx_qwen_moe_accumulate_dynamic",
         ] {
             assert!(

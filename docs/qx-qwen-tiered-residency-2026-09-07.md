@@ -1,7 +1,7 @@
 # Qwen heterogeneous tiered residency
 
 Date: 2026-09-07
-Status: trace-emulated candidate; physical runtime and iPhone measurement pending
+Status: heterogeneous execution proven on Mac; physical cache runtime and iPhone measurement pending
 
 ## Outcome
 
@@ -192,3 +192,38 @@ target/release/qx-route-cache replay-artifact-io \
    product claim.
 
 The candidate should remain trace-emulated until those gates pass.
+
+## Heterogeneous GPU execution
+
+The canonical Qwen runtime can now execute the artifact's Q2S4, Q3, and
+source-exact Q4 experts directly from each layer-local file-backed slab. The
+router selects top-8 experts on the GPU, and a 128-byte codec table selects the
+decoder without CPU route readback or per-expert buffer rebinding. Q2S4 keeps
+its original packet path; Q4 has a codec-specialized group decoder.
+
+Mixed-codec CPU/GPU parity passes on sampled layer-0 and layer-5 routes, while
+a Q2S4-only route through a heterogeneous layer confirms the original compact
+path remains fast. A complete 48-layer deterministic replay measured 55.147 ms
+GPU per warm token, or 18.13 tok/s, on the 24 GiB M5 Pro. Before the dedicated
+Q4 decoder the same heterogeneous execution took 68.577 ms GPU, or 14.58
+tok/s. The specialization therefore improved delivered throughput by 24.36%
+and reduced measured MoE time from 39.061 to 25.787 ms/token.
+
+A same-build revalidation produced 53.787 ms GPU/token, or 18.59 tok/s, with
+mixed-layer relative L2 unchanged at 0.00005393. First-token wall time moved
+from 2.936 s to 2.098 s as the mmap page state changed, so cold wall latency is
+reported separately and is not treated as kernel throughput.
+
+The remaining heterogeneous penalty is concentrated in the four early Q3
+layers: the uniform-Q2S4 control is 51.308 ms GPU/token, while the mixed model
+is 55.147 ms. The next representation/runtime experiment is the existing
+lossless Q3Superblock112 transport: 96 contiguous code bytes plus eight FP16
+scales per 256 weights, consumed with packet-vector decoding. It changes no Q3
+quantized values and requires no student retraining.
+
+The committed runtime result is
+`benchmarks/results/qwen3-30b-a3b-heterogeneous-gpu-runtime-2026-09-07.json`.
+Its claim is deliberately narrow: sampled mixed-layer semantic parity and
+complete-model deterministic execution on this Mac. It does not yet prove
+complete-model CPU parity, bounded physical residency, iPhone throughput, or
+quality.

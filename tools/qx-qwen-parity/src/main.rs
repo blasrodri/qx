@@ -81,14 +81,21 @@ fn run() -> Result<()> {
             .map_err(anyhow::Error::msg)?;
     let bind_elapsed = bind_started.elapsed();
     let allocated_after_bind = context.current_allocated_bytes();
-    let actual_bits = context
-        .run_prepared_qwen_q2s4_expert(&persistent_layer.experts[args.expert as usize], &input_bits)
+    let metrics = persistent_layer.experts[args.expert as usize]
+        .as_ref()
+        .map(|prepared_expert| {
+            context
+                .run_prepared_qwen_q2s4_expert(prepared_expert, &input_bits)
+                .map(|actual_bits| {
+                    let actual = actual_bits
+                        .iter()
+                        .map(|&bits| f16::from_bits(bits).to_f32())
+                        .collect::<Vec<_>>();
+                    ErrorMetrics::between(&expected, &actual)
+                })
+        })
+        .transpose()
         .map_err(anyhow::Error::msg)?;
-    let actual = actual_bits
-        .iter()
-        .map(|&bits| f16::from_bits(bits).to_f32())
-        .collect::<Vec<_>>();
-    let metrics = ErrorMetrics::between(&expected, &actual);
 
     let router_index = find_layer_matrix(&artifact, args.layer, TensorKind::Router, 128, HIDDEN)?;
     let router = artifact.quantized_tensor(router_index)?;
@@ -273,13 +280,6 @@ fn run() -> Result<()> {
         .collect::<Vec<_>>()
         .try_into()
         .expect("top-8 route has eight weights");
-    let prepared_refs = post_actual_route
-        .iter()
-        .map(|&(expert, _)| &persistent_layer.experts[expert])
-        .collect::<Vec<_>>();
-    let moe_actual_bits = context
-        .run_prepared_qwen_q2s4_experts_weighted(&prepared_refs, &moe_input_bits, &route_weights)
-        .map_err(anyhow::Error::msg)?;
     let moe_expected = (0..HIDDEN)
         .map(|row| {
             let value = cpu_expert_outputs
@@ -290,11 +290,28 @@ fn run() -> Result<()> {
             f16::from_f32(value).to_f32()
         })
         .collect::<Vec<_>>();
-    let moe_actual = moe_actual_bits
+    let prepared_refs = post_actual_route
         .iter()
-        .map(|&bits| f16::from_bits(bits).to_f32())
-        .collect::<Vec<_>>();
-    let moe_metrics = ErrorMetrics::between(&moe_expected, &moe_actual);
+        .map(|&(expert, _)| persistent_layer.experts[expert].as_ref())
+        .collect::<Option<Vec<_>>>();
+    let moe_metrics = prepared_refs
+        .map(|prepared_refs| {
+            context
+                .run_prepared_qwen_q2s4_experts_weighted(
+                    &prepared_refs,
+                    &moe_input_bits,
+                    &route_weights,
+                )
+                .map(|moe_actual_bits| {
+                    let moe_actual = moe_actual_bits
+                        .iter()
+                        .map(|&bits| f16::from_bits(bits).to_f32())
+                        .collect::<Vec<_>>();
+                    ErrorMetrics::between(&moe_expected, &moe_actual)
+                })
+        })
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
 
     // Replay the same route through the production-shaped graph: router
     // selection, slab-offset expert execution, and accumulation are one GPU
@@ -457,7 +474,14 @@ fn run() -> Result<()> {
         "mapped slab:    {} bytes",
         persistent_layer.mapped_slab_bytes()
     );
-    println!("bound experts:  {}", persistent_layer.experts.len());
+    println!(
+        "bound Q2S4:      {}",
+        persistent_layer
+            .experts
+            .iter()
+            .filter(|expert| expert.is_some())
+            .count()
+    );
     println!(
         "binding time:   {:.3} ms",
         bind_elapsed.as_secs_f64() * 1000.0
@@ -468,18 +492,23 @@ fn run() -> Result<()> {
     );
     println!("gate/up:       {} x {}", gate.rows, gate.cols);
     println!("down:          {} x {}", down.rows, down.cols);
-    println!("max abs error: {:.8}", metrics.max_abs);
-    println!("RMSE:          {:.8}", metrics.rmse);
-    println!("relative L2:   {:.8}", metrics.relative_l2);
-    println!("cosine:        {:.8}", metrics.cosine);
-    if metrics.relative_l2 > args.max_relative_l2 {
-        bail!(
-            "Qwen expert parity failed: relative L2 {:.8} exceeds {:.8}",
-            metrics.relative_l2,
-            args.max_relative_l2
-        );
+    println!("selected codec:{:?}", gate.quant_type);
+    if let Some(metrics) = metrics.as_ref() {
+        println!("max abs error: {:.8}", metrics.max_abs);
+        println!("RMSE:          {:.8}", metrics.rmse);
+        println!("relative L2:   {:.8}", metrics.relative_l2);
+        println!("cosine:        {:.8}", metrics.cosine);
+        if metrics.relative_l2 > args.max_relative_l2 {
+            bail!(
+                "Qwen expert parity failed: relative L2 {:.8} exceeds {:.8}",
+                metrics.relative_l2,
+                args.max_relative_l2
+            );
+        }
+        println!("direct Q2S4 parity: pass\n");
+    } else {
+        println!("direct expert parity: skipped; mixed codec is covered by dynamic parity\n");
     }
-    println!("expert parity: pass\n");
     println!("router relative L2: {:.8}", router_metrics.relative_l2);
     println!("router cosine:      {:.8}", router_metrics.cosine);
     println!(
@@ -545,8 +574,12 @@ fn run() -> Result<()> {
             .map(|item| item.0)
             .collect::<Vec<_>>()
     );
-    println!("weighted MoE L2:     {:.8}", moe_metrics.relative_l2);
-    println!("weighted MoE cosine: {:.8}", moe_metrics.cosine);
+    if let Some(moe_metrics) = moe_metrics.as_ref() {
+        println!("weighted Q2S4 L2:    {:.8}", moe_metrics.relative_l2);
+        println!("weighted Q2S4 cosine:{:.8}", moe_metrics.cosine);
+    } else {
+        println!("weighted Q2S4 path:  skipped for mixed route");
+    }
     println!("GPU graph top-8:      {graph_route:?}");
     println!("GPU route weight Δ:   {graph_weight_error:.8}");
     println!(
@@ -582,7 +615,9 @@ fn run() -> Result<()> {
         );
     }
     if post_router_metrics.relative_l2 > args.max_relative_l2
-        || moe_metrics.relative_l2 > args.max_relative_l2
+        || moe_metrics
+            .as_ref()
+            .is_some_and(|metrics| metrics.relative_l2 > args.max_relative_l2)
         || dynamic_moe_metrics.relative_l2 > args.max_relative_l2
         || layer_metrics.relative_l2 > args.max_relative_l2
         || graph_weight_error > 0.001
@@ -831,8 +866,10 @@ fn find_expert(
         TensorKind::Down => (HIDDEN, INTERMEDIATE),
         _ => unreachable!(),
     };
-    if entry.quant_type != QuantType::Q2S4
-        || entry.group_size != 32
+    if !matches!(
+        entry.quant_type,
+        QuantType::Q2S4 | QuantType::Q3 | QuantType::Q4
+    ) || entry.group_size != 32
         || entry.layout != qx_quant::PackingLayout::RowMajor
         || (entry.rows as usize, entry.cols as usize) != expected
     {
