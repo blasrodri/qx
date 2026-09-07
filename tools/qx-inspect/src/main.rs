@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use qx_format::{ExpertRepresentation, ExpertWeightPlan, TensorDirectoryEntry, TensorKind};
+use qx_format::{
+    ExpertRepresentation, ExpertResidencyPlan, ExpertWeightPlan, TensorDirectoryEntry, TensorKind,
+};
 use qx_model::{
     Granite3A400M, ModelArchitecture, ModelShape, QWEN3_30B_A3B_MODEL_ID, Qwen3MoeConfig,
 };
@@ -150,6 +152,7 @@ struct ArtifactAudit {
     plan_id: Option<String>,
     expert_policy_id: Option<String>,
     expert_policy_validated_layers: Vec<u16>,
+    expert_residency: Option<ExpertResidencyPlan>,
     limitations: Vec<&'static str>,
 }
 
@@ -395,9 +398,11 @@ fn inspect_artifact(path: &Path) -> Result<ArtifactAudit> {
             .and_then(|plan| plan.expert_weights.as_ref())
             .map(|policy| policy.validated_layers.clone())
             .unwrap_or_default(),
+        expert_residency: plan.and_then(|plan| plan.expert_residency.clone()),
         limitations: vec![
             "the expert codec has not passed end-to-end perplexity and task quality gates",
-            "bounded expert-cache residency and the physical iPhone memory gate are not implemented",
+            "the explicit GPU expert cache is experimental and rejected as the canonical Apple unified-memory backend",
+            "native file-backed residency still requires a physical iPhone jetsam and sustained-throughput gate",
             "the Mac Metal runtime passes sampled parity, but this is not an app release model",
         ],
     })

@@ -922,6 +922,33 @@ pub mod platform {
         down_data_offsets: RuntimeBuffer,
         down_scale_offsets: RuntimeBuffer,
         codecs: RuntimeBuffer,
+        uncached_storage: RuntimeBuffer,
+        uncached_slots: RuntimeBuffer,
+    }
+
+    pub struct PreparedQwenExpertCache {
+        resolve_pipeline: Pipeline,
+        fill_pipeline: Pipeline,
+        storage: RuntimeBuffer,
+        keys: RuntimeBuffer,
+        ages: RuntimeBuffer,
+        clock: RuntimeBuffer,
+        resolved_slots: RuntimeBuffer,
+        copy_flags: RuntimeBuffer,
+        counters: RuntimeBuffer,
+        seen: RuntimeBuffer,
+        slots: usize,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct QwenExpertCacheStats {
+        pub hits: u32,
+        pub misses: u32,
+        pub evictions: u32,
+        pub q4_selections: u32,
+        pub bypasses: u32,
+        pub slots: usize,
+        pub storage_bytes: usize,
     }
 
     pub struct PreparedQwenQ4Embedding {
@@ -1499,6 +1526,8 @@ pub mod platform {
         qwen_dynamic_gate_pipeline: Mutex<Option<Pipeline>>,
         qwen_dynamic_down_tiled_pipeline: Mutex<Option<Pipeline>>,
         qwen_dynamic_accumulate_pipeline: Mutex<Option<Pipeline>>,
+        qwen_q4_cache_resolve_pipeline: Mutex<Option<Pipeline>>,
+        qwen_q4_cache_fill_pipeline: Mutex<Option<Pipeline>>,
         logits_pipeline: Mutex<Option<Pipeline>>,
         dense_pipeline: Mutex<Option<Pipeline>>,
         f16_dense_pipeline: Mutex<Option<Pipeline>>,
@@ -2095,6 +2124,142 @@ pub mod platform {
             expert_outputs: &RuntimeBuffer,
             output: &RuntimeBuffer,
         ) -> Result<(), String> {
+            self.encode_qwen_dynamic_moe_impl(
+                prepared,
+                input,
+                ids,
+                weights,
+                expert_activations,
+                expert_outputs,
+                output,
+                &prepared.uncached_storage,
+                &prepared.uncached_slots,
+            )
+        }
+
+        /// Resolve and fill the bounded source-Q4 cache entirely on GPU, then
+        /// execute the same mixed expert graph against the resolved slots.
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_qwen_dynamic_moe_cached(
+            &mut self,
+            prepared: &PreparedQwenDynamicMoe,
+            cache: &PreparedQwenExpertCache,
+            layer: u16,
+            input: &RuntimeBuffer,
+            ids: &RuntimeBuffer,
+            weights: &RuntimeBuffer,
+            expert_activations: &RuntimeBuffer,
+            expert_outputs: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+        ) -> Result<(), String> {
+            let layer = u32::from(layer);
+            let cache_slots = u32::try_from(cache.slots)
+                .map_err(|_| "Qwen expert cache slot count exceeds u32".to_owned())?;
+            self.encoder
+                .setComputePipelineState(&cache.resolve_pipeline);
+            unsafe {
+                for (buffer, index) in [
+                    (&prepared.codecs, 0),
+                    (ids, 1),
+                    (&cache.keys, 2),
+                    (&cache.ages, 3),
+                    (&cache.clock, 4),
+                    (&cache.resolved_slots, 5),
+                    (&cache.copy_flags, 6),
+                    (&cache.counters, 7),
+                    (&cache.seen, 8),
+                ] {
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
+                }
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&layer).cast(),
+                    std::mem::size_of_val(&layer),
+                    9,
+                );
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&cache_slots).cast(),
+                    std::mem::size_of_val(&cache_slots),
+                    10,
+                );
+            }
+            self.encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+
+            self.encoder.setComputePipelineState(&cache.fill_pipeline);
+            unsafe {
+                for (buffer, index) in [
+                    (&prepared.slab, 0),
+                    (&prepared.gate_data_offsets, 1),
+                    (&prepared.gate_scale_offsets, 2),
+                    (&prepared.down_data_offsets, 3),
+                    (&prepared.down_scale_offsets, 4),
+                    (ids, 5),
+                    (&cache.resolved_slots, 6),
+                    (&cache.copy_flags, 7),
+                    (&cache.storage, 8),
+                ] {
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
+                }
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: 8,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+
+            self.encode_qwen_dynamic_moe_impl(
+                prepared,
+                input,
+                ids,
+                weights,
+                expert_activations,
+                expert_outputs,
+                output,
+                &cache.storage,
+                &cache.resolved_slots,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn encode_qwen_dynamic_moe_impl(
+            &mut self,
+            prepared: &PreparedQwenDynamicMoe,
+            input: &RuntimeBuffer,
+            ids: &RuntimeBuffer,
+            weights: &RuntimeBuffer,
+            expert_activations: &RuntimeBuffer,
+            expert_outputs: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            cache_storage: &RuntimeBuffer,
+            resolved_slots: &RuntimeBuffer,
+        ) -> Result<(), String> {
             const HIDDEN: usize = 2048;
             const INTERMEDIATE: usize = 768;
             const TOP_K: usize = 8;
@@ -2121,6 +2286,8 @@ pub mod platform {
                         (input, 4),
                         (ids, 5),
                         (expert_activations, 6),
+                        (cache_storage, 7),
+                        (resolved_slots, 8),
                     ] {
                         self.encoder.setBuffer_offset_atIndex(
                             Some(&buffer.buffer),
@@ -2154,6 +2321,8 @@ pub mod platform {
                         (expert_activations, 4),
                         (ids, 5),
                         (expert_outputs, 6),
+                        (cache_storage, 7),
+                        (resolved_slots, 8),
                     ] {
                         self.encoder.setBuffer_offset_atIndex(
                             Some(&buffer.buffer),
@@ -2189,6 +2358,8 @@ pub mod platform {
                         (input, 6),
                         (ids, 7),
                         (expert_outputs, 8),
+                        (cache_storage, 9),
+                        (resolved_slots, 10),
                     ] {
                         self.encoder.setBuffer_offset_atIndex(
                             Some(&buffer.buffer),
@@ -9048,6 +9219,8 @@ pub mod platform {
                 qwen_dynamic_gate_pipeline: Mutex::new(None),
                 qwen_dynamic_down_tiled_pipeline: Mutex::new(None),
                 qwen_dynamic_accumulate_pipeline: Mutex::new(None),
+                qwen_q4_cache_resolve_pipeline: Mutex::new(None),
+                qwen_q4_cache_fill_pipeline: Mutex::new(None),
                 logits_pipeline: Mutex::new(None),
                 dense_pipeline: Mutex::new(None),
                 f16_dense_pipeline: Mutex::new(None),
@@ -9701,6 +9874,22 @@ pub mod platform {
                 &self.qwen_dynamic_accumulate_pipeline,
                 Q2_KERNEL_SOURCE,
                 "qx_qwen_moe_accumulate_dynamic",
+            )
+        }
+
+        fn qwen_q4_cache_resolve_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_q4_cache_resolve_pipeline,
+                Q2_KERNEL_SOURCE,
+                "qx_qwen_q4_cache_resolve",
+            )
+        }
+
+        fn qwen_q4_cache_fill_pipeline(&self) -> Result<Pipeline, String> {
+            self.qwen_named_pipeline(
+                &self.qwen_q4_cache_fill_pipeline,
+                Q2_KERNEL_SOURCE,
+                "qx_qwen_q4_cache_fill",
             )
         }
 
@@ -14098,7 +14287,95 @@ pub mod platform {
                 down_data_offsets: offset_buffer(down_data_offsets)?,
                 down_scale_offsets: offset_buffer(down_scale_offsets)?,
                 codecs: self.input_runtime_buffer(codecs)?,
+                uncached_storage: self.allocate_runtime_buffer(4)?,
+                uncached_slots: {
+                    let slots = [u32::MAX; 8];
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            slots.as_ptr().cast::<u8>(),
+                            std::mem::size_of_val(&slots),
+                        )
+                    };
+                    self.input_runtime_buffer(bytes)?
+                },
             })
+        }
+
+        /// Allocate a bounded, fully associative cache for source-exact Q4
+        /// Qwen experts. Metadata and replacement decisions remain on GPU.
+        pub fn prepare_qwen_expert_cache(
+            &self,
+            budget_bytes: usize,
+        ) -> Result<PreparedQwenExpertCache, String> {
+            const SLOT_BYTES: usize = 2_654_208;
+            let slots = budget_bytes / SLOT_BYTES;
+            if slots < 8 {
+                return Err(format!(
+                    "Qwen expert cache budget {budget_bytes} provides {slots} slots; at least eight are required for one top-8 route"
+                ));
+            }
+            let storage_bytes = slots
+                .checked_mul(SLOT_BYTES)
+                .ok_or_else(|| "Qwen expert cache allocation overflows".to_owned())?;
+            let u32_bytes = |values: &[u32]| unsafe {
+                std::slice::from_raw_parts(
+                    values.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(values),
+                )
+            };
+            let keys = vec![u32::MAX; slots];
+            let ages = vec![0_u32; slots];
+            Ok(PreparedQwenExpertCache {
+                resolve_pipeline: self.qwen_q4_cache_resolve_pipeline()?,
+                fill_pipeline: self.qwen_q4_cache_fill_pipeline()?,
+                storage: self.allocate_runtime_buffer(storage_bytes)?,
+                keys: self.input_runtime_buffer(u32_bytes(&keys))?,
+                ages: self.input_runtime_buffer(u32_bytes(&ages))?,
+                clock: self.input_runtime_buffer(u32_bytes(&[0]))?,
+                resolved_slots: self.input_runtime_buffer(u32_bytes(&[u32::MAX; 8]))?,
+                copy_flags: self.input_runtime_buffer(u32_bytes(&[0; 8]))?,
+                counters: self.input_runtime_buffer(u32_bytes(&[0; 5]))?,
+                seen: self.input_runtime_buffer(&[0; 48 * 128])?,
+                slots,
+            })
+        }
+
+        pub fn qwen_expert_cache_stats(
+            &self,
+            cache: &PreparedQwenExpertCache,
+        ) -> Result<QwenExpertCacheStats, String> {
+            let counters = self.read_runtime_u32s(&cache.counters, 5)?;
+            Ok(QwenExpertCacheStats {
+                hits: counters[0],
+                misses: counters[1],
+                evictions: counters[2],
+                q4_selections: counters[3],
+                bypasses: counters[4],
+                slots: cache.slots,
+                storage_bytes: cache.storage.len(),
+            })
+        }
+
+        /// Reset cache metadata at a host synchronization boundary. Cached
+        /// payload bytes need not be cleared because empty keys make them
+        /// unreachable to the resolver.
+        pub fn reset_qwen_expert_cache(
+            &self,
+            cache: &PreparedQwenExpertCache,
+        ) -> Result<(), String> {
+            let u32_bytes = |values: &[u32]| unsafe {
+                std::slice::from_raw_parts(
+                    values.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(values),
+                )
+            };
+            self.write_runtime_buffer(&cache.keys, u32_bytes(&vec![u32::MAX; cache.slots]))?;
+            self.write_runtime_buffer(&cache.ages, u32_bytes(&vec![0; cache.slots]))?;
+            self.write_runtime_buffer(&cache.clock, u32_bytes(&[0]))?;
+            self.write_runtime_buffer(&cache.resolved_slots, u32_bytes(&[u32::MAX; 8]))?;
+            self.write_runtime_buffer(&cache.copy_flags, u32_bytes(&[0; 8]))?;
+            self.write_runtime_buffer(&cache.counters, u32_bytes(&[0; 5]))?;
+            self.write_runtime_buffer(&cache.seen, &[0; 48 * 128])
         }
 
         /// Execute one prepared Qwen Q2S4 expert with one command buffer and

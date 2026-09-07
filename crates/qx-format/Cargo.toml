@@ -12,3 +12,6 @@ qx-quant.workspace = true
 qx-model.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-30b-a3b-expert-residency-runtime",
+  "promotion_evidence": true,
+  "device": {
+    "identifier": "Mac17,9",
+    "chip": "Apple M5 Pro",
+    "memory_gib": 24
+  },
+  "artifact": {
+    "path": "external/models/qwen3-30b-a3b-a19pro-q2s4-q3-early4-q3-112-v1.qx",
+    "sha256": "9ddc646bcffa05626073ff46c0bc0adf2d18e16680e5f6a69c47e2f0f1d33711",
+    "logical_weight_bytes": 11537506304,
+    "source_q4_bytes": 3020488704,
+    "metal_logical_weight_bytes": 11259314176
+  },
+  "workload": {
+    "input_token": 1,
+    "sequential_tokens": 64,
+    "state_context": 64,
+    "gpu_resident_token_chain": true,
+    "command_buffers": 1,
+    "runs_per_variant": 3
+  },
+  "native_file_backed": {
+    "gpu_ms_per_token": [51.917, 51.960, 51.923],
+    "mean_gpu_ms_per_token": 51.93333333333334,
+    "tokens_per_second": 19.25545571245186,
+    "dispatches_per_token": 724,
+    "final_token": 15,
+    "current_process_footprint_bytes": 81855280,
+    "lifetime_max_process_footprint_bytes": 98534192,
+    "maximum_resident_set_bytes": 81756160
+  },
+  "gpu_lru_second_touch": {
+    "budget_bytes": 134217728,
+    "slots": 50,
+    "allocated_storage_bytes": 132710400,
+    "gpu_ms_per_token": [55.481, 55.513, 55.524],
+    "mean_gpu_ms_per_token": 55.506,
+    "tokens_per_second": 18.016070334738586,
+    "dispatches_per_token": 820,
+    "hits": 1024,
+    "misses": 549,
+    "evictions": 300,
+    "bypasses": 199,
+    "hit_rate": 0.6509853782581055,
+    "final_token": 15,
+    "current_process_footprint_bytes": 213599096,
+    "lifetime_max_process_footprint_bytes": 242811768,
+    "latency_increase_percent": 6.879332477535294,
+    "throughput_change_percent": -6.436541394924264
+  },
+  "vm_diagnostic": {
+    "file_cache_resident_bytes": 11537514496,
+    "source_q4_file_cache_resident_bytes": 3020488704,
+    "source_q4_dontneed_advised_bytes": 3020488704,
+    "interpretation": "mincore reports global clean-file cache presence after artifact encoding, not process-charged physical footprint; MADV_DONTNEED releases mapping ownership but does not purge the global file cache"
+  },
+  "decision": {
+    "apple_unified_memory": "native-file-backed",
+    "gpu_lru": "retain-experimental-not-canonical",
+    "admission": "second-touch-if-gpu-lru-is-selected",
+    "planner_dimension": "ExpertResidencyPlan",
+    "claim_boundary": "Mac process-footprint and throughput control only. It does not establish iOS jetsam accounting, sustained thermal behavior, storage latency under pressure, or app-release fit."
+  }
+}

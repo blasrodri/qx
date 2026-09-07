@@ -38,6 +38,15 @@ struct Args {
     full_replays: usize,
     #[arg(long)]
     stage_profile: bool,
+    /// Enable the GPU-resident source-Q4 cache with this binary MiB budget.
+    #[arg(long, default_value_t = 0)]
+    expert_cache_mib: usize,
+    /// Encode this many causally chained tokens in one GPU command buffer.
+    #[arg(long, default_value_t = 0)]
+    sequential_tokens: usize,
+    /// Report file-backed weight residency and discard source-Q4 pages after synchronization.
+    #[arg(long)]
+    resident_audit: bool,
 }
 
 fn main() -> Result<()> {
@@ -641,8 +650,16 @@ fn run_full_model(
 ) -> Result<()> {
     let allocated_before = context.current_allocated_bytes();
     let prepare_started = Instant::now();
-    let model =
-        qx_runtime_v2::PreparedQwenModel::load(context, artifact).map_err(anyhow::Error::msg)?;
+    let expert_cache_bytes = args
+        .expert_cache_mib
+        .checked_mul(1024 * 1024)
+        .context("Qwen expert cache budget overflows")?;
+    let model = qx_runtime_v2::PreparedQwenModel::load_with_expert_cache_budget(
+        context,
+        artifact,
+        expert_cache_bytes,
+    )
+    .map_err(anyhow::Error::msg)?;
     let prepare_wall = prepare_started.elapsed();
     let state = model
         .allocate_state(context, args.state_context)
@@ -760,6 +777,178 @@ fn run_full_model(
     }
     if let Some(timeline) = stage_profile {
         print_full_model_stage_profile(&timeline, model.layers.len())?;
+    }
+    if let Some(stats) = model
+        .expert_cache_stats(context)
+        .map_err(anyhow::Error::msg)?
+    {
+        let hit_rate = if stats.q4_selections == 0 {
+            0.0
+        } else {
+            f64::from(stats.hits) / f64::from(stats.q4_selections)
+        };
+        println!(
+            "Q4 cache:             {} slots / {} bytes, {} hits / {} misses / {} evictions / {} bypasses, {:.2}% hit rate",
+            stats.slots,
+            stats.storage_bytes,
+            stats.hits,
+            stats.misses,
+            stats.evictions,
+            stats.bypasses,
+            hit_rate * 100.0,
+        );
+    }
+    if args.sequential_tokens > 0 {
+        run_sequential_model(context, &model, &state, args)?;
+    }
+    if args.resident_audit {
+        let before = model.weight_residency().map_err(anyhow::Error::msg)?;
+        let advised = model
+            .discard_source_q4_pages()
+            .map_err(anyhow::Error::msg)?;
+        let after = model.weight_residency().map_err(anyhow::Error::msg)?;
+        println!();
+        println!("QX file-backed weight residency");
+        println!(
+            "before:                {} / {} total bytes, {} / {} source-Q4 bytes resident",
+            before.total.resident_bytes,
+            before.total.logical_bytes,
+            before.source_q4.resident_bytes,
+            before.source_q4.logical_bytes,
+        );
+        println!("source-Q4 advised:     {advised} bytes");
+        println!(
+            "after:                 {} / {} total bytes, {} / {} source-Q4 bytes resident",
+            after.total.resident_bytes,
+            after.total.logical_bytes,
+            after.source_q4.resident_bytes,
+            after.source_q4.logical_bytes,
+        );
+        let process = process_memory_snapshot()?;
+        println!("process resident:      {} bytes", process.resident_bytes);
+        println!(
+            "process footprint:     {} bytes",
+            process.physical_footprint_bytes
+        );
+        println!(
+            "lifetime max footprint:{} bytes",
+            process.lifetime_max_footprint_bytes
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct ProcessMemorySnapshot {
+    resident_bytes: u64,
+    physical_footprint_bytes: u64,
+    lifetime_max_footprint_bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn process_memory_snapshot() -> Result<ProcessMemorySnapshot> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: proc_pid_rusage initializes the V4 structure selected by the
+    // flavor, and the current process remains alive for the duration of the call.
+    let result = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            usage.as_mut_ptr().cast(),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("query process memory footprint");
+    }
+    // SAFETY: a successful call initialized the complete rusage_info_v4.
+    let usage = unsafe { usage.assume_init() };
+    Ok(ProcessMemorySnapshot {
+        resident_bytes: usage.ri_resident_size,
+        physical_footprint_bytes: usage.ri_phys_footprint,
+        lifetime_max_footprint_bytes: usage.ri_lifetime_max_phys_footprint,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn run_sequential_model(
+    context: &qx_metal::platform::MetalContext,
+    model: &qx_runtime_v2::PreparedQwenModel,
+    state: &qx_runtime_v2::QwenModelState,
+    args: &Args,
+) -> Result<()> {
+    if args.sequential_tokens > state.max_context() {
+        bail!(
+            "sequential token count {} exceeds state context {}",
+            args.sequential_tokens,
+            state.max_context()
+        );
+    }
+    model
+        .reset_expert_cache(context)
+        .map_err(anyhow::Error::msg)?;
+    context
+        .write_runtime_buffer(&state.token, &args.input_token.to_ne_bytes())
+        .map_err(anyhow::Error::msg)?;
+    let metrics_before = context.metrics().map_err(anyhow::Error::msg)?;
+    let started = Instant::now();
+    let mut graph = context.begin_decode().map_err(anyhow::Error::msg)?;
+    for position in 0..args.sequential_tokens {
+        let (input, output) = if position.is_multiple_of(2) {
+            (&state.token, &state.next_token)
+        } else {
+            (&state.next_token, &state.token)
+        };
+        model
+            .encode_token(
+                &mut graph,
+                context,
+                state,
+                input,
+                output,
+                u32::try_from(position).context("sequential position exceeds u32")?,
+            )
+            .map_err(anyhow::Error::msg)?;
+    }
+    graph.finish(context).map_err(anyhow::Error::msg)?;
+    let wall = started.elapsed();
+    let metrics_after = context.metrics().map_err(anyhow::Error::msg)?;
+    let final_buffer = if args.sequential_tokens.is_multiple_of(2) {
+        &state.token
+    } else {
+        &state.next_token
+    };
+    let final_token = context
+        .read_runtime_u32(final_buffer)
+        .map_err(anyhow::Error::msg)?;
+    let tokens = args.sequential_tokens as f64;
+    println!();
+    println!("QX sequential GPU-resident Qwen graph");
+    println!("tokens:                {}", args.sequential_tokens);
+    println!("final token:           {final_token}");
+    println!(
+        "mean:                  {:.3} ms wall, {:.3} ms GPU, {} CB / {:.2} dispatches per token",
+        wall.as_secs_f64() * 1000.0 / tokens,
+        (metrics_after.gpu_time_seconds - metrics_before.gpu_time_seconds) * 1000.0 / tokens,
+        metrics_after.command_buffers - metrics_before.command_buffers,
+        (metrics_after.dispatches - metrics_before.dispatches) as f64 / tokens,
+    );
+    if let Some(stats) = model
+        .expert_cache_stats(context)
+        .map_err(anyhow::Error::msg)?
+    {
+        let hit_rate = if stats.q4_selections == 0 {
+            0.0
+        } else {
+            f64::from(stats.hits) / f64::from(stats.q4_selections)
+        };
+        println!(
+            "sequential Q4 cache:   {} hits / {} misses / {} evictions / {} bypasses, {:.2}% hit rate",
+            stats.hits,
+            stats.misses,
+            stats.evictions,
+            stats.bypasses,
+            hit_rate * 100.0,
+        );
     }
     Ok(())
 }

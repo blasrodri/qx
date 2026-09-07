@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use qx_format::{
-    AttentionTopology, CompiledTensor, ExecutionPlanManifest, ExpertLayerWeightPlan,
-    ExpertRepresentation, ExpertWeightPlan, KvPrecision, MemoryPlan, MoeTopology, QkvTopology,
-    RawTensor, RepresentationPlan, RmsTopology, RopeKvTopology, SparseExpertPolicy, TensorKind,
-    WeightStorage, write_artifact_with_raw_and_plan,
+    AttentionTopology, CompiledTensor, ExecutionPlanManifest, ExpertCacheAdmission,
+    ExpertLayerWeightPlan, ExpertRepresentation, ExpertResidencyBackend, ExpertResidencyPlan,
+    ExpertWeightPlan, KvPrecision, MemoryPlan, MoeTopology, QkvTopology, RawTensor,
+    RepresentationPlan, RmsTopology, RopeKvTopology, SparseExpertPolicy, TensorKind, WeightStorage,
+    write_artifact_with_raw_and_plan,
 };
 use qx_model::{ModelShape, QWEN3_30B_A3B_MODEL_ID, Qwen3MoeConfig};
 use qx_quant::{PackingLayout, QuantType, QuantizedTensor};
@@ -303,6 +304,12 @@ fn main() -> Result<()> {
         dense: ExpertRepresentation::Group32Q4RowMajor,
     };
     execution_plan.expert_weights = expert_policy.as_ref().map(|policy| policy.plan.clone());
+    execution_plan.expert_residency = expert_policy.as_ref().map(|_| ExpertResidencyPlan {
+        backend: ExpertResidencyBackend::NativeFileBacked,
+        cache_bytes: 0,
+        admission: ExpertCacheAdmission::SecondTouch,
+        reclaim_at_chunk_boundary: true,
+    });
     execution_plan.topology.qkv = QkvTopology::Split;
     execution_plan.topology.input_rms = RmsTopology::Materialized;
     execution_plan.topology.post_attention_rms = RmsTopology::Materialized;

@@ -1,7 +1,7 @@
 //! Fixed-layout metadata and weight primitives for the memory-mappable `.qx`
 //! artifact.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use half::f16;
 use memmap2::{Mmap, UncheckedAdvice};
 use qx_model::ModelShape;
@@ -146,6 +146,31 @@ pub enum WeightStorage {
     CopiedShared,
     MmapNoCopy,
     Hybrid,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpertResidencyBackend {
+    /// Let the unified-memory VM fault clean mmap-backed expert pages directly
+    /// into the GPU working set and reclaim them under pressure.
+    NativeFileBacked,
+    /// Copy admitted source experts into a bounded GPU-managed LRU.
+    GpuLru,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpertCacheAdmission {
+    EveryMiss,
+    SecondTouch,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExpertResidencyPlan {
+    pub backend: ExpertResidencyBackend,
+    pub cache_bytes: u64,
+    pub admission: ExpertCacheAdmission,
+    pub reclaim_at_chunk_boundary: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -401,6 +426,10 @@ pub struct ExecutionPlanManifest {
     /// preserves the compiler decision and its screening provenance.
     #[serde(default)]
     pub expert_weights: Option<ExpertWeightPlan>,
+    /// Device-selected sparse expert residency. Absence preserves the legacy
+    /// native mmap/no-copy behavior.
+    #[serde(default)]
+    pub expert_residency: Option<ExpertResidencyPlan>,
     pub topology: TopologyPlan,
     /// Optional compiler-selected MoE mapping. Older artifacts omit this and
     /// retain the runtime default; new factorial candidates persist the
@@ -514,6 +543,7 @@ impl ExecutionPlanManifest {
                 dense: ExpertRepresentation::Group32Q4RowMajor,
             },
             expert_weights: None,
+            expert_residency: None,
             topology: TopologyPlan {
                 qkv: QkvTopology::Fused,
                 input_rms: RmsTopology::ScalarConsumer,
@@ -683,6 +713,63 @@ pub struct MappedArtifact {
     info: QxArtifactInfo,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResidentRangeStats {
+    pub logical_bytes: u64,
+    pub resident_bytes: u64,
+    pub pages: u64,
+    pub resident_pages: u64,
+}
+
+#[cfg(unix)]
+fn system_page_size() -> Result<usize> {
+    // SAFETY: sysconf has no pointer preconditions.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        bail!("operating-system page size is unavailable");
+    }
+    Ok(page_size as usize)
+}
+
+#[cfg(not(unix))]
+fn system_page_size() -> Result<usize> {
+    Ok(4096)
+}
+
+fn normalized_page_ranges(ranges: &[(u64, u64)], mapped_len: usize) -> Result<Vec<(usize, usize)>> {
+    let page_size = system_page_size()?;
+    let mut normalized = Vec::with_capacity(ranges.len());
+    for &(offset, length) in ranges {
+        if length == 0 {
+            continue;
+        }
+        let end = offset
+            .checked_add(length)
+            .context("mapped file range overflows")?;
+        if end > mapped_len as u64 {
+            bail!("mapped file range exceeds the artifact");
+        }
+        let start = offset as usize / page_size * page_size;
+        let end = (end as usize)
+            .div_ceil(page_size)
+            .saturating_mul(page_size)
+            .min(mapped_len);
+        normalized.push((start, end));
+    }
+    normalized.sort_unstable();
+    let mut merged = Vec::<(usize, usize)>::with_capacity(normalized.len());
+    for (start, end) in normalized {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    Ok(merged)
+}
+
 impl MappedArtifact {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -738,6 +825,58 @@ impl MappedArtifact {
             self.mmap.unchecked_advise(UncheckedAdvice::DontNeed)?;
         }
         Ok(())
+    }
+
+    /// Advise the OS that selected immutable file-backed ranges can be
+    /// reclaimed. Callers must synchronize GPU readers before invoking this.
+    pub fn discard_file_ranges(&self, ranges: &[(u64, u64)]) -> Result<u64> {
+        let ranges = normalized_page_ranges(ranges, self.mmap.len())?;
+        let mut advised = 0_u64;
+        #[cfg(unix)]
+        for (start, end) in ranges {
+            // SAFETY: the normalized range is page-aligned and lies entirely
+            // inside this immutable read-only mapping.
+            unsafe {
+                self.mmap
+                    .unchecked_advise_range(UncheckedAdvice::DontNeed, start, end - start)?;
+            }
+            advised += (end - start) as u64;
+        }
+        #[cfg(not(unix))]
+        let _ = ranges;
+        Ok(advised)
+    }
+
+    /// Query current physical residency for selected file ranges. This is a
+    /// diagnostic snapshot, not a promise that the OS will retain the pages.
+    #[cfg(unix)]
+    pub fn resident_file_ranges(&self, ranges: &[(u64, u64)]) -> Result<ResidentRangeStats> {
+        let ranges = normalized_page_ranges(ranges, self.mmap.len())?;
+        let page_size = system_page_size()?;
+        let mut stats = ResidentRangeStats::default();
+        for (start, end) in ranges {
+            let bytes = end - start;
+            let pages = bytes.div_ceil(page_size);
+            let mut residency = vec![0_u8; pages];
+            // SAFETY: the mapping and vector cover the exact page-aligned
+            // address/length pair passed to mincore.
+            let result = unsafe {
+                libc::mincore(
+                    self.mmap.as_ptr().add(start).cast_mut().cast(),
+                    bytes,
+                    residency.as_mut_ptr().cast(),
+                )
+            };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let resident_pages = residency.iter().filter(|value| **value & 1 != 0).count();
+            stats.logical_bytes += bytes as u64;
+            stats.pages += pages as u64;
+            stats.resident_pages += resident_pages as u64;
+            stats.resident_bytes += (resident_pages * page_size) as u64;
+        }
+        Ok(stats)
     }
 
     pub fn tensor_bytes(&self, index: usize) -> Result<(&[u8], &[u8])> {
@@ -1703,6 +1842,21 @@ mod tests {
     }
 
     #[test]
+    fn residency_ranges_are_page_aligned_and_coalesced() {
+        let page = system_page_size().unwrap();
+        let ranges = normalized_page_ranges(
+            &[
+                (page as u64 + 17, 32),
+                ((page * 2 - 8) as u64, 32),
+                ((page * 4 + 1) as u64, 1),
+            ],
+            page * 8,
+        )
+        .unwrap();
+        assert_eq!(ranges, vec![(page, page * 3), (page * 4, page * 5)]);
+    }
+
+    #[test]
     fn artifact_round_trip_preserves_directory_and_memory_plan() {
         let tensor = QuantizedTensor::quantize(&[1.0, -0.5, 0.25, 0.0], 2, 2, QuantType::Q3, 2);
         let path = std::env::temp_dir().join(format!("qx-artifact-{}.qx", std::process::id()));
@@ -2196,6 +2350,12 @@ mod tests {
                 causal_anchors: vec![1],
                 training_manifest_sha256: "d".repeat(64),
             }],
+        });
+        manifest.expert_residency = Some(ExpertResidencyPlan {
+            backend: ExpertResidencyBackend::GpuLru,
+            cache_bytes: 128 * 1024 * 1024,
+            admission: ExpertCacheAdmission::SecondTouch,
+            reclaim_at_chunk_boundary: true,
         });
         let encoded = serde_json::to_vec(&manifest).unwrap();
         let decoded: ExecutionPlanManifest = serde_json::from_slice(&encoded).unwrap();

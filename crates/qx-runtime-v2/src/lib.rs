@@ -877,6 +877,32 @@ impl PreparedQwenLayer {
         workspace: &QwenLayerWorkspace,
         position: u32,
     ) -> Result<(), String> {
+        self.encode_with_expert_cache(
+            graph,
+            context,
+            hidden,
+            key_cache,
+            value_cache,
+            output,
+            workspace,
+            position,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_with_expert_cache(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        context: &qx_metal::platform::MetalContext,
+        hidden: &qx_metal::platform::RuntimeBuffer,
+        key_cache: &qx_metal::platform::RuntimeBuffer,
+        value_cache: &qx_metal::platform::RuntimeBuffer,
+        output: &qx_metal::platform::RuntimeBuffer,
+        workspace: &QwenLayerWorkspace,
+        position: u32,
+        expert_cache: Option<&qx_metal::platform::PreparedQwenExpertCache>,
+    ) -> Result<(), String> {
         graph.encode_qwen_rms_norm(
             context,
             hidden,
@@ -950,15 +976,29 @@ impl PreparedQwenLayer {
             &workspace.expert_ids,
             &workspace.expert_weights,
         )?;
-        graph.encode_qwen_dynamic_moe(
-            &self.dynamic_moe,
-            &workspace.moe_input,
-            &workspace.expert_ids,
-            &workspace.expert_weights,
-            &workspace.expert_activations,
-            &workspace.expert_outputs,
-            &workspace.moe_output,
-        )?;
+        if let Some(cache) = expert_cache {
+            graph.encode_qwen_dynamic_moe_cached(
+                &self.dynamic_moe,
+                cache,
+                self.layer,
+                &workspace.moe_input,
+                &workspace.expert_ids,
+                &workspace.expert_weights,
+                &workspace.expert_activations,
+                &workspace.expert_outputs,
+                &workspace.moe_output,
+            )?;
+        } else {
+            graph.encode_qwen_dynamic_moe(
+                &self.dynamic_moe,
+                &workspace.moe_input,
+                &workspace.expert_ids,
+                &workspace.expert_weights,
+                &workspace.expert_activations,
+                &workspace.expert_outputs,
+                &workspace.moe_output,
+            )?;
+        }
         graph.encode_qwen_residual(
             context,
             &workspace.hidden_after_attention,
@@ -979,7 +1019,15 @@ pub struct PreparedQwenModel {
     pub final_norm: qx_metal::platform::RuntimeBuffer,
     pub lm_head: qx_metal::platform::PreparedQ4Stage,
     pub vocabulary: usize,
+    expert_cache: Option<qx_metal::platform::PreparedQwenExpertCache>,
     artifact: Arc<qx_format::MappedArtifact>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QwenWeightResidencySnapshot {
+    pub total: qx_format::ResidentRangeStats,
+    pub source_q4: qx_format::ResidentRangeStats,
 }
 
 /// Mutable GPU state for one Qwen decode stream. KV storage is bounded by the
@@ -1053,6 +1101,29 @@ impl PreparedQwenModel {
     pub fn load(
         context: &qx_metal::platform::MetalContext,
         artifact: Arc<qx_format::MappedArtifact>,
+    ) -> Result<Self, String> {
+        let residency = artifact
+            .info()
+            .execution_plan
+            .as_ref()
+            .and_then(|plan| plan.expert_residency.as_ref());
+        let cache_bytes = match residency {
+            Some(plan) if plan.backend == qx_format::ExpertResidencyBackend::GpuLru => {
+                if plan.admission != qx_format::ExpertCacheAdmission::SecondTouch {
+                    return Err("Qwen GPU LRU currently requires second-touch admission".to_owned());
+                }
+                usize::try_from(plan.cache_bytes)
+                    .map_err(|_| "Qwen expert cache budget does not fit usize".to_owned())?
+            }
+            _ => 0,
+        };
+        Self::load_with_expert_cache_budget(context, artifact, cache_bytes)
+    }
+
+    pub fn load_with_expert_cache_budget(
+        context: &qx_metal::platform::MetalContext,
+        artifact: Arc<qx_format::MappedArtifact>,
+        expert_cache_budget_bytes: usize,
     ) -> Result<Self, String> {
         let shape = artifact
             .info()
@@ -1128,12 +1199,16 @@ impl PreparedQwenModel {
                 layer as u16,
             )?);
         }
+        let expert_cache = (expert_cache_budget_bytes != 0)
+            .then(|| context.prepare_qwen_expert_cache(expert_cache_budget_bytes))
+            .transpose()?;
         Ok(Self {
             layers,
             embedding,
             final_norm,
             lm_head,
             vocabulary: shape.vocabulary,
+            expert_cache,
             artifact,
         })
     }
@@ -1172,7 +1247,7 @@ impl PreparedQwenModel {
             } else {
                 (&state.hidden_b, &state.hidden_a)
             };
-            layer.encode(
+            layer.encode_with_expert_cache(
                 graph,
                 context,
                 input,
@@ -1181,6 +1256,7 @@ impl PreparedQwenModel {
                 output,
                 &state.workspace,
                 position,
+                self.expert_cache.as_ref(),
             )?;
         }
         let final_hidden = if self.layers.len().is_multiple_of(2) {
@@ -1203,6 +1279,94 @@ impl PreparedQwenModel {
     pub fn artifact(&self) -> &Arc<qx_format::MappedArtifact> {
         &self.artifact
     }
+
+    pub fn expert_cache_stats(
+        &self,
+        context: &qx_metal::platform::MetalContext,
+    ) -> Result<Option<qx_metal::platform::QwenExpertCacheStats>, String> {
+        self.expert_cache
+            .as_ref()
+            .map(|cache| context.qwen_expert_cache_stats(cache))
+            .transpose()
+    }
+
+    pub fn reset_expert_cache(
+        &self,
+        context: &qx_metal::platform::MetalContext,
+    ) -> Result<(), String> {
+        if let Some(cache) = self.expert_cache.as_ref() {
+            context.reset_qwen_expert_cache(cache)?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot reclaimable file-backed page residency. This does not count
+    /// runtime arenas, KV state, or the optional explicit Q4 cache buffer.
+    pub fn weight_residency(&self) -> Result<QwenWeightResidencySnapshot, String> {
+        let header = &self.artifact.info().header;
+        let total_ranges = [(header.weights_offset, header.weights_length)];
+        let source_ranges = qwen_source_q4_ranges(&self.artifact)?;
+        Ok(QwenWeightResidencySnapshot {
+            total: self
+                .artifact
+                .resident_file_ranges(&total_ranges)
+                .map_err(|error| error.to_string())?,
+            source_q4: self
+                .artifact
+                .resident_file_ranges(&source_ranges)
+                .map_err(|error| error.to_string())?,
+        })
+    }
+
+    /// Release clean source-exact Q4 pages after the caller has synchronized
+    /// all command buffers that may still read them.
+    pub fn discard_source_q4_pages(&self) -> Result<u64, String> {
+        self.artifact
+            .discard_file_ranges(&qwen_source_q4_ranges(&self.artifact)?)
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn qwen_source_q4_ranges(artifact: &qx_format::MappedArtifact) -> Result<Vec<(u64, u64)>, String> {
+    let policy = artifact
+        .info()
+        .execution_plan
+        .as_ref()
+        .and_then(|plan| plan.expert_weights.as_ref())
+        .ok_or_else(|| "Qwen artifact has no heterogeneous expert policy".to_owned())?;
+    let source = policy
+        .layers
+        .iter()
+        .flat_map(|layer| {
+            layer
+                .source_experts
+                .iter()
+                .map(move |expert| (layer.layer, *expert))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut ranges = Vec::with_capacity(source.len() * 4);
+    for entry in artifact
+        .info()
+        .entries
+        .iter()
+        .filter(|entry| entry.is_expert() && source.contains(&(entry.layer, entry.expert)))
+    {
+        if entry.quant_type != qx_quant::QuantType::Q4
+            || entry.layout != qx_quant::PackingLayout::RowMajor
+        {
+            return Err(format!(
+                "source-exact Qwen entry has unsupported encoding at {}:{}",
+                entry.layer, entry.expert
+            ));
+        }
+        ranges.push((entry.scale_offset, entry.scale_length));
+        ranges.push((entry.data_offset, entry.data_length));
+    }
+    if ranges.len() != source.len() * 4 {
+        return Err("source-exact Qwen directory is incomplete".to_owned());
+    }
+    Ok(ranges)
 }
 
 #[cfg(target_os = "macos")]

@@ -116,7 +116,7 @@ p95, 32.91 MiB p99, 3.27 ms mean shaped I/O, 13.16 ms p95, and 34.21 ms p99.
 Larger caches are effectively flat in this control because each short request
 cannot populate them before reset.
 
-This supports the following runtime candidate:
+The trace model initially supported the following runtime candidate:
 
 ```text
 ExpertResidencyPlan {
@@ -128,9 +128,11 @@ ExpertResidencyPlan {
 }
 ```
 
-The cache size is a measured workload/device candidate, not a universal model
-constant. The compiler should select it from the artifact policy, device memory
-budget, route replay, and physical storage profile.
+The cache size was a measured workload/device candidate, not a universal model
+constant. The physical runtime experiment below supersedes this candidate on
+Apple unified memory: native file-backed residency is faster and consumes less
+process-charged memory. A bounded explicit cache remains a selectable backend
+for devices where source storage is not directly GPU-addressable.
 
 ## Why this reopens the phone lane
 
@@ -240,6 +242,51 @@ promoted for Qwen Q3 students, not merely retained as an experiment.
 
 Machine-readable evidence is in
 `benchmarks/results/qwen3-30b-a3b-q3-superblock112-runtime-2026-09-07.json`.
+
+## Physical runtime policy: native VM versus explicit GPU LRU
+
+QX now has an executable GPU-resident source-Q4 LRU for testing the residency
+model without reintroducing a CPU token boundary. A resolver dispatch owns a
+fully associative 50-slot table, second-touch admission rejects one-off tail
+experts, and a conditional fill dispatch copies admitted 2,654,208-byte Q4
+experts into a 126.56 MiB Metal buffer. Hit, miss, eviction, bypass, and Q4
+selection counters remain on GPU until the chunk boundary.
+
+The explicit cache is correct but is not the Apple winner. Three paired runs
+of 64 causally chained tokens in one command buffer produced:
+
+| Runtime residency | GPU ms/token | tok/s | dispatches/token | final token |
+|---|---:|---:|---:|---:|
+| native mmap/no-copy | 51.933 | 19.26 | 724 | 15 |
+| 128 MiB GPU LRU, second-touch | 55.506 | 18.02 | 820 | 15 |
+
+The LRU recorded 1,024 hits, 549 misses, 300 evictions, and 199 first-touch
+bypasses, for a 65.10% hit rate. It nevertheless increased token latency by
+6.88% and reduced throughput by 6.44%, because unified memory already makes
+clean file-backed pages directly GPU-readable; copying admitted experts adds
+another read/write traversal and 96 dispatches per token.
+
+Process accounting makes the structural distinction explicit. The native path
+mapped 11,259,314,176 bytes (10.486 GiB) of logical Metal weight resources, but
+a 64-token run peaked at 98,534,192 bytes of process physical footprint. The
+explicit cache peaked at 242,811,768 bytes. These figures exclude globally
+reclaimable clean file-cache pages. `mincore` reported the complete artifact resident because it
+had just been encoded and audited; `MADV_DONTNEED` did not purge that global
+cache, so file-cache presence is not reported as QX process footprint.
+
+The compiler/runtime now expresses this as `ExpertResidencyPlan`. Apple
+unified-memory artifacts select `NativeFileBacked`; `GpuLru` with second-touch
+admission remains an experimental backend for a device whose physical storage
+and fault measurements justify the copy. This is the stronger result: the
+planner can choose the residency mechanism per target rather than assuming
+that an application-owned cache is universally better.
+
+This Mac result does not prove iPhone jetsam safety. iOS may account Metal and
+file-backed GPU pages differently, and storage pressure, thermals, and a real
+application add memory not represented here. The exact next gate is the same
+instrumented 64-token run inside the iPhone app, recording jetsam footprint,
+page-ins, GPU time, and sustained throughput. Machine-readable evidence is in
+`benchmarks/results/qwen3-30b-a3b-expert-residency-runtime-2026-09-07.json`.
 
 The committed runtime result is
 `benchmarks/results/qwen3-30b-a3b-heterogeneous-gpu-runtime-2026-09-07.json`.

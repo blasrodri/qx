@@ -367,6 +367,140 @@ inline float qx_qwen_q3_112_dot_threadgroup(
     return sum;
 }
 
+constant constexpr uint qx_qwen_q4_gate_scale_bytes = 196608u;
+constant constexpr uint qx_qwen_q4_gate_data_bytes = 1572864u;
+constant constexpr uint qx_qwen_q4_down_scale_bytes = 98304u;
+constant constexpr uint qx_qwen_q4_down_data_bytes = 786432u;
+constant constexpr uint qx_qwen_q4_cache_gate_scale_offset = 0u;
+constant constexpr uint qx_qwen_q4_cache_gate_data_offset = 196608u;
+constant constexpr uint qx_qwen_q4_cache_down_scale_offset = 1769472u;
+constant constexpr uint qx_qwen_q4_cache_down_data_offset = 1867776u;
+constant constexpr uint qx_qwen_q4_cache_slot_bytes = 2654208u;
+constant constexpr uint qx_qwen_uncached_slot = 0xffffffffu;
+
+// Resolve the selected source-exact Q4 experts against a small fully
+// associative GPU cache. One thread owns the metadata update, so token graphs
+// queued back-to-back preserve exact LRU semantics without atomics or host
+// synchronization. One-hit entries bypass storage; only a second touch earns
+// admission, preventing the sparse tail from polluting the bounded cache.
+// Counters are [hits, misses, evictions, Q4 selections, bypasses].
+kernel void qx_qwen_q4_cache_resolve(
+    device const uchar* codecs [[buffer(0)]],
+    device const uint* expert_ids [[buffer(1)]],
+    device uint* keys [[buffer(2)]],
+    device uint* ages [[buffer(3)]],
+    device uint* clock [[buffer(4)]],
+    device uint* resolved_slots [[buffer(5)]],
+    device uint* copy_flags [[buffer(6)]],
+    device uint* counters [[buffer(7)]],
+    device uchar* seen [[buffer(8)]],
+    constant uint& layer [[buffer(9)]],
+    constant uint& cache_slots [[buffer(10)]],
+    uint tid [[thread_position_in_grid]]) {
+    if (tid != 0u) {
+        return;
+    }
+    uint now = clock[0] + 1u;
+    if (now == 0u) {
+        for (uint slot = 0; slot < cache_slots; ++slot) {
+            ages[slot] = 0u;
+        }
+        now = 1u;
+    }
+    clock[0] = now;
+    for (uint route_slot = 0; route_slot < 8u; ++route_slot) {
+        uint expert = expert_ids[route_slot];
+        resolved_slots[route_slot] = qx_qwen_uncached_slot;
+        copy_flags[route_slot] = 0u;
+        if (codecs[expert] != 4u) {
+            continue;
+        }
+        counters[3] += 1u;
+        uint key = layer * 128u + expert;
+        uint hit_slot = qx_qwen_uncached_slot;
+        uint empty_slot = qx_qwen_uncached_slot;
+        uint oldest_slot = 0u;
+        uint oldest_age = 0xffffffffu;
+        for (uint slot = 0; slot < cache_slots; ++slot) {
+            uint cached_key = keys[slot];
+            if (cached_key == key) {
+                hit_slot = slot;
+                break;
+            }
+            if (cached_key == qx_qwen_uncached_slot && empty_slot == qx_qwen_uncached_slot) {
+                empty_slot = slot;
+            }
+            if (ages[slot] < oldest_age) {
+                oldest_age = ages[slot];
+                oldest_slot = slot;
+            }
+        }
+        if (hit_slot != qx_qwen_uncached_slot) {
+            counters[0] += 1u;
+            ages[hit_slot] = now;
+            resolved_slots[route_slot] = hit_slot;
+            continue;
+        }
+        counters[1] += 1u;
+        if (seen[key] == 0u) {
+            seen[key] = 1u;
+            counters[4] += 1u;
+            continue;
+        }
+        uint target = empty_slot != qx_qwen_uncached_slot ? empty_slot : oldest_slot;
+        if (empty_slot == qx_qwen_uncached_slot) {
+            counters[2] += 1u;
+        }
+        keys[target] = key;
+        ages[target] = now;
+        resolved_slots[route_slot] = target;
+        copy_flags[route_slot] = 1u;
+    }
+}
+
+inline void qx_qwen_copy_words(
+    device const uchar* source,
+    device uchar* destination,
+    uint bytes,
+    uint tid) {
+    device const uint* source_words = reinterpret_cast<device const uint*>(source);
+    device uint* destination_words = reinterpret_cast<device uint*>(destination);
+    for (uint word = tid; word < bytes / 4u; word += 256u) {
+        destination_words[word] = source_words[word];
+    }
+}
+
+// Eight fixed threadgroups avoid a route readback or indirect dispatch. Cache
+// hits exit immediately; a miss copies the source expert's four physical
+// ranges into one consumer-native fixed slot.
+kernel void qx_qwen_q4_cache_fill(
+    device const uchar* slab [[buffer(0)]],
+    device const ulong* gate_data_offsets [[buffer(1)]],
+    device const ulong* gate_scale_offsets [[buffer(2)]],
+    device const ulong* down_data_offsets [[buffer(3)]],
+    device const ulong* down_scale_offsets [[buffer(4)]],
+    device const uint* expert_ids [[buffer(5)]],
+    device const uint* resolved_slots [[buffer(6)]],
+    device const uint* copy_flags [[buffer(7)]],
+    device uchar* cache [[buffer(8)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint route_slot [[threadgroup_position_in_grid]]) {
+    if (copy_flags[route_slot] == 0u) {
+        return;
+    }
+    uint expert = expert_ids[route_slot];
+    uint cache_slot = resolved_slots[route_slot];
+    device uchar* target = cache + cache_slot * qx_qwen_q4_cache_slot_bytes;
+    qx_qwen_copy_words(slab + gate_scale_offsets[expert],
+        target + qx_qwen_q4_cache_gate_scale_offset, qx_qwen_q4_gate_scale_bytes, tid);
+    qx_qwen_copy_words(slab + gate_data_offsets[expert],
+        target + qx_qwen_q4_cache_gate_data_offset, qx_qwen_q4_gate_data_bytes, tid);
+    qx_qwen_copy_words(slab + down_scale_offsets[expert],
+        target + qx_qwen_q4_cache_down_scale_offset, qx_qwen_q4_down_scale_bytes, tid);
+    qx_qwen_copy_words(slab + down_data_offsets[expert],
+        target + qx_qwen_q4_cache_down_data_offset, qx_qwen_q4_down_data_bytes, tid);
+}
+
 kernel void qx_qwen_moe_dynamic(
     device const uchar* slab [[buffer(0)]],
     device const ulong* gate_data_offsets [[buffer(1)]],
@@ -377,6 +511,8 @@ kernel void qx_qwen_moe_dynamic(
     device const half* input [[buffer(6)]],
     device const uint* expert_ids [[buffer(7)]],
     device half* expert_outputs [[buffer(8)]],
+    device const uchar* cache [[buffer(9)]],
+    device const uint* resolved_slots [[buffer(10)]],
     uint lane [[thread_position_in_threadgroup]],
     uint slot [[threadgroup_position_in_grid]]) {
     constexpr uint hidden = 2048;
@@ -392,6 +528,16 @@ kernel void qx_qwen_moe_dynamic(
     device const uchar* down_data = slab + down_data_offsets[expert];
     device const half* down_scales =
         reinterpret_cast<device const half*>(slab + down_scale_offsets[expert]);
+    uint cache_slot = resolved_slots[slot];
+    if (codec == 4u && cache_slot != qx_qwen_uncached_slot) {
+        device const uchar* cached = cache + cache_slot * qx_qwen_q4_cache_slot_bytes;
+        gate_data = cached + qx_qwen_q4_cache_gate_data_offset;
+        gate_scales = reinterpret_cast<device const half*>(
+            cached + qx_qwen_q4_cache_gate_scale_offset);
+        down_data = cached + qx_qwen_q4_cache_down_data_offset;
+        down_scales = reinterpret_cast<device const half*>(
+            cached + qx_qwen_q4_cache_down_scale_offset);
+    }
     threadgroup half activated[intermediate];
 
     float gate = 0.0f;
@@ -474,6 +620,8 @@ kernel void qx_qwen_moe_gate_dynamic(
     device const half* input [[buffer(4)]],
     device const uint* expert_ids [[buffer(5)]],
     device half* activations [[buffer(6)]],
+    device const uchar* cache [[buffer(7)]],
+    device const uint* resolved_slots [[buffer(8)]],
     uint lane [[thread_position_in_threadgroup]],
     uint slot [[threadgroup_position_in_grid]]) {
     constexpr uint hidden = 2048;
@@ -485,6 +633,13 @@ kernel void qx_qwen_moe_gate_dynamic(
     device const uchar* gate_data = slab + gate_data_offsets[expert];
     device const half* gate_scales =
         reinterpret_cast<device const half*>(slab + gate_scale_offsets[expert]);
+    uint cache_slot = resolved_slots[slot];
+    if (codec == 4u && cache_slot != qx_qwen_uncached_slot) {
+        device const uchar* cached = cache + cache_slot * qx_qwen_q4_cache_slot_bytes;
+        gate_data = cached + qx_qwen_q4_cache_gate_data_offset;
+        gate_scales = reinterpret_cast<device const half*>(
+            cached + qx_qwen_q4_cache_gate_scale_offset);
+    }
     uint up_row = intermediate + lane;
     float gate = 0.0f;
     float up = 0.0f;
@@ -538,6 +693,8 @@ kernel void qx_qwen_moe_down_tiled_dynamic(
     device const half* activations [[buffer(4)]],
     device const uint* expert_ids [[buffer(5)]],
     device half* expert_outputs [[buffer(6)]],
+    device const uchar* cache [[buffer(7)]],
+    device const uint* resolved_slots [[buffer(8)]],
     uint tid [[thread_position_in_threadgroup]],
     uint group_id [[threadgroup_position_in_grid]]) {
     constexpr uint hidden = 2048;
@@ -554,6 +711,13 @@ kernel void qx_qwen_moe_down_tiled_dynamic(
     device const uchar* down_data = slab + down_data_offsets[expert];
     device const half* down_scales =
         reinterpret_cast<device const half*>(slab + down_scale_offsets[expert]);
+    uint cache_slot = resolved_slots[slot];
+    if (codec == 4u && cache_slot != qx_qwen_uncached_slot) {
+        device const uchar* cached = cache + cache_slot * qx_qwen_q4_cache_slot_bytes;
+        down_data = cached + qx_qwen_q4_cache_down_data_offset;
+        down_scales = reinterpret_cast<device const half*>(
+            cached + qx_qwen_q4_cache_down_scale_offset);
+    }
     device const half* activated = activations + slot * intermediate;
     float down = 0.0f;
     if (codec == 2) {

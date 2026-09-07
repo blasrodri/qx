@@ -13,3 +13,6 @@ qx-metal.workspace = true
 qx-model.workspace = true
 qx-quant.workspace = true
 qx-runtime-v2.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true

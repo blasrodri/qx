@@ -460,6 +460,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
+ "libc",
  "memmap2",
  "qx-model",
  "qx-quant",
@@ -565,6 +566,7 @@ dependencies = [
  "anyhow",
  "clap",
  "half",
+ "libc",
  "qx-format",
  "qx-metal",
  "qx-model",
