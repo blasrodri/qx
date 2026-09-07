@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-30b-a3b-layer-local-metal-mapping",
+  "promotion_evidence": true,
+  "device": {
+    "identifier": "Mac17,9",
+    "chip": "Apple M5 Pro",
+    "memory_gib": 24
+  },
+  "artifact": {
+    "path": "external/models/qwen3-30b-a3b-a19pro-q2s4-capacity-candidate.qx",
+    "representation": "uniform-q2s4-control",
+    "weight_slab_bytes": 9926475776
+  },
+  "layer_0": {
+    "before": {
+      "metal_buffer_bytes": 9926475776,
+      "binding_ms": 30.793
+    },
+    "after": {
+      "metal_buffer_bytes": 199507968,
+      "binding_ms": 3.834,
+      "relative_l2": 0.00008352,
+      "cosine": 1.0,
+      "warm_wall_ms": 1.376,
+      "warm_gpu_ms": 1.212
+    },
+    "metal_buffer_reduction_ratio": 49.754783608442146,
+    "parity": "pass"
+  },
+  "complete_model": {
+    "prepared_layers": 48,
+    "preparation_ms": 54.879,
+    "state_context": 2,
+    "runtime_state_bytes": 592968,
+    "metal_logical_weight_bytes": 9729900544,
+    "first_token_wall_ms": 1375.976,
+    "first_token_gpu_ms": 60.097,
+    "warm_token_wall_ms": 51.386,
+    "warm_token_gpu_ms": 50.713,
+    "warm_tokens_per_second": 19.46055345814035,
+    "deterministic_replay": true,
+    "command_buffers_per_token": 1,
+    "dispatches_per_token": 724
+  },
+  "decision": {
+    "layer_local_mapping": "promote-for-qwen",
+    "full_artifact_metal_buffer": "remove",
+    "heterogeneous_runtime": "next",
+    "claim_boundary": "mapping parity and complete-model execution on M5 Pro; no iPhone residency or throughput claim"
+  }
+}

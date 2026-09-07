@@ -713,6 +713,17 @@ impl MappedArtifact {
         self.mmap.len()
     }
 
+    /// Borrow an arbitrary file-relative region from the immutable mapping.
+    /// Runtime backends use this to create page-aligned, layer-local no-copy
+    /// device buffers without forcing one device buffer to span the complete
+    /// multi-gigabyte artifact.
+    pub fn mapped_range(&self, range: std::ops::Range<usize>) -> Result<&[u8]> {
+        if range.start >= range.end || range.end > self.mmap.len() {
+            bail!("QX mapped range is empty or outside the artifact");
+        }
+        Ok(&self.mmap[range])
+    }
+
     /// Ask the OS to reclaim file-backed pages already copied into Metal
     /// buffers. The mapping remains valid and will fault pages back in if a
     /// later CPU inspection needs them.
@@ -1719,6 +1730,13 @@ mod tests {
         )
         .unwrap();
         let artifact = MappedArtifact::open(&path).unwrap();
+        assert_eq!(artifact.mapped_range(0..8).unwrap(), MAGIC);
+        assert!(artifact.mapped_range(8..8).is_err());
+        assert!(
+            artifact
+                .mapped_range(0..artifact.mapped_bytes() + 1)
+                .is_err()
+        );
         let raw_index = artifact
             .info()
             .entries

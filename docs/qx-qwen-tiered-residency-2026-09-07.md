@@ -88,6 +88,26 @@ buffer binding, GPU contention, or delivered model throughput. The committed
 aggregate is
 `benchmarks/results/qwen3-30b-a3b-tiered-residency-physical-io-2026-09-07.json`.
 
+## Layer-local Metal mapping
+
+The runtime previously wrapped the complete 9--11 GiB artifact weight slab in
+one `MTLBuffer`, then expressed every tensor as a subregion. That preserves
+GPU-resident routing but creates the wrong resource shape for a memory-limited
+phone. QX now creates one page-aligned no-copy buffer for each layer's
+quantized extent and small tensor-local buffers for raw norms, embedding, and
+LM head. Every buffer retains the same immutable artifact mmap owner.
+
+On the uniform-Q2S4 control, layer 0's Metal resource fell from 9,926,475,776
+bytes to 199,507,968 bytes (49.76x smaller). Expert, router, attention, dynamic
+MoE, and complete-layer parity all pass. A complete 48-layer model still
+constructs and executes in one command buffer: its warm token measured 51.386
+ms wall / 50.713 ms GPU on the M5 Pro, or 19.46 tok/s, with a context-2 state.
+This does not reduce total weight bytes by itself; it removes the giant-buffer
+constraint and gives the OS/Metal layer-sized file-backed residency units.
+
+The committed control is
+`benchmarks/results/qwen3-30b-a3b-layer-local-metal-mapping-2026-09-07.json`.
+
 ## Cold-request control
 
 Resetting the LRU between every corpus paragraph prevents cross-request warming.

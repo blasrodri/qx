@@ -714,15 +714,20 @@ impl PreparedQwenLayer {
             return Err("Qwen layer requires mmap/no-copy weight storage".to_owned());
         }
         context.prepare_qwen_layer_graph()?;
-        let weight_slab = artifact.weight_slab().map_err(|error| error.to_string())?;
-        let pointer = NonNull::new(weight_slab.as_ptr() as *mut c_void)
-            .ok_or_else(|| "Qwen artifact weight slab is empty".to_owned())?;
-        let slab =
-            unsafe { context.input_buffer_no_copy(pointer, weight_slab.len(), artifact.clone())? };
+        let (slab, slab_file_offset) = qwen_layer_slab(context, &artifact, layer)?;
 
-        let raw = |kind| qwen_raw_buffer(&artifact, &slab, layer, kind);
+        let raw = |kind| qwen_raw_tensor_buffer(context, &artifact, layer, kind);
         let matrix = |kind, rows, columns| {
-            qwen_q4_stage(context, &artifact, &slab, layer, kind, rows, columns)
+            qwen_q4_stage(
+                context,
+                &artifact,
+                &slab,
+                slab_file_offset,
+                layer,
+                kind,
+                rows,
+                columns,
+            )
         };
         let input_norm = raw(qx_format::TensorKind::InputNorm)?;
         let post_attention_norm = raw(qx_format::TensorKind::PostAttentionNorm)?;
@@ -741,14 +746,14 @@ impl PreparedQwenLayer {
         for expert in 0..128_u8 {
             let gate_index =
                 qwen_entry_index(&artifact, layer, expert, qx_format::TensorKind::GateUp)?;
-            let (gate_scales_range, gate_data_range) = artifact
-                .tensor_slab_ranges(gate_index)
-                .map_err(|error| error.to_string())?;
+            let (gate_scales_range, gate_data_range) =
+                qwen_entry_ranges(&artifact, &slab, slab_file_offset, gate_index)?;
             gate_data_offsets.push(gate_data_range.start as u64);
             gate_scale_offsets.push(gate_scales_range.start as u64);
             let (gate_scales, gate_data) = qwen_entry_buffers(
                 &artifact,
                 &slab,
+                slab_file_offset,
                 layer,
                 expert,
                 qx_format::TensorKind::GateUp,
@@ -758,14 +763,14 @@ impl PreparedQwenLayer {
             )?;
             let down_index =
                 qwen_entry_index(&artifact, layer, expert, qx_format::TensorKind::Down)?;
-            let (down_scales_range, down_data_range) = artifact
-                .tensor_slab_ranges(down_index)
-                .map_err(|error| error.to_string())?;
+            let (down_scales_range, down_data_range) =
+                qwen_entry_ranges(&artifact, &slab, slab_file_offset, down_index)?;
             down_data_offsets.push(down_data_range.start as u64);
             down_scale_offsets.push(down_scales_range.start as u64);
             let (down_scales, down_data) = qwen_entry_buffers(
                 &artifact,
                 &slab,
+                slab_file_offset,
                 layer,
                 expert,
                 qx_format::TensorKind::Down,
@@ -1017,14 +1022,18 @@ impl PreparedQwenModel {
         {
             return Err(format!("unsupported complete Qwen shape {shape:?}"));
         }
-        let weight_slab = artifact.weight_slab().map_err(|error| error.to_string())?;
-        let pointer = NonNull::new(weight_slab.as_ptr() as *mut c_void)
-            .ok_or_else(|| "Qwen artifact weight slab is empty".to_owned())?;
-        let slab =
-            unsafe { context.input_buffer_no_copy(pointer, weight_slab.len(), artifact.clone())? };
+        let embedding_index = qwen_entry_index(
+            &artifact,
+            u16::MAX,
+            u8::MAX,
+            qx_format::TensorKind::Embedding,
+        )?;
+        let (embedding_slab, embedding_file_offset) =
+            qwen_tensor_slab(context, &artifact, embedding_index)?;
         let (embedding_scales, embedding_data) = qwen_entry_buffers(
             &artifact,
-            &slab,
+            &embedding_slab,
+            embedding_file_offset,
             u16::MAX,
             u8::MAX,
             qx_format::TensorKind::Embedding,
@@ -1037,12 +1046,30 @@ impl PreparedQwenModel {
             embedding_scales,
             shape.vocabulary,
         )?;
-        let final_norm =
-            qwen_raw_buffer(&artifact, &slab, u16::MAX, qx_format::TensorKind::FinalNorm)?;
+        let final_norm_index = qwen_entry_index(
+            &artifact,
+            u16::MAX,
+            u8::MAX,
+            qx_format::TensorKind::FinalNorm,
+        )?;
+        let (final_norm_slab, final_norm_file_offset) =
+            qwen_tensor_slab(context, &artifact, final_norm_index)?;
+        let final_norm = qwen_raw_buffer(
+            &artifact,
+            &final_norm_slab,
+            final_norm_file_offset,
+            u16::MAX,
+            qx_format::TensorKind::FinalNorm,
+        )?;
+        let lm_head_index =
+            qwen_entry_index(&artifact, u16::MAX, u8::MAX, qx_format::TensorKind::LmHead)?;
+        let (lm_head_slab, lm_head_file_offset) =
+            qwen_tensor_slab(context, &artifact, lm_head_index)?;
         let lm_head = qwen_q4_stage(
             context,
             &artifact,
-            &slab,
+            &lm_head_slab,
+            lm_head_file_offset,
             u16::MAX,
             qx_format::TensorKind::LmHead,
             shape.vocabulary,
@@ -1134,6 +1161,131 @@ impl PreparedQwenModel {
 }
 
 #[cfg(target_os = "macos")]
+fn qwen_layer_slab(
+    context: &qx_metal::platform::MetalContext,
+    artifact: &Arc<qx_format::MappedArtifact>,
+    layer: u16,
+) -> Result<(qx_metal::platform::RuntimeBuffer, u64), String> {
+    let indices = artifact
+        .info()
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            (entry.layer == layer && entry.group_size != 0).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    qwen_mapped_slab(context, artifact, &indices)
+}
+
+#[cfg(target_os = "macos")]
+fn qwen_tensor_slab(
+    context: &qx_metal::platform::MetalContext,
+    artifact: &Arc<qx_format::MappedArtifact>,
+    index: usize,
+) -> Result<(qx_metal::platform::RuntimeBuffer, u64), String> {
+    qwen_mapped_slab(context, artifact, &[index])
+}
+
+#[cfg(target_os = "macos")]
+fn qwen_raw_tensor_buffer(
+    context: &qx_metal::platform::MetalContext,
+    artifact: &Arc<qx_format::MappedArtifact>,
+    layer: u16,
+    kind: qx_format::TensorKind,
+) -> Result<qx_metal::platform::RuntimeBuffer, String> {
+    let index = qwen_entry_index(artifact, layer, u8::MAX, kind)?;
+    let (slab, slab_file_offset) = qwen_tensor_slab(context, artifact, index)?;
+    qwen_raw_buffer(artifact, &slab, slab_file_offset, layer, kind)
+}
+
+#[cfg(target_os = "macos")]
+fn qwen_mapped_slab(
+    context: &qx_metal::platform::MetalContext,
+    artifact: &Arc<qx_format::MappedArtifact>,
+    indices: &[usize],
+) -> Result<(qx_metal::platform::RuntimeBuffer, u64), String> {
+    let mut first = u64::MAX;
+    let mut end = 0_u64;
+    for &index in indices {
+        let entry = artifact
+            .info()
+            .entries
+            .get(index)
+            .ok_or_else(|| format!("Qwen tensor index {index} is outside the artifact"))?;
+        for (offset, length) in [
+            (entry.scale_offset, entry.scale_length),
+            (entry.data_offset, entry.data_length),
+        ] {
+            if length == 0 {
+                continue;
+            }
+            first = first.min(offset);
+            end = end.max(
+                offset
+                    .checked_add(length)
+                    .ok_or_else(|| "Qwen tensor range overflows".to_owned())?,
+            );
+        }
+    }
+    if first == u64::MAX || end <= first {
+        return Err("Qwen mapped slab has no tensor payload".to_owned());
+    }
+    let alignment = qx_format::WEIGHT_SLAB_ALIGNMENT;
+    let aligned_first = first / alignment * alignment;
+    let aligned_end = end
+        .checked_add(alignment - 1)
+        .ok_or_else(|| "Qwen aligned slab range overflows".to_owned())?
+        / alignment
+        * alignment;
+    let start = usize::try_from(aligned_first)
+        .map_err(|_| "Qwen slab offset does not fit usize".to_owned())?;
+    let end =
+        usize::try_from(aligned_end).map_err(|_| "Qwen slab end does not fit usize".to_owned())?;
+    let mapped = artifact
+        .mapped_range(start..end)
+        .map_err(|error| error.to_string())?;
+    let pointer = NonNull::new(mapped.as_ptr() as *mut c_void)
+        .ok_or_else(|| "Qwen mapped slab is empty".to_owned())?;
+    let buffer = unsafe { context.input_buffer_no_copy(pointer, mapped.len(), artifact.clone())? };
+    Ok((buffer, aligned_first))
+}
+
+#[cfg(target_os = "macos")]
+fn qwen_entry_ranges(
+    artifact: &qx_format::MappedArtifact,
+    slab: &qx_metal::platform::RuntimeBuffer,
+    slab_file_offset: u64,
+    index: usize,
+) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>), String> {
+    let entry = artifact
+        .info()
+        .entries
+        .get(index)
+        .ok_or_else(|| format!("Qwen tensor index {index} is outside the artifact"))?;
+    let relative = |offset: u64, length: u64| -> Result<std::ops::Range<usize>, String> {
+        let start = offset
+            .checked_sub(slab_file_offset)
+            .ok_or_else(|| "Qwen tensor begins before its mapped slab".to_owned())?;
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| "Qwen tensor range overflows".to_owned())?;
+        let start = usize::try_from(start)
+            .map_err(|_| "Qwen tensor offset does not fit usize".to_owned())?;
+        let end =
+            usize::try_from(end).map_err(|_| "Qwen tensor end does not fit usize".to_owned())?;
+        if end > slab.len() {
+            return Err("Qwen tensor exceeds its mapped slab".to_owned());
+        }
+        Ok(start..end)
+    };
+    Ok((
+        relative(entry.scale_offset, entry.scale_length)?,
+        relative(entry.data_offset, entry.data_length)?,
+    ))
+}
+
+#[cfg(target_os = "macos")]
 fn qwen_entry_index(
     artifact: &qx_format::MappedArtifact,
     layer: u16,
@@ -1152,6 +1304,7 @@ fn qwen_entry_index(
 fn qwen_entry_buffers(
     artifact: &qx_format::MappedArtifact,
     slab: &qx_metal::platform::RuntimeBuffer,
+    slab_file_offset: u64,
     layer: u16,
     expert: u8,
     kind: qx_format::TensorKind,
@@ -1175,9 +1328,7 @@ fn qwen_entry_buffers(
     {
         return Err(format!("unsupported mapped Qwen entry {entry:?}"));
     }
-    let (scales, data) = artifact
-        .tensor_slab_ranges(index)
-        .map_err(|error| error.to_string())?;
+    let (scales, data) = qwen_entry_ranges(artifact, slab, slab_file_offset, index)?;
     Ok((
         slab.subregion(scales.start, scales.len())?,
         slab.subregion(data.start, data.len())?,
@@ -1188,6 +1339,7 @@ fn qwen_entry_buffers(
 fn qwen_raw_buffer(
     artifact: &qx_format::MappedArtifact,
     slab: &qx_metal::platform::RuntimeBuffer,
+    slab_file_offset: u64,
     layer: u16,
     kind: qx_format::TensorKind,
 ) -> Result<qx_metal::platform::RuntimeBuffer, String> {
@@ -1196,9 +1348,7 @@ fn qwen_raw_buffer(
     if entry.group_size != 0 || entry.scale_length != 0 {
         return Err(format!("Qwen {kind:?} is not a raw vector"));
     }
-    let (_, data) = artifact
-        .tensor_slab_ranges(index)
-        .map_err(|error| error.to_string())?;
+    let (_, data) = qwen_entry_ranges(artifact, slab, slab_file_offset, index)?;
     slab.subregion(data.start, data.len())
 }
 
@@ -1207,6 +1357,7 @@ fn qwen_q4_stage(
     context: &qx_metal::platform::MetalContext,
     artifact: &qx_format::MappedArtifact,
     slab: &qx_metal::platform::RuntimeBuffer,
+    slab_file_offset: u64,
     layer: u16,
     kind: qx_format::TensorKind,
     rows: usize,
@@ -1215,6 +1366,7 @@ fn qwen_q4_stage(
     let (scales, data) = qwen_entry_buffers(
         artifact,
         slab,
+        slab_file_offset,
         layer,
         u8::MAX,
         kind,
