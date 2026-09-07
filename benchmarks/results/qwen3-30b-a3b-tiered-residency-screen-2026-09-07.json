@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "classification": "qwen3-30b-a3b-heterogeneous-tiered-residency-screen",
+  "promotion_evidence": false,
+  "measurement_semantics": "trace-emulated-whole-expert-lru-with-synthetic-io",
+  "artifact": {
+    "policy_id": "qwen3-30b-a3b-a19pro-q2s4-q3-early4-v1",
+    "sha256": "32be704346c44573da7cd5e218bd60e2f13f33be174d3048a0c5528a29f9b7e2",
+    "file_bytes": 11538169856,
+    "logical_total_bytes": 11941398016
+  },
+  "tier_split": {
+    "resident_students": 5006,
+    "stream_exact_experts": 1138,
+    "resident_weight_bytes": 8517017600,
+    "stream_weight_bytes": 3020488704,
+    "kv_cache_bytes_context_4096": 402653184,
+    "modeled_runtime_bytes": 1238528,
+    "resident_total_without_cache_bytes": 8920909312,
+    "resident_total_without_cache_gib": 8.308244228363178
+  },
+  "evidence": {
+    "tokens": 567,
+    "expert_route_lookups": 217728,
+    "streamed_expert_lookups": 1830,
+    "streamed_expert_route_fraction": 0.008404982363315697,
+    "traces": [
+      {
+        "kind": "curated-general-heldout",
+        "tokens": 232,
+        "sha256": "2eebb0258cce313aac485516c969b28a46834461e1ac3526dd1c0c13f3066ee8"
+      },
+      {
+        "kind": "wikitext-heldout-extension",
+        "tokens": 335,
+        "sha256": "bf2b62740103d1f6e12b7c6c2d765c123d37291f974fb1a48dd744db4c8d49f0"
+      }
+    ]
+  },
+  "io_shape": {
+    "bandwidth_mib_s": 1000.0,
+    "fixed_latency_us": 100.0,
+    "max_inflight_fetches": 8,
+    "classification": "synthetic-not-device-measured"
+  },
+  "persistent_lru": [
+    {
+      "cache_mib": 64,
+      "modeled_resident_gib": 8.370744228363037,
+      "hit_rate": 0.5327868852459017,
+      "mean_missing_mib_per_token": 3.8169642857142856,
+      "p50_missing_mib_per_token": 0.0,
+      "p95_missing_mib_per_token": 17.71875,
+      "p99_missing_mib_per_token": 48.09375,
+      "mean_shaped_io_ms_per_token": 3.9568231922398462,
+      "p95_shaped_io_ms_per_token": 18.41875,
+      "p99_shaped_io_ms_per_token": 49.59375000000001
+    },
+    {
+      "cache_mib": 128,
+      "modeled_resident_gib": 8.433244228363037,
+      "hit_rate": 0.6508196721311476,
+      "mean_missing_mib_per_token": 2.8526785714285716,
+      "p50_missing_mib_per_token": 0.0,
+      "p95_missing_mib_per_token": 12.65625,
+      "p99_missing_mib_per_token": 27.84375,
+      "mean_shaped_io_ms_per_token": 2.9597332451499083,
+      "p95_shaped_io_ms_per_token": 13.15625,
+      "p99_shaped_io_ms_per_token": 28.943750000000005
+    },
+    {
+      "cache_mib": 256,
+      "modeled_resident_gib": 8.558244228363037,
+      "hit_rate": 0.6961748633879782,
+      "mean_missing_mib_per_token": 2.482142857142857,
+      "p50_missing_mib_per_token": 0.0,
+      "p95_missing_mib_per_token": 12.65625,
+      "p99_missing_mib_per_token": 27.84375,
+      "mean_shaped_io_ms_per_token": 2.575264550264547,
+      "p95_shaped_io_ms_per_token": 13.15625,
+      "p99_shaped_io_ms_per_token": 28.943750000000005
+    },
+    {
+      "cache_mib": 512,
+      "modeled_resident_gib": 8.808244228363037,
+      "hit_rate": 0.7524590163934426,
+      "mean_missing_mib_per_token": 2.0223214285714284,
+      "p50_missing_mib_per_token": 0.0,
+      "p95_missing_mib_per_token": 10.125,
+      "p99_missing_mib_per_token": 25.3125,
+      "mean_shaped_io_ms_per_token": 2.098688271604938,
+      "p95_shaped_io_ms_per_token": 10.525,
+      "p99_shaped_io_ms_per_token": 26.312500000000004
+    }
+  ],
+  "request_reset_lru": [
+    {
+      "cache_mib": 64,
+      "modeled_resident_gib": 8.370744228363037,
+      "hit_rate": 0.5109289617486339,
+      "mean_missing_mib_per_token": 3.9955357142857144,
+      "p50_missing_mib_per_token": 0.0,
+      "p95_missing_mib_per_token": 17.71875,
+      "p99_missing_mib_per_token": 48.09375,
+      "mean_shaped_io_ms_per_token": 4.142096560846547,
+      "p95_shaped_io_ms_per_token": 18.41875,
+      "p99_shaped_io_ms_per_token": 49.79375000000001
+    },
+    {
+      "cache_mib": 128,
+      "modeled_resident_gib": 8.433244228363037,
+      "hit_rate": 0.6147540983606558,
+      "mean_missing_mib_per_token": 3.1473214285714284,
+      "p50_missing_mib_per_token": 0.0,
+      "p95_missing_mib_per_token": 12.65625,
+      "p99_missing_mib_per_token": 32.90625,
+      "mean_shaped_io_ms_per_token": 3.2654872134038726,
+      "p95_shaped_io_ms_per_token": 13.15625,
+      "p99_shaped_io_ms_per_token": 34.206250000000004
+    },
+    {
+      "cache_mib": 256,
+      "modeled_resident_gib": 8.558244228363037,
+      "hit_rate": 0.6251366120218579,
+      "mean_missing_mib_per_token": 3.0625,
+      "p50_missing_mib_per_token": 0.0,
+      "p95_missing_mib_per_token": 12.65625,
+      "p99_missing_mib_per_token": 32.90625,
+      "mean_shaped_io_ms_per_token": 3.1773148148148085,
+      "p95_shaped_io_ms_per_token": 13.15625,
+      "p99_shaped_io_ms_per_token": 34.206250000000004
+    },
+    {
+      "cache_mib": 512,
+      "modeled_resident_gib": 8.808244228363037,
+      "hit_rate": 0.6251366120218579,
+      "mean_missing_mib_per_token": 3.0625,
+      "p50_missing_mib_per_token": 0.0,
+      "p95_missing_mib_per_token": 12.65625,
+      "p99_missing_mib_per_token": 32.90625,
+      "mean_shaped_io_ms_per_token": 3.1773148148148085,
+      "p95_shaped_io_ms_per_token": 13.15625,
+      "p99_shaped_io_ms_per_token": 34.206250000000004
+    }
+  ],
+  "selected_candidate": {
+    "policy": "resident-all-students-stream-source-exact-lru",
+    "cache_mib": 128,
+    "modeled_resident_gib": 8.433244228363037,
+    "reason": "first cache knee; larger reset-cache budgets do not improve the combined p95 tail"
+  },
+  "decision": {
+    "tiered_residency": "continue-to-physical-runtime-prototype",
+    "static_hot": "not_selected",
+    "width_reduction": "not_required_for-the-first-8.5-gib-residency-candidate",
+    "claim_boundary": "installed artifact remains 10.746 GiB; memory and I/O values are modeled, not physical iPhone measurements"
+  },
+  "limitations": [
+    "route evidence covers 567 teacher-forced tokens from general and WikiText corpora",
+    "the I/O shaper is synthetic and is not an iPhone storage measurement",
+    "the simulator treats one source-exact expert as one packet while the current artifact stores scales and projection payloads in separate typed slabs",
+    "the modeled runtime allowance excludes unimplemented Qwen Metal buffers and application overhead",
+    "mmap pages are assumed evictable until a source-exact expert is routed",
+    "quality evidence covers only the promoted four-layer student composition, not all 48 transformed layers"
+  ]
+}

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const SCHEMA_VERSION: u32 = 1;
-const SIMULATION_SCHEMA_VERSION: u32 = 2;
+const SIMULATION_SCHEMA_VERSION: u32 = 3;
 const DEFAULT_Q3_EXPERT_BYTES: u64 = 2_064_384;
 const DEFAULT_EXPERT_NEURONS: usize = 768;
 const MAX_GREEDY_CONTRIBUTION_PACKETS: usize = 64;
@@ -148,8 +148,13 @@ enum Command {
     },
     /// Replay a route trace through one or more bounded expert caches.
     Simulate {
+        /// Route traces to replay as one ordered evaluation set.
+        #[arg(long, required = true)]
+        trace: Vec<PathBuf>,
+        /// Compiled heterogeneous artifact whose source-exact tier is cache simulated.
+        /// Its directory supplies the streamed expert set and exact payload size.
         #[arg(long)]
-        trace: PathBuf,
+        artifact_tier: Option<PathBuf>,
         /// Disjoint calibration trace used only to select static hot experts.
         #[arg(long)]
         calibration: Option<PathBuf>,
@@ -610,17 +615,32 @@ struct PacketContributionMetrics {
 #[derive(Debug, Serialize)]
 struct SimulationReport {
     schema_version: u32,
-    trace: String,
+    traces: Vec<String>,
     calibration: Option<String>,
+    artifact_residency: Option<ArtifactResidencyReport>,
     trace_header: TraceHeader,
     expert_bytes: u64,
     expert_neurons: usize,
     packet_neurons: Vec<usize>,
     hot_fractions: Vec<f64>,
+    reset_between_requests: bool,
     measure_phases: Vec<String>,
     layouts: Vec<PhysicalLayout>,
     io_shape: Option<IoShape>,
     results: Vec<SimulationResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactResidencyReport {
+    artifact: String,
+    policy_id: String,
+    resident_experts: usize,
+    streamed_experts: usize,
+    resident_weight_bytes: u64,
+    streamed_weight_bytes: u64,
+    kv_cache_bytes: u64,
+    runtime_bytes: u64,
+    resident_total_without_cache_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -641,8 +661,12 @@ struct SimulationResult {
     packets_per_expert: usize,
     packet_bytes: u64,
     resident_packet_capacity: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modeled_resident_total_bytes: Option<u64>,
     token_records: usize,
     expert_route_lookups: u64,
+    streamed_expert_lookups: u64,
+    streamed_expert_route_fraction: f64,
     route_lookups: u64,
     hits: u64,
     misses: u64,
@@ -1237,6 +1261,7 @@ fn main() -> Result<()> {
         }),
         Command::Simulate {
             trace,
+            artifact_tier,
             calibration,
             policies,
             hot_fractions,
@@ -1253,6 +1278,7 @@ fn main() -> Result<()> {
             output,
         } => simulate(SimulateArgs {
             trace,
+            artifact_tier,
             calibration,
             policies,
             hot_fractions,
@@ -1741,7 +1767,8 @@ struct ExpertStudentSpec {
 }
 
 struct SimulateArgs {
-    trace: PathBuf,
+    trace: Vec<PathBuf>,
+    artifact_tier: Option<PathBuf>,
     calibration: Option<PathBuf>,
     policies: Vec<CachePolicy>,
     hot_fractions: Vec<f64>,
@@ -5153,14 +5180,147 @@ fn select_contribution_packets(curve: &[f32], target: f64) -> Result<(usize, f64
     ))
 }
 
+struct ResolvedArtifactTier {
+    streamed_experts: HashSet<ExpertKey>,
+    expert_bytes: u64,
+    report: ArtifactResidencyReport,
+}
+
+fn resolve_artifact_tier(path: &Path, trace_header: &TraceHeader) -> Result<ResolvedArtifactTier> {
+    let artifact = qx_format::MappedArtifact::open(path)
+        .with_context(|| format!("open heterogeneous QX artifact {}", path.display()))?;
+    let info = artifact.info();
+    let execution_plan = info
+        .execution_plan
+        .as_ref()
+        .context("artifact has no execution plan")?;
+    let policy = execution_plan
+        .expert_weights
+        .as_ref()
+        .context("artifact has no heterogeneous expert-weight plan")?;
+    if policy.layers.len() != trace_header.layers
+        || execution_plan.model_shape.as_ref().is_none_or(|shape| {
+            shape.layers != trace_header.layers || shape.experts != trace_header.experts
+        })
+    {
+        bail!("artifact expert topology does not match the route trace");
+    }
+
+    let mut streamed_experts = HashSet::new();
+    for (expected_layer, layer) in policy.layers.iter().enumerate() {
+        let students = layer
+            .student_experts
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let sources = layer.source_experts.iter().copied().collect::<HashSet<_>>();
+        let anchors = layer.causal_anchors.iter().copied().collect::<HashSet<_>>();
+        if usize::from(layer.layer) != expected_layer
+            || !matches!(
+                layer.student_representation,
+                qx_format::ExpertRepresentation::Group32Q2S4RowMajor
+                    | qx_format::ExpertRepresentation::Group32Q3RowMajor
+            )
+            || layer.source_representation != qx_format::ExpertRepresentation::Group32Q4RowMajor
+            || students.len() != layer.student_experts.len()
+            || sources.len() != layer.source_experts.len()
+            || anchors.len() != layer.causal_anchors.len()
+            || !students.is_disjoint(&sources)
+            || !anchors.is_subset(&sources)
+            || students.len() + sources.len() != trace_header.experts
+            || students
+                .union(&sources)
+                .any(|expert| usize::from(*expert) >= trace_header.experts)
+        {
+            bail!("artifact expert policy is not exhaustive at layer {expected_layer}");
+        }
+        for expert in sources {
+            streamed_experts.insert((layer.layer, u16::from(expert)));
+        }
+    }
+    if streamed_experts.is_empty() {
+        bail!("artifact expert policy has no source-exact tier to simulate");
+    }
+
+    let mut expert_bytes = None;
+    let mut streamed_weight_bytes = 0_u64;
+    for &(layer, expert) in &streamed_experts {
+        let entries = info
+            .entries
+            .iter()
+            .filter(|entry| entry.layer == layer && u16::from(entry.expert) == expert)
+            .collect::<Vec<_>>();
+        if entries.len() != 2
+            || entries.iter().any(|entry| {
+                entry.quant_type != qx_quant::QuantType::Q4
+                    || !matches!(
+                        entry.kind,
+                        qx_format::TensorKind::GateUp | qx_format::TensorKind::Down
+                    )
+            })
+        {
+            bail!("source-exact tensor payload is invalid at {layer}:{expert}");
+        }
+        let bytes = entries.iter().try_fold(0_u64, |total, entry| {
+            total
+                .checked_add(entry.scale_length)
+                .and_then(|value| value.checked_add(entry.data_length))
+                .context("source-exact expert payload bytes overflow")
+        })?;
+        if expert_bytes.is_some_and(|expected| expected != bytes) {
+            bail!("source-exact expert payloads are not uniformly sized");
+        }
+        expert_bytes = Some(bytes);
+        streamed_weight_bytes = streamed_weight_bytes
+            .checked_add(bytes)
+            .context("streamed expert tier bytes overflow")?;
+    }
+    let expert_bytes = expert_bytes.expect("streamed tier was checked non-empty");
+    let memory = info.memory_plan;
+    let runtime_bytes = memory
+        .total_bytes
+        .checked_sub(memory.weights_bytes)
+        .and_then(|value| value.checked_sub(memory.kv_cache_bytes))
+        .context("artifact memory plan is internally inconsistent")?;
+    let resident_weight_bytes = memory
+        .weights_bytes
+        .checked_sub(streamed_weight_bytes)
+        .context("streamed tier exceeds artifact weight bytes")?;
+    let resident_total_without_cache_bytes = memory
+        .total_bytes
+        .checked_sub(streamed_weight_bytes)
+        .context("streamed tier exceeds artifact total bytes")?;
+    let resident_experts = trace_header.layers * trace_header.experts - streamed_experts.len();
+    Ok(ResolvedArtifactTier {
+        streamed_experts,
+        expert_bytes,
+        report: ArtifactResidencyReport {
+            artifact: path.display().to_string(),
+            policy_id: policy.policy_id.clone(),
+            resident_experts,
+            streamed_experts: policy
+                .layers
+                .iter()
+                .map(|layer| layer.source_experts.len())
+                .sum(),
+            resident_weight_bytes,
+            streamed_weight_bytes,
+            kv_cache_bytes: memory.kv_cache_bytes,
+            runtime_bytes,
+            resident_total_without_cache_bytes,
+        },
+    })
+}
+
 fn simulate(args: SimulateArgs) -> Result<()> {
     let SimulateArgs {
         trace,
+        artifact_tier,
         calibration,
         policies,
         hot_fractions,
         budgets,
-        expert_bytes,
+        expert_bytes: configured_expert_bytes,
         expert_neurons,
         packet_neurons,
         layouts,
@@ -5184,7 +5344,7 @@ fn simulate(args: SimulateArgs) -> Result<()> {
     {
         bail!("hot fractions must be finite and strictly between zero and one");
     }
-    if expert_bytes == 0 || expert_neurons == 0 {
+    if configured_expert_bytes == 0 || expert_neurons == 0 {
         bail!("expert-bytes and expert-neurons must be positive");
     }
     if io_fixed_us < 0.0 || !io_fixed_us.is_finite() || io_parallelism == 0 {
@@ -5205,10 +5365,25 @@ fn simulate(args: SimulateArgs) -> Result<()> {
     if io_shape.is_none() && io_fixed_us != 0.0 {
         bail!("io-fixed-us requires io-bandwidth-mib-s");
     }
-    let trace_header = read_trace_header(&trace)?;
-    let tokens = load_simulation_tokens(&trace, &trace_header)?;
+    let first_trace = trace.first().context("provide at least one route trace")?;
+    let trace_header = read_trace_header(first_trace)?;
+    let artifact_tier = artifact_tier
+        .as_deref()
+        .map(|path| resolve_artifact_tier(path, &trace_header))
+        .transpose()?;
+    let expert_bytes = artifact_tier
+        .as_ref()
+        .map_or(configured_expert_bytes, |tier| tier.expert_bytes);
+    let streamed_experts = artifact_tier.as_ref().map(|tier| &tier.streamed_experts);
+    let resident_base_bytes = artifact_tier
+        .as_ref()
+        .map(|tier| tier.report.resident_total_without_cache_bytes);
+    let mut tokens = Vec::new();
+    for path in &trace {
+        tokens.extend(load_simulation_tokens(path, &trace_header)?);
+    }
     let hot_frequency = calibration
-        .map(|path| collect_frequency(path, &trace_header))
+        .map(|path| collect_frequency(path, &trace_header, streamed_experts))
         .transpose()?;
     let co_selection_ranks = calibration
         .map(|path| collect_co_selection_ranks(path, &trace_header))
@@ -5257,6 +5432,7 @@ fn simulate(args: SimulateArgs) -> Result<()> {
                                 trace_header.layers,
                                 trace_header.experts,
                                 packets_per_expert,
+                                streamed_experts,
                             )
                         });
                         results.push(simulate_cell(SimulationCellConfig {
@@ -5275,6 +5451,8 @@ fn simulate(args: SimulateArgs) -> Result<()> {
                             reset_between_requests,
                             measure_phases: &measured_phase_set,
                             static_hot: hot.as_ref(),
+                            streamed_experts,
+                            resident_base_bytes,
                         })?);
                     }
                 }
@@ -5283,13 +5461,18 @@ fn simulate(args: SimulateArgs) -> Result<()> {
     }
     let report = SimulationReport {
         schema_version: SIMULATION_SCHEMA_VERSION,
-        trace: trace.display().to_string(),
+        traces: trace
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
         calibration: calibration.map(|path| path.display().to_string()),
+        artifact_residency: artifact_tier.map(|tier| tier.report),
         trace_header,
         expert_bytes,
         expert_neurons,
         packet_neurons,
         hot_fractions,
+        reset_between_requests,
         measure_phases,
         layouts,
         io_shape,
@@ -5336,6 +5519,8 @@ struct SimulationCellConfig<'a> {
     reset_between_requests: bool,
     measure_phases: &'a HashSet<String>,
     static_hot: Option<&'a HashSet<PacketKey>>,
+    streamed_experts: Option<&'a HashSet<ExpertKey>>,
+    resident_base_bytes: Option<u64>,
 }
 
 struct SimulationToken {
@@ -5415,13 +5600,19 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
             let mut layer_missing_ordinals = Vec::new();
             let mut layer_missing_packets = 0u64;
             for &expert in experts {
+                if config
+                    .streamed_experts
+                    .is_some_and(|streamed| !streamed.contains(&(layer as u16, expert)))
+                {
+                    continue;
+                }
                 current_keys.insert((layer as u16, expert));
                 for packet in 0..config.packets_per_expert {
                     let key = (layer as u16, expert, packet as u16);
-                    if let Some(previous) = last_access.insert(key, access_clock) {
-                        if measured {
-                            reuse_distances.push(access_clock.saturating_sub(previous + 1));
-                        }
+                    if let Some(previous) = last_access.insert(key, access_clock)
+                        && measured
+                    {
+                        reuse_distances.push(access_clock.saturating_sub(previous + 1));
                     }
                     access_clock += 1;
                     let hit = state.access(key, &mut token_evictions);
@@ -5502,6 +5693,10 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
         bail!("trace contains no token records");
     }
     let route_lookups = hits + misses;
+    let streamed_expert_lookups = route_lookups / config.packets_per_expert as u64;
+    let expert_route_lookups = token_records as u64
+        * config.expected_header.layers as u64
+        * config.expected_header.top_k as u64;
     let total_missing_bytes = misses.saturating_mul(config.packet_bytes);
     Ok(SimulationResult {
         policy: config.policy.label().to_owned(),
@@ -5512,10 +5707,14 @@ fn simulate_cell(config: SimulationCellConfig<'_>) -> Result<SimulationResult> {
         packets_per_expert: config.packets_per_expert,
         packet_bytes: config.packet_bytes,
         resident_packet_capacity: config.capacity,
+        modeled_resident_total_bytes: config
+            .resident_base_bytes
+            .and_then(|base| base.checked_add(config.budget_bytes)),
         token_records,
-        expert_route_lookups: token_records as u64
-            * config.expected_header.layers as u64
-            * config.expected_header.top_k as u64,
+        expert_route_lookups,
+        streamed_expert_lookups,
+        streamed_expert_route_fraction: streamed_expert_lookups as f64
+            / expert_route_lookups.max(1) as f64,
         route_lookups,
         hits,
         misses,
@@ -5650,11 +5849,17 @@ impl LruCache {
 fn collect_frequency(
     path: &Path,
     expected_header: &TraceHeader,
+    streamed_experts: Option<&HashSet<ExpertKey>>,
 ) -> Result<HashMap<ExpertKey, u64>> {
     let mut frequency = HashMap::new();
     visit_trace(path, expected_header, |token| {
         for (layer, experts) in token.routes.iter().enumerate() {
             for &expert in experts {
+                if streamed_experts
+                    .is_some_and(|streamed| !streamed.contains(&(layer as u16, expert)))
+                {
+                    continue;
+                }
                 *frequency.entry((layer as u16, expert)).or_insert(0) += 1;
             }
         }
@@ -5770,6 +5975,7 @@ fn hottest_packet_keys(
     layers: usize,
     experts: usize,
     packets_per_expert: usize,
+    allowed_experts: Option<&HashSet<ExpertKey>>,
 ) -> HashSet<PacketKey> {
     let mut ranked = frequency
         .iter()
@@ -5786,6 +5992,11 @@ fn hottest_packet_keys(
         .collect::<HashSet<_>>();
     for layer in 0..layers {
         for expert in 0..experts {
+            if allowed_experts
+                .is_some_and(|allowed| !allowed.contains(&(layer as u16, expert as u16)))
+            {
+                continue;
+            }
             for packet in 0..packets_per_expert {
                 if selected.len() >= capacity {
                     return selected;
@@ -7500,6 +7711,8 @@ mod tests {
             reset_between_requests: false,
             measure_phases: &measured,
             static_hot: None,
+            streamed_experts: None,
+            resident_base_bytes: None,
         })
         .unwrap();
         assert_eq!(result.token_records, 1);
@@ -7510,15 +7723,20 @@ mod tests {
     #[test]
     fn hottest_keys_are_selected_by_frequency() {
         let frequency = HashMap::from([((0, 1), 4), ((0, 2), 9), ((1, 0), 6)]);
-        let hot = hottest_packet_keys(&frequency, 2, 2, 3, 1);
+        let hot = hottest_packet_keys(&frequency, 2, 2, 3, 1, None);
         assert_eq!(hot, HashSet::from([(0, 2, 0), (1, 0, 0)]));
     }
 
     #[test]
     fn hottest_keys_fill_unused_capacity_with_cold_experts() {
-        let hot = hottest_packet_keys(&HashMap::from([((1, 1), 9)]), 4, 2, 2, 1);
+        let hot = hottest_packet_keys(&HashMap::from([((1, 1), 9)]), 4, 2, 2, 1, None);
         assert_eq!(hot.len(), 4);
         assert!(hot.contains(&(1, 1, 0)));
+
+        let allowed = HashSet::from([(1_u16, 1_u16), (0_u16, 0_u16)]);
+        let filtered =
+            hottest_packet_keys(&HashMap::from([((1, 1), 9)]), 4, 2, 2, 1, Some(&allowed));
+        assert_eq!(filtered, HashSet::from([(1, 1, 0), (0, 0, 0)]));
     }
 
     #[test]
@@ -7823,6 +8041,8 @@ mod tests {
             reset_between_requests: false,
             measure_phases: &HashSet::new(),
             static_hot: None,
+            streamed_experts: None,
+            resident_base_bytes: None,
         })
         .unwrap();
         assert_eq!(result.token_records, 3);
@@ -7850,6 +8070,8 @@ mod tests {
             reset_between_requests: false,
             measure_phases: &HashSet::new(),
             static_hot: None,
+            streamed_experts: None,
+            resident_base_bytes: None,
         })
         .unwrap();
         assert_eq!(packetized.total_missing_bytes, result.total_missing_bytes);
@@ -7863,6 +8085,36 @@ mod tests {
         );
         assert_eq!(packetized.maximum_contiguous_burst_bytes, 100);
         assert!(packetized.p95_serial_io_ms_per_token.is_some());
+
+        let streamed = HashSet::from([(0_u16, 1_u16)]);
+        let tiered = simulate_cell(SimulationCellConfig {
+            tokens: &tokens,
+            expected_header: &header,
+            policy: CachePolicy::Lru,
+            hot_fraction: None,
+            layout: PhysicalLayout::ExpertContiguous,
+            co_selection_ranks: None,
+            budget_bytes: 100,
+            capacity: 1,
+            packet_neurons: 1,
+            packets_per_expert: 1,
+            packet_bytes: 100,
+            io_shape: None,
+            reset_between_requests: false,
+            measure_phases: &HashSet::new(),
+            static_hot: None,
+            streamed_experts: Some(&streamed),
+            resident_base_bytes: Some(1_000),
+        })
+        .unwrap();
+        assert_eq!(tiered.expert_route_lookups, 6);
+        assert_eq!(tiered.streamed_expert_lookups, 1);
+        assert_eq!(tiered.streamed_expert_route_fraction, 1.0 / 6.0);
+        assert_eq!(tiered.modeled_resident_total_bytes, Some(1_100));
+        assert_eq!(tiered.route_lookups, 1);
+        assert_eq!(tiered.hits, 0);
+        assert_eq!(tiered.misses, 1);
+        assert_eq!(tiered.p95_missing_bytes_per_token, 100);
         std::fs::remove_file(path).unwrap();
     }
 
