@@ -26,6 +26,8 @@ pub struct ModelSpecV1 {
 pub enum GraniteMathFunctionsV1 {
     Precise = 1,
     Fast = 2,
+    /// Protocol-defined fixed-operation exp/rsqrt approximations.
+    ConsensusFixedV1 = 3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,7 +155,10 @@ pub fn granite_execution_spec() -> Result<Digest, CommitError> {
 pub fn granite_execution_spec_with_checkpoint_interval(
     checkpoint_interval: u8,
 ) -> Result<Digest, CommitError> {
-    granite_execution_spec_with_math_functions(checkpoint_interval, GraniteMathFunctionsV1::Precise)
+    granite_execution_spec_with_math_functions(
+        checkpoint_interval,
+        GraniteMathFunctionsV1::ConsensusFixedV1,
+    )
 }
 
 /// Produce a distinct execution-spec digest for the candidate that retains
@@ -244,9 +249,14 @@ mod tests {
             granite_execution_spec_with_math_functions(2, GraniteMathFunctionsV1::Precise).unwrap();
         let fast =
             granite_execution_spec_with_math_functions(2, GraniteMathFunctionsV1::Fast).unwrap();
+        let fixed =
+            granite_execution_spec_with_math_functions(2, GraniteMathFunctionsV1::ConsensusFixedV1)
+                .unwrap();
         assert_ne!(precise, fast);
+        assert_ne!(precise, fixed);
+        assert_ne!(fast, fixed);
         assert_eq!(
-            precise,
+            fixed,
             granite_execution_spec_with_checkpoint_interval(2).unwrap()
         );
         let relaxed = granite_execution_spec_with_math_profile(

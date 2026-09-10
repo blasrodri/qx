@@ -124,6 +124,87 @@ fn block_seeded_unsigned_result_is_bisected_and_convicted_on_sbf() {
 }
 
 #[test]
+fn fixed_exp_scalar_transition_convicts_wrong_miner_on_sbf() {
+    let f = Fixture::new();
+    let mut vm = f.vm();
+    vm.sysvars.clock.slot = 100;
+    let job_hash = [0x42; 32];
+    let transition = 17_u32;
+    let op = 10_u8;
+    let a = 2.0_f32.to_bits();
+    let b = 0.0_f32.to_bits();
+    let c = 0.0_f32.to_bits();
+    let honest = qx_consensus_math::exp_f32(2.0).unwrap().to_bits();
+    let dishonest = honest ^ 1;
+    let common = scalar_state_hash(job_hash, transition, op, a, b, c, None);
+    let challenger_end = scalar_state_hash(job_hash, transition, op, a, b, c, Some(honest));
+    let defender_end = scalar_state_hash(job_hash, transition, op, a, b, c, Some(dishonest));
+
+    let mut dispute = owned(DISPUTE_BYTES, f.program);
+    dispute.data[..4].copy_from_slice(b"QXD2");
+    dispute.data[4] = 5;
+    dispute.data[6] = 2;
+    dispute.data[72..104].copy_from_slice(&job_hash);
+    dispute.data[104..136].copy_from_slice(f.miner.as_ref());
+    dispute.data[136..168].copy_from_slice(f.challenger.as_ref());
+    dispute.data[232..264].copy_from_slice(&common);
+    dispute.data[264..296].copy_from_slice(&defender_end);
+    dispute.data[296..328].copy_from_slice(&challenger_end);
+    dispute.data[360..368].copy_from_slice(&1_000_u64.to_le_bytes());
+    dispute.data[368..376].copy_from_slice(&1_200_u64.to_le_bytes());
+    dispute.data[376..380].copy_from_slice(&transition.to_le_bytes());
+    dispute.data[380..384].copy_from_slice(&(transition + 1).to_le_bytes());
+
+    let mut challenger_body = vec![op];
+    challenger_body.extend_from_slice(&a.to_le_bytes());
+    challenger_body.extend_from_slice(&b.to_le_bytes());
+    challenger_body.extend_from_slice(&c.to_le_bytes());
+    challenger_body.extend_from_slice(&honest.to_le_bytes());
+    let challenger = vm.process_instruction(
+        &f.ix(
+            21,
+            vec![
+                AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.challenger, true),
+            ],
+            &challenger_body,
+        ),
+        &[(f.dispute, dispute), (f.challenger, Account::default())],
+    );
+    assert_ok(&challenger.program_result);
+    let dispute = account(&challenger.resulting_accounts, f.dispute);
+
+    let miner = vm.process_instruction(
+        &f.ix(
+            22,
+            vec![
+                AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.miner, true),
+            ],
+            &dishonest.to_le_bytes(),
+        ),
+        &[(f.dispute, dispute), (f.miner, Account::default())],
+    );
+    assert_ok(&miner.program_result);
+    let dispute = account(&miner.resulting_accounts, f.dispute);
+
+    let resolved = vm.process_instruction(
+        &f.ix(23, vec![AccountMeta::new(f.dispute, false)], &[]),
+        &[(f.dispute, dispute)],
+    );
+    assert_ok(&resolved.program_result);
+    let dispute = account(&resolved.resulting_accounts, f.dispute);
+    assert_eq!((dispute.data[4], dispute.data[5]), (8, 2));
+    assert_eq!(u32_at(&dispute.data, 436), honest);
+    println!(
+        "v2_fixed_exp_terminal_cu={}",
+        challenger.compute_units_consumed
+            + miner.compute_units_consumed
+            + resolved.compute_units_consumed
+    );
+}
+
+#[test]
 fn pure_state_machine_timeout_penalizes_each_non_responder() {
     let mut miner_due =
         qx_verifier_core::BisectionGameV1::open(3, [1; 32], [2; 32], 10, 3).unwrap();
@@ -667,6 +748,34 @@ fn append_proof(body: &mut Vec<u8>, proof: &MerkleProof) {
     body.extend_from_slice(&proof.leaf_count.to_le_bytes());
     body.push(proof.siblings.len() as u8);
     append_siblings(body, proof);
+}
+
+fn scalar_state_hash(
+    job_hash: [u8; 32],
+    transition: u32,
+    op: u8,
+    a: u32,
+    b: u32,
+    c: u32,
+    result: Option<u32>,
+) -> [u8; 32] {
+    let phase = u8::from(result.is_some());
+    let result = result.unwrap_or(0);
+    hash_domain(
+        HashAlgorithm::Blake3V1,
+        b"QX:SCALAR:STATE:V1",
+        &[
+            &job_hash,
+            &transition.to_le_bytes(),
+            &[op],
+            &[phase],
+            &a.to_le_bytes(),
+            &b.to_le_bytes(),
+            &c.to_le_bytes(),
+            &result.to_le_bytes(),
+        ],
+    )
+    .unwrap()
 }
 
 fn append_siblings(body: &mut Vec<u8>, proof: &MerkleProof) {

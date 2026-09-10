@@ -22,6 +22,31 @@ pub enum QxOpV1 {
     Rsqrt = 9,
     ExpApprox = 10,
     KvAppend = 11,
+    Div = 12,
+    Select = 13,
+}
+
+impl TryFrom<u8> for QxOpV1 {
+    type Error = VerificationError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Dot),
+            2 => Ok(Self::Add),
+            3 => Ok(Self::Mul),
+            4 => Ok(Self::QuantizedFma),
+            5 => Ok(Self::ReduceSum),
+            6 => Ok(Self::ReduceMax),
+            7 => Ok(Self::Compare),
+            8 => Ok(Self::ArgMax),
+            9 => Ok(Self::Rsqrt),
+            10 => Ok(Self::ExpApprox),
+            11 => Ok(Self::KvAppend),
+            12 => Ok(Self::Div),
+            13 => Ok(Self::Select),
+            _ => Err(VerificationError::InvalidWitness("unknown QX operation")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,6 +73,89 @@ impl std::fmt::Display for VerificationError {
 }
 
 impl std::error::Error for VerificationError {}
+
+/// Evaluate a scalar verification-IR transition. Operands are raw binary32
+/// bits so the commitment layer never depends on text or host serialization.
+/// Vector operations reduce to these scalar steps during a terminal dispute.
+pub fn evaluate_scalar_op_v1(op: QxOpV1, operands: [u32; 3]) -> Result<u32, VerificationError> {
+    let [a_bits, b_bits, c_bits] = operands;
+    let a = finite_f32(a_bits)?;
+    let b = finite_f32(b_bits)?;
+    let c = finite_f32(c_bits)?;
+    let result = match op {
+        QxOpV1::Dot | QxOpV1::QuantizedFma => libm_fma(a, b, c),
+        QxOpV1::Add | QxOpV1::ReduceSum => a + b,
+        QxOpV1::Mul => a * b,
+        QxOpV1::ReduceMax => {
+            if ordered_finite_ge(a_bits, b_bits) {
+                a
+            } else {
+                b
+            }
+        }
+        QxOpV1::Compare => {
+            if ordered_finite_ge(a_bits, b_bits) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        QxOpV1::Rsqrt => qx_consensus_math::rsqrt_f32(a)
+            .ok_or(VerificationError::InvalidWitness("invalid rsqrt input"))?,
+        QxOpV1::ExpApprox => qx_consensus_math::exp_f32(a)
+            .ok_or(VerificationError::InvalidWitness("invalid exp input"))?,
+        QxOpV1::Div => qx_consensus_math::div_f32(a, b)
+            .ok_or(VerificationError::InvalidWitness("invalid division"))?,
+        QxOpV1::Select => match a_bits {
+            0x0000_0000 => c,
+            0x3f80_0000 => b,
+            _ => {
+                return Err(VerificationError::InvalidWitness(
+                    "select condition must be exactly 0.0 or 1.0",
+                ));
+            }
+        },
+        QxOpV1::ArgMax | QxOpV1::KvAppend => {
+            return Err(VerificationError::InvalidWitness(
+                "operation requires a structured terminal witness",
+            ));
+        }
+    };
+    if !result.is_finite() {
+        return Err(VerificationError::InvalidWitness("non-finite result"));
+    }
+    Ok(result.to_bits())
+}
+
+#[inline(always)]
+fn libm_fma(a: f32, b: f32, c: f32) -> f32 {
+    // qx-consensus-math already pins libm's software-exact fmaf dependency;
+    // expose it there rather than relying on target-specific contraction.
+    qx_consensus_math::fma_f32(a, b, c)
+}
+
+fn finite_f32(bits: u32) -> Result<f32, VerificationError> {
+    let value = f32::from_bits(bits);
+    value
+        .is_finite()
+        .then_some(value)
+        .ok_or(VerificationError::InvalidWitness("non-finite operand"))
+}
+
+fn ordered_finite_ge(left: u32, right: u32) -> bool {
+    // Values have already been checked finite. Byte-wise key comparison also
+    // avoids the SBF f32 comparison miscompile covered by program tests.
+    let left = if left & 0x7fff_ffff == 0 { 0 } else { left };
+    let right = if right & 0x7fff_ffff == 0 { 0 } else { right };
+    let key = |bits: u32| {
+        if bits & 0x8000_0000 != 0 {
+            !bits
+        } else {
+            bits ^ 0x8000_0000
+        }
+    };
+    key(left).to_be_bytes() >= key(right).to_be_bytes()
+}
 
 /// The terminal unit for the current Metal Q4 reduction: one lane-local FMA.
 /// A dispute first narrows to a lane and then to one `column = lane + 32*step`.
@@ -537,6 +645,40 @@ mod tests {
         assert_eq!(
             verify_quantized_fma_v1(witness.weight.commitment.root, &witness),
             Err(VerificationError::ArithmeticClaimFailed)
+        );
+    }
+
+    #[test]
+    fn scalar_ir_covers_inference_arithmetic() {
+        let bits = |value: f32| value.to_bits();
+        assert_eq!(
+            evaluate_scalar_op_v1(QxOpV1::Add, [bits(2.0), bits(3.0), bits(0.0)]).unwrap(),
+            bits(5.0)
+        );
+        assert_eq!(
+            evaluate_scalar_op_v1(QxOpV1::Mul, [bits(2.0), bits(3.0), bits(0.0)]).unwrap(),
+            bits(6.0)
+        );
+        assert_eq!(
+            evaluate_scalar_op_v1(QxOpV1::QuantizedFma, [bits(2.0), bits(3.0), bits(4.0)]).unwrap(),
+            bits(10.0)
+        );
+        assert_eq!(
+            evaluate_scalar_op_v1(QxOpV1::Div, [bits(3.0), bits(2.0), bits(0.0)]).unwrap(),
+            bits(1.5)
+        );
+        assert_eq!(
+            evaluate_scalar_op_v1(QxOpV1::ReduceMax, [bits(-1.0), bits(-2.0), bits(0.0)]).unwrap(),
+            bits(-1.0)
+        );
+        for op in [QxOpV1::Rsqrt, QxOpV1::ExpApprox] {
+            let result = evaluate_scalar_op_v1(op, [bits(2.0), bits(0.0), bits(0.0)]).unwrap();
+            assert!(f32::from_bits(result).is_finite());
+        }
+        assert!(evaluate_scalar_op_v1(QxOpV1::Div, [bits(1.0), bits(0.0), bits(0.0)]).is_err());
+        assert_eq!(
+            evaluate_scalar_op_v1(QxOpV1::Select, [bits(1.0), bits(7.0), bits(9.0)]).unwrap(),
+            bits(7.0)
         );
     }
 

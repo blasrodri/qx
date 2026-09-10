@@ -9,8 +9,10 @@ use qx_quant::{PackingLayout, QuantType};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetalMathProfile {
-    /// IEEE-safe expression evaluation and precise single-precision math
-    /// functions. This remains the default conservative profile.
+    /// Protocol-defined fixed-operation exp/rsqrt with IEEE-safe arithmetic.
+    ConsensusFixedV1,
+    /// IEEE-safe expression evaluation with Metal-native precise math
+    /// functions. Retained as a non-consensus A/B reference.
     SafePrecise,
     /// IEEE-safe expression evaluation with the faster Metal math functions.
     /// This is a benchmark candidate until cross-device parity is established.
@@ -26,6 +28,7 @@ pub enum MetalMathProfile {
 impl MetalMathProfile {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ConsensusFixedV1 => "consensus-fixed-v1",
             Self::SafePrecise => "safe-precise",
             Self::SafeFastFunctions => "safe-fast-functions",
             Self::RelaxedPrecise => "relaxed-precise",
@@ -43,12 +46,14 @@ pub fn active_metal_math_profile() -> MetalMathProfile {
 fn metal_math_profile_from_env() -> MetalMathProfile {
     if env_is_false("QX_METAL_PRECISE_MATH") {
         MetalMathProfile::UnsafeCompilerDefault
+    } else if env_is_true("QX_METAL_NATIVE_MATH") {
+        MetalMathProfile::SafePrecise
     } else if env_is_true("QX_METAL_RELAXED_ARITHMETIC") {
         MetalMathProfile::RelaxedPrecise
     } else if env_is_true("QX_METAL_FAST_FUNCTIONS") {
         MetalMathProfile::SafeFastFunctions
     } else {
-        MetalMathProfile::SafePrecise
+        MetalMathProfile::ConsensusFixedV1
     }
 }
 
@@ -66,19 +71,41 @@ fn env_is_true(name: &str) -> bool {
     )
 }
 
-pub const Q2_KERNEL_SOURCE: &str = include_str!("../../../kernels/q2_expert.metal");
-pub const Q3_KERNEL_SOURCE: &str = include_str!("../../../kernels/q3_expert.metal");
-pub const Q4_KERNEL_SOURCE: &str = include_str!("../../../kernels/q4_expert.metal");
+pub const CONSENSUS_MATH_KERNEL_SOURCE: &str =
+    include_str!("../../../kernels/consensus_math.metal");
+pub const Q2_KERNEL_SOURCE: &str = concat!(
+    include_str!("../../../kernels/consensus_math.metal"),
+    include_str!("../../../kernels/q2_expert.metal")
+);
+pub const Q3_KERNEL_SOURCE: &str = concat!(
+    include_str!("../../../kernels/consensus_math.metal"),
+    include_str!("../../../kernels/q3_expert.metal")
+);
+pub const Q4_KERNEL_SOURCE: &str = concat!(
+    include_str!("../../../kernels/consensus_math.metal"),
+    include_str!("../../../kernels/q4_expert.metal")
+);
 pub const LOGITS_KERNEL_SOURCE: &str = include_str!("../../../kernels/logits.metal");
 pub const DENSE_KERNEL_SOURCE: &str = include_str!("../../../kernels/dense.metal");
 pub const F16_DENSE_KERNEL_SOURCE: &str = include_str!("../../../kernels/f16_dense.metal");
 pub const ARGMAX_KERNEL_SOURCE: &str = include_str!("../../../kernels/argmax.metal");
-pub const V2_KERNEL_SOURCE: &str = include_str!("../../../kernels/v2_decode.metal");
-pub const Q4_DENSE_KERNEL_SOURCE: &str = include_str!("../../../kernels/q4_dense.metal");
-pub const DYNAMIC_MOE_KERNEL_SOURCE: &str = include_str!("../../../kernels/dynamic_moe.metal");
+pub const V2_KERNEL_SOURCE: &str = concat!(
+    include_str!("../../../kernels/consensus_math.metal"),
+    include_str!("../../../kernels/v2_decode.metal")
+);
+pub const Q4_DENSE_KERNEL_SOURCE: &str = concat!(
+    include_str!("../../../kernels/consensus_math.metal"),
+    include_str!("../../../kernels/q4_dense.metal")
+);
+pub const DYNAMIC_MOE_KERNEL_SOURCE: &str = concat!(
+    include_str!("../../../kernels/consensus_math.metal"),
+    include_str!("../../../kernels/dynamic_moe.metal")
+);
 pub const Q4_EMBEDDING_KERNEL_SOURCE: &str = include_str!("../../../kernels/q4_embedding.metal");
-pub const QWEN_ATTENTION_KERNEL_SOURCE: &str =
-    include_str!("../../../kernels/qwen_attention.metal");
+pub const QWEN_ATTENTION_KERNEL_SOURCE: &str = concat!(
+    include_str!("../../../kernels/consensus_math.metal"),
+    include_str!("../../../kernels/qwen_attention.metal")
+);
 pub const VERIFICATION_HASH_KERNEL_SOURCE: &str =
     include_str!("../../../kernels/verification_hash.metal");
 
@@ -127,7 +154,7 @@ pub mod platform {
     use block2::RcBlock;
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
-    use objc2_foundation::{NSRange, NSString};
+    use objc2_foundation::{NSDictionary, NSObject, NSRange, NSString};
     pub use objc2_metal::MTLSize;
     use objc2_metal::{
         MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
@@ -139,9 +166,9 @@ pub mod platform {
     };
 
     use super::{
-        ARGMAX_KERNEL_SOURCE, DENSE_KERNEL_SOURCE, DYNAMIC_MOE_KERNEL_SOURCE,
-        F16_DENSE_KERNEL_SOURCE, LOGITS_KERNEL_SOURCE, MetalMathProfile, PackingLayout,
-        Q2_KERNEL_SOURCE, Q4_DENSE_KERNEL_SOURCE, Q4_EMBEDDING_KERNEL_SOURCE,
+        ARGMAX_KERNEL_SOURCE, CONSENSUS_MATH_KERNEL_SOURCE, DENSE_KERNEL_SOURCE,
+        DYNAMIC_MOE_KERNEL_SOURCE, F16_DENSE_KERNEL_SOURCE, LOGITS_KERNEL_SOURCE, MetalMathProfile,
+        PackingLayout, Q2_KERNEL_SOURCE, Q4_DENSE_KERNEL_SOURCE, Q4_EMBEDDING_KERNEL_SOURCE,
         QWEN_ATTENTION_KERNEL_SOURCE, QuantType, V2_KERNEL_SOURCE, active_metal_math_profile,
         kernel_source,
     };
@@ -163,12 +190,19 @@ pub mod platform {
             _ => MTLMathMode::Safe,
         });
         options.setMathFloatingPointFunctions(match profile {
-            MetalMathProfile::SafePrecise | MetalMathProfile::RelaxedPrecise => {
-                MTLMathFloatingPointFunctions::Precise
-            }
+            MetalMathProfile::ConsensusFixedV1
+            | MetalMathProfile::SafePrecise
+            | MetalMathProfile::RelaxedPrecise => MTLMathFloatingPointFunctions::Precise,
             MetalMathProfile::SafeFastFunctions => MTLMathFloatingPointFunctions::Fast,
             MetalMathProfile::UnsafeCompilerDefault => unreachable!(),
         });
+        if profile == MetalMathProfile::ConsensusFixedV1 {
+            let key = NSString::from_str("QX_CONSENSUS_FIXED_MATH");
+            let value = NSString::from_str("1");
+            let macros: Retained<NSDictionary<NSString, NSObject>> =
+                NSDictionary::from_slices(&[&*key], &[&*value]);
+            unsafe { options.setPreprocessorMacros(Some(&macros)) };
+        }
         Some(options)
     }
 
@@ -9563,6 +9597,78 @@ pub mod platform {
             })
         }
 
+        /// Execute the protocol math conformance kernel and return raw exp and
+        /// reciprocal-square-root bits for cross-implementation tests.
+        pub fn run_consensus_math_conformance(
+            &self,
+            inputs: &[f32],
+        ) -> Result<Vec<[u32; 2]>, String> {
+            if inputs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let source = NSString::from_str(CONSENSUS_MATH_KERNEL_SOURCE);
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
+                .map_err(|error| {
+                    format!("Metal consensus-math library compilation failed: {error}")
+                })?;
+            let function = library
+                .newFunctionWithName(&NSString::from_str("qx_consensus_math_conformance"))
+                .ok_or_else(|| "Metal consensus-math conformance function missing".to_owned())?;
+            let pipeline = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal consensus-math pipeline creation failed".to_owned())?;
+            let input_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    inputs.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(inputs),
+                )
+            };
+            let input = self.input_buffer(input_bytes)?;
+            let output = self
+                .device
+                .newBufferWithLength_options(
+                    inputs.len() * std::mem::size_of::<[u32; 2]>(),
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .ok_or_else(|| "Metal consensus-math output allocation failed".to_owned())?;
+            let command_buffer = self.queue.commandBuffer().ok_or_else(|| {
+                "Metal consensus-math command buffer allocation failed".to_owned()
+            })?;
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or_else(|| "Metal consensus-math encoder allocation failed".to_owned())?;
+            encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&input), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&output), 0, 1);
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: inputs.len(),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: inputs
+                        .len()
+                        .min(pipeline.maxTotalThreadsPerThreadgroup() as usize),
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            command_buffer.commit();
+            command_buffer.waitUntilCompleted();
+            if command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
+                return Err("Metal consensus-math execution failed".to_owned());
+            }
+            let pointer = output.contents().as_ptr() as *const [u32; 2];
+            Ok(unsafe { std::slice::from_raw_parts(pointer, inputs.len()).to_vec() })
+        }
+
         /// Start a new GPU queue-gap interval without discarding cumulative
         /// work counters. The next completed command buffer becomes the
         /// timestamp anchor, so setup/prefill time is not charged as decode
@@ -15355,6 +15461,23 @@ pub mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn consensus_math_is_bit_exact_between_rust_and_metal() {
+        let context = platform::MetalContext::system_default().expect("Metal device");
+        let inputs = [1.0e-6_f32, 0.001, 0.25, 0.5, 1.0, 2.0, 10.0, 1024.0];
+        let observed = context
+            .run_consensus_math_conformance(&inputs)
+            .expect("consensus math dispatch");
+        let expected = inputs.map(|value| {
+            [
+                qx_consensus_math::exp_f32(value).unwrap().to_bits(),
+                qx_consensus_math::rsqrt_f32(value).unwrap().to_bits(),
+            ]
+        });
+        assert_eq!(observed, expected);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

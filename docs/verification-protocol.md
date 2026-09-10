@@ -49,21 +49,21 @@ The current live-SBF measurements are:
 
 | Operation | Compute units |
 |---|---:|
-| Finalize epoch seed (once/epoch) | 1,787 |
-| Authenticate job/result and open challenge | 5,837 |
+| Finalize epoch seed (once/epoch) | 1,786 |
+| Authenticate job/result and open challenge | 5,840 |
 | Both boundary openings + one midpoint round | 10,154 |
-| Weight proof + objective FMA | 9,448 |
+| Weight proof + objective FMA | 9,485 |
 
 Each additional binary-search level costs one challenger and one miner
-midpoint instruction. The complete three-state test dispute is 29,191 CU,
+midpoint instruction. The complete three-state test dispute is 29,280 CU,
 including both terminal-state reveals. The full test also exercises both
 timeout directions, rejects an unselected result, rejects duplicate epoch
 submission, and convicts an incorrect accumulator without a miner co-signature.
 
 Three production gates remain deliberately disabled: collateral transfer and
 settlement, the hierarchical bridge from the runtime's job/token/layer root to
-the dispute-local operator trace, and deterministic terminal coverage for all
-operators beyond Q4 FMA. Therefore this code demonstrates adversarial
+the dispute-local operator trace, and structured terminal witnesses for
+append-only KV updates. Therefore this code demonstrates adversarial
 attribution, sampling, bisection, and one objective terminal transition; it is
 not yet safe to enable automatic slashing for an arbitrary full inference.
 
@@ -224,14 +224,21 @@ the active dispute PDA, so a proof cannot be replayed into another dispute.
 `QX_EXEC_METAL_V1` now replaces native `simd_sum`/`simd_max` with an explicit
 32-lane shuffle-down tree in the Q4, dense, decode, and dynamic-MoE kernels.
 Metal fast math is disabled by default, and the host verifier contains the
-matching FP32 sum oracle. Live Metal tests pass, and the execution-spec digest
-binds the tree and precise-math requirement.
+matching FP32 sum oracle. It also replaces native `exp` and `rsqrt` throughout
+the model kernels with protocol-defined fixed-operation implementations. Rust,
+Metal, and the SBF terminal evaluator share identical constants and operation
+order. Live Metal bit-parity tests pass, and execution-spec
+`160456e4bd0da974fcc6515c8c5ebddaddb2a63d4f180d0fb3ad6fa7dda2c521`
+binds the fixed-math profile.
 
-This removes the previously unspecified reduction order, but costs 5.749% over
-the explicit tree compiled in fast mode. Precise execution plus commitments is
-8.820% slower than fast uncommitted execution. Deterministic decompositions and
-terminal instructions are still needed for rsqrt, exp/softmax, RoPE, KV append,
-and the remaining verification IR before a complete inference can be slashed.
+The scalar terminal IR now objectively evaluates FMA/dot steps, add, multiply,
+ordered sum/max, compare, select, division, fixed exp, and fixed rsqrt. An
+actual SBF fixed-exp dispute consumes 8,110 CU across both terminal reveals and
+resolution. RoPE decomposes into multiply/add steps; softmax and RMSNorm use the
+fixed exp/rsqrt/div primitives. Argmax and Top-K decompose into compare/select.
+KV leaf hashing exists, but its append/frontier-update witness and the nested
+layer-to-operator trace bridge remain required before complete inference is
+slashable end to end.
 
 An experimental Metal profile now combines relaxed arithmetic optimization
 with precise math functions. It reduced the mean fast-uncommitted to

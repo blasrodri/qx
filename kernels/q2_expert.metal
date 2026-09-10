@@ -105,7 +105,7 @@ kernel void qx_q2_expert(
     if (row < intermediate) {
         float gate = float(gate_up[row]);
         float up = float(gate_up[intermediate + row]);
-        activated[row] = half((gate / (1.0f + exp(-gate))) * up);
+        activated[row] = half((gate / (1.0f + qx_consensus_exp(-gate))) * up);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -156,7 +156,7 @@ kernel void qx_q2s4_expert(
     if (row < intermediate) {
         float gate = float(gate_up[row]);
         float up = float(gate_up[intermediate + row]);
-        activated[row] = half((gate / (1.0f + exp(-gate))) * up);
+        activated[row] = half((gate / (1.0f + qx_consensus_exp(-gate))) * up);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -212,7 +212,7 @@ kernel void qx_q2s4_qwen_expert(
     half gate_half = half(gate);
     half up_half = half(up);
     float gate_rounded = float(gate_half);
-    activated[lane] = half((gate_rounded / (1.0f + exp(-gate_rounded))) * float(up_half));
+    activated[lane] = half((gate_rounded / (1.0f + qx_consensus_exp(-gate_rounded))) * float(up_half));
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint row = lane; row < hidden; row += intermediate) {
@@ -578,7 +578,7 @@ kernel void qx_qwen_moe_dynamic(
     half gate_half = half(gate);
     half up_half = half(up);
     float gate_rounded = float(gate_half);
-    activated[lane] = half((gate_rounded / (1.0f + exp(-gate_rounded))) * float(up_half));
+    activated[lane] = half((gate_rounded / (1.0f + qx_consensus_exp(-gate_rounded))) * float(up_half));
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint row = lane; row < hidden; row += intermediate) {
         float down = 0.0f;
@@ -682,7 +682,7 @@ kernel void qx_qwen_moe_gate_dynamic(
     half up_half = half(up);
     float gate_rounded = float(gate_half);
     activations[slot * intermediate + lane] =
-        half((gate_rounded / (1.0f + exp(-gate_rounded))) * float(up_half));
+        half((gate_rounded / (1.0f + qx_consensus_exp(-gate_rounded))) * float(up_half));
 }
 
 kernel void qx_qwen_moe_down_tiled_dynamic(

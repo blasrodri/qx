@@ -65,7 +65,7 @@ kernel void qx_v2_rmsnorm(
     if (tid != 0) return;
     float sum = 0.0f;
     for (uint i = 0; i < params.n; ++i) sum += input[i] * input[i];
-    float inverse = rsqrt(sum / float(params.n) + params.epsilon);
+    float inverse = qx_consensus_rsqrt(sum / float(params.n) + params.epsilon);
     for (uint i = 0; i < params.n; ++i) output[i] = input[i] * inverse * weights[i];
 }
 
@@ -93,7 +93,7 @@ kernel void qx_v2_rmsnorm_simd(
     if (simdgroup == 0) {
         float total = lane < 8 ? partials[lane] : 0.0f;
         total = qx_ordered_simd_sum(total);
-        if (lane == 0) partials[0] = rsqrt(total / float(params.n) + params.epsilon);
+        if (lane == 0) partials[0] = qx_consensus_rsqrt(total / float(params.n) + params.epsilon);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < params.n) output[tid] = input[tid] * partials[0] * weights[tid];
@@ -121,7 +121,7 @@ kernel void qx_v2_rmsnorm_scalar(
     if (simdgroup == 0) {
         float total = lane < 8 ? partials[lane] : 0.0f;
         total = qx_ordered_simd_sum(total);
-        if (lane == 0) output[0] = rsqrt(total / float(params.n) + params.epsilon);
+        if (lane == 0) output[0] = qx_consensus_rsqrt(total / float(params.n) + params.epsilon);
     }
 }
 
@@ -150,7 +150,7 @@ kernel void qx_v2_rmsnorm_batch(
     if (simdgroup == 0) {
         float total = lane < 8 ? partials[lane] : 0.0f;
         total = qx_ordered_simd_sum(total);
-        if (lane == 0) partials[0] = rsqrt(total / float(params.n) + params.epsilon);
+        if (lane == 0) partials[0] = qx_consensus_rsqrt(total / float(params.n) + params.epsilon);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < params.n) {
@@ -172,7 +172,7 @@ kernel void qx_v2_rmsnorm_batch_scalar(
     uint base = token * params.n;
     float sum = 0.0f;
     for (uint i = 0; i < params.n; ++i) sum += input[base + i] * input[base + i];
-    float inverse = rsqrt(sum / float(params.n) + params.epsilon);
+    float inverse = qx_consensus_rsqrt(sum / float(params.n) + params.epsilon);
     for (uint i = 0; i < params.n; ++i) {
         output[base + i] = input[base + i] * inverse * weights[i];
     }
@@ -196,7 +196,7 @@ kernel void qx_v2_rmsnorm_batch_parallel_writeback(
             float value = input[base + i];
             sum += value * value;
         }
-        shared_inverse[0] = rsqrt(sum / float(params.n) + params.epsilon);
+        shared_inverse[0] = qx_consensus_rsqrt(sum / float(params.n) + params.epsilon);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < params.n; i += 256) {
@@ -622,7 +622,7 @@ kernel void qx_v2_attention(
         for (uint d = 0; d < head_dim; ++d) {
             score += query[query_offset + d] * key_cache[cache_offset + d];
         }
-        denominator += exp(score * scale - maximum);
+        denominator += qx_consensus_exp(score * scale - maximum);
     }
     float value = 0.0f;
     for (uint position = 0; position < params.length; ++position) {
@@ -632,7 +632,7 @@ kernel void qx_v2_attention(
         for (uint d = 0; d < head_dim; ++d) {
             score += query[query_offset + d] * key_cache[cache_offset + d];
         }
-        value += exp(score * scale - maximum) / denominator
+        value += qx_consensus_exp(score * scale - maximum) / denominator
             * value_cache[cache_offset + dimension];
     }
     output[tid] = value;
@@ -677,7 +677,7 @@ kernel void qx_v2_attention_batch(
         for (uint d = 0; d < head_dim; ++d) {
             score += query[query_base + d] * key_cache[cache_offset + d];
         }
-        denominator += exp(score * scale - maximum);
+        denominator += qx_consensus_exp(score * scale - maximum);
     }
     float value = 0.0f;
     for (uint position = 0; position < length; ++position) {
@@ -686,7 +686,7 @@ kernel void qx_v2_attention_batch(
         for (uint d = 0; d < head_dim; ++d) {
             score += query[query_base + d] * key_cache[cache_offset + d];
         }
-        value += exp(score * scale - maximum) / denominator
+        value += qx_consensus_exp(score * scale - maximum) / denominator
             * value_cache[cache_offset + dimension];
     }
     output[token * hidden + local] = value;
@@ -737,7 +737,7 @@ kernel void qx_v2_attention_batch_simd(
         }
         float denominator = 0.0f;
         for (uint position = 0; position < length; ++position) {
-            float weight = exp(scores[score_offset + position] - maximum);
+            float weight = qx_consensus_exp(scores[score_offset + position] - maximum);
             scores[score_offset + position] = weight;
             denominator += weight;
         }
@@ -798,7 +798,7 @@ kernel void qx_v2_attention_simd(
         }
         float denominator = 0.0f;
         for (uint position = 0; position < params.length; ++position) {
-            float weight = exp(scores[score_offset + position] - maximum);
+            float weight = qx_consensus_exp(scores[score_offset + position] - maximum);
             scores[score_offset + position] = weight;
             denominator += weight;
         }
@@ -951,10 +951,10 @@ kernel void qx_v2_attention_stream_gqa(
 
         float new_max0 = max(max0, dot0);
         float new_max1 = max(max1, dot1);
-        float alpha0 = exp(max0 - new_max0);
-        float alpha1 = exp(max1 - new_max1);
-        float beta0 = exp(dot0 - new_max0);
-        float beta1 = exp(dot1 - new_max1);
+        float alpha0 = qx_consensus_exp(max0 - new_max0);
+        float alpha1 = qx_consensus_exp(max1 - new_max1);
+        float beta0 = qx_consensus_exp(dot0 - new_max0);
+        float beta1 = qx_consensus_exp(dot1 - new_max1);
         max0 = new_max0;
         max1 = new_max1;
         sum0 = sum0 * alpha0 + beta0;
@@ -1025,10 +1025,10 @@ kernel void qx_v2_attention_chunked_gqa(
             query[query1 + dim0] * k0 + query[query1 + dim1] * k1) * scale, 0);
         float new_max0 = max(max0, dot0);
         float new_max1 = max(max1, dot1);
-        float alpha0 = exp(max0 - new_max0);
-        float alpha1 = exp(max1 - new_max1);
-        float beta0 = exp(dot0 - new_max0);
-        float beta1 = exp(dot1 - new_max1);
+        float alpha0 = qx_consensus_exp(max0 - new_max0);
+        float alpha1 = qx_consensus_exp(max1 - new_max1);
+        float beta0 = qx_consensus_exp(dot0 - new_max0);
+        float beta1 = qx_consensus_exp(dot1 - new_max1);
         max0 = new_max0;
         max1 = new_max1;
         sum0 = sum0 * alpha0 + beta0;
@@ -1079,7 +1079,7 @@ kernel void qx_v2_attention_chunked_merge(
     float value = 0.0f;
     for (uint c = 0; c < chunks; ++c) {
         uint stats = partial_floats + (q_head * chunks + c) * 2;
-        float factor = exp(scratch[stats] - global_max);
+        float factor = qx_consensus_exp(scratch[stats] - global_max);
         total += scratch[stats + 1] * factor;
         value += scratch[(q_head * chunks + c) * head_dim + dimension] * factor;
     }
@@ -1101,7 +1101,7 @@ kernel void qx_v2_attention_softmax(
     }
     float denominator = 0.0f;
     for (uint position = 0; position < params.length; ++position) {
-        float weight = exp(scores[offset + position] - maximum);
+        float weight = qx_consensus_exp(scores[offset + position] - maximum);
         scores[offset + position] = weight;
         denominator += weight;
     }
@@ -1163,7 +1163,7 @@ kernel void qx_v2_attention_softmax_simd(
 
     float local_sum = 0.0f;
     for (uint position = tid; position < params.length; position += 256) {
-        local_sum += exp(scores[group_id * max_context + position] - maximum);
+        local_sum += qx_consensus_exp(scores[group_id * max_context + position] - maximum);
     }
     local_sum = qx_ordered_simd_sum(local_sum);
     if (lane == 0) sum_reductions[simdgroup] = local_sum;
@@ -1176,7 +1176,7 @@ kernel void qx_v2_attention_softmax_simd(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint position = tid; position < params.length; position += 256) {
         scores[group_id * max_context + position] =
-            exp(scores[group_id * max_context + position] - maximum) / denominator;
+            qx_consensus_exp(scores[group_id * max_context + position] - maximum) / denominator;
     }
     (void)q_heads;
 }
@@ -1346,7 +1346,7 @@ kernel void qx_v2_topk(
     }
     float denominator = 0.0f;
     for (uint slot = 0; slot < 8; ++slot) {
-        weights[slot] = exp(weights[slot] - maximum);
+        weights[slot] = qx_consensus_exp(weights[slot] - maximum);
         denominator += weights[slot];
     }
     for (uint slot = 0; slot < 8; ++slot) weights[slot] /= denominator;
@@ -1380,7 +1380,7 @@ kernel void qx_v2_topk_batch(
     }
     float denominator = 0.0f;
     for (uint slot = 0; slot < 8; ++slot) {
-        weights[output_base + slot] = exp(weights[output_base + slot] - maximum);
+        weights[output_base + slot] = qx_consensus_exp(weights[output_base + slot] - maximum);
         denominator += weights[output_base + slot];
     }
     for (uint slot = 0; slot < 8; ++slot) {

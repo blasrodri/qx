@@ -6,6 +6,16 @@
 
 use qx_model::{ATTENTION_HEADS, EXPERTS, HIDDEN, KV_HEADS, LAYERS, TOP_K, VOCAB};
 
+#[inline(always)]
+fn consensus_exp(value: f32) -> f32 {
+    qx_consensus_math::exp_f32(value).expect("finite model exp input")
+}
+
+#[inline(always)]
+fn consensus_rsqrt(value: f32) -> f32 {
+    qx_consensus_math::rsqrt_f32(value).expect("positive finite RMS input")
+}
+
 /// The artifact manifest after install-time choices and diagnostic overrides
 /// have been resolved. This is the runtime-facing plan object; graph builders
 /// can consume it directly instead of repeatedly asking process-global
@@ -4440,7 +4450,7 @@ impl CpuQ4Reference {
                     .map(|index| {
                         let gate = gate_up_values[index];
                         let up = gate_up_values[INTERMEDIATE + index];
-                        (gate / (1.0 + (-gate).exp())) * up
+                        (gate / (1.0 + consensus_exp(-gate))) * up
                     })
                     .collect::<Vec<_>>();
                 let expert_output = down.mat_vec(&activated);
@@ -4536,11 +4546,11 @@ impl CpuQ4Cache {
             let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let denominator = scores
                 .iter()
-                .map(|score| (*score - maximum).exp())
+                .map(|score| consensus_exp(*score - maximum))
                 .sum::<f32>();
             for (cached, score) in scores.into_iter().enumerate() {
                 let key_start = (cached * KV_HEADS + kv_head) * HEAD_DIM;
-                let weight = (score - maximum).exp() / denominator;
+                let weight = consensus_exp(score - maximum) / denominator;
                 let value_start = key_start;
                 for index in 0..HEAD_DIM {
                     output[query_start + index] += weight * self.values[value_start + index];
@@ -4610,7 +4620,7 @@ fn artifact_raw_norm(
 
 fn cpu_rms_norm(input: &[f32], weight: &[f32]) -> Vec<f32> {
     let mean_square = input.iter().map(|value| value * value).sum::<f32>() / HIDDEN as f32;
-    let scale = (mean_square + qx_model::RMS_EPSILON).sqrt().recip();
+    let scale = consensus_rsqrt(mean_square + qx_model::RMS_EPSILON);
     input
         .iter()
         .zip(weight)
@@ -4652,11 +4662,11 @@ fn cpu_topk(logits: &[f32]) -> Vec<(u8, f32)> {
     }
     let denominator = selected
         .iter()
-        .map(|(_, value)| (*value - maximum).exp())
+        .map(|(_, value)| consensus_exp(*value - maximum))
         .sum::<f32>();
     selected
         .into_iter()
-        .map(|(expert, value)| (expert, (value - maximum).exp() / denominator))
+        .map(|(expert, value)| (expert, consensus_exp(value - maximum) / denominator))
         .collect()
 }
 

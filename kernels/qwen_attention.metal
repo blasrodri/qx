@@ -22,7 +22,7 @@ kernel void qx_qwen_rms_norm(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float inverse_rms = rsqrt(sums[0] / float(hidden) + 1.0e-6f);
+    float inverse_rms = qx_consensus_rsqrt(sums[0] / float(hidden) + 1.0e-6f);
     for (uint index = tid; index < hidden; index += group) {
         output[index] = half(float(input[index]) * inverse_rms * norm[index]);
     }
@@ -53,7 +53,7 @@ kernel void qx_qwen_residual_rms_norm(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float inverse_rms = rsqrt(sums[0] / float(hidden) + 1.0e-6f);
+    float inverse_rms = qx_consensus_rsqrt(sums[0] / float(hidden) + 1.0e-6f);
     for (uint index = tid; index < hidden; index += group) {
         norm_output[index] = half(float(hidden_output[index]) * inverse_rms * norm[index]);
     }
@@ -162,7 +162,7 @@ kernel void qx_qwen_qk_norm_rope(
         float value = float(values[offset + index]);
         sum_squares += value * value;
     }
-    float inverse_rms = rsqrt(sum_squares / float(head_dim) + epsilon);
+    float inverse_rms = qx_consensus_rsqrt(sum_squares / float(head_dim) + epsilon);
     for (uint index = 0; index < half_dim; ++index) {
         float left = float(values[offset + index]) * inverse_rms * norm[index];
         float right = float(values[offset + half_dim + index]) * inverse_rms
@@ -197,7 +197,7 @@ kernel void qx_qwen_gqa_attention(
     uint dimension = index % head_dim;
     uint key_head = query_head / (query_heads / key_heads);
     uint query_offset = query_head * head_dim;
-    float scale = rsqrt(float(head_dim));
+    float scale = qx_consensus_rsqrt(float(head_dim));
 
     float maximum = -INFINITY;
     for (uint token = 0; token < context; ++token) {
@@ -219,7 +219,7 @@ kernel void qx_qwen_gqa_attention(
             score += float(query[query_offset + column])
                 * float(key_cache[key_offset + column]);
         }
-        float weight = exp(score * scale - maximum);
+        float weight = qx_consensus_exp(score * scale - maximum);
         denominator += weight;
         weighted += weight * float(value_cache[key_offset + dimension]);
     }
@@ -248,7 +248,7 @@ kernel void qx_qwen_gqa_score_reuse(
     threadgroup float* reductions = scratch + context;
     uint key_head = query_head / (query_heads / key_heads);
     uint query_offset = query_head * head_dim;
-    float scale = rsqrt(float(head_dim));
+    float scale = qx_consensus_rsqrt(float(head_dim));
 
     for (uint token = 0; token < context; ++token) {
         uint key_offset = (token * key_heads + key_head) * head_dim;
@@ -283,7 +283,7 @@ kernel void qx_qwen_gqa_score_reuse(
 
     float local_denominator = 0.0f;
     for (uint token = tid; token < context; token += head_dim) {
-        local_denominator += exp(scores[token] - maximum);
+        local_denominator += qx_consensus_exp(scores[token] - maximum);
     }
     reductions[tid] = local_denominator;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -298,7 +298,7 @@ kernel void qx_qwen_gqa_score_reuse(
     float weighted = 0.0f;
     for (uint token = 0; token < context; ++token) {
         uint value_offset = (token * key_heads + key_head) * head_dim;
-        weighted += exp(scores[token] - maximum) * float(value_cache[value_offset + tid]);
+        weighted += qx_consensus_exp(scores[token] - maximum) * float(value_cache[value_offset + tid]);
     }
     output[query_offset + tid] = half(weighted / denominator);
 }
@@ -335,7 +335,7 @@ kernel void qx_qwen_top8(
     float maximum = best_values[0];
     float denominator = 0.0f;
     for (uint slot = 0; slot < 8; ++slot) {
-        weights[slot] = exp(best_values[slot] - maximum);
+        weights[slot] = qx_consensus_exp(best_values[slot] - maximum);
         denominator += weights[slot];
     }
     for (uint slot = 0; slot < 8; ++slot) {

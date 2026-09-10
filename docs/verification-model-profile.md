@@ -164,16 +164,19 @@ storage. A single token-end hash dispatch processes all 24 layers and returns
 only 1,536 digest bytes after the runtime's existing token synchronization.
 
 This closes the byte-level commitment gap. Consensus arithmetic now uses an
-explicit 32-lane shuffle-down reduction tree and disables Metal fast math; a
-CPU verifier primitive reproduces the same sum order. Commitment overhead in
-that precise profile is 2.904%. Precise committed execution is currently
-8.820% slower than fast uncommitted execution, so the complete <5% gate is open
-again even though commitment work itself is below 3%. The execution-spec
-digest binds the hash design, reduction tree, math mode, and checkpoint
-interval. See `docs/verification-benchmarks.md` for exact measurements.
+explicit 32-lane shuffle-down reduction tree, protocol-defined fixed-operation
+`exp` and `rsqrt`, and safe Metal arithmetic; CPU and SBF primitives reproduce
+the same operation order. The fixed profile measured 2.829% commitment
+overhead. Its 512-position PTB PPL differed from native precise math by only
+`4.8735e-8` relatively, with complete sampled top-k agreement. Execution-spec
+`160456e4bd0da974fcc6515c8c5ebddaddb2a63d4f180d0fb3ad6fa7dda2c521`
+binds the hash design, reduction tree, math mode, fixed functions, and
+checkpoint interval. See `docs/verification-benchmarks.md` for exact
+measurements.
 
 A distinct relaxed-arithmetic/precise-functions candidate now measures 3.734%
 total overhead using the means of two independent 31-repeat candidate runs and
 two bracketing fast controls. It is repeatable on this M5 Pro but remains
-non-slashable until cross-device parity, compiler/metallib pinning, and complete
-terminal operation coverage are demonstrated.
+non-slashable until cross-device parity and compiler/metallib pinning are
+demonstrated. It is retained as historical performance evidence rather than
+the default protocol profile.

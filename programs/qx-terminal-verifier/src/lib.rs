@@ -125,6 +125,11 @@ pub fn process_instruction(
         v2::OP_STAGE_Q4_WEIGHT_V2 => v2::stage_q4_weight(program_id, accounts, &mut cursor),
         v2::OP_RESOLVE_Q4_FMA_V2 => v2::resolve_q4_fma(program_id, accounts, &mut cursor),
         v2::OP_TIMEOUT_V2 => v2::timeout(program_id, accounts, &mut cursor),
+        v2::OP_CHALLENGER_SCALAR_V2 => {
+            v2::submit_challenger_scalar(program_id, accounts, &mut cursor)
+        }
+        v2::OP_MINER_SCALAR_V2 => v2::submit_miner_scalar(program_id, accounts, &mut cursor),
+        v2::OP_RESOLVE_SCALAR_V2 => v2::resolve_scalar(program_id, accounts, &mut cursor),
         _ => Err(QxError::InvalidEncoding.into()),
     }
 }

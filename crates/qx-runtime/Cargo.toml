@@ -8,6 +8,7 @@ license.workspace = true
 half.workspace = true
 qx-compiler.workspace = true
 qx-commit = { path = "../qx-commit" }
+qx-consensus-math.workspace = true
 qx-format.workspace = true
 qx-metal.workspace = true
 qx-model.workspace = true

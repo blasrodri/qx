@@ -18,6 +18,9 @@ pub(super) const OP_MINER_TERMINAL_V2: u8 = 17;
 pub(super) const OP_STAGE_Q4_WEIGHT_V2: u8 = 18;
 pub(super) const OP_RESOLVE_Q4_FMA_V2: u8 = 19;
 pub(super) const OP_TIMEOUT_V2: u8 = 20;
+pub(super) const OP_CHALLENGER_SCALAR_V2: u8 = 21;
+pub(super) const OP_MINER_SCALAR_V2: u8 = 22;
+pub(super) const OP_RESOLVE_SCALAR_V2: u8 = 23;
 
 pub const JOB_PAYLOAD_BYTES: usize = 310;
 pub const JOB_ACCOUNT_BYTES: usize = 314;
@@ -72,6 +75,7 @@ const D_AUDIT_SEED: &[u8] = b"QX:AUDIT:SEED:V2";
 const D_AUDIT_DRAW: &[u8] = b"QX:AUDIT:DRAW:V1";
 const D_TRACE_TREE: &[u8] = b"QX:DISPUTE:TRACE:V1";
 const D_FMA_STATE: &[u8] = b"QX:FMA:STATE:V1";
+const D_SCALAR_STATE: &[u8] = b"QX:SCALAR:STATE:V1";
 
 const PHASE_CHALLENGER_BOUNDS: u8 = 1;
 const PHASE_MINER_BOUNDS: u8 = 2;
@@ -795,6 +799,138 @@ pub(super) fn resolve_q4_fma(
     Ok(())
 }
 
+/// Reveal an entire two-state scalar primitive after the surrounding trace
+/// has already narrowed to one transition. The agreed predecessor binds all
+/// operands; the challenger endpoint binds its claimed result.
+pub(super) fn submit_challenger_scalar(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [dispute, challenger] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    let mut state = checked_party_state(
+        program_id,
+        dispute,
+        challenger,
+        PHASE_CHALLENGER_TERMINAL,
+        PARTY_CHALLENGER,
+    )?;
+    let op = cursor.u8()?;
+    let a = cursor.u32()?;
+    let b = cursor.u32()?;
+    let c = cursor.u32()?;
+    let challenger_result = cursor.u32()?;
+    if !cursor.is_empty() || !scalar_op_supported(op) {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let job_hash = array_at(&state, D_JOB_HASH_OFFSET)?;
+    let transition = u32_at(&state, D_LOW_OFFSET)?;
+    let common = scalar_state_hash(&job_hash, transition, op, a, b, c, None);
+    let challenger_output =
+        scalar_state_hash(&job_hash, transition, op, a, b, c, Some(challenger_result));
+    if common != array_at(&state, D_COMMON_ROOT_OFFSET)?
+        || challenger_output != array_at(&state, D_CHALLENGER_END_OFFSET)?
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    state[D_RESOLUTION_FLAGS_OFFSET] = op;
+    put(&mut state, D_TENSOR_OFFSET, &a.to_le_bytes())?;
+    put(&mut state, D_ROW_OFFSET, &b.to_le_bytes())?;
+    put(&mut state, D_COLUMN_OFFSET, &c.to_le_bytes())?;
+    put(
+        &mut state,
+        D_CHALLENGER_BITS_OFFSET,
+        &challenger_result.to_le_bytes(),
+    )?;
+    set_phase(&mut state, PHASE_MINER_TERMINAL, PARTY_MINER)?;
+    refresh_deadline(&mut state, Clock::get()?.slot)
+}
+
+pub(super) fn submit_miner_scalar(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [dispute, miner] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    let mut state = checked_party_state(
+        program_id,
+        dispute,
+        miner,
+        PHASE_MINER_TERMINAL,
+        PARTY_MINER,
+    )?;
+    let defender_result = cursor.u32()?;
+    if !cursor.is_empty() {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let output = scalar_state_hash(
+        &array_at(&state, D_JOB_HASH_OFFSET)?,
+        u32_at(&state, D_LOW_OFFSET)?,
+        state[D_RESOLUTION_FLAGS_OFFSET],
+        u32_at(&state, D_TENSOR_OFFSET)?,
+        u32_at(&state, D_ROW_OFFSET)?,
+        u32_at(&state, D_COLUMN_OFFSET)?,
+        Some(defender_result),
+    );
+    if output != array_at(&state, D_DEFENDER_END_OFFSET)? {
+        return Err(QxError::InvalidState.into());
+    }
+    put(
+        &mut state,
+        D_DEFENDER_BITS_OFFSET,
+        &defender_result.to_le_bytes(),
+    )?;
+    set_phase(&mut state, PHASE_TERMINAL_READY, PARTY_CHALLENGER)?;
+    refresh_deadline(&mut state, Clock::get()?.slot)
+}
+
+pub(super) fn resolve_scalar(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [dispute] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    if !cursor.is_empty()
+        || dispute.owner != program_id
+        || !dispute.is_writable
+        || dispute.data_len() != DISPUTE_V2_ACCOUNT_BYTES
+    {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let mut state = dispute.try_borrow_mut_data()?;
+    require_dispute(&state, PHASE_TERMINAL_READY)?;
+    require_deadline(&state)?;
+    let expected = evaluate_scalar(
+        state[D_RESOLUTION_FLAGS_OFFSET],
+        u32_at(&state, D_TENSOR_OFFSET)?,
+        u32_at(&state, D_ROW_OFFSET)?,
+        u32_at(&state, D_COLUMN_OFFSET)?,
+    )?;
+    let defender = u32_at(&state, D_DEFENDER_BITS_OFFSET)?;
+    let challenger = u32_at(&state, D_CHALLENGER_BITS_OFFSET)?;
+    let expected_bytes = expected.to_le_bytes();
+    let agrees_with_challenger = expected_bytes == challenger.to_le_bytes();
+    let disagrees_with_miner = expected_bytes != defender.to_le_bytes();
+    let winner = if disagrees_with_miner && agrees_with_challenger {
+        PARTY_CHALLENGER
+    } else {
+        PARTY_MINER
+    };
+    put(&mut state, D_ACC_START_OFFSET, &expected.to_le_bytes())?;
+    state[D_RESOLUTION_FLAGS_OFFSET] =
+        u8::from(agrees_with_challenger) | (u8::from(disagrees_with_miner) << 1);
+    state[D_PHASE_OFFSET] = PHASE_RESOLVED_V2;
+    state[D_WINNER_OFFSET] = winner;
+    state[D_EXPECTED_PARTY_OFFSET] = PARTY_NONE;
+    Ok(())
+}
+
 pub(super) fn timeout(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1044,6 +1180,93 @@ fn fma_state_hash(
             &accumulator_bits.to_le_bytes(),
         ],
     )
+}
+
+fn scalar_state_hash(
+    job_hash: &[u8; 32],
+    transition: u32,
+    op: u8,
+    a: u32,
+    b: u32,
+    c: u32,
+    result: Option<u32>,
+) -> [u8; 32] {
+    let phase = u8::from(result.is_some());
+    let result = result.unwrap_or(0);
+    blake3_domain(
+        D_SCALAR_STATE,
+        &[
+            job_hash,
+            &transition.to_le_bytes(),
+            &[op],
+            &[phase],
+            &a.to_le_bytes(),
+            &b.to_le_bytes(),
+            &c.to_le_bytes(),
+            &result.to_le_bytes(),
+        ],
+    )
+}
+
+fn scalar_op_supported(op: u8) -> bool {
+    matches!(op, 1..=7 | 9 | 10 | 12 | 13)
+}
+
+fn evaluate_scalar(op: u8, a_bits: u32, b_bits: u32, c_bits: u32) -> Result<u32, ProgramError> {
+    if !scalar_op_supported(op) {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let a = f32::from_bits(a_bits);
+    let b = f32::from_bits(b_bits);
+    let c = f32::from_bits(c_bits);
+    if !a.is_finite() || !b.is_finite() || !c.is_finite() {
+        return Err(QxError::NonFinite.into());
+    }
+    let result = match op {
+        1 | 4 => qx_consensus_math::fma_f32(a, b, c),
+        2 | 5 => a + b,
+        3 => a * b,
+        6 => {
+            if finite_ge(a_bits, b_bits) {
+                a
+            } else {
+                b
+            }
+        }
+        7 => {
+            if finite_ge(a_bits, b_bits) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        9 => qx_consensus_math::rsqrt_f32(a).ok_or(QxError::InvalidEncoding)?,
+        10 => qx_consensus_math::exp_f32(a).ok_or(QxError::InvalidEncoding)?,
+        12 => qx_consensus_math::div_f32(a, b).ok_or(QxError::InvalidEncoding)?,
+        13 => match a_bits {
+            0x0000_0000 => c,
+            0x3f80_0000 => b,
+            _ => return Err(QxError::InvalidEncoding.into()),
+        },
+        _ => return Err(QxError::InvalidEncoding.into()),
+    };
+    if !result.is_finite() {
+        return Err(QxError::NonFinite.into());
+    }
+    Ok(result.to_bits())
+}
+
+fn finite_ge(left: u32, right: u32) -> bool {
+    let left = if left & 0x7fff_ffff == 0 { 0 } else { left };
+    let right = if right & 0x7fff_ffff == 0 { 0 } else { right };
+    let key = |bits: u32| {
+        if bits & 0x8000_0000 != 0 {
+            !bits
+        } else {
+            bits ^ 0x8000_0000
+        }
+    };
+    key(left).to_be_bytes() >= key(right).to_be_bytes()
 }
 
 fn audit_seed(

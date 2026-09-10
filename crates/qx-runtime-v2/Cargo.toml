@@ -10,4 +10,5 @@ qx-model.workspace = true
 qx-safetensors.workspace = true
 qx-quant.workspace = true
 qx-commit = { path = "../qx-commit" }
+qx-consensus-math.workspace = true
 qx-format.workspace = true

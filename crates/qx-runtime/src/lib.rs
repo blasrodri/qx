@@ -19,6 +19,16 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[inline(always)]
+fn consensus_exp(value: f32) -> f32 {
+    qx_consensus_math::exp_f32(value).expect("finite model exp input")
+}
+
+#[inline(always)]
+fn consensus_rsqrt(value: f32) -> f32 {
+    qx_consensus_math::rsqrt_f32(value).expect("positive finite RMS input")
+}
+
 #[cfg(target_os = "macos")]
 #[link(name = "Accelerate", kind = "framework")]
 unsafe extern "C" {
@@ -327,7 +337,8 @@ pub fn granite_attention_decode(
             .fold(f32::NEG_INFINITY, f32::max);
         let mut normalizer = 0.0;
         for cached_position in 0..cache.length {
-            cache.scores[cached_position] = (cache.scores[cached_position] - max_score).exp();
+            cache.scores[cached_position] =
+                consensus_exp(cache.scores[cached_position] - max_score);
             normalizer += cache.scores[cached_position];
         }
         for cached_position in 0..cache.length {
@@ -524,13 +535,13 @@ impl GraniteLayerWeights {
         let max_logit = logits[indices[0]];
         let normalizer = indices[..TOP_K]
             .iter()
-            .map(|index| (logits[*index] - max_logit).exp())
+            .map(|index| consensus_exp(logits[*index] - max_logit))
             .sum::<f32>();
         std::array::from_fn(|slot| {
             let index = indices[slot];
             RoutedExpert {
                 index: index as u8,
-                weight: (logits[index] - max_logit).exp() / normalizer,
+                weight: consensus_exp(logits[index] - max_logit) / normalizer,
             }
         })
     }
@@ -1286,7 +1297,7 @@ fn validate_granite_metadata(model_dir: &Path) -> Result<(), String> {
 
 fn rms_norm(input: &[f32; HIDDEN], weight: &[f32]) -> [f32; HIDDEN] {
     let mean_square = input.iter().map(|value| value * value).sum::<f32>() / HIDDEN as f32;
-    let scale = (mean_square + qx_model::RMS_EPSILON).sqrt().recip();
+    let scale = consensus_rsqrt(mean_square + qx_model::RMS_EPSILON);
     std::array::from_fn(|index| input[index] * scale * weight[index])
 }
 
@@ -1322,7 +1333,7 @@ impl FloatExpert {
             .map(|index| {
                 let gate = gate_up[index];
                 let up = gate_up[intermediate + index];
-                (gate / (1.0 + (-gate).exp())) * up
+                (gate / (1.0 + consensus_exp(-gate))) * up
             })
             .collect::<Vec<_>>();
         self.down.apply(&activated)

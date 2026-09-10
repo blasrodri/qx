@@ -10,7 +10,7 @@ qx-quant.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3.2", features = ["NSString"] }
+objc2-foundation = { version = "0.3.2", features = ["NSDictionary", "NSObject", "NSString"] }
 objc2-metal = { version = "0.3.2", features = [
     "MTLAllocation",
     "MTLBuffer",
@@ -31,3 +31,4 @@ objc2-metal = { version = "0.3.2", features = [
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 half.workspace = true
 qx-commit = { path = "../qx-commit" }
+qx-consensus-math.workspace = true

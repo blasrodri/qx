@@ -262,6 +262,13 @@ fn metal_benchmark(
     println!("checkpoint_interval={checkpoint_interval}");
     println!("metal_math_profile={}", math_profile.as_str());
     match math_profile {
+        MetalMathProfile::ConsensusFixedV1 => println!(
+            "execution_spec={}",
+            hex(&qx_commit::granite_execution_spec_with_math_functions(
+                checkpoint_interval.try_into()?,
+                GraniteMathFunctionsV1::ConsensusFixedV1,
+            )?)
+        ),
         MetalMathProfile::SafePrecise => println!(
             "execution_spec={}",
             hex(&qx_commit::granite_execution_spec_with_math_functions(

@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 half.workspace = true
 qx-commit = { path = "../qx-commit" }
+qx-consensus-math.workspace = true

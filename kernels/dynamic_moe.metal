@@ -1068,7 +1068,7 @@ kernel void qx_verifier_q4_moe_silu_batch(
     uint base = pair * 2 * intermediate;
     float gate = gate_up[base + row];
     float up = gate_up[base + intermediate + row];
-    activated[pair * intermediate + row] = (gate / (1.0f + exp(-gate))) * up;
+    activated[pair * intermediate + row] = (gate / (1.0f + qx_consensus_exp(-gate))) * up;
 }
 
 kernel void qx_verifier_q4_moe_down_batch(
@@ -3486,7 +3486,7 @@ kernel void qx_dynamic_q4_moe(
         if (row < intermediate) {
             float gate = gate_up[row];
             float up = gate_up[intermediate + row];
-            activated[row] = (gate / (1.0f + exp(-gate))) * up;
+            activated[row] = (gate / (1.0f + qx_consensus_exp(-gate))) * up;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uint down_base = expert * down_packed_stride;
@@ -3578,7 +3578,7 @@ kernel void qx_dynamic_q4_moe_simd(
                 if (row < intermediate) {
                     float gate = gate_up[row];
                     float up = gate_up[intermediate + row];
-                    activated[row] = (gate / (1.0f + exp(-gate))) * up;
+                    activated[row] = (gate / (1.0f + qx_consensus_exp(-gate))) * up;
                 }
             }
         }
@@ -5050,7 +5050,7 @@ kernel void qx_dynamic_q4_moe_silu(
     uint base = slot * 2 * intermediate;
     float gate = gate_up[base + row];
     float up = gate_up[base + intermediate + row];
-    activated[slot * intermediate + row] = (gate / (1.0f + exp(-gate))) * up;
+    activated[slot * intermediate + row] = (gate / (1.0f + qx_consensus_exp(-gate))) * up;
 }
 
 kernel void qx_dynamic_q4_moe_down_simd(

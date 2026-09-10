@@ -43,7 +43,7 @@ kernel void qx_residual_rms_scalar(
     if (simdgroup == 0u) {
         float total = lane < 8u ? partials[lane] : 0.0f;
         total = qx_ordered_simd_sum(total);
-        if (lane == 0u) inverse_rms[0] = rsqrt(total / 1024.0f + 1.0e-5f);
+        if (lane == 0u) inverse_rms[0] = qx_consensus_rsqrt(total / 1024.0f + 1.0e-5f);
     }
 }
 
@@ -71,7 +71,7 @@ kernel void qx_residual_rms_scalar_snapshot(
     if (simdgroup == 0u) {
         float total = lane < 8u ? partials[lane] : 0.0f;
         total = qx_ordered_simd_sum(total);
-        if (lane == 0u) inverse_rms[0] = rsqrt(total / 1024.0f + 1.0e-5f);
+        if (lane == 0u) inverse_rms[0] = qx_consensus_rsqrt(total / 1024.0f + 1.0e-5f);
     }
 }
 
@@ -101,7 +101,7 @@ kernel void qx_attention_softmax_onepass_simd(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float local_sum = 0.0f;
     for (uint position = tid; position < length; position += 256u) {
-        local_sum += exp(scores[q_head * max_context + position] - maximum);
+        local_sum += qx_consensus_exp(scores[q_head * max_context + position] - maximum);
     }
     local_sum = qx_ordered_simd_sum(local_sum);
     if (lane == 0u) reductions[simdgroup] = local_sum;
@@ -114,7 +114,7 @@ kernel void qx_attention_softmax_onepass_simd(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint position = tid; position < length; position += 256u) {
         scores[q_head * max_context + position] =
-            exp(scores[q_head * max_context + position] - maximum) / denominator;
+            qx_consensus_exp(scores[q_head * max_context + position] - maximum) / denominator;
     }
 }
 

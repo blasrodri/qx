@@ -1,12 +1,12 @@
 # QX verification benchmark report
 
 For epoch sampling economics and the terminal Solana fraud-proof benchmark,
-see `docs/verification-protocol.md`. The adversarial V2 path uses 1,787 CU once
-per epoch to finalize entropy, 5,837 CU to authenticate and open a challenged
-result, 10,154 CU for both boundary proofs plus one midpoint round, and 9,448
+see `docs/verification-protocol.md`. The adversarial V2 path uses 1,786 CU once
+per epoch to finalize entropy, 5,840 CU to authenticate and open a challenged
+result, 10,154 CU for both boundary proofs plus one midpoint round, and 9,485
 CU for the staged Q4 weight proof plus objective FMA. Each further binary
 search level adds another two-party midpoint round. The complete three-state
-test dispute, including both terminal-state reveals, is 29,191 CU.
+test dispute, including both terminal-state reveals, is 29,280 CU.
 
 - Date: 2026-09-10
 - Machine/runtime: local Apple Metal device, release build
@@ -86,7 +86,7 @@ a slashable execution profile.
 Metal's modern compile controls let QX keep precise single-precision math
 functions while selecting relaxed expression optimization independently. The
 runtime exposes this candidate with `QX_METAL_RELAXED_ARITHMETIC=1`; it receives
-a distinct execution-spec digest and does not replace the safe-precise default.
+a distinct execution-spec digest and does not replace the consensus-fixed default.
 The runtime fixes the selected profile at first use so lazy kernel compilation
 cannot mix arithmetic profiles within one process.
 
@@ -177,3 +177,27 @@ cargo run --release -q -p qx-verify -- metal-benchmark \
 Prefix the command with `QX_METAL_RELAXED_ARITHMETIC=1` to reproduce the
 reduced-overhead candidate. The benchmark prints the active profile and its
 execution-spec digest before the timing results.
+
+## Fixed consensus transcendental profile
+
+The default profile now uses a range-reduced degree-7 binary32 exponential and
+a fixed integer seed plus four Newton refinements for reciprocal square root.
+Every constant is specified as raw binary32 bits. A Metal conformance kernel
+checks the GPU outputs bit-for-bit against the Rust/SBF implementation.
+`QX_METAL_NATIVE_MATH=1` retains native precise functions only as an A/B
+diagnostic; it produces a distinct execution-spec digest and is not the default.
+
+On the same Granite artifact, a 9-repeat, 23-executed-token fixed-math run
+measured 103.099 ms without commitments and 106.016 ms with commitments:
+**2.829% commitment overhead**. The corresponding native run generated the
+same 16 tokens. A 512-position held-out PTB teacher-forced comparison measured:
+
+| Profile | NLL | PPL |
+|:---|---:|---:|
+| Native precise | 3.4243704835 | 30.703310526 |
+| Consensus fixed V1 | 3.4243705322 | 30.703312022 |
+
+The relative PPL change was `4.8735e-8`; eight sampled logit vectors retained
+100% top-1, top-5, and top-10 agreement and cosine
+`0.9999999999997112`. This is a strong numerical regression check, not a
+replacement for the sealed multi-domain/task promotion gate.

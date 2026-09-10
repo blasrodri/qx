@@ -8,6 +8,7 @@ members = [
     "crates/qx-runtime-v2",
     "crates/qx-commit",
     "crates/qx-verifier-core",
+    "crates/qx-consensus-math",
     "programs/qx-terminal-verifier",
     "crates/qx-format",
     "crates/qx-safetensors",
@@ -53,6 +54,7 @@ qx-runtime-v2 = { path = "crates/qx-runtime-v2" }
 qx-safetensors = { path = "crates/qx-safetensors" }
 qx-tokenizer = { path = "crates/qx-tokenizer" }
 qx-eval = { path = "crates/qx-eval" }
+qx-consensus-math = { path = "crates/qx-consensus-math" }
 regex = "1"
 rayon = "1"
 safetensors = "0.4"

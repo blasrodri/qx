@@ -88,7 +88,7 @@ kernel void qx_q3_expert(
     if (row < intermediate) {
         float gate = float(gate_up[row]);
         float up = float(gate_up[intermediate + row]);
-        activated[row] = half((gate / (1.0f + exp(-gate))) * up);
+        activated[row] = half((gate / (1.0f + qx_consensus_exp(-gate))) * up);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
