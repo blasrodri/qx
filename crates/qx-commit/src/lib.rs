@@ -4,21 +4,27 @@
 //! independent of Rust layout. The CPU implementation is the protocol oracle;
 //! a future Metal implementation must match its golden vectors byte-for-byte.
 
+mod dispute;
 mod epoch;
 mod execution;
 mod hash;
+mod job;
 mod merkle;
 mod model;
 mod receipt;
 mod state;
 mod weights;
 
+pub use dispute::{EpochBlockSeedV2, FmaStateV1};
 pub use epoch::{
-    AuditEpochV1, audit_detection_probability, derive_audit_seed_v1, required_audit_count,
-    sample_receipt_indices_v1,
+    AuditEpochV1, audit_detection_probability, audit_selected_v1, derive_audit_seed_v1,
+    required_audit_count, sample_receipt_indices_v1,
 };
-pub use execution::{CheckpointV1, CommitmentMetrics, ExecutionCommitterV1, ExecutionTraceV1};
+pub use execution::{
+    CheckpointV1, CommitmentMetrics, ExecutionCommitterV1, ExecutionTraceV1, TokenResultV1,
+};
 pub use hash::{Digest, HashAlgorithm, ProtocolVersion, hash_domain, hash_domain_input_len};
+pub use job::{JobPayloadV1, ResultLeafV1};
 pub use merkle::{FixedMerkleAccumulator, MerkleProof, MerkleTree, MutableMerkleTree};
 pub use model::{
     GraniteMathFunctionsV1, GraniteMathModeV1, ModelSpecV1, granite_architecture_root,
@@ -49,7 +55,10 @@ pub const D_ACTIVATION_CHUNK: &[u8] = b"QX:ACTIVATION:CHUNK:V1";
 pub const D_ACTIVATION_TREE: &[u8] = b"QX:ACTIVATION:TREE:V1";
 pub const D_CHECKPOINT: &[u8] = b"QX:CHECKPOINT:V1";
 pub const D_TOKEN: &[u8] = b"QX:TOKEN:V1";
+pub const D_TOKEN_RESULT: &[u8] = b"QX:TOKEN:RESULT:V1";
 pub const D_JOB: &[u8] = b"QX:JOB:V1";
+pub const D_JOB_PAYLOAD: &[u8] = b"QX:JOB:PAYLOAD:V1";
+pub const D_RESULT: &[u8] = b"QX:RESULT:V1";
 pub const D_RECEIPT: &[u8] = b"QX:RECEIPT:V1";
 pub const D_BATCH: &[u8] = b"QX:BATCH:V1";
 pub const D_INPUT: &[u8] = b"QX:INPUT:V1";
@@ -58,7 +67,10 @@ pub const D_ARCHITECTURE: &[u8] = b"QX:ARCHITECTURE:V1";
 pub const D_EXECUTION_SPEC: &[u8] = b"QX:EXECUTION:V1";
 pub const D_WEIGHT_TREE: &[u8] = b"QX:WEIGHT:TREE:V1";
 pub const D_AUDIT_SEED: &[u8] = b"QX:AUDIT:SEED:V1";
+pub const D_AUDIT_SEED_V2: &[u8] = b"QX:AUDIT:SEED:V2";
 pub const D_AUDIT_DRAW: &[u8] = b"QX:AUDIT:DRAW:V1";
+pub const D_DISPUTE_TRACE: &[u8] = b"QX:DISPUTE:TRACE:V1";
+pub const D_FMA_STATE: &[u8] = b"QX:FMA:STATE:V1";
 
 pub const MAX_MERKLE_DEPTH: usize = 32;
 /// Hot per-token commitment trees use the Solana-supported BLAKE3 syscall;

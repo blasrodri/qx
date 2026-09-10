@@ -82,6 +82,45 @@ pub fn sample_receipt_indices_v1(
     Ok(selected)
 }
 
+/// Deterministic per-result Bernoulli sampling. Unlike a global k-of-n draw,
+/// adding cheap receipts cannot dilute another result's inclusion probability.
+pub fn audit_selected_v1(
+    seed: &Digest,
+    epoch: u64,
+    leaf_index: u32,
+    job_hash: &Digest,
+    probability_ppm: u32,
+) -> Result<bool, CommitError> {
+    if probability_ppm > 1_000_000 {
+        return Err(CommitError::InvalidShape(
+            "audit probability exceeds one million ppm".to_owned(),
+        ));
+    }
+    if probability_ppm == 0 {
+        return Ok(false);
+    }
+    if probability_ppm == 1_000_000 {
+        return Ok(true);
+    }
+    let digest = hash_domain(
+        HashAlgorithm::Blake3V1,
+        D_AUDIT_DRAW,
+        &[
+            seed,
+            &epoch.to_le_bytes(),
+            &leaf_index.to_le_bytes(),
+            job_hash,
+        ],
+    )?;
+    let draw = u64::from_le_bytes(
+        digest[..8]
+            .try_into()
+            .map_err(|_| CommitError::InvalidExecution("invalid audit digest".to_owned()))?,
+    );
+    let threshold = ((u128::from(probability_ppm) << 64) / 1_000_000_u128) as u64;
+    Ok(draw < threshold)
+}
+
 /// Probability that a uniform sample without replacement contains at least
 /// one of `cheated_receipts` bad receipts.
 pub fn audit_detection_probability(
@@ -186,5 +225,18 @@ mod tests {
             baseline,
             derive_audit_seed_v1(&changed, &[9; 32], &[]).unwrap()
         );
+    }
+
+    #[test]
+    fn independent_sampling_is_deterministic_and_has_exact_boundaries() {
+        let seed = [8; 32];
+        let job = [9; 32];
+        assert!(!audit_selected_v1(&seed, 1, 7, &job, 0).unwrap());
+        assert!(audit_selected_v1(&seed, 1, 7, &job, 1_000_000).unwrap());
+        assert_eq!(
+            audit_selected_v1(&seed, 1, 7, &job, 10_000).unwrap(),
+            audit_selected_v1(&seed, 1, 7, &job, 10_000).unwrap()
+        );
+        assert!(audit_selected_v1(&seed, 1, 7, &job, 1_000_001).is_err());
     }
 }

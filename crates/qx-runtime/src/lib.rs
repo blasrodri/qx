@@ -1220,21 +1220,32 @@ impl GraniteModel {
         }
         let lm_head_start = Instant::now();
         #[cfg(target_os = "macos")]
-        if let (Some(context), Some(logits)) = (&self.logits_context, &self.logits) {
-            let result = context.run_prepared_logits(logits, &hidden, LOGITS_SCALING);
-            if let Some(lm_head) = lm_head {
-                *lm_head += lm_head_start.elapsed();
-            }
-            return result;
-        }
+        let result = if let (Some(context), Some(logits)) = (&self.logits_context, &self.logits) {
+            context.run_prepared_logits(logits, &hidden, LOGITS_SCALING)?
+        } else {
+            self.embeddings
+                .apply(&hidden)
+                .into_iter()
+                .map(|logit| logit / LOGITS_SCALING)
+                .collect()
+        };
+        #[cfg(not(target_os = "macos"))]
         let result = self
             .embeddings
             .apply(&hidden)
             .into_iter()
             .map(|logit| logit / LOGITS_SCALING)
-            .collect();
+            .collect::<Vec<_>>();
         if let Some(lm_head) = lm_head {
             *lm_head += lm_head_start.elapsed();
+        }
+        if let Some(committer) = commitments.as_deref_mut() {
+            committer
+                .commit_output_token(
+                    u32::try_from(position).map_err(|_| "token position exceeds u32".to_owned())?,
+                    argmax(&result),
+                )
+                .map_err(|error| error.to_string())?;
         }
         Ok(result)
     }

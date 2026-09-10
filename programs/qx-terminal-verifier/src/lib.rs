@@ -1,5 +1,7 @@
 #![allow(unexpected_cfgs)]
 
+mod v2;
+
 use half::f16;
 use solana_program::{
     account_info::AccountInfo,
@@ -104,6 +106,25 @@ pub fn process_instruction(
         OP_TIMEOUT_V1 => timeout_dispute(program_id, accounts, &mut cursor),
         OP_REGISTER_MODEL_V1 => register_model(program_id, accounts, &mut cursor),
         OP_CLOSE_EPOCH_V1 => close_epoch(program_id, accounts, &mut cursor),
+        v2::OP_REGISTER_JOB_V2 => v2::register_job(program_id, accounts, &mut cursor),
+        v2::OP_SUBMIT_EPOCH_V2 => v2::submit_epoch(program_id, accounts, &mut cursor),
+        v2::OP_FINALIZE_EPOCH_V2 => v2::finalize_epoch(program_id, accounts, &mut cursor),
+        v2::OP_OPEN_CHALLENGE_V2 => v2::open_challenge(program_id, accounts, &mut cursor),
+        v2::OP_CHALLENGER_BOUNDS_V2 => {
+            v2::submit_challenger_bounds(program_id, accounts, &mut cursor)
+        }
+        v2::OP_MINER_BOUNDS_V2 => v2::submit_miner_bounds(program_id, accounts, &mut cursor),
+        v2::OP_CHALLENGER_MIDPOINT_V2 => {
+            v2::submit_challenger_midpoint(program_id, accounts, &mut cursor)
+        }
+        v2::OP_MINER_MIDPOINT_V2 => v2::submit_miner_midpoint(program_id, accounts, &mut cursor),
+        v2::OP_CHALLENGER_TERMINAL_V2 => {
+            v2::submit_challenger_terminal(program_id, accounts, &mut cursor)
+        }
+        v2::OP_MINER_TERMINAL_V2 => v2::submit_miner_terminal(program_id, accounts, &mut cursor),
+        v2::OP_STAGE_Q4_WEIGHT_V2 => v2::stage_q4_weight(program_id, accounts, &mut cursor),
+        v2::OP_RESOLVE_Q4_FMA_V2 => v2::resolve_q4_fma(program_id, accounts, &mut cursor),
+        v2::OP_TIMEOUT_V2 => v2::timeout(program_id, accounts, &mut cursor),
         _ => Err(QxError::InvalidEncoding.into()),
     }
 }
@@ -570,10 +591,11 @@ fn verify_staged_q4_fma(
     if !result.is_finite() {
         return Err(QxError::NonFinite.into());
     }
-    let result_bits = result.to_bits();
     let defender_end = u32_at(&dispute_data, DISPUTE_DEFENDER_END_OFFSET)?;
     let challenger_end = u32_at(&dispute_data, DISPUTE_CHALLENGER_END_OFFSET)?;
-    let winner = match (result_bits == defender_end, result_bits == challenger_end) {
+    let agrees_with_defender = result == f32::from_bits(defender_end);
+    let agrees_with_challenger = result == f32::from_bits(challenger_end);
+    let winner = match (agrees_with_defender, agrees_with_challenger) {
         (true, false) => WINNER_MINER,
         (false, true) => WINNER_CHALLENGER,
         _ => return Err(QxError::InvalidArithmetic.into()),

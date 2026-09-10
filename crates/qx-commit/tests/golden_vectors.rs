@@ -1,8 +1,8 @@
 use qx_commit::{
     CheckpointV1, D_BATCH, D_JOB, D_KV, D_TOKEN, D_WEIGHT_TREE, HashAlgorithm, InferenceReceiptV1,
-    MerkleTree, ModelSpecV1, ProtocolVersion, WeightLeafV1, granite_architecture_root,
-    granite_execution_spec, hash_domain, input_hash_v1, kv_leaf_hash_v1, output_hash_v1,
-    state_hash_v1,
+    MerkleTree, ModelSpecV1, ProtocolVersion, TokenResultV1, WeightLeafV1,
+    granite_architecture_root, granite_execution_spec, hash_domain, input_hash_v1, kv_leaf_hash_v1,
+    output_hash_v1, state_hash_v1,
 };
 
 fn hex(value: [u8; 32]) -> String {
@@ -86,8 +86,16 @@ fn protocol_v1_golden_vectors() {
     let token_root = MerkleTree::new(trace_algorithm, D_TOKEN, &[checkpoint, checkpoint_other])
         .unwrap()
         .root();
+    let token_result = TokenResultV1 {
+        job_id: [0x11; 32],
+        token_index: 9,
+        checkpoint_root: token_root,
+        predicted_token: 42,
+    }
+    .hash()
+    .unwrap();
     let job_other = hash_domain(algorithm, D_TOKEN, &[b"other-token"]).unwrap();
-    let job_root = MerkleTree::new(trace_algorithm, D_JOB, &[token_root, job_other])
+    let job_root = MerkleTree::new(trace_algorithm, D_JOB, &[token_result, job_other])
         .unwrap()
         .root();
     let input_hash = input_hash_v1(&model_id, &[1, 2, 49_154]).unwrap();
@@ -115,7 +123,7 @@ fn protocol_v1_golden_vectors() {
         (
             "model_id",
             model_id,
-            "eb225fbf386bf23d16727f128d424a87feadce29d9690ab40df2d7c1049f3807",
+            "318691013fcf12fa8c304237d55881bb3de63945e77c3781df56534e6f22ea6e",
         ),
         (
             "weight_leaf",
@@ -148,14 +156,19 @@ fn protocol_v1_golden_vectors() {
             "a4fe82012dbe3226056e3292f4c8aaa86ca00056f3200b329f3a4a8fb39f1203",
         ),
         (
+            "token_result",
+            token_result,
+            "10f001d850f188c201806809383b54bf43b4b7dfe929ebdbb7876f8bb1f03cad",
+        ),
+        (
             "job_root",
             job_root,
-            "78d575364160174375cb6fdd99f9f01e494de2075cd0bf2e42f1e18370a1d615",
+            "857538b381b8f832e22b36ee7b6bede7b0a89eef13d7172cb0f88bde97859c3e",
         ),
         (
             "input_hash",
             input_hash,
-            "d9e5a40ee1f9bdfadfb23b44560e76e9a343212c918bd4e85c1baddbbe8a8a7f",
+            "38e1f2cc6967b045595a7af1f0d85db7217994a429deed4c070a0a10db88a384",
         ),
         (
             "output_hash",
@@ -165,12 +178,12 @@ fn protocol_v1_golden_vectors() {
         (
             "receipt_hash",
             receipt,
-            "e2649bdf788fbba9d30e3fb6bc71e193cec606233e06f7b70cbcec11f5a71f7c",
+            "237faff76041d14145c6172b7ef7ede823f2879bb29be96feb87b9f07d8095a7",
         ),
         (
             "batch_root",
             batch_root,
-            "7b7fb3eea5655b661c448769ab0bb4fd16f6b2307f02058e586aad62bb07197b",
+            "73d8d62b27f594dce4cd00fbc67bd2a617a2d5197ad451f0145e52bc61997b5e",
         ),
     ];
     if std::env::var_os("QX_PRINT_GOLDEN").is_some() {

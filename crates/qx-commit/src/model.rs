@@ -199,6 +199,7 @@ pub fn granite_execution_spec_with_math_profile(
     bytes.extend_from_slice(&256_u16.to_le_bytes()); // state hash chunk bytes
     bytes.push(1); // raw BLAKE3(left || right) state-tree parent
     bytes.push(HashAlgorithm::Blake3V1 as u8); // hot KV/checkpoint/token/job trees
+    bytes.push(1); // token trace leaf binds the deterministic predicted token
     bytes.push(32); // SIMD width
     bytes.extend_from_slice(&[16, 8, 4, 2, 1]); // fixed shuffle-down reduction tree
     bytes.push(1); // Q4 dot and MoE accumulation use explicit ordered FMA

@@ -1,9 +1,12 @@
 # QX verification benchmark report
 
 For epoch sampling economics and the terminal Solana fraud-proof benchmark,
-see `docs/verification-protocol.md`. The receipt-bound SBF path costs 13,652 CU
-from challenge opening through resolution. Its terminal two-instruction portion
-costs 9,780 CU.
+see `docs/verification-protocol.md`. The adversarial V2 path uses 1,787 CU once
+per epoch to finalize entropy, 5,837 CU to authenticate and open a challenged
+result, 10,154 CU for both boundary proofs plus one midpoint round, and 9,448
+CU for the staged Q4 weight proof plus objective FMA. Each further binary
+search level adds another two-party midpoint round. The complete three-state
+test dispute, including both terminal-state reveals, is 29,191 CU.
 
 - Date: 2026-09-10
 - Machine/runtime: local Apple Metal device, release build
@@ -11,6 +14,14 @@ costs 9,780 CU.
 - Artifact bytes: 751,009,792
 - Context capacity: 512
 Workload: 8 prompt tokens, 8 returned tokens, 15 executed tokens
+
+After binding each predicted token into its token-trace leaf, a fresh 31-repeat
+safe-precise run (8 prompt, 16 returned, 23 executed) measured 103.778 ms
+uncommitted and 106.675 ms committed: **2.792% commitment overhead**. The new
+execution-spec digest is
+`f19851a93e31d52a7ac5a99f810cf8d9137ee46330428a68ebd8e4cd1d1ad45d`
+and the trace root was
+`3503482caef298f02192c140cc5b968e0e2e6b1de0e07173b55c98a2d22d5ba8`.
 
 All reported comparisons alternate baseline and verified execution on the same
 loaded generator. Outputs are required to match. Timings are medians after four

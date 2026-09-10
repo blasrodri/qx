@@ -1,6 +1,7 @@
 use crate::{
-    CommitError, D_CHECKPOINT, D_JOB, D_KV, D_TOKEN, Digest, FixedMerkleAccumulator, MerkleTree,
-    MutableMerkleTree, TRACE_HASH_ALGORITHM, hash_domain, kv_leaf_hash_v1, state_hash_v1,
+    CommitError, D_CHECKPOINT, D_JOB, D_KV, D_TOKEN, D_TOKEN_RESULT, Digest,
+    FixedMerkleAccumulator, MerkleTree, MutableMerkleTree, TRACE_HASH_ALGORITHM, hash_domain,
+    kv_leaf_hash_v1, state_hash_v1,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +31,38 @@ impl CheckpointV1 {
         hash_domain(
             TRACE_HASH_ALGORITHM,
             D_CHECKPOINT,
+            &[&self.canonical_bytes()],
+        )
+    }
+}
+
+/// One executed token's checkpoint root and deterministic next-token result.
+/// Binding the prediction prevents a miner from pairing an honest execution
+/// trace with a different output sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TokenResultV1 {
+    pub job_id: Digest,
+    pub token_index: u32,
+    pub checkpoint_root: Digest,
+    pub predicted_token: u32,
+}
+
+impl TokenResultV1 {
+    pub const CANONICAL_SIZE: usize = 72;
+
+    pub fn canonical_bytes(&self) -> [u8; Self::CANONICAL_SIZE] {
+        let mut bytes = [0; Self::CANONICAL_SIZE];
+        bytes[..32].copy_from_slice(&self.job_id);
+        bytes[32..36].copy_from_slice(&self.token_index.to_le_bytes());
+        bytes[36..68].copy_from_slice(&self.checkpoint_root);
+        bytes[68..72].copy_from_slice(&self.predicted_token.to_le_bytes());
+        bytes
+    }
+
+    pub fn hash(&self) -> Result<Digest, CommitError> {
+        hash_domain(
+            TRACE_HASH_ALGORITHM,
+            D_TOKEN_RESULT,
             &[&self.canonical_bytes()],
         )
     }
@@ -68,6 +101,7 @@ pub struct ExecutionCommitterV1 {
     kv_trees: Vec<FixedMerkleAccumulator>,
     global_kv: MutableMerkleTree,
     token_checkpoints: Vec<Digest>,
+    pending_token_root: Option<Digest>,
     job_tree: FixedMerkleAccumulator,
     metrics: CommitmentMetrics,
 }
@@ -115,6 +149,7 @@ impl ExecutionCommitterV1 {
             kv_trees,
             global_kv: MutableMerkleTree::new(TRACE_HASH_ALGORITHM, D_KV, layers)?,
             token_checkpoints: Vec::with_capacity(layers),
+            pending_token_root: None,
             job_tree: FixedMerkleAccumulator::new(TRACE_HASH_ALGORITHM, D_JOB, context_depth)?,
             metrics: CommitmentMetrics::default(),
         })
@@ -133,6 +168,11 @@ impl ExecutionCommitterV1 {
                 "expected token {} layer {}, received token {token_index} layer {layer_index}",
                 self.expected_token, self.expected_layer
             )));
+        }
+        if self.pending_token_root.is_some() {
+            return Err(CommitError::InvalidExecution(
+                "predicted token must be committed before the next layer".to_owned(),
+            ));
         }
         if token_index as usize >= self.max_context {
             return Err(CommitError::TreeCapacityExceeded);
@@ -180,6 +220,11 @@ impl ExecutionCommitterV1 {
                 self.expected_token, self.expected_layer
             )));
         }
+        if self.pending_token_root.is_some() {
+            return Err(CommitError::InvalidExecution(
+                "predicted token must be committed before the next layer".to_owned(),
+            ));
+        }
         if token_index as usize >= self.max_context {
             return Err(CommitError::TreeCapacityExceeded);
         }
@@ -220,16 +265,43 @@ impl ExecutionCommitterV1 {
         if self.expected_layer == self.layers {
             let token_tree =
                 MerkleTree::new(TRACE_HASH_ALGORITHM, D_TOKEN, &self.token_checkpoints)?;
-            self.job_tree.append(token_tree.root())?;
+            self.pending_token_root = Some(token_tree.root());
             self.token_checkpoints.clear();
             self.expected_layer = 0;
-            self.expected_token = self
-                .expected_token
-                .checked_add(1)
-                .ok_or(CommitError::ArithmeticOverflow)?;
-            self.metrics.executed_tokens = self.expected_token;
         }
         Ok(checkpoint)
+    }
+
+    /// Complete one token after the runtime has deterministically selected its
+    /// next token. This must occur before any layer of the following token.
+    pub fn commit_output_token(
+        &mut self,
+        token_index: u32,
+        predicted_token: u32,
+    ) -> Result<Digest, CommitError> {
+        if token_index != self.expected_token || self.expected_layer != 0 {
+            return Err(CommitError::InvalidExecution(format!(
+                "expected output for token {}, received token {token_index}",
+                self.expected_token
+            )));
+        }
+        let checkpoint_root = self.pending_token_root.take().ok_or_else(|| {
+            CommitError::InvalidExecution("token layers are not complete".to_owned())
+        })?;
+        let leaf = TokenResultV1 {
+            job_id: self.job_id,
+            token_index,
+            checkpoint_root,
+            predicted_token,
+        }
+        .hash()?;
+        self.job_tree.append(leaf)?;
+        self.expected_token = self
+            .expected_token
+            .checked_add(1)
+            .ok_or(CommitError::ArithmeticOverflow)?;
+        self.metrics.executed_tokens = self.expected_token;
+        Ok(leaf)
     }
 
     fn is_checkpoint_layer(&self, layer_index: usize) -> bool {
@@ -237,9 +309,9 @@ impl ExecutionCommitterV1 {
     }
 
     pub fn finish(&self) -> Result<ExecutionTraceV1, CommitError> {
-        if self.expected_layer != 0 {
+        if self.expected_layer != 0 || self.pending_token_root.is_some() {
             return Err(CommitError::InvalidExecution(
-                "cannot finish a partially committed token".to_owned(),
+                "cannot finish a partially committed token or unbound prediction".to_owned(),
             ));
         }
         if self.job_tree.is_empty() {
@@ -291,6 +363,7 @@ mod tests {
                         )
                         .unwrap();
                 }
+                state.commit_output_token(token, 100 + token).unwrap();
             }
             state.finish().unwrap()
         }
@@ -308,6 +381,7 @@ mod tests {
                 .commit_layer(0, layer, &[layer as f32; 4], &[1.0, 2.0], &[3.0, 4.0])
                 .unwrap();
         }
+        state.commit_output_token(0, 17).unwrap();
         let trace = state.finish().unwrap();
         assert_eq!(trace.metrics.checkpoint_count, 2);
         // Four 16-byte K/V pairs plus two 16-byte residuals.
@@ -316,5 +390,16 @@ mod tests {
             crate::granite_execution_spec().unwrap(),
             crate::granite_execution_spec_with_checkpoint_interval(2).unwrap()
         );
+    }
+
+    #[test]
+    fn prediction_is_bound_into_the_job_trace() {
+        fn root(predicted_token: u32) -> Digest {
+            let mut state = ExecutionCommitterV1::new([6; 32], 1, 2).unwrap();
+            state.commit_layer(0, 0, &[1.0], &[2.0], &[3.0]).unwrap();
+            state.commit_output_token(0, predicted_token).unwrap();
+            state.finish().unwrap().trace_root
+        }
+        assert_ne!(root(11), root(12));
     }
 }

@@ -136,6 +136,11 @@ executed token** (`24 × (1024 + 512 + 512) × 4`). The selected two-layer
 profile covers every K/V append plus 12 residuals, or **147,456 bytes/token**.
 Only digests and Merkle frontiers remain after a token; no activation tensor is
 retained.
+Each completed token adds a 72-byte canonical token-result preimage binding the
+job ID, token index, checkpoint root, and greedy predicted token. Its hash,
+rather than the bare checkpoint root, is the job-tree leaf. This prevents
+attaching a different output sequence to an honest execution trace and adds no
+permanent activation storage.
 The accelerator-facing encoding divides each canonical tensor into 256-byte
 leaves, binds each leaf's index, and reduces it under separate residual, key,
 and value tree domains. The CPU oracle and Metal implementation produce

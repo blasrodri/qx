@@ -2796,6 +2796,13 @@ impl GraniteV2Generator {
                 )
                 .map_err(|error| error.to_string())?;
         }
+        committer
+            .commit_output_token(
+                u32::try_from(token_index)
+                    .map_err(|_| "verification token index exceeds u32".to_owned())?,
+                predicted,
+            )
+            .map_err(|error| error.to_string())?;
         Ok(predicted)
     }
 

@@ -252,6 +252,212 @@ pub struct DisagreementLocation {
     pub bisection_rounds: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisputePartyV1 {
+    Miner,
+    Challenger,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BisectionPhaseV1 {
+    AwaitMinerBounds,
+    AwaitChallengerMidpoint,
+    AwaitMinerMidpoint,
+    Terminal,
+    Resolved,
+}
+
+/// Consensus state transitions for an adversarial trace bisection. Merkle
+/// proof authentication is performed by the caller before passing a claim to
+/// this state machine. No transition requires both parties to sign.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BisectionGameV1 {
+    pub phase: BisectionPhaseV1,
+    pub low: u32,
+    pub high: u32,
+    pub trace_length: u32,
+    pub common_claim: Digest,
+    pub miner_end_claim: Digest,
+    pub challenger_end_claim: Digest,
+    pub pending_midpoint: u32,
+    pub pending_challenger_claim: Digest,
+    pub response_deadline_slot: u64,
+    pub response_window_slots: u64,
+    pub winner: Option<DisputePartyV1>,
+}
+
+impl BisectionGameV1 {
+    pub fn open(
+        trace_length: u32,
+        challenger_start_claim: Digest,
+        challenger_end_claim: Digest,
+        current_slot: u64,
+        response_window_slots: u64,
+    ) -> Result<Self, VerificationError> {
+        if trace_length < 2 || response_window_slots == 0 {
+            return Err(VerificationError::InvalidWitness(
+                "a dispute needs at least two states and a response window",
+            ));
+        }
+        Ok(Self {
+            phase: BisectionPhaseV1::AwaitMinerBounds,
+            low: 0,
+            high: trace_length - 1,
+            trace_length,
+            common_claim: challenger_start_claim,
+            miner_end_claim: [0; 32],
+            challenger_end_claim,
+            pending_midpoint: 0,
+            pending_challenger_claim: [0; 32],
+            response_deadline_slot: next_deadline(current_slot, response_window_slots)?,
+            response_window_slots,
+            winner: None,
+        })
+    }
+
+    pub fn submit_miner_bounds(
+        &mut self,
+        miner_start_claim: Digest,
+        miner_end_claim: Digest,
+        current_slot: u64,
+    ) -> Result<(), VerificationError> {
+        self.require_live(BisectionPhaseV1::AwaitMinerBounds, current_slot)?;
+        if miner_start_claim != self.common_claim || miner_end_claim == self.challenger_end_claim {
+            return Err(VerificationError::InvalidWitness(
+                "trace bounds must have a common start and differing end",
+            ));
+        }
+        self.miner_end_claim = miner_end_claim;
+        if self.high == 1 {
+            self.phase = BisectionPhaseV1::Terminal;
+        } else {
+            self.phase = BisectionPhaseV1::AwaitChallengerMidpoint;
+            self.refresh_deadline(current_slot)?;
+        }
+        Ok(())
+    }
+
+    pub fn submit_challenger_midpoint(
+        &mut self,
+        index: u32,
+        claim: Digest,
+        current_slot: u64,
+    ) -> Result<(), VerificationError> {
+        self.require_live(BisectionPhaseV1::AwaitChallengerMidpoint, current_slot)?;
+        let expected = self.low + (self.high - self.low) / 2;
+        if index != expected || index <= self.low || index >= self.high {
+            return Err(VerificationError::InvalidWitness("invalid midpoint"));
+        }
+        self.pending_midpoint = index;
+        self.pending_challenger_claim = claim;
+        self.phase = BisectionPhaseV1::AwaitMinerMidpoint;
+        self.refresh_deadline(current_slot)?;
+        Ok(())
+    }
+
+    pub fn submit_miner_midpoint(
+        &mut self,
+        index: u32,
+        claim: Digest,
+        current_slot: u64,
+    ) -> Result<(), VerificationError> {
+        self.require_live(BisectionPhaseV1::AwaitMinerMidpoint, current_slot)?;
+        if index != self.pending_midpoint {
+            return Err(VerificationError::InvalidWitness("unexpected midpoint"));
+        }
+        if claim == self.pending_challenger_claim {
+            self.low = index;
+            self.common_claim = claim;
+        } else {
+            self.high = index;
+            self.miner_end_claim = claim;
+            self.challenger_end_claim = self.pending_challenger_claim;
+        }
+        self.pending_midpoint = 0;
+        self.pending_challenger_claim = [0; 32];
+        if self.high - self.low == 1 {
+            self.phase = BisectionPhaseV1::Terminal;
+        } else {
+            self.phase = BisectionPhaseV1::AwaitChallengerMidpoint;
+            self.refresh_deadline(current_slot)?;
+        }
+        Ok(())
+    }
+
+    pub fn timeout(&mut self, current_slot: u64) -> Result<DisputePartyV1, VerificationError> {
+        if current_slot <= self.response_deadline_slot || self.winner.is_some() {
+            return Err(VerificationError::InvalidWitness(
+                "timeout is not available",
+            ));
+        }
+        let winner = match self.phase {
+            BisectionPhaseV1::AwaitMinerBounds | BisectionPhaseV1::AwaitMinerMidpoint => {
+                DisputePartyV1::Challenger
+            }
+            BisectionPhaseV1::AwaitChallengerMidpoint => DisputePartyV1::Miner,
+            BisectionPhaseV1::Terminal | BisectionPhaseV1::Resolved => {
+                return Err(VerificationError::InvalidWitness(
+                    "terminal resolution does not use a bisection timeout",
+                ));
+            }
+        };
+        self.phase = BisectionPhaseV1::Resolved;
+        self.winner = Some(winner);
+        Ok(winner)
+    }
+
+    /// Resolve only the miner's committed transition. A challenger wins only
+    /// by supplying the canonical alternative; if neither claim is canonical,
+    /// this challenge fails without immunizing the result against others.
+    pub fn resolve_terminal_bits(
+        &mut self,
+        expected_bits: u32,
+        miner_bits: u32,
+        challenger_bits: u32,
+    ) -> Result<DisputePartyV1, VerificationError> {
+        if self.phase != BisectionPhaseV1::Terminal || self.winner.is_some() {
+            return Err(VerificationError::InvalidWitness(
+                "dispute has not reached a live terminal transition",
+            ));
+        }
+        let winner = if expected_bits != miner_bits && expected_bits == challenger_bits {
+            DisputePartyV1::Challenger
+        } else {
+            DisputePartyV1::Miner
+        };
+        self.phase = BisectionPhaseV1::Resolved;
+        self.winner = Some(winner);
+        Ok(winner)
+    }
+
+    fn require_live(
+        &self,
+        phase: BisectionPhaseV1,
+        current_slot: u64,
+    ) -> Result<(), VerificationError> {
+        if self.phase != phase || self.winner.is_some() {
+            return Err(VerificationError::InvalidWitness("wrong dispute phase"));
+        }
+        if current_slot > self.response_deadline_slot {
+            return Err(VerificationError::InvalidWitness(
+                "response deadline passed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn refresh_deadline(&mut self, current_slot: u64) -> Result<(), VerificationError> {
+        self.response_deadline_slot = next_deadline(current_slot, self.response_window_slots)?;
+        Ok(())
+    }
+}
+
+fn next_deadline(current_slot: u64, response_window: u64) -> Result<u64, VerificationError> {
+    current_slot
+        .checked_add(response_window)
+        .ok_or(VerificationError::Overflow)
+}
+
 /// Host oracle for the interactive token/layer bisection. On-chain, each
 /// midpoint is authenticated against the parties' existing Merkle roots.
 pub fn locate_first_disagreement<T: Eq>(
@@ -398,5 +604,49 @@ mod tests {
         assert_eq!(cost.sha256_hashes, 1);
         assert_eq!(cost.blake3_hashes, 2);
         assert!(cost.compact_witness_bytes < 512);
+    }
+
+    #[test]
+    fn adversarial_bisection_reaches_first_bad_transition_without_cosigning() {
+        let correct = [[1; 32], [2; 32], [3; 32], [4; 32], [5; 32]];
+        let miner = [[1; 32], [2; 32], [9; 32], [8; 32], [7; 32]];
+        let mut game = BisectionGameV1::open(5, correct[0], correct[4], 10, 5).unwrap();
+        game.submit_miner_bounds(miner[0], miner[4], 11).unwrap();
+        game.submit_challenger_midpoint(2, correct[2], 12).unwrap();
+        game.submit_miner_midpoint(2, miner[2], 13).unwrap();
+        game.submit_challenger_midpoint(1, correct[1], 14).unwrap();
+        game.submit_miner_midpoint(1, miner[1], 15).unwrap();
+        assert_eq!(game.phase, BisectionPhaseV1::Terminal);
+        assert_eq!((game.low, game.high), (1, 2));
+        assert_eq!(game.common_claim, correct[1]);
+        assert_eq!(game.miner_end_claim, miner[2]);
+        assert_eq!(game.challenger_end_claim, correct[2]);
+        assert_eq!(
+            game.resolve_terminal_bits(3.0_f32.to_bits(), 9.0_f32.to_bits(), 3.0_f32.to_bits())
+                .unwrap(),
+            DisputePartyV1::Challenger
+        );
+    }
+
+    #[test]
+    fn timeout_penalizes_the_party_whose_turn_it_is() {
+        let mut miner_turn = BisectionGameV1::open(4, [1; 32], [4; 32], 10, 5).unwrap();
+        assert_eq!(miner_turn.timeout(16).unwrap(), DisputePartyV1::Challenger);
+
+        let mut challenger_turn = BisectionGameV1::open(4, [1; 32], [4; 32], 10, 5).unwrap();
+        challenger_turn
+            .submit_miner_bounds([1; 32], [9; 32], 11)
+            .unwrap();
+        assert_eq!(challenger_turn.timeout(17).unwrap(), DisputePartyV1::Miner);
+    }
+
+    #[test]
+    fn invalid_challenger_terminal_claim_does_not_slash_the_miner() {
+        let mut game = BisectionGameV1::open(2, [1; 32], [2; 32], 10, 5).unwrap();
+        game.submit_miner_bounds([1; 32], [3; 32], 11).unwrap();
+        assert_eq!(
+            game.resolve_terminal_bits(7, 8, 9).unwrap(),
+            DisputePartyV1::Miner
+        );
     }
 }

@@ -12,13 +12,60 @@ to decide whether the selected inference is checked.
 
 This separates three costs:
 
-1. every inference pays 2.904% measured commitment cost inside the selected
-   precise two-layer checkpoint profile; migrating from fast uncommitted
-   execution to precise committed execution currently costs 8.820%;
+1. every inference pays 2.792% measured commitment cost inside the selected
+   precise two-layer checkpoint profile, including output-token binding; the
+   earlier fast-uncommitted to precise-committed migration measurement was
+   8.820%, so arithmetic mode remains a separate deployment cost;
 2. the network pays approximately `audited receipts / epoch receipts` in extra
    off-chain inference work, adjusted for the lengths of the selected jobs;
 3. Solana pays only when a selected replay disagrees and a bonded dispute is
    opened.
+
+## Adversarial V2 implementation status (2026-09-10)
+
+The implemented live SBF path is:
+
+```text
+requester-signed immutable job payload (310 bytes, off chain)
+  -> unsigned result leaf (104 bytes)
+  -> one miner-signed epoch root
+  -> first produced Solana block after epoch close
+  -> per-job Bernoulli audit draw
+  -> independent challenger/miner Merkle openings
+  -> unilateral logarithmic bisection with turn-specific timeouts
+  -> authenticated Q4 weight + activation opening
+  -> objective FP32 FMA result
+```
+
+There is no miner signature per job. The requester's job signature is checked
+only if a challenge opens, so normal operation has no per-job Solana
+transaction. A program-owned miner identity records the last submitted epoch;
+the job payload binds its one assigned epoch. Together these reject duplicate
+epoch/root grinding. The miner does not choose the entropy slot, challenge
+window, or response timeout. The constants are 216,000 slots for challenges
+and 1,200 slots per dispute move.
+
+The current live-SBF measurements are:
+
+| Operation | Compute units |
+|---|---:|
+| Finalize epoch seed (once/epoch) | 1,787 |
+| Authenticate job/result and open challenge | 5,837 |
+| Both boundary openings + one midpoint round | 10,154 |
+| Weight proof + objective FMA | 9,448 |
+
+Each additional binary-search level costs one challenger and one miner
+midpoint instruction. The complete three-state test dispute is 29,191 CU,
+including both terminal-state reveals. The full test also exercises both
+timeout directions, rejects an unselected result, rejects duplicate epoch
+submission, and convicts an incorrect accumulator without a miner co-signature.
+
+Three production gates remain deliberately disabled: collateral transfer and
+settlement, the hierarchical bridge from the runtime's job/token/layer root to
+the dispute-local operator trace, and deterministic terminal coverage for all
+operators beyond Q4 FMA. Therefore this code demonstrates adversarial
+attribution, sampling, bisection, and one objective terminal transition; it is
+not yet safe to enable automatic slashing for an arbitrary full inference.
 
 ## Epoch selection
 
@@ -53,15 +100,23 @@ is authenticated at that position against `receipt_root`. The selection code
 and probability calculator live in `qx-commit`; `qx-verify sampling-cost`
 reproduces the economics.
 
+V2 uses a per-job Bernoulli draw instead of global k-of-n. The immutable job
+payload commits `audit_probability_ppm`; the on-chain check hashes the closed
+epoch seed, epoch number, leaf index, and job hash. Adding cheap results cannot
+dilute another job's probability. Zero and one million ppm are exact boundary
+cases. Entropy is the earliest produced Solana slot strictly after the epoch
+root closes, found by binary search in the canonical slot-hashes sysvar;
+skipped slots do not create a finalizer-selectable fallback.
+
 The entropy rule must not give the miner a choice among several valid seeds.
 For approximately independent alternatives, if one seed detects cheating with
 probability `p`, a miner allowed to choose the most favorable of `g` seeds is
 detected only with probability `p^g`. Commit/reveal schemes need a fixed rule
 for missing reveals; otherwise withholding itself becomes a second seed.
-A fixed future Solana entropy slot mixed with at least one independently
-committed value is the minimum sensible construction. The production design
-must specify the exact Solana entropy source and its availability/fallback
-rule before deployment.
+V2 implements this as the first produced successor block and binds the miner,
+epoch, result root, result count, entropy slot, program instance, and block
+hash into the seed. Long forks and slot-hash retention still need deployment
+monitoring, but neither miner nor finalizer chooses among valid hashes.
 
 ## What sampling buys
 
@@ -117,7 +172,10 @@ and commits dispute-local activations with 128-byte BLAKE3 leaves. The smaller
 leaf is deliberate: it keeps the activation opening transportable alongside
 the 26-level production weight proof.
 
-The deployable SBF prototype uses two instructions:
+The following measurements describe the older compatibility V1 terminal path.
+It requires a per-result miner signature and mutual terminal agreement, so it
+is retained for regression comparison and must not drive settlement. That
+prototype uses two instructions:
 
 | Instruction | Data | CU | Purpose |
 |---|---:|---:|---|
@@ -186,20 +244,25 @@ repeatable on one GPU.
 
 Accordingly, the current code proves these pieces:
 
-- deterministic epoch receipt selection and exact detection probabilities;
+- deterministic epoch result selection and exact detection probabilities;
+- one aggregate miner epoch signature, requester-authenticated job payloads,
+  and no normal per-job Solana registration;
+- binding of every executed token's predicted token into the runtime trace;
 - state and weight openings;
 - token/layer disagreement location oracle;
 - router ordering and tie breaking;
-- authenticated terminal Q4 FMA on actual SBF with measured CU;
+- unilateral on-chain bisection and authenticated terminal Q4 FMA on actual
+  SBF with measured CU;
 - rejection of corrupted arithmetic, openings, and false ordering claims.
 
-The SBF path now authenticates the receipt signature and epoch inclusion and
-binds the model, parties, activation root, arithmetic claims, and staged weight
-to a single dispute account. It still uses a two-party terminal-boundary
-agreement as the handoff from off-chain narrowing. Automatic slashing remains
-disabled until on-chain token/layer/operator bisection can reach that same
-terminal phase without miner cooperation and the remaining IR operations are
-deterministically covered.
+The V2 path authenticates the requester job signature lazily, attributes an
+unsigned result through the miner's epoch, and binds the model, parties,
+activation root, arithmetic claims, and staged weight to one dispute account.
+It no longer needs mutual agreement or a miner signature per result.
+Automatic slashing remains disabled until hierarchical token/layer/operator
+bisection reaches this terminal phase from the production runtime root, the
+remaining IR operations are deterministically covered, and collateral/bond
+settlement is implemented.
 
 ## Platform references
 
