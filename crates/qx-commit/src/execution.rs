@@ -37,7 +37,7 @@ impl CheckpointV1 {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CommitmentMetrics {
-    /// Raw canonical residual + newly appended K/V bytes passed to SHA-256.
+    /// Raw canonical residual + newly appended K/V bytes covered by hashing.
     pub canonical_state_bytes: u64,
     pub checkpoint_count: u64,
     pub executed_tokens: u32,

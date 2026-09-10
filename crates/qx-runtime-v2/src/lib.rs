@@ -2722,7 +2722,7 @@ impl GraniteV2Generator {
     }
 
     /// Enable or disable production commitments. Enabling adds one batched
-    /// SHA-256 dispatch per token plus 98,304 transient residual-snapshot
+    /// BLAKE3 dispatch per token plus 98,304 transient residual-snapshot
     /// bytes and 1,536 compact digest bytes.
     pub fn set_verification_enabled(&mut self, enabled: bool) -> Result<(), String> {
         if enabled && self.verification_digests.is_none() {

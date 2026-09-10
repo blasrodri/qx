@@ -147,14 +147,15 @@ the signed receipt exactly **274 bytes**, below the 512-byte target.
 ## CPU/Metal compatibility and Phase-4 gate
 
 The current sealed M5 V2 artifact stores both K and V as FP32. Metal now hashes
-the exact GPU-resident bytes and matches the CPU SHA-256 oracle in a golden
+the exact GPU-resident bytes and matches the CPU BLAKE3 oracle in a golden
 parity test. Post-layer residual snapshots use 98,304 transient bytes per
 runtime instance and are written by the existing final residual kernel; the
 snapshots are overwritten each token and are never receipt or permanent trace
 storage. A single token-end hash dispatch processes all 24 layers and returns
 only 1,536 digest bytes after the runtime's existing token synchronization.
 
-This closes the byte-level compatibility gap, but the measured every-layer
-overhead is 9.58%, above the 5% hard performance ceiling. See
-`docs/verification-benchmarks.md` for the exact commands, frequency sweep, and
-profiling conclusion. The Phase-4 performance gate remains failed.
+This closes the byte-level compatibility gap. With GPU-oriented BLAKE3 state
+leaves and raw BLAKE3 state-tree parents, the measured every-layer overhead is
+4.368%, below the 5% hard performance ceiling. The execution-spec digest binds
+the state hash, 256-byte chunk width, and parent construction. See
+`docs/verification-benchmarks.md` for exact commands and profiling history.

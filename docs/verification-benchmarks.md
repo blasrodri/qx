@@ -20,9 +20,24 @@ concurrently into 1,536 bytes. The CPU reads those digests only after the
 existing token wait and incrementally maintains the KV, checkpoint, token, and
 job Merkle frontiers.
 
-SHA-256 state, key, and value leaves are 256-byte indexed chunks with separate
-domains. Metal and the CPU oracle match byte-for-byte. Normal inference output
-is unchanged.
+BLAKE3 state, key, and value leaves are 256-byte indexed chunks with separate
+domains. State-tree parents use `BLAKE3(left || right)`; their typed leaf
+domains prevent cross-tree ambiguity. The execution-spec digest binds these
+choices. Metal and the CPU oracle match byte-for-byte, and normal inference
+output is unchanged. Small receipt, weight, and outer trace commitments remain
+SHA-256.
+
+## Selected configuration
+
+| Checkpoint interval | Baseline total | Verified total | Overhead | Baseline tok/s | Verified tok/s | Status |
+|---:|---:|---:|---:|---:|---:|:---|
+| 1 layer, BLAKE3 | 63.291 ms | 66.056 ms | **4.368%** | 236.999 | 227.079 | pass |
+
+This run used six warmups and eleven alternating repeats. It produced the
+deterministic trace root
+`b522fca64f2ab1c524e5af4daee5382c55a1644bdf93b3a22582b48aa16eb9bc`.
+
+## SHA-256 frequency experiment
 
 | Checkpoint interval | Baseline total | Verified total | Overhead | Baseline tok/s | Verified tok/s | Status |
 |---:|---:|---:|---:|---:|---:|:---|
@@ -36,7 +51,7 @@ not currently emit a production trace root. Interval 1 is the specified V1
 path and produced the deterministic trace root
 `83131d5f0acb8d9e7c80680d7796465cde1e5b9533d54f080cdfc26b921d05b0`.
 
-The final every-layer GPU counters were 58.773 ms baseline versus 63.386 ms
+The SHA-256 every-layer GPU counters were 58.773 ms baseline versus 63.386 ms
 verified, with 5,850 versus 5,865 dispatches over the workload. CPU encode time
 decreased slightly (1.976 ms to 1.799 ms), while CPU wait tracked GPU time. No
 per-layer command buffers or waits were added.
@@ -51,7 +66,9 @@ Profiling deliberately retained failed intermediate measurements:
 | Parallel 256-byte chunks, one layer dispatch | 411.618% |
 | Three SIMD groups per layer dispatch | 161.229% |
 | Batched 24-layer hash with separate copy dispatches | 10.535% |
-| Batched hash with residual snapshot fused into existing kernel | 9.582% |
+| Batched SHA-256 with residual snapshot fused into existing kernel | 9.582% |
+| BLAKE3 leaves, domain-framed state-tree parents | 5.065% |
+| BLAKE3 leaves, single-block typed-tree parents | **4.368%** |
 
 Batching and the narrowly scoped snapshot fusion removed 23 extra dispatches
 per layer sequence and reduced the original overhead by more than two orders
@@ -59,11 +76,10 @@ of magnitude. The frequency sweep is almost flat at intervals 2 and 4, showing
 that incremental K/V SHA-256 is now the limiting work rather than checkpoint
 frequency, CPU work, synchronization, or residual copies.
 
-The required `<5%` gate is **not achieved**. Advancing the normal path requires
-a measured change to the commitment hash strategy (for example a
-protocol-versioned, GPU-efficient hash with an acceptable Solana verification
-cost) or a materially faster SHA-256 Metal implementation. Later gateway and
-Solana protocol work cannot be assumed to improve this normal-path cost.
+The required `<5%` gate is **achieved**. Solana exposes `sol_blake3`, so terminal
+state and Merkle witnesses can be recomputed on-chain without a software hash
+implementation. Cluster feature activation and actual terminal-witness compute
+units still need to be verified in the Solana-program phase.
 
 Reproduction command:
 

@@ -145,6 +145,9 @@ pub fn granite_execution_spec() -> Result<Digest, CommitError> {
     bytes.push(1); // greedy decoding
     bytes.push(1); // argmax ties: lowest token id
     bytes.push(1); // total_cmp ordering for exceptional values
+    bytes.push(HashAlgorithm::Blake3V1 as u8); // residual and new-K/V leaf hash
+    bytes.extend_from_slice(&256_u16.to_le_bytes()); // state hash chunk bytes
+    bytes.push(1); // raw BLAKE3(left || right) state-tree parent
     hash_domain(HashAlgorithm::Sha256V1, D_EXECUTION_SPEC, &[&bytes])
 }
 

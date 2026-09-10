@@ -114,7 +114,7 @@ fn protocol_v1_golden_vectors() {
         (
             "model_id",
             model_id,
-            "3028b0108d882f938eca5f94d09fa8c7b08a8161787bbb9703af9bec3b055161",
+            "66fd72adbd450d3bce40175621a45b915e3b0f922ca393f32264605fb35b56a1",
         ),
         (
             "weight_leaf",
@@ -129,32 +129,32 @@ fn protocol_v1_golden_vectors() {
         (
             "kv_leaf",
             kv_leaf,
-            "e0b263b4cc4e3ad6840885a70e3bbd5b1f99aead9d8138e46152724cb24add83",
+            "3516c5116950fd510fd4c2c65b63454c29739d9030e3a83e1944391137b8dac1",
         ),
         (
             "kv_root",
             kv_root,
-            "aece4ec1f72ec39eef2e9c5c47a43cef40b33cef80c0ad0c1e0fba2464b556ed",
+            "c48fe05432bcdd0dba35c2adec3f7be97aa3459ee856aed3ea05edcedbf29982",
         ),
         (
             "checkpoint",
             checkpoint,
-            "721e055e203280d3459842836ea99b0d18da782e121b061d1444843fffeb01db",
+            "f67a9d34fd9de5eeb4f4d777d815e1c7fc6432c0694a619566a9caac9590a4c7",
         ),
         (
             "token_root",
             token_root,
-            "7fcc68424c7303a35b6f3cd841d8baeb1ecea0a8c42f7e9e4a3d2ecda6145054",
+            "effe355973ec1771030b73fa306a8650d4672f1f718477b169f23d3a52915eaa",
         ),
         (
             "job_root",
             job_root,
-            "8abb0da549b004d123f78c78590b05dd574a724b425c1a7fbdbaff87c96d6f1b",
+            "cc583130bd1db297747a8586e7efe4bd70a023abdae4c89b5aa02f90b9154887",
         ),
         (
             "input_hash",
             input_hash,
-            "54b91ab41c81270d7089b09766881456931f64345e4f2251a36c6f3f1bc5d0ae",
+            "7e3b7685134054c9ea2c0c16d693a794e6f578a8edd5830c1969d1dd0aadc595",
         ),
         (
             "output_hash",
@@ -164,12 +164,12 @@ fn protocol_v1_golden_vectors() {
         (
             "receipt_hash",
             receipt,
-            "f7f60781cf573efb1a95a7495ffde11bd1e806d020b79a46ea82ccbeff50b4f1",
+            "acb4d297e54e2c23ac9012e1a660bae134487741dbc8fae2992b849f3c0af22f",
         ),
         (
             "batch_root",
             batch_root,
-            "c2d8a194ded611326be14ea2b7e487b5fd4436265a655419017c20cb960264c0",
+            "ed7e44f0cfa6e19dda5fc47dc0ae494d0d8a8a3899f8f8bb298bdcf87a85505f",
         ),
     ];
     for (name, digest, expected) in vectors {

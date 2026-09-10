@@ -37,8 +37,20 @@ constant uint SHA256_K[64] = {
     0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
     0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
 };
+constant uint B3_IV[8] = {
+    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u,
+};
+constant uchar B3_SCHEDULE[7][16] = {
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+    {2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8},
+    {3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1},
+    {10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6},
+    {12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4},
+    {9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7},
+    {11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13},
+};
 
-constant uchar MERKLE_DOMAIN[12] = {'Q','X',':','M','E','R','K','L','E',':','V','1'};
 constant uchar STATE_DOMAIN[11] = {'Q','X',':','S','T','A','T','E',':','V','1'};
 constant uchar STATE_CHUNK_DOMAIN[17] = {
     'Q','X',':','S','T','A','T','E',':','C','H','U','N','K',':','V','1'
@@ -59,6 +71,139 @@ constant uchar KV_VALUE_TREE_DOMAIN[19] = {
 
 inline uint rotr(uint value, uint shift) {
     return (value >> shift) | (value << (32u - shift));
+}
+
+struct Blake3Context {
+    uint cv[8];
+    uchar block[64];
+    uint used;
+    uint blocks;
+};
+
+inline void b3_g(thread uint* state, uint a, uint b, uint c, uint d, uint x, uint y) {
+    state[a] = state[a] + state[b] + x;
+    state[d] = rotr(state[d] ^ state[a], 16);
+    state[c] += state[d];
+    state[b] = rotr(state[b] ^ state[c], 12);
+    state[a] = state[a] + state[b] + y;
+    state[d] = rotr(state[d] ^ state[a], 8);
+    state[c] += state[d];
+    state[b] = rotr(state[b] ^ state[c], 7);
+}
+
+inline void b3_compress(
+    thread const uint* cv,
+    thread const uchar* block,
+    uint block_len,
+    uint flags,
+    thread uint* output) {
+    uint message[16];
+    for (uint word = 0; word < 16; ++word) {
+        uint offset = word * 4;
+        message[word] = uint(block[offset]) | (uint(block[offset + 1]) << 8)
+            | (uint(block[offset + 2]) << 16) | (uint(block[offset + 3]) << 24);
+    }
+    uint state[16];
+    for (uint index = 0; index < 8; ++index) state[index] = cv[index];
+    for (uint index = 0; index < 4; ++index) state[8 + index] = B3_IV[index];
+    state[12] = 0;
+    state[13] = 0;
+    state[14] = block_len;
+    state[15] = flags;
+    for (uint round = 0; round < 7; ++round) {
+        constant const uchar* s = B3_SCHEDULE[round];
+        b3_g(state, 0, 4, 8, 12, message[s[0]], message[s[1]]);
+        b3_g(state, 1, 5, 9, 13, message[s[2]], message[s[3]]);
+        b3_g(state, 2, 6, 10, 14, message[s[4]], message[s[5]]);
+        b3_g(state, 3, 7, 11, 15, message[s[6]], message[s[7]]);
+        b3_g(state, 0, 5, 10, 15, message[s[8]], message[s[9]]);
+        b3_g(state, 1, 6, 11, 12, message[s[10]], message[s[11]]);
+        b3_g(state, 2, 7, 8, 13, message[s[12]], message[s[13]]);
+        b3_g(state, 3, 4, 9, 14, message[s[14]], message[s[15]]);
+    }
+    for (uint index = 0; index < 8; ++index) output[index] = state[index] ^ state[index + 8];
+}
+
+inline void b3_init(thread Blake3Context& context) {
+    for (uint index = 0; index < 8; ++index) context.cv[index] = B3_IV[index];
+    for (uint index = 0; index < 64; ++index) context.block[index] = 0;
+    context.used = 0;
+    context.blocks = 0;
+}
+
+inline void b3_flush(thread Blake3Context& context) {
+    uint next[8];
+    b3_compress(context.cv, context.block, 64, context.blocks == 0 ? 1u : 0u, next);
+    for (uint index = 0; index < 8; ++index) context.cv[index] = next[index];
+    for (uint index = 0; index < 64; ++index) context.block[index] = 0;
+    context.used = 0;
+    context.blocks += 1;
+}
+
+inline void b3_byte(thread Blake3Context& context, uchar value) {
+    if (context.used == 64) b3_flush(context);
+    context.block[context.used++] = value;
+}
+
+inline void b3_u64_le(thread Blake3Context& context, ulong value) {
+    for (uint shift = 0; shift < 64; shift += 8) b3_byte(context, uchar(value >> shift));
+}
+inline void b3_u32_le(thread Blake3Context& context, uint value) {
+    for (uint shift = 0; shift < 32; shift += 8) b3_byte(context, uchar(value >> shift));
+}
+inline void b3_u16_le(thread Blake3Context& context, ushort value) {
+    b3_byte(context, uchar(value));
+    b3_byte(context, uchar(value >> 8));
+}
+inline void b3_constant_bytes(thread Blake3Context& context, constant const uchar* bytes, uint len) {
+    for (uint index = 0; index < len; ++index) b3_byte(context, bytes[index]);
+}
+inline void b3_device_bytes(thread Blake3Context& context, device const uchar* bytes, uint len) {
+    for (uint index = 0; index < len; ++index) b3_byte(context, bytes[index]);
+}
+inline void b3_device_chunk_256(thread Blake3Context& context, device const uchar* bytes) {
+    uint consumed = 0;
+    uint first = 64 - context.used;
+    for (; consumed < first; ++consumed) context.block[context.used++] = bytes[consumed];
+    while (consumed + 64 < 256) {
+        b3_flush(context);
+        for (uint index = 0; index < 64; ++index) context.block[index] = bytes[consumed + index];
+        context.used = 64;
+        consumed += 64;
+    }
+    if (context.used == 64) b3_flush(context);
+    for (; consumed < 256; ++consumed) context.block[context.used++] = bytes[consumed];
+}
+inline void b3_digest_words(thread Blake3Context& context, threadgroup const uint* words) {
+    for (uint word = 0; word < 8; ++word) {
+        uint value = words[word];
+        b3_byte(context, uchar(value));
+        b3_byte(context, uchar(value >> 8));
+        b3_byte(context, uchar(value >> 16));
+        b3_byte(context, uchar(value >> 24));
+    }
+}
+inline void b3_finish(thread Blake3Context& context, thread uint* output) {
+    uint flags = (context.blocks == 0 ? 1u : 0u) | 2u | 8u;
+    b3_compress(context.cv, context.block, context.used, flags, output);
+}
+inline void b3_store_threadgroup_device(threadgroup const uint* words, device uchar* output) {
+    for (uint word = 0; word < 8; ++word) {
+        uint value = words[word];
+        output[word * 4] = uchar(value);
+        output[word * 4 + 1] = uchar(value >> 8);
+        output[word * 4 + 2] = uchar(value >> 16);
+        output[word * 4 + 3] = uchar(value >> 24);
+    }
+}
+inline void b3_store_device(thread const uint* words, device uchar* output) {
+    for (uint word = 0; word < 8; ++word) {
+        uint value = words[word];
+        output[word * 4] = uchar(value);
+        output[word * 4 + 1] = uchar(value >> 8);
+        output[word * 4 + 2] = uchar(value >> 16);
+        output[word * 4 + 3] = uchar(value >> 24);
+    }
 }
 
 inline void sha256_compress(thread Sha256Context& context) {
@@ -232,34 +377,27 @@ inline void hash_chunk(
     constant const uchar* domain,
     uint domain_length,
     thread uint* output) {
-    Sha256Context context;
-    sha256_init(context);
-    sha256_constant_bytes(context, domain, domain_length);
-    sha256_u64_le(context, 4);
-    sha256_u32_le(context, chunk_index);
-    sha256_u64_le(context, 256);
-    sha256_device_chunk_256(context, bytes + chunk_index * 256);
-    sha256_finalize(context);
-    for (uint word = 0; word < 8; ++word) output[word] = context.state[word];
+    Blake3Context context;
+    b3_init(context);
+    b3_constant_bytes(context, domain, domain_length);
+    b3_u64_le(context, 4);
+    b3_u32_le(context, chunk_index);
+    b3_u64_le(context, 256);
+    b3_device_chunk_256(context, bytes + chunk_index * 256);
+    b3_finish(context, output);
 }
 
 inline void hash_parent(
-    constant const uchar* tree_domain,
-    uint tree_domain_length,
+    constant const uchar*,
+    uint,
     threadgroup const uint* left,
     threadgroup const uint* right,
     thread uint* output) {
-    Sha256Context context;
-    sha256_init(context);
-    sha256_constant_bytes(context, MERKLE_DOMAIN, 12);
-    sha256_u64_le(context, tree_domain_length);
-    sha256_constant_bytes(context, tree_domain, tree_domain_length);
-    sha256_u64_le(context, 32);
-    sha256_digest_words(context, left);
-    sha256_u64_le(context, 32);
-    sha256_digest_words(context, right);
-    sha256_finalize(context);
-    for (uint word = 0; word < 8; ++word) output[word] = context.state[word];
+    Blake3Context context;
+    b3_init(context);
+    b3_digest_words(context, left);
+    b3_digest_words(context, right);
+    b3_finish(context, output);
 }
 
 inline void reduce_tree(
@@ -310,7 +448,7 @@ kernel void qx_verification_hash_state_kv(
     uint group = tid / 32;
     uint lane = tid % 32;
 
-    // Give residual, key, and value independent SIMD groups so their SHA-256
+    // Give residual, key, and value independent SIMD groups so their BLAKE3
     // compression streams can make progress concurrently.
     if (group == 0 && checkpoint && lane < state_chunks) {
         uint digest[8];
@@ -359,19 +497,20 @@ kernel void qx_verification_hash_state_kv(
     }
 
     if (tid == 0) {
-        sha256_store_threadgroup_device(state_nodes, output);
-        Sha256Context kv;
-        sha256_init(kv);
-        sha256_constant_bytes(kv, KV_DOMAIN, 8);
-        sha256_u64_le(kv, 2);
-        sha256_u16_le(kv, ushort(layer));
-        sha256_u64_le(kv, 4);
-        sha256_u32_le(kv, params.token);
-        sha256_u64_le(kv, 32);
-        sha256_digest_words(kv, key_nodes);
-        sha256_u64_le(kv, 32);
-        sha256_digest_words(kv, value_nodes);
-        sha256_finalize(kv);
-        sha256_store_device(kv.state, output + 32);
+        b3_store_threadgroup_device(state_nodes, output);
+        Blake3Context kv;
+        b3_init(kv);
+        b3_constant_bytes(kv, KV_DOMAIN, 8);
+        b3_u64_le(kv, 2);
+        b3_u16_le(kv, ushort(layer));
+        b3_u64_le(kv, 4);
+        b3_u32_le(kv, params.token);
+        b3_u64_le(kv, 32);
+        b3_digest_words(kv, key_nodes);
+        b3_u64_le(kv, 32);
+        b3_digest_words(kv, value_nodes);
+        uint kv_output[8];
+        b3_finish(kv, kv_output);
+        b3_store_device(kv_output, output + 32);
     }
 }

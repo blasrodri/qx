@@ -1,6 +1,6 @@
 use crate::{
-    CommitError, D_KV, D_KV_KEY_CHUNK, D_KV_KEY_TREE, D_KV_VALUE_CHUNK, D_KV_VALUE_TREE, D_STATE,
-    D_STATE_CHUNK, Digest, HashAlgorithm, MerkleTree, hash_domain,
+    CommitError, D_KV, D_KV_KEY_CHUNK, D_KV_KEY_TREE, D_KV_VALUE_CHUNK, D_KV_VALUE_TREE,
+    D_MERKLE_EMPTY, D_STATE, D_STATE_CHUNK, Digest, HashAlgorithm, hash_domain,
 };
 
 /// Consensus chunk size for accelerator-friendly state commitments.
@@ -22,17 +22,34 @@ fn chunk_tree_hash(
         .map(|(index, chunk)| {
             let index = u32::try_from(index).map_err(|_| CommitError::ArithmeticOverflow)?;
             hash_domain(
-                HashAlgorithm::Sha256V1,
+                HashAlgorithm::Blake3V1,
                 leaf_domain,
                 &[&index.to_le_bytes(), chunk],
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(MerkleTree::new(HashAlgorithm::Sha256V1, tree_domain, &leaves)?.root())
+    let capacity = leaves
+        .len()
+        .checked_next_power_of_two()
+        .ok_or(CommitError::ArithmeticOverflow)?;
+    let mut nodes = leaves;
+    let empty = hash_domain(HashAlgorithm::Blake3V1, D_MERKLE_EMPTY, &[tree_domain])?;
+    nodes.resize(capacity, empty);
+    while nodes.len() > 1 {
+        let mut parents = Vec::with_capacity(nodes.len() / 2);
+        for pair in nodes.chunks_exact(2) {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&pair[0]);
+            hasher.update(&pair[1]);
+            parents.push(*hasher.finalize().as_bytes());
+        }
+        nodes = parents;
+    }
+    nodes.pop().ok_or(CommitError::EmptyTree)
 }
 
 /// Commit canonical post-layer residual bytes using independently hashable
-/// chunks followed by a domain-separated Merkle reduction.
+/// chunks followed by a typed-leaf BLAKE3 Merkle reduction.
 pub fn state_hash_v1(bytes: &[u8]) -> Result<Digest, CommitError> {
     chunk_tree_hash(bytes, D_STATE_CHUNK, D_STATE)
 }
@@ -48,7 +65,7 @@ pub fn kv_leaf_hash_v1(
     let key_root = chunk_tree_hash(key_bytes, D_KV_KEY_CHUNK, D_KV_KEY_TREE)?;
     let value_root = chunk_tree_hash(value_bytes, D_KV_VALUE_CHUNK, D_KV_VALUE_TREE)?;
     hash_domain(
-        HashAlgorithm::Sha256V1,
+        HashAlgorithm::Blake3V1,
         D_KV,
         &[
             &layer_index.to_le_bytes(),
