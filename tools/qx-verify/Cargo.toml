@@ -10,4 +10,5 @@ clap.workspace = true
 qx-commit = { path = "../../crates/qx-commit" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+qx-metal.workspace = true
 qx-runtime-v2.workspace = true

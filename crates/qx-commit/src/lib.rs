@@ -21,8 +21,9 @@ pub use execution::{CheckpointV1, CommitmentMetrics, ExecutionCommitterV1, Execu
 pub use hash::{Digest, HashAlgorithm, ProtocolVersion, hash_domain, hash_domain_input_len};
 pub use merkle::{FixedMerkleAccumulator, MerkleProof, MerkleTree, MutableMerkleTree};
 pub use model::{
-    ModelSpecV1, granite_architecture_root, granite_execution_spec,
-    granite_execution_spec_with_checkpoint_interval,
+    GraniteMathFunctionsV1, GraniteMathModeV1, ModelSpecV1, granite_architecture_root,
+    granite_execution_spec, granite_execution_spec_with_checkpoint_interval,
+    granite_execution_spec_with_math_functions, granite_execution_spec_with_math_profile,
 };
 pub use receipt::{InferenceReceiptV1, SignedInferenceReceiptV1, input_hash_v1, output_hash_v1};
 pub use state::{

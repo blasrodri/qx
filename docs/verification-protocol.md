@@ -175,6 +175,15 @@ the explicit tree compiled in fast mode. Precise execution plus commitments is
 terminal instructions are still needed for rsqrt, exp/softmax, RoPE, KV append,
 and the remaining verification IR before a complete inference can be slashed.
 
+An experimental Metal profile now combines relaxed arithmetic optimization
+with precise math functions. It reduced the mean fast-uncommitted to
+relaxed-committed migration cost to 3.734% in two independent 31-repeat runs,
+and all 62 repeats produced the same trace root. Recorded AIR still carries
+unsafe reassociation, signed-zero, reciprocal, contraction, and approximate
+function flags, so this result is a performance candidate rather than a
+slashable consensus profile. It must not be promoted solely because it is
+repeatable on one GPU.
+
 Accordingly, the current code proves these pieces:
 
 - deterministic epoch receipt selection and exact detection probabilities;

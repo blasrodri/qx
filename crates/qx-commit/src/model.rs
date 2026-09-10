@@ -21,6 +21,20 @@ pub struct ModelSpecV1 {
     pub tokenizer_hash: Digest,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum GraniteMathFunctionsV1 {
+    Precise = 1,
+    Fast = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum GraniteMathModeV1 {
+    Safe = 1,
+    Relaxed = 2,
+}
+
 impl ModelSpecV1 {
     pub const CANONICAL_SIZE: usize = 184;
 
@@ -139,6 +153,29 @@ pub fn granite_execution_spec() -> Result<Digest, CommitError> {
 pub fn granite_execution_spec_with_checkpoint_interval(
     checkpoint_interval: u8,
 ) -> Result<Digest, CommitError> {
+    granite_execution_spec_with_math_functions(checkpoint_interval, GraniteMathFunctionsV1::Precise)
+}
+
+/// Produce a distinct execution-spec digest for the candidate that retains
+/// safe arithmetic evaluation but selects Metal's fast transcendental
+/// functions. Fast functions are not slashable until cross-device parity and
+/// terminal approximations have been established.
+pub fn granite_execution_spec_with_math_functions(
+    checkpoint_interval: u8,
+    math_functions: GraniteMathFunctionsV1,
+) -> Result<Digest, CommitError> {
+    granite_execution_spec_with_math_profile(
+        checkpoint_interval,
+        GraniteMathModeV1::Safe,
+        math_functions,
+    )
+}
+
+pub fn granite_execution_spec_with_math_profile(
+    checkpoint_interval: u8,
+    math_mode: GraniteMathModeV1,
+    math_functions: GraniteMathFunctionsV1,
+) -> Result<Digest, CommitError> {
     if !matches!(checkpoint_interval, 1 | 2 | 4) {
         return Err(CommitError::InvalidShape(
             "Granite checkpoint interval must be 1, 2, or 4".to_owned(),
@@ -164,8 +201,9 @@ pub fn granite_execution_spec_with_checkpoint_interval(
     bytes.push(HashAlgorithm::Blake3V1 as u8); // hot KV/checkpoint/token/job trees
     bytes.push(32); // SIMD width
     bytes.extend_from_slice(&[16, 8, 4, 2, 1]); // fixed shuffle-down reduction tree
-    bytes.push(1); // Metal fast math disabled
-    bytes.push(1); // precise FP32 math functions
+    bytes.push(1); // Q4 dot and MoE accumulation use explicit ordered FMA
+    bytes.push(math_mode as u8);
+    bytes.push(math_functions as u8);
     if checkpoint_interval != 1 {
         bytes.extend_from_slice(b"CHECKPOINT_INTERVAL");
         bytes.push(checkpoint_interval);
@@ -197,5 +235,25 @@ mod tests {
         };
         assert_eq!(spec.canonical_bytes().len(), ModelSpecV1::CANONICAL_SIZE);
         spec.validate_granite_v1().unwrap();
+    }
+
+    #[test]
+    fn math_function_profiles_have_distinct_execution_specs() {
+        let precise =
+            granite_execution_spec_with_math_functions(2, GraniteMathFunctionsV1::Precise).unwrap();
+        let fast =
+            granite_execution_spec_with_math_functions(2, GraniteMathFunctionsV1::Fast).unwrap();
+        assert_ne!(precise, fast);
+        assert_eq!(
+            precise,
+            granite_execution_spec_with_checkpoint_interval(2).unwrap()
+        );
+        let relaxed = granite_execution_spec_with_math_profile(
+            2,
+            GraniteMathModeV1::Relaxed,
+            GraniteMathFunctionsV1::Precise,
+        )
+        .unwrap();
+        assert_ne!(precise, relaxed);
     }
 }

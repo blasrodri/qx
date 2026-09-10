@@ -70,6 +70,43 @@ consensus-mode overhead does not yet meet the original 5% ceiling. The
 `QX_METAL_PRECISE_MATH=0` escape hatch is diagnostic only and must not identify
 a slashable execution profile.
 
+### Relaxed-arithmetic candidate
+
+Metal's modern compile controls let QX keep precise single-precision math
+functions while selecting relaxed expression optimization independently. The
+runtime exposes this candidate with `QX_METAL_RELAXED_ARITHMETIC=1`; it receives
+a distinct execution-spec digest and does not replace the safe-precise default.
+The runtime fixes the selected profile at first use so lazy kernel compilation
+cannot mix arithmetic profiles within one process.
+
+Two independent 31-repeat processes produced:
+
+| Run | Uncommitted | Committed | Commitment overhead | Trace root |
+|---:|---:|---:|---:|:---|
+| 1 | 97.551 ms | 100.651 ms | 3.178% | `9b7ba037...9b88f59` |
+| 2 | 97.774 ms | 100.923 ms | 3.221% | `9b7ba037...9b88f59` |
+
+Fast-uncommitted control runs bracketing this experiment measured 96.189 and
+98.128 ms. Comparing the means (97.159 ms fast control and 100.787 ms relaxed
+committed) gives **3.734% total migration overhead** on this machine, versus
+8.820% in the earlier safe-precise experiment. Every one of the 62 relaxed
+repeats produced the same trace root and output tokens.
+
+Safe arithmetic with only fast transcendental functions did not help: it
+measured 102.241 ms uncommitted and 105.532 ms committed, so the former tax is
+primarily expression optimization rather than `exp`/`rsqrt` function choice.
+
+The selected K4 gate/up, down, and expert-accumulation kernels now spell their
+dot steps as ordered explicit `fma` calls, matching the terminal verifier's
+primitive. Their safe-precise and compiler-default trace roots did not change.
+
+The relaxed profile is **not slashable yet**. Its recorded AIR retains unsafe
+floating-point flags (`reassoc`, `nsz`, `arcp`, `contract`, and `afn`) even
+though the five-stage SIMD shuffle dependency and explicit FMA calls remain in
+the lowering. Promotion requires identical traces across supported Apple GPU
+families, a pinned compiler/metallib identity, and terminal semantics for every
+remaining relaxed operation.
+
 ## SHA-256 frequency experiment
 
 | Checkpoint interval | Baseline total | Verified total | Overhead | Baseline tok/s | Verified tok/s | Status |
@@ -111,9 +148,11 @@ of magnitude. The frequency sweep is almost flat at intervals 2 and 4, showing
 that incremental K/V SHA-256 is now the limiting work rather than checkpoint
 frequency, CPU work, synchronization, or residual copies.
 
-The commitment-only `<5%` gate is achieved and its `<=3%` desired target is now
-achieved in precise mode. The stricter, more honest comparison against the old
-fast execution path is 8.820%, so the complete performance gate remains open.
+The commitment-only `<5%` gate is achieved and its `<=3%` desired target is
+achieved in safe-precise mode. The safe-precise comparison against the old fast
+execution path remains 8.820%. The relaxed-precise candidate reduces the
+measured total to 3.734%, below 5%, but the complete production gate remains
+open until its cross-device consensus requirements pass.
 See the protocol document for the receipt-bound Solana measurements.
 
 Reproduction command:
@@ -123,3 +162,7 @@ cargo run --release -q -p qx-verify -- metal-benchmark \
   external/models/granite-m5-pro-q4-rowinline-k4-vector-unroll4-down-short-context-active.qx \
   --context 512 --new-tokens 16 --warmup 8 --repeats 31 --checkpoint-interval 2
 ```
+
+Prefix the command with `QX_METAL_RELAXED_ARITHMETIC=1` to reproduce the
+reduced-overhead candidate. The benchmark prints the active profile and its
+execution-spec digest before the timing results.

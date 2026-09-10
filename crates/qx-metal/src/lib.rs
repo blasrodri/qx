@@ -7,6 +7,65 @@
 
 use qx_quant::{PackingLayout, QuantType};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetalMathProfile {
+    /// IEEE-safe expression evaluation and precise single-precision math
+    /// functions. This remains the default conservative profile.
+    SafePrecise,
+    /// IEEE-safe expression evaluation with the faster Metal math functions.
+    /// This is a benchmark candidate until cross-device parity is established.
+    SafeFastFunctions,
+    /// Relaxed arithmetic with precise math functions. This preserves NaN and
+    /// infinity handling but may still reassociate arithmetic, so it is a
+    /// diagnostic profile until compiled lowering is constrained and audited.
+    RelaxedPrecise,
+    /// Compiler defaults used by the historical diagnostic escape hatch.
+    UnsafeCompilerDefault,
+}
+
+impl MetalMathProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SafePrecise => "safe-precise",
+            Self::SafeFastFunctions => "safe-fast-functions",
+            Self::RelaxedPrecise => "relaxed-precise",
+            Self::UnsafeCompilerDefault => "unsafe-compiler-default",
+        }
+    }
+}
+
+pub fn active_metal_math_profile() -> MetalMathProfile {
+    static PROFILE: std::sync::OnceLock<MetalMathProfile> = std::sync::OnceLock::new();
+
+    *PROFILE.get_or_init(metal_math_profile_from_env)
+}
+
+fn metal_math_profile_from_env() -> MetalMathProfile {
+    if env_is_false("QX_METAL_PRECISE_MATH") {
+        MetalMathProfile::UnsafeCompilerDefault
+    } else if env_is_true("QX_METAL_RELAXED_ARITHMETIC") {
+        MetalMathProfile::RelaxedPrecise
+    } else if env_is_true("QX_METAL_FAST_FUNCTIONS") {
+        MetalMathProfile::SafeFastFunctions
+    } else {
+        MetalMathProfile::SafePrecise
+    }
+}
+
+fn env_is_false(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("0" | "false" | "no")
+    )
+}
+
+fn env_is_true(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1" | "true" | "yes")
+    )
+}
+
 pub const Q2_KERNEL_SOURCE: &str = include_str!("../../../kernels/q2_expert.metal");
 pub const Q3_KERNEL_SOURCE: &str = include_str!("../../../kernels/q3_expert.metal");
 pub const Q4_KERNEL_SOURCE: &str = include_str!("../../../kernels/q4_expert.metal");
@@ -75,14 +134,16 @@ pub mod platform {
         MTLCommonCounterSetTimestamp, MTLCompileOptions, MTLComputeCommandEncoder,
         MTLComputePipelineState, MTLCounter, MTLCounterResultTimestamp, MTLCounterSampleBuffer,
         MTLCounterSampleBufferDescriptor, MTLCounterSamplingPoint, MTLCounterSet,
-        MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLStorageMode,
+        MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLMathFloatingPointFunctions,
+        MTLMathMode, MTLResourceOptions, MTLStorageMode,
     };
 
     use super::{
         ARGMAX_KERNEL_SOURCE, DENSE_KERNEL_SOURCE, DYNAMIC_MOE_KERNEL_SOURCE,
-        F16_DENSE_KERNEL_SOURCE, LOGITS_KERNEL_SOURCE, PackingLayout, Q2_KERNEL_SOURCE,
-        Q4_DENSE_KERNEL_SOURCE, Q4_EMBEDDING_KERNEL_SOURCE, QWEN_ATTENTION_KERNEL_SOURCE,
-        QuantType, V2_KERNEL_SOURCE, kernel_source,
+        F16_DENSE_KERNEL_SOURCE, LOGITS_KERNEL_SOURCE, MetalMathProfile, PackingLayout,
+        Q2_KERNEL_SOURCE, Q4_DENSE_KERNEL_SOURCE, Q4_EMBEDDING_KERNEL_SOURCE,
+        QWEN_ATTENTION_KERNEL_SOURCE, QuantType, V2_KERNEL_SOURCE, active_metal_math_profile,
+        kernel_source,
     };
 
     const HIDDEN: usize = 1024;
@@ -90,17 +151,24 @@ pub mod platform {
     const GROUP_SIZE: usize = 32;
 
     fn consensus_compile_options() -> Option<Retained<MTLCompileOptions>> {
-        if matches!(
-            std::env::var("QX_METAL_PRECISE_MATH").ok().as_deref(),
-            Some("0" | "false" | "no")
-        ) {
+        let profile = active_metal_math_profile();
+        if profile == MetalMathProfile::UnsafeCompilerDefault {
             return None;
         }
         let options = MTLCompileOptions::new();
         // QX_EXEC_METAL_V1 requires IEEE-safe expression evaluation so the
         // compiler cannot reassociate the explicit SIMD reduction tree.
-        #[allow(deprecated)]
-        options.setFastMathEnabled(false);
+        options.setMathMode(match profile {
+            MetalMathProfile::RelaxedPrecise => MTLMathMode::Relaxed,
+            _ => MTLMathMode::Safe,
+        });
+        options.setMathFloatingPointFunctions(match profile {
+            MetalMathProfile::SafePrecise | MetalMathProfile::RelaxedPrecise => {
+                MTLMathFloatingPointFunctions::Precise
+            }
+            MetalMathProfile::SafeFastFunctions => MTLMathFloatingPointFunctions::Fast,
+            MetalMathProfile::UnsafeCompilerDefault => unreachable!(),
+        });
         Some(options)
     }
 

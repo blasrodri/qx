@@ -190,11 +190,14 @@ fn metal_benchmark(
     checkpoint_interval: usize,
 ) -> Result<()> {
     use anyhow::{Context, bail};
+    use qx_commit::{GraniteMathFunctionsV1, GraniteMathModeV1};
+    use qx_metal::MetalMathProfile;
     use qx_runtime_v2::GraniteV2Generator;
 
     if new_tokens == 0 || repeats == 0 {
         bail!("new-tokens and repeats must be positive");
     }
+    let math_profile = qx_metal::active_metal_math_profile();
     let prompt = [1_u32, 42, 314, 2718, 17, 19, 23, 29];
     if prompt.len() + new_tokens > context {
         bail!("prompt plus generated tokens exceeds context");
@@ -257,6 +260,34 @@ fn metal_benchmark(
     println!("generated_tokens={new_tokens}");
     println!("repeats={repeats}");
     println!("checkpoint_interval={checkpoint_interval}");
+    println!("metal_math_profile={}", math_profile.as_str());
+    match math_profile {
+        MetalMathProfile::SafePrecise => println!(
+            "execution_spec={}",
+            hex(&qx_commit::granite_execution_spec_with_math_functions(
+                checkpoint_interval.try_into()?,
+                GraniteMathFunctionsV1::Precise,
+            )?)
+        ),
+        MetalMathProfile::SafeFastFunctions => println!(
+            "execution_spec={}",
+            hex(&qx_commit::granite_execution_spec_with_math_functions(
+                checkpoint_interval.try_into()?,
+                GraniteMathFunctionsV1::Fast,
+            )?)
+        ),
+        MetalMathProfile::RelaxedPrecise => println!(
+            "execution_spec={}",
+            hex(&qx_commit::granite_execution_spec_with_math_profile(
+                checkpoint_interval.try_into()?,
+                GraniteMathModeV1::Relaxed,
+                GraniteMathFunctionsV1::Precise,
+            )?)
+        ),
+        MetalMathProfile::UnsafeCompilerDefault => {
+            println!("execution_spec=diagnostic-only")
+        }
+    }
     print_mode("baseline", &baseline);
     print_mode("verified", &verified);
     println!("verification_overhead_percent={overhead:.3}");

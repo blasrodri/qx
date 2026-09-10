@@ -1019,28 +1019,28 @@ kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_unroll4(
             float weight10 = float(int(packed1 & 0xfu) - 7) * selected_scale1;
             float weight11 = float(int((packed1 >> 4u) & 0xfu) - 7) * selected_scale1;
             if (active > 0) {
-                sums.x += weight00 * cached_input[input_base0]
-                    + weight01 * cached_input[input_base0 + 1u]
-                    + weight10 * cached_input[input_base1]
-                    + weight11 * cached_input[input_base1 + 1u];
+                sums.x = fma(weight00, cached_input[input_base0], sums.x);
+                sums.x = fma(weight01, cached_input[input_base0 + 1u], sums.x);
+                sums.x = fma(weight10, cached_input[input_base1], sums.x);
+                sums.x = fma(weight11, cached_input[input_base1 + 1u], sums.x);
             }
             if (active > 1) {
-                sums.y += weight00 * cached_input[hidden + input_base0]
-                    + weight01 * cached_input[hidden + input_base0 + 1u]
-                    + weight10 * cached_input[hidden + input_base1]
-                    + weight11 * cached_input[hidden + input_base1 + 1u];
+                sums.y = fma(weight00, cached_input[hidden + input_base0], sums.y);
+                sums.y = fma(weight01, cached_input[hidden + input_base0 + 1u], sums.y);
+                sums.y = fma(weight10, cached_input[hidden + input_base1], sums.y);
+                sums.y = fma(weight11, cached_input[hidden + input_base1 + 1u], sums.y);
             }
             if (active > 2) {
-                sums.z += weight00 * cached_input[2u * hidden + input_base0]
-                    + weight01 * cached_input[2u * hidden + input_base0 + 1u]
-                    + weight10 * cached_input[2u * hidden + input_base1]
-                    + weight11 * cached_input[2u * hidden + input_base1 + 1u];
+                sums.z = fma(weight00, cached_input[2u * hidden + input_base0], sums.z);
+                sums.z = fma(weight01, cached_input[2u * hidden + input_base0 + 1u], sums.z);
+                sums.z = fma(weight10, cached_input[2u * hidden + input_base1], sums.z);
+                sums.z = fma(weight11, cached_input[2u * hidden + input_base1 + 1u], sums.z);
             }
             if (active > 3) {
-                sums.w += weight00 * cached_input[3u * hidden + input_base0]
-                    + weight01 * cached_input[3u * hidden + input_base0 + 1u]
-                    + weight10 * cached_input[3u * hidden + input_base1]
-                    + weight11 * cached_input[3u * hidden + input_base1 + 1u];
+                sums.w = fma(weight00, cached_input[3u * hidden + input_base0], sums.w);
+                sums.w = fma(weight01, cached_input[3u * hidden + input_base0 + 1u], sums.w);
+                sums.w = fma(weight10, cached_input[3u * hidden + input_base1], sums.w);
+                sums.w = fma(weight11, cached_input[3u * hidden + input_base1 + 1u], sums.w);
             }
         }
     }
@@ -1274,10 +1274,14 @@ kernel void qx_verifier_q4_moe_down_compact_unique_packet_k4_unroll4(
             float weight11 = float(int((packed1 >> 4u) & 0xfu) - 7) * selected_scale1;
             for (uint token_slot = 0; token_slot < active; ++token_slot) {
                 uint token_base = token_slot * intermediate;
-                sums[token_slot] += weight00 * cached_activated[token_base + input_base0]
-                    + weight01 * cached_activated[token_base + input_base0 + 1u]
-                    + weight10 * cached_activated[token_base + input_base1]
-                    + weight11 * cached_activated[token_base + input_base1 + 1u];
+                sums[token_slot] = fma(
+                    weight00, cached_activated[token_base + input_base0], sums[token_slot]);
+                sums[token_slot] = fma(
+                    weight01, cached_activated[token_base + input_base0 + 1u], sums[token_slot]);
+                sums[token_slot] = fma(
+                    weight10, cached_activated[token_base + input_base1], sums[token_slot]);
+                sums[token_slot] = fma(
+                    weight11, cached_activated[token_base + input_base1 + 1u], sums[token_slot]);
             }
         }
     }
@@ -1305,7 +1309,7 @@ kernel void qx_verifier_q4_moe_accumulate_batch(
     float value = 0.0f;
     for (uint pair = 0; pair < pair_count; ++pair) {
         if (route_tokens[pair] == token) {
-            value += route_weights[pair] * expert_output[pair * hidden + row];
+            value = fma(route_weights[pair], expert_output[pair * hidden + row], value);
         }
     }
     output[token * hidden + row] = value;

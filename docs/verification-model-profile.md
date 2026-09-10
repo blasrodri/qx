@@ -166,3 +166,9 @@ that precise profile is 2.904%. Precise committed execution is currently
 again even though commitment work itself is below 3%. The execution-spec
 digest binds the hash design, reduction tree, math mode, and checkpoint
 interval. See `docs/verification-benchmarks.md` for exact measurements.
+
+A distinct relaxed-arithmetic/precise-functions candidate now measures 3.734%
+total overhead using the means of two independent 31-repeat candidate runs and
+two bracketing fast controls. It is repeatable on this M5 Pro but remains
+non-slashable until cross-device parity, compiler/metallib pinning, and complete
+terminal operation coverage are demonstrated.

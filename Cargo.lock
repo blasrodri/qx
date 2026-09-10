@@ -2420,6 +2420,7 @@ dependencies = [
  "anyhow",
  "clap",
  "qx-commit",
+ "qx-metal",
  "qx-runtime-v2",
 ]
 
