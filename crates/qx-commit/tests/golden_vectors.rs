@@ -12,6 +12,7 @@ fn hex(value: [u8; 32]) -> String {
 #[test]
 fn protocol_v1_golden_vectors() {
     let algorithm = HashAlgorithm::Sha256V1;
+    let trace_algorithm = HashAlgorithm::Blake3V1;
     let weight_a = WeightLeafV1 {
         tensor_id: 7,
         row: 3,
@@ -69,7 +70,7 @@ fn protocol_v1_golden_vectors() {
     let value = f32_bytes(&[3.0, 4.0, -5.0, 6.0]);
     let kv_leaf = kv_leaf_hash_v1(2, 9, &key, &value).unwrap();
     let kv_other = hash_domain(algorithm, D_KV, &[b"other-kv-leaf"]).unwrap();
-    let kv_root = MerkleTree::new(algorithm, D_KV, &[kv_leaf, kv_other])
+    let kv_root = MerkleTree::new(trace_algorithm, D_KV, &[kv_leaf, kv_other])
         .unwrap()
         .root();
     let checkpoint = CheckpointV1 {
@@ -82,11 +83,11 @@ fn protocol_v1_golden_vectors() {
     .hash()
     .unwrap();
     let checkpoint_other = hash_domain(algorithm, qx_commit::D_CHECKPOINT, &[b"other"]).unwrap();
-    let token_root = MerkleTree::new(algorithm, D_TOKEN, &[checkpoint, checkpoint_other])
+    let token_root = MerkleTree::new(trace_algorithm, D_TOKEN, &[checkpoint, checkpoint_other])
         .unwrap()
         .root();
     let job_other = hash_domain(algorithm, D_TOKEN, &[b"other-token"]).unwrap();
-    let job_root = MerkleTree::new(algorithm, D_JOB, &[token_root, job_other])
+    let job_root = MerkleTree::new(trace_algorithm, D_JOB, &[token_root, job_other])
         .unwrap()
         .root();
     let input_hash = input_hash_v1(&model_id, &[1, 2, 49_154]).unwrap();
@@ -114,7 +115,7 @@ fn protocol_v1_golden_vectors() {
         (
             "model_id",
             model_id,
-            "66fd72adbd450d3bce40175621a45b915e3b0f922ca393f32264605fb35b56a1",
+            "9cc6a4729f516c340998cff7a3e2964f5f218c87d541a815507ac30a7cc74fb7",
         ),
         (
             "weight_leaf",
@@ -134,27 +135,27 @@ fn protocol_v1_golden_vectors() {
         (
             "kv_root",
             kv_root,
-            "c48fe05432bcdd0dba35c2adec3f7be97aa3459ee856aed3ea05edcedbf29982",
+            "ac3cb8d1ef765a4b2e71c4adc61921ab2105650d8a3685e445df7c27afbd3c6c",
         ),
         (
             "checkpoint",
             checkpoint,
-            "f67a9d34fd9de5eeb4f4d777d815e1c7fc6432c0694a619566a9caac9590a4c7",
+            "73eabcfc5497772b03f0473ae0054c66a93b5b83b877ba3e5f5640dfa8b1a826",
         ),
         (
             "token_root",
             token_root,
-            "effe355973ec1771030b73fa306a8650d4672f1f718477b169f23d3a52915eaa",
+            "a4fe82012dbe3226056e3292f4c8aaa86ca00056f3200b329f3a4a8fb39f1203",
         ),
         (
             "job_root",
             job_root,
-            "cc583130bd1db297747a8586e7efe4bd70a023abdae4c89b5aa02f90b9154887",
+            "78d575364160174375cb6fdd99f9f01e494de2075cd0bf2e42f1e18370a1d615",
         ),
         (
             "input_hash",
             input_hash,
-            "7e3b7685134054c9ea2c0c16d693a794e6f578a8edd5830c1969d1dd0aadc595",
+            "c04599cacc0338a35a8a3a8c4b3f3874a51867f4c6bda0693ce612e2c17e9869",
         ),
         (
             "output_hash",
@@ -164,14 +165,20 @@ fn protocol_v1_golden_vectors() {
         (
             "receipt_hash",
             receipt,
-            "acb4d297e54e2c23ac9012e1a660bae134487741dbc8fae2992b849f3c0af22f",
+            "c67ff92ec8d7051cd068ea24869d8ab7028d2b853bca4d4a7166dee5682e38aa",
         ),
         (
             "batch_root",
             batch_root,
-            "ed7e44f0cfa6e19dda5fc47dc0ae494d0d8a8a3899f8f8bb298bdcf87a85505f",
+            "5959886605f9f2eeea0d9ce91123ad97149a52ec436e77bfbcc2a0f47935b362",
         ),
     ];
+    if std::env::var_os("QX_PRINT_GOLDEN").is_some() {
+        for (name, digest, _) in vectors {
+            println!("{name}={}", hex(digest));
+        }
+        return;
+    }
     for (name, digest, expected) in vectors {
         assert_eq!(hex(digest), expected, "{name}");
     }

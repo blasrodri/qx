@@ -1,6 +1,6 @@
 use crate::{
-    CommitError, D_CHECKPOINT, D_JOB, D_KV, D_TOKEN, Digest, FixedMerkleAccumulator, HashAlgorithm,
-    MerkleTree, MutableMerkleTree, ProtocolVersion, hash_domain, kv_leaf_hash_v1, state_hash_v1,
+    CommitError, D_CHECKPOINT, D_JOB, D_KV, D_TOKEN, Digest, FixedMerkleAccumulator, MerkleTree,
+    MutableMerkleTree, TRACE_HASH_ALGORITHM, hash_domain, kv_leaf_hash_v1, state_hash_v1,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,7 +28,7 @@ impl CheckpointV1 {
 
     pub fn hash(&self) -> Result<Digest, CommitError> {
         hash_domain(
-            ProtocolVersion::V1.hash_algorithm(),
+            TRACE_HASH_ALGORITHM,
             D_CHECKPOINT,
             &[&self.canonical_bytes()],
         )
@@ -61,6 +61,7 @@ pub struct ExecutionTraceV1 {
 pub struct ExecutionCommitterV1 {
     job_id: Digest,
     layers: usize,
+    checkpoint_interval: usize,
     expected_layer: usize,
     expected_token: u32,
     max_context: usize,
@@ -73,6 +74,15 @@ pub struct ExecutionCommitterV1 {
 
 impl ExecutionCommitterV1 {
     pub fn new(job_id: Digest, layers: usize, max_context: usize) -> Result<Self, CommitError> {
+        Self::new_with_checkpoint_interval(job_id, layers, max_context, 1)
+    }
+
+    pub fn new_with_checkpoint_interval(
+        job_id: Digest,
+        layers: usize,
+        max_context: usize,
+        checkpoint_interval: usize,
+    ) -> Result<Self, CommitError> {
         if layers == 0 || layers > u16::MAX as usize {
             return Err(CommitError::InvalidShape(format!(
                 "layer count {layers} is unsupported"
@@ -83,23 +93,29 @@ impl ExecutionCommitterV1 {
                 "context {max_context} is unsupported"
             )));
         }
+        if checkpoint_interval == 0 || !layers.is_multiple_of(checkpoint_interval) {
+            return Err(CommitError::InvalidShape(format!(
+                "checkpoint interval {checkpoint_interval} must divide {layers} layers"
+            )));
+        }
         let context_capacity = max_context
             .checked_next_power_of_two()
             .ok_or(CommitError::ArithmeticOverflow)?;
         let context_depth = context_capacity.trailing_zeros() as usize;
         let kv_trees = (0..layers)
-            .map(|_| FixedMerkleAccumulator::new(HashAlgorithm::Sha256V1, D_KV, context_depth))
+            .map(|_| FixedMerkleAccumulator::new(TRACE_HASH_ALGORITHM, D_KV, context_depth))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             job_id,
             layers,
+            checkpoint_interval,
             expected_layer: 0,
             expected_token: 0,
             max_context,
             kv_trees,
-            global_kv: MutableMerkleTree::new(HashAlgorithm::Sha256V1, D_KV, layers)?,
+            global_kv: MutableMerkleTree::new(TRACE_HASH_ALGORITHM, D_KV, layers)?,
             token_checkpoints: Vec::with_capacity(layers),
-            job_tree: FixedMerkleAccumulator::new(HashAlgorithm::Sha256V1, D_JOB, context_depth)?,
+            job_tree: FixedMerkleAccumulator::new(TRACE_HASH_ALGORITHM, D_JOB, context_depth)?,
             metrics: CommitmentMetrics::default(),
         })
     }
@@ -111,7 +127,7 @@ impl ExecutionCommitterV1 {
         residual: &[f32],
         new_key: &[f32],
         new_value: &[f32],
-    ) -> Result<Digest, CommitError> {
+    ) -> Result<Option<Digest>, CommitError> {
         if token_index != self.expected_token || layer_index as usize != self.expected_layer {
             return Err(CommitError::InvalidExecution(format!(
                 "expected token {} layer {}, received token {token_index} layer {layer_index}",
@@ -132,10 +148,11 @@ impl ExecutionCommitterV1 {
         let value_bytes = canonical_f32(new_value)?;
         let residual_hash = state_hash_v1(&residual_bytes)?;
         let kv_leaf = kv_leaf_hash_v1(layer_index, token_index, &key_bytes, &value_bytes)?;
-        let canonical_bytes = residual_bytes
+        let checkpoint = self.is_checkpoint_layer(layer_index as usize);
+        let canonical_bytes = key_bytes
             .len()
-            .checked_add(key_bytes.len())
-            .and_then(|value| value.checked_add(value_bytes.len()))
+            .checked_add(value_bytes.len())
+            .and_then(|value| value.checked_add(if checkpoint { residual_bytes.len() } else { 0 }))
             .ok_or(CommitError::ArithmeticOverflow)?;
         self.commit_layer_hashes(
             token_index,
@@ -156,7 +173,7 @@ impl ExecutionCommitterV1 {
         residual_hash: Digest,
         kv_leaf: Digest,
         canonical_bytes: usize,
-    ) -> Result<Digest, CommitError> {
+    ) -> Result<Option<Digest>, CommitError> {
         if token_index != self.expected_token || layer_index as usize != self.expected_layer {
             return Err(CommitError::InvalidExecution(format!(
                 "expected token {} layer {}, received token {token_index} layer {layer_index}",
@@ -170,15 +187,20 @@ impl ExecutionCommitterV1 {
         kv_tree.append(kv_leaf)?;
         self.global_kv
             .update(layer_index as usize, kv_tree.root()?)?;
-        let checkpoint = CheckpointV1 {
-            job_id: self.job_id,
-            token_index,
-            layer_index,
-            residual_hash,
-            global_kv_root: self.global_kv.root(),
-        }
-        .hash()?;
-        self.token_checkpoints.push(checkpoint);
+        let checkpoint = if self.is_checkpoint_layer(layer_index as usize) {
+            let checkpoint = CheckpointV1 {
+                job_id: self.job_id,
+                token_index,
+                layer_index,
+                residual_hash,
+                global_kv_root: self.global_kv.root(),
+            }
+            .hash()?;
+            self.token_checkpoints.push(checkpoint);
+            Some(checkpoint)
+        } else {
+            None
+        };
         self.metrics.canonical_state_bytes = self
             .metrics
             .canonical_state_bytes
@@ -186,16 +208,18 @@ impl ExecutionCommitterV1 {
                 u64::try_from(canonical_bytes).map_err(|_| CommitError::ArithmeticOverflow)?,
             )
             .ok_or(CommitError::ArithmeticOverflow)?;
-        self.metrics.checkpoint_count = self
-            .metrics
-            .checkpoint_count
-            .checked_add(1)
-            .ok_or(CommitError::ArithmeticOverflow)?;
+        if checkpoint.is_some() {
+            self.metrics.checkpoint_count = self
+                .metrics
+                .checkpoint_count
+                .checked_add(1)
+                .ok_or(CommitError::ArithmeticOverflow)?;
+        }
 
         self.expected_layer += 1;
         if self.expected_layer == self.layers {
             let token_tree =
-                MerkleTree::new(HashAlgorithm::Sha256V1, D_TOKEN, &self.token_checkpoints)?;
+                MerkleTree::new(TRACE_HASH_ALGORITHM, D_TOKEN, &self.token_checkpoints)?;
             self.job_tree.append(token_tree.root())?;
             self.token_checkpoints.clear();
             self.expected_layer = 0;
@@ -206,6 +230,10 @@ impl ExecutionCommitterV1 {
             self.metrics.executed_tokens = self.expected_token;
         }
         Ok(checkpoint)
+    }
+
+    fn is_checkpoint_layer(&self, layer_index: usize) -> bool {
+        (layer_index + 1).is_multiple_of(self.checkpoint_interval) || layer_index + 1 == self.layers
     }
 
     pub fn finish(&self) -> Result<ExecutionTraceV1, CommitError> {
@@ -269,5 +297,24 @@ mod tests {
         assert_eq!(run(false), run(false));
         assert_ne!(run(false).trace_root, run(true).trace_root);
         assert_eq!(run(false).metrics.canonical_state_bytes, 192);
+    }
+
+    #[test]
+    fn coarser_checkpoints_keep_every_kv_leaf_and_reduce_residual_hashing() {
+        let mut state =
+            ExecutionCommitterV1::new_with_checkpoint_interval([4; 32], 4, 8, 2).unwrap();
+        for layer in 0..4 {
+            state
+                .commit_layer(0, layer, &[layer as f32; 4], &[1.0, 2.0], &[3.0, 4.0])
+                .unwrap();
+        }
+        let trace = state.finish().unwrap();
+        assert_eq!(trace.metrics.checkpoint_count, 2);
+        // Four 16-byte K/V pairs plus two 16-byte residuals.
+        assert_eq!(trace.metrics.canonical_state_bytes, 96);
+        assert_ne!(
+            crate::granite_execution_spec().unwrap(),
+            crate::granite_execution_spec_with_checkpoint_interval(2).unwrap()
+        );
     }
 }

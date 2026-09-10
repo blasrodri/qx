@@ -131,6 +131,19 @@ pub fn granite_architecture_root() -> Result<Digest, CommitError> {
 
 /// Digest of the pinned CPU-oracle semantics used by Phase 3.
 pub fn granite_execution_spec() -> Result<Digest, CommitError> {
+    granite_execution_spec_with_checkpoint_interval(1)
+}
+
+/// V1 defines every-layer checkpoints implicitly. Supported coarser profiles
+/// append their interval so each receives a distinct execution-spec digest.
+pub fn granite_execution_spec_with_checkpoint_interval(
+    checkpoint_interval: u8,
+) -> Result<Digest, CommitError> {
+    if !matches!(checkpoint_interval, 1 | 2 | 4) {
+        return Err(CommitError::InvalidShape(
+            "Granite checkpoint interval must be 1, 2, or 4".to_owned(),
+        ));
+    }
     let mut bytes = Vec::with_capacity(64);
     bytes.extend_from_slice(b"QX_EXEC_GRANITE_CPU_V1");
     bytes.push(1); // activation FP32
@@ -148,6 +161,11 @@ pub fn granite_execution_spec() -> Result<Digest, CommitError> {
     bytes.push(HashAlgorithm::Blake3V1 as u8); // residual and new-K/V leaf hash
     bytes.extend_from_slice(&256_u16.to_le_bytes()); // state hash chunk bytes
     bytes.push(1); // raw BLAKE3(left || right) state-tree parent
+    bytes.push(HashAlgorithm::Blake3V1 as u8); // hot KV/checkpoint/token/job trees
+    if checkpoint_interval != 1 {
+        bytes.extend_from_slice(b"CHECKPOINT_INTERVAL");
+        bytes.push(checkpoint_interval);
+    }
     hash_domain(HashAlgorithm::Sha256V1, D_EXECUTION_SPEC, &[&bytes])
 }
 

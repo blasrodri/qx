@@ -37,6 +37,15 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         checkpoint_interval: usize,
     },
+    /// Size epoch audits and show the probability that cheating is sampled.
+    SamplingCost {
+        #[arg(long, default_value_t = 10_000)]
+        receipts: u32,
+        #[arg(long, default_value_t = 100)]
+        cheated: u32,
+        #[arg(long, value_delimiter = ',', default_value = "10,25,50,100,250,500")]
+        audits: Vec<u32>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -62,6 +71,43 @@ fn main() -> Result<()> {
             repeats,
             checkpoint_interval,
         )?,
+        Command::SamplingCost {
+            receipts,
+            cheated,
+            audits,
+        } => sampling_cost(receipts, cheated, &audits)?,
+    }
+    Ok(())
+}
+
+fn sampling_cost(receipts: u32, cheated: u32, audits: &[u32]) -> Result<()> {
+    use anyhow::bail;
+
+    if receipts == 0 || cheated == 0 || cheated > receipts {
+        bail!("require 0 < cheated <= receipts");
+    }
+    println!("epoch_receipts={receipts}");
+    println!("cheated_receipts={cheated}");
+    println!(
+        "cheated_fraction_percent={:.6}",
+        f64::from(cheated) * 100.0 / f64::from(receipts)
+    );
+    for &audit_count in audits {
+        let probability = qx_commit::audit_detection_probability(receipts, cheated, audit_count)?;
+        println!(
+            "audits={audit_count} audit_fraction_percent={:.4} detection_percent={:.6} two_seed_grind_detection_percent={:.6}",
+            f64::from(audit_count) * 100.0 / f64::from(receipts),
+            probability * 100.0,
+            probability.powi(2) * 100.0,
+        );
+    }
+    for target in [0.9, 0.99, 0.999] {
+        let required = qx_commit::required_audit_count(receipts, cheated, target)?;
+        println!(
+            "target_detection_percent={:.1} required_audits={required} required_fraction_percent={:.4}",
+            target * 100.0,
+            f64::from(required) * 100.0 / f64::from(receipts),
+        );
     }
     Ok(())
 }
@@ -250,9 +296,14 @@ fn run_sample(
         .begin_metrics_interval()
         .map_err(anyhow::Error::msg)?;
     let before = qx_metal_metrics::snapshot(generator).map_err(anyhow::Error::msg)?;
-    let mut committer = (verified && checkpoint_interval == 1)
+    let mut committer = verified
         .then(|| {
-            qx_commit::ExecutionCommitterV1::new([job_tag; 32], 24, generator.context_length())
+            qx_commit::ExecutionCommitterV1::new_with_checkpoint_interval(
+                [job_tag; 32],
+                24,
+                generator.context_length(),
+                checkpoint_interval,
+            )
         })
         .transpose()?;
     let total_start = Instant::now();

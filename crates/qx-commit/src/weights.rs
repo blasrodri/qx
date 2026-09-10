@@ -61,6 +61,22 @@ impl WeightProofV1 {
             self.commitment.root,
         )
     }
+
+    /// Compact terminal-witness encoding size when the registered model
+    /// supplies the commitment root and leaf count. The proof transmits only
+    /// the logical leaf coordinates/payload, Merkle position, and siblings.
+    pub fn compact_encoded_len(&self) -> Result<usize, CommitError> {
+        4_usize
+            .checked_add(4)
+            .and_then(|value| value.checked_add(4))
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| value.checked_add(2))
+            .and_then(|value| value.checked_add(self.leaf.packed_values.len()))
+            .and_then(|value| value.checked_add(2))
+            .and_then(|value| value.checked_add(4))
+            .and_then(|value| value.checked_add(self.proof.siblings.len() * 32))
+            .ok_or(CommitError::ArithmeticOverflow)
+    }
 }
 
 #[derive(Clone, Copy)]

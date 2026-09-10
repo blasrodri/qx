@@ -1,5 +1,10 @@
 # QX verification benchmark report
 
+For epoch sampling economics and the terminal Solana fraud-proof benchmark,
+see `docs/verification-protocol.md`. The current executed SBF costs are 7,108
+CU for a production-depth weight opening and 1,877 CU for an activation opening
+plus one exact Q4 FP32 FMA (8,985 CU total over two transportable instructions).
+
 - Date: 2026-09-10
 - Machine/runtime: local Apple Metal device, release build
 - Artifact: `granite-m5-pro-q4-rowinline-k4-vector-unroll4-down-short-context-active.qx`
@@ -9,33 +14,39 @@ Workload: 8 prompt tokens, 8 returned tokens, 15 executed tokens
 
 All reported comparisons alternate baseline and verified execution on the same
 loaded generator. Outputs are required to match. Timings are medians after four
-warmups. The final every-layer and frequency runs use seven or nine repeats.
+or more warmups. The final selected-profile runs use 31 alternating repeats.
 
 ## Final implementation
 
-The verified graph writes each 4 KiB post-layer residual into a 96 KiB
+The verified graph writes selected 4 KiB post-layer residuals into a 96 KiB
 transient snapshot arena as part of the existing residual/RMS kernel. K/V stay
-in the existing GPU cache. One token-end Metal dispatch hashes all 24 layers
-concurrently into 1,536 bytes. The CPU reads those digests only after the
-existing token wait and incrementally maintains the KV, checkpoint, token, and
-job Merkle frontiers.
+in the existing GPU cache. One token-end Metal dispatch hashes all 24 layers'
+new K/V and the selected residuals concurrently into 1,536 bytes. The CPU reads
+those digests only after the existing token wait and incrementally maintains
+the KV, checkpoint, token, and job Merkle frontiers.
 
 BLAKE3 state, key, and value leaves are 256-byte indexed chunks with separate
 domains. State-tree parents use `BLAKE3(left || right)`; their typed leaf
-domains prevent cross-tree ambiguity. The execution-spec digest binds these
-choices. Metal and the CPU oracle match byte-for-byte, and normal inference
-output is unchanged. Small receipt, weight, and outer trace commitments remain
-SHA-256.
+domains prevent cross-tree ambiguity. Hot CPU-side KV, checkpoint, token, and
+job trees also use domain-framed BLAKE3; immutable model, weight, and receipt
+objects remain SHA-256. The execution-spec digest binds these choices and the
+checkpoint interval. Metal and the CPU oracle match byte-for-byte, and normal
+inference output is unchanged.
 
 ## Selected configuration
 
 | Checkpoint interval | Baseline total | Verified total | Overhead | Baseline tok/s | Verified tok/s | Status |
 |---:|---:|---:|---:|---:|---:|:---|
-| 1 layer, BLAKE3 | 63.291 ms | 66.056 ms | **4.368%** | 236.999 | 227.079 | pass |
+| 1 layer | 97.631 ms | 100.994 ms | 3.445% | 235.582 | 227.737 | pass |
+| **2 layers (selected)** | **99.723 ms** | **102.917 ms** | **3.203%** | **230.639** | **223.481** | **pass** |
+| 4 layers | 98.208 ms | 101.844 ms | 3.703% | 234.198 | 225.836 | pass |
 
-This run used six warmups and eleven alternating repeats. It produced the
-deterministic trace root
-`b522fca64f2ab1c524e5af4daee5382c55a1644bdf93b3a22582b48aa16eb9bc`.
+These final runs used eight warmups, 31 alternating repeats, 8 prompt tokens,
+and 16 returned tokens. The selected profile commits residuals after layers
+1, 3, ..., 23 while retaining every layer's append-only K/V commitment. It
+therefore widens initial dispute replay from one layer to two without sampling
+or omitting any K/V history. Its deterministic trace root was
+`63caefd734814b80e90ebfc78888a61a89c16141853b8c8777850e0e4d382dcb`.
 
 ## SHA-256 frequency experiment
 
@@ -68,7 +79,9 @@ Profiling deliberately retained failed intermediate measurements:
 | Batched 24-layer hash with separate copy dispatches | 10.535% |
 | Batched SHA-256 with residual snapshot fused into existing kernel | 9.582% |
 | BLAKE3 leaves, domain-framed state-tree parents | 5.065% |
-| BLAKE3 leaves, single-block typed-tree parents | **4.368%** |
+| BLAKE3 leaves, single-block typed-tree parents | 4.368% |
+| BLAKE3 hot CPU trace trees, every-layer checkpoints | 3.445% |
+| BLAKE3 hot trees, two-layer checkpoints | **3.203%** |
 
 Batching and the narrowly scoped snapshot fusion removed 23 extra dispatches
 per layer sequence and reduced the original overhead by more than two orders
@@ -76,15 +89,16 @@ of magnitude. The frequency sweep is almost flat at intervals 2 and 4, showing
 that incremental K/V SHA-256 is now the limiting work rather than checkpoint
 frequency, CPU work, synchronization, or residual copies.
 
-The required `<5%` gate is **achieved**. Solana exposes `sol_blake3`, so terminal
-state and Merkle witnesses can be recomputed on-chain without a software hash
-implementation. Cluster feature activation and actual terminal-witness compute
-units still need to be verified in the Solana-program phase.
+The required `<5%` gate is **achieved**. The `<=3%` desired target is not yet
+achieved; the best robust run is 3.203%, and the four-layer profile did not
+improve it. Solana exposes `sol_blake3`, and the actual terminal program is now
+measured at 8,985 CU across two transportable instructions; see the protocol
+document for the proof and account sizes.
 
 Reproduction command:
 
 ```text
 cargo run --release -q -p qx-verify -- metal-benchmark \
   external/models/granite-m5-pro-q4-rowinline-k4-vector-unroll4-down-short-context-active.qx \
-  --context 512 --new-tokens 8 --warmup 4 --repeats 9 --checkpoint-interval 1
+  --context 512 --new-tokens 16 --warmup 8 --repeats 31 --checkpoint-interval 2
 ```

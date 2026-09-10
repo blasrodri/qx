@@ -1885,7 +1885,7 @@ impl PreparedAttentionStack {
         start_layer: usize,
         end_layer: usize,
         resolved_plan: Option<&ResolvedExecutionPlan>,
-        commitment_residuals: Option<&qx_metal::platform::RuntimeBuffer>,
+        commitment_residuals: Option<(&qx_metal::platform::RuntimeBuffer, usize)>,
     ) -> Result<(), String> {
         if start_layer > end_layer || end_layer > LAYERS {
             return Err(format!(
@@ -2019,7 +2019,10 @@ impl PreparedAttentionStack {
                     moe_consumer_plan,
                 )?;
             }
-            if let Some(commitment_residuals) = commitment_residuals {
+            let checkpoint = commitment_residuals.is_some_and(|(_, interval)| {
+                (layer + 1).is_multiple_of(interval) || layer + 1 == LAYERS
+            });
+            if let Some((commitment_residuals, _)) = commitment_residuals.filter(|_| checkpoint) {
                 let snapshot = commitment_residuals.subregion(
                     layer * HIDDEN * std::mem::size_of::<f32>(),
                     HIDDEN * std::mem::size_of::<f32>(),
@@ -2167,7 +2170,7 @@ impl PreparedAttentionStack {
                 start,
                 end,
                 resolved_plan,
-                commitment_buffers.map(|(residuals, _, _)| residuals),
+                commitment_buffers.map(|(residuals, _, interval)| (residuals, interval)),
             )?;
             if segment + 1 < command_buffers {
                 graph.begin_next_command_buffer(context)?;
@@ -2753,9 +2756,6 @@ impl GraniteV2Generator {
         token: u32,
         committer: &mut qx_commit::ExecutionCommitterV1,
     ) -> Result<u32, String> {
-        if self.verification_checkpoint_interval != 1 {
-            return Err("trace construction currently requires every-layer checkpoints".to_owned());
-        }
         self.set_verification_enabled(true)?;
         let token_index = self.position;
         let predicted = self.step(token)?;
@@ -2775,9 +2775,16 @@ impl GraniteV2Generator {
             let kv_hash: [u8; 32] = bytes[offset + 32..offset + 64]
                 .try_into()
                 .map_err(|_| "invalid KV digest width".to_owned())?;
-            let canonical_bytes = HIDDEN * std::mem::size_of::<f32>()
-                + KV_HEADS * HEAD_DIM * self.buffers.plan.kv_key_element_bytes[layer]
-                + KV_HEADS * HEAD_DIM * self.buffers.plan.kv_value_element_bytes[layer];
+            let checkpoint = (layer + 1).is_multiple_of(self.verification_checkpoint_interval)
+                || layer + 1 == LAYERS;
+            let canonical_bytes =
+                KV_HEADS * HEAD_DIM * self.buffers.plan.kv_key_element_bytes[layer]
+                    + KV_HEADS * HEAD_DIM * self.buffers.plan.kv_value_element_bytes[layer]
+                    + if checkpoint {
+                        HIDDEN * std::mem::size_of::<f32>()
+                    } else {
+                        0
+                    };
             committer
                 .commit_layer_hashes(
                     u32::try_from(token_index)

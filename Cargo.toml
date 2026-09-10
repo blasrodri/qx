@@ -7,6 +7,8 @@ members = [
     "crates/qx-runtime",
     "crates/qx-runtime-v2",
     "crates/qx-commit",
+    "crates/qx-verifier-core",
+    "programs/qx-terminal-verifier",
     "crates/qx-format",
     "crates/qx-safetensors",
     "crates/qx-tokenizer",
