@@ -9,4 +9,5 @@ qx-metal.workspace = true
 qx-model.workspace = true
 qx-safetensors.workspace = true
 qx-quant.workspace = true
+qx-commit = { path = "../qx-commit" }
 qx-format.workspace = true

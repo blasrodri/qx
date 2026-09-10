@@ -27,6 +27,34 @@ kernel void qx_residual_rms_scalar(
     }
 }
 
+kernel void qx_residual_rms_scalar_snapshot(
+    device const float* left [[buffer(0)]],
+    device const float* right [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    device float* inverse_rms [[buffer(3)]],
+    constant float& scale [[buffer(4)]],
+    device float* snapshot [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float partials[8];
+    float square_sum = 0.0f;
+    for (uint i = tid; i < 1024u; i += 256u) {
+        float value = left[i] + scale * right[i];
+        output[i] = value;
+        snapshot[i] = value;
+        square_sum += value * value;
+    }
+    square_sum = simd_sum(square_sum);
+    if (lane == 0u) partials[simdgroup] = square_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0u) {
+        float total = lane < 8u ? partials[lane] : 0.0f;
+        total = simd_sum(total);
+        if (lane == 0u) inverse_rms[0] = rsqrt(total / 1024.0f + 1.0e-5f);
+    }
+}
+
 kernel void qx_attention_softmax_onepass_simd(
     device float* scores [[buffer(0)]],
     constant uint& length [[buffer(1)]],

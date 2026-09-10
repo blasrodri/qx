@@ -1,6 +1,6 @@
 use crate::{
-    CommitError, D_CHECKPOINT, D_JOB, D_KV, D_STATE, D_TOKEN, Digest, FixedMerkleAccumulator,
-    HashAlgorithm, MerkleTree, MutableMerkleTree, ProtocolVersion, hash_domain,
+    CommitError, D_CHECKPOINT, D_JOB, D_KV, D_TOKEN, Digest, FixedMerkleAccumulator, HashAlgorithm,
+    MerkleTree, MutableMerkleTree, ProtocolVersion, hash_domain, kv_leaf_hash_v1, state_hash_v1,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,17 +130,42 @@ impl ExecutionCommitterV1 {
         let residual_bytes = canonical_f32(residual)?;
         let key_bytes = canonical_f32(new_key)?;
         let value_bytes = canonical_f32(new_value)?;
-        let residual_hash = hash_domain(HashAlgorithm::Sha256V1, D_STATE, &[&residual_bytes])?;
-        let kv_leaf = hash_domain(
-            HashAlgorithm::Sha256V1,
-            D_KV,
-            &[
-                &layer_index.to_le_bytes(),
-                &token_index.to_le_bytes(),
-                &key_bytes,
-                &value_bytes,
-            ],
-        )?;
+        let residual_hash = state_hash_v1(&residual_bytes)?;
+        let kv_leaf = kv_leaf_hash_v1(layer_index, token_index, &key_bytes, &value_bytes)?;
+        let canonical_bytes = residual_bytes
+            .len()
+            .checked_add(key_bytes.len())
+            .and_then(|value| value.checked_add(value_bytes.len()))
+            .ok_or(CommitError::ArithmeticOverflow)?;
+        self.commit_layer_hashes(
+            token_index,
+            layer_index,
+            residual_hash,
+            kv_leaf,
+            canonical_bytes,
+        )
+    }
+
+    /// Consume state/KV digests produced by a compatible accelerator. The
+    /// caller supplies the number of canonical tensor bytes covered so
+    /// receipts retain auditable accounting without retaining those tensors.
+    pub fn commit_layer_hashes(
+        &mut self,
+        token_index: u32,
+        layer_index: u16,
+        residual_hash: Digest,
+        kv_leaf: Digest,
+        canonical_bytes: usize,
+    ) -> Result<Digest, CommitError> {
+        if token_index != self.expected_token || layer_index as usize != self.expected_layer {
+            return Err(CommitError::InvalidExecution(format!(
+                "expected token {} layer {}, received token {token_index} layer {layer_index}",
+                self.expected_token, self.expected_layer
+            )));
+        }
+        if token_index as usize >= self.max_context {
+            return Err(CommitError::TreeCapacityExceeded);
+        }
         let kv_tree = &mut self.kv_trees[layer_index as usize];
         kv_tree.append(kv_leaf)?;
         self.global_kv
@@ -157,7 +182,9 @@ impl ExecutionCommitterV1 {
         self.metrics.canonical_state_bytes = self
             .metrics
             .canonical_state_bytes
-            .checked_add((residual_bytes.len() + key_bytes.len() + value_bytes.len()) as u64)
+            .checked_add(
+                u64::try_from(canonical_bytes).map_err(|_| CommitError::ArithmeticOverflow)?,
+            )
             .ok_or(CommitError::ArithmeticOverflow)?;
         self.metrics.checkpoint_count = self
             .metrics

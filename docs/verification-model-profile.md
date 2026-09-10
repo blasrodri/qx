@@ -132,6 +132,11 @@ commits:
 This is 8,192 canonical bytes per layer and **196,608 canonical activation/KV
 bytes per executed token** (`24 × (1024 + 512 + 512) × 4`). Only digests and
 Merkle frontiers remain after a token; no activation tensor is retained.
+The accelerator-facing encoding divides each canonical tensor into 256-byte
+leaves, binds each leaf's index, and reduces it under separate residual, key,
+and value tree domains. The CPU oracle and Metal implementation produce
+identical commitments and the structure permits independent chunk proofs
+during replay.
 Generation executes and commits `input_token_count + output_token_count - 1`
 tokens in the usual non-EOS case because the final output is the prediction of
 the preceding step.
@@ -139,22 +144,17 @@ the preceding step.
 `InferenceReceiptV1` is 210 canonical bytes. Adding an Ed25519 signature makes
 the signed receipt exactly **274 bytes**, below the 512-byte target.
 
-## Known CPU/Metal compatibility gap
+## CPU/Metal compatibility and Phase-4 gate
 
-The CPU commitment format is deterministic and covered by golden vectors, but
-full CPU/Metal execution-root equality is not yet established:
+The current sealed M5 V2 artifact stores both K and V as FP32. Metal now hashes
+the exact GPU-resident bytes and matches the CPU SHA-256 oracle in a golden
+parity test. Post-layer residual snapshots use 98,304 transient bytes per
+runtime instance and are written by the existing final residual kernel; the
+snapshots are overwritten each token and are never receipt or permanent trace
+storage. A single token-end hash dispatch processes all 24 layers and returns
+only 1,536 digest bytes after the runtime's existing token synchronization.
 
-- V1 stores both K and V as FP32; the current sealed M5 V2 profile stores K as
-  FP32 and V as FP16.
-- V1's artifact MoE boundary converts its FP32 input/output through FP16,
-  while other V1 dense operations retain FP32 host state.
-- V2 keeps layer residuals and KV state GPU-resident and currently exposes no
-  commitment kernel or compact per-layer digest output.
-- Accelerate/CPU reductions and Metal reductions are not promised to be
-  bit-identical merely because their mathematical expressions agree.
-
-Therefore `QX_EXEC_GRANITE_CPU_V1` is a CPU oracle profile, not a claim that the
-current V2 Metal graph already has the same trace root. Phase 4 must define and
-measure a sealed Metal profile, add GPU hashing without activation readback,
-and demonstrate CPU hashing of the same canonical GPU bytes matches the Metal
-digest before any on-chain dispute implementation is considered valid.
+This closes the byte-level compatibility gap, but the measured every-layer
+overhead is 9.58%, above the 5% hard performance ceiling. See
+`docs/verification-benchmarks.md` for the exact commands, frequency sweep, and
+profiling conclusion. The Phase-4 performance gate remains failed.

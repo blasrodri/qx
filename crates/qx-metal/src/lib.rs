@@ -20,6 +20,8 @@ pub const DYNAMIC_MOE_KERNEL_SOURCE: &str = include_str!("../../../kernels/dynam
 pub const Q4_EMBEDDING_KERNEL_SOURCE: &str = include_str!("../../../kernels/q4_embedding.metal");
 pub const QWEN_ATTENTION_KERNEL_SOURCE: &str =
     include_str!("../../../kernels/qwen_attention.metal");
+pub const VERIFICATION_HASH_KERNEL_SOURCE: &str =
+    include_str!("../../../kernels/verification_hash.metal");
 
 pub fn kernel_source(quant_type: QuantType) -> &'static str {
     match quant_type {
@@ -1533,6 +1535,7 @@ pub mod platform {
         f16_dense_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_library: Mutex<Option<Retained<ProtocolObject<dyn MTLLibrary>>>>,
         residual_rms_pipeline: Mutex<Option<Pipeline>>,
+        residual_rms_snapshot_pipeline: Mutex<Option<Pipeline>>,
         attention_softmax_onepass_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_pipeline: Mutex<Option<Pipeline>>,
         q4_dense_simd_pipeline: Mutex<Option<Pipeline>>,
@@ -1566,6 +1569,7 @@ pub mod platform {
         argmax_partial_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_pipeline: Mutex<Option<Pipeline>>,
         argmax_reduce_partials_pipeline: Mutex<Option<Pipeline>>,
+        verification_hash_pipeline: Mutex<Option<Pipeline>>,
         v2_pipelines: Mutex<[Option<Pipeline>; 42]>,
         scratch: Mutex<MetalScratch>,
         metrics: Mutex<MetalMetricsState>,
@@ -8773,6 +8777,62 @@ pub mod platform {
             Ok(())
         }
 
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_residual_rms_scalar_snapshot(
+            &mut self,
+            context: &MetalContext,
+            left: &RuntimeBuffer,
+            right: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            inverse_rms: &RuntimeBuffer,
+            snapshot: &RuntimeBuffer,
+            scale: f32,
+        ) -> Result<(), String> {
+            if left.length < 1024 * std::mem::size_of::<f32>()
+                || right.length < 1024 * std::mem::size_of::<f32>()
+                || output.length < 1024 * std::mem::size_of::<f32>()
+                || snapshot.length < 1024 * std::mem::size_of::<f32>()
+                || inverse_rms.length < std::mem::size_of::<f32>()
+            {
+                return Err(
+                    "residual/RMS snapshot buffers are smaller than the fixed shape".to_owned(),
+                );
+            }
+            let pipeline = context.residual_rms_snapshot_pipeline()?;
+            self.encoder.setComputePipelineState(&pipeline);
+            unsafe {
+                for (buffer, offset, index) in [
+                    (&left.buffer, left.offset, 0),
+                    (&right.buffer, right.offset, 1),
+                    (&output.buffer, output.offset, 2),
+                    (&inverse_rms.buffer, inverse_rms.offset, 3),
+                    (&snapshot.buffer, snapshot.offset, 5),
+                ] {
+                    self.encoder
+                        .setBuffer_offset_atIndex(Some(buffer), offset, index);
+                }
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&scale).cast(),
+                    std::mem::size_of_val(&scale),
+                    4,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 256,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
         pub fn encode_residual_batch(
             &mut self,
             context: &MetalContext,
@@ -9043,6 +9103,128 @@ pub mod platform {
             )
         }
 
+        /// Hash post-layer residual snapshots and their newly appended K/V
+        /// slices concurrently at the end of the token command stream. Only
+        /// the two 32-byte digests per layer are written to the output.
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode_verification_hashes(
+            &mut self,
+            context: &MetalContext,
+            residual_snapshots: &RuntimeBuffer,
+            kv_arena: &RuntimeBuffer,
+            output: &RuntimeBuffer,
+            token: u32,
+            layers: usize,
+            residual_stride: usize,
+            checkpoint_interval: usize,
+            key_offsets: [u32; 24],
+            value_offsets: [u32; 24],
+            key_bytes: [u32; 24],
+            value_bytes: [u32; 24],
+        ) -> Result<(), String> {
+            #[repr(C)]
+            struct Params {
+                token: u32,
+                layers: u32,
+                residual_stride: u32,
+                checkpoint_interval: u32,
+                key_offsets: [u32; 24],
+                value_offsets: [u32; 24],
+                key_bytes: [u32; 24],
+                value_bytes: [u32; 24],
+            }
+            if layers == 0 || layers > 24 {
+                return Err(format!(
+                    "verification layer count {layers} is outside 1..=24"
+                ));
+            }
+            if checkpoint_interval == 0 || checkpoint_interval > layers {
+                return Err(format!(
+                    "verification checkpoint interval {checkpoint_interval} is outside 1..={layers}"
+                ));
+            }
+            if output.len() < layers * 64 {
+                return Err("verification digest output is too small".to_owned());
+            }
+            if residual_snapshots.len() < layers * residual_stride {
+                return Err("verification residual snapshot buffer is too small".to_owned());
+            }
+            const VERIFICATION_CHUNK_BYTES: usize = 256;
+            let validate = |name: &str, bytes: usize, max_chunks: usize| {
+                if bytes == 0 || !bytes.is_multiple_of(VERIFICATION_CHUNK_BYTES) {
+                    return Err(format!(
+                        "verification {name} size {bytes} is not a non-zero multiple of {}",
+                        VERIFICATION_CHUNK_BYTES
+                    ));
+                }
+                let chunks = bytes / VERIFICATION_CHUNK_BYTES;
+                if !chunks.is_power_of_two() || chunks > max_chunks {
+                    return Err(format!(
+                        "verification {name} chunk count {chunks} must be a power of two <= {max_chunks}"
+                    ));
+                }
+                Ok(())
+            };
+            validate("residual", residual_stride, 16)?;
+            for layer in 0..layers {
+                validate("key", key_bytes[layer] as usize, 8)?;
+                validate("value", value_bytes[layer] as usize, 8)?;
+                let key_end = key_offsets[layer] as usize + key_bytes[layer] as usize;
+                let value_end = value_offsets[layer] as usize + value_bytes[layer] as usize;
+                if key_end > kv_arena.len() || value_end > kv_arena.len() {
+                    return Err(format!(
+                        "verification layer {layer} KV slice is out of bounds"
+                    ));
+                }
+            }
+            let params = Params {
+                token,
+                layers: layers as u32,
+                residual_stride: u32::try_from(residual_stride)
+                    .map_err(|_| "verification residual stride exceeds u32".to_owned())?,
+                checkpoint_interval: checkpoint_interval as u32,
+                key_offsets,
+                value_offsets,
+                key_bytes,
+                value_bytes,
+            };
+            let pipeline = context.verification_hash_pipeline()?;
+            self.encoder.setComputePipelineState(&pipeline);
+            for (index, buffer) in [residual_snapshots, kv_arena, output]
+                .into_iter()
+                .enumerate()
+            {
+                unsafe {
+                    self.encoder.setBuffer_offset_atIndex(
+                        Some(&buffer.buffer),
+                        buffer.offset,
+                        index,
+                    );
+                }
+            }
+            unsafe {
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&params).cast(),
+                    std::mem::size_of_val(&params),
+                    3,
+                );
+            }
+            self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: layers,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 96,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.dispatches += 1;
+            Ok(())
+        }
+
         /// End and commit the current command buffer, then continue encoding
         /// on the same queue without waiting on the CPU. Metal command queues
         /// preserve submission order, so the next segment observes all writes
@@ -9226,6 +9408,7 @@ pub mod platform {
                 f16_dense_pipeline: Mutex::new(None),
                 q4_dense_library: Mutex::new(None),
                 residual_rms_pipeline: Mutex::new(None),
+                residual_rms_snapshot_pipeline: Mutex::new(None),
                 attention_softmax_onepass_pipeline: Mutex::new(None),
                 q4_dense_pipeline: Mutex::new(None),
                 q4_dense_simd_pipeline: Mutex::new(None),
@@ -9259,6 +9442,7 @@ pub mod platform {
                 argmax_partial_pipeline: Mutex::new(None),
                 argmax_reduce_pipeline: Mutex::new(None),
                 argmax_reduce_partials_pipeline: Mutex::new(None),
+                verification_hash_pipeline: Mutex::new(None),
                 v2_pipelines: Mutex::new([
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
                     None, None, None, None, None, None, None, None, None, None, None, None, None,
@@ -10169,6 +10353,27 @@ pub mod platform {
             Ok(value)
         }
 
+        fn residual_rms_snapshot_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .residual_rms_snapshot_pipeline
+                .lock()
+                .map_err(|_| "Metal residual/RMS snapshot cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let library = self.q4_dense_library()?;
+            let name = NSString::from_str("qx_residual_rms_scalar_snapshot");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal residual/RMS snapshot function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal residual/RMS snapshot pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
+            Ok(value)
+        }
+
         fn attention_softmax_onepass_pipeline(&self) -> Result<Pipeline, String> {
             let mut pipeline = self
                 .attention_softmax_onepass_pipeline
@@ -10964,6 +11169,31 @@ pub mod platform {
                 .newComputePipelineStateWithFunction_error(&function)
                 .map_err(|_| "Metal V2 decode pipeline creation failed".to_owned())?;
             pipelines[index] = Some(value.clone());
+            Ok(value)
+        }
+
+        fn verification_hash_pipeline(&self) -> Result<Pipeline, String> {
+            let mut pipeline = self
+                .verification_hash_pipeline
+                .lock()
+                .map_err(|_| "Metal verification hash pipeline cache is poisoned".to_owned())?;
+            if let Some(value) = pipeline.as_ref() {
+                return Ok(value.clone());
+            }
+            let source = NSString::from_str(crate::VERIFICATION_HASH_KERNEL_SOURCE);
+            let library = self
+                .device
+                .newLibraryWithSource_options_error(&source, None)
+                .map_err(|_| "Metal verification hash library compilation failed".to_owned())?;
+            let name = NSString::from_str("qx_verification_hash_state_kv");
+            let function = library
+                .newFunctionWithName(&name)
+                .ok_or_else(|| "Metal verification hash function was not found".to_owned())?;
+            let value = self
+                .device
+                .newComputePipelineStateWithFunction_error(&function)
+                .map_err(|_| "Metal verification hash pipeline creation failed".to_owned())?;
+            *pipeline = Some(value.clone());
             Ok(value)
         }
 
@@ -15039,6 +15269,85 @@ pub mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verification_hash_matches_cpu_golden_oracle() {
+        let context = platform::MetalContext::system_default().expect("Metal device");
+        let residual_values = (0..1024)
+            .map(|index| index as f32 * 0.125 - 64.0)
+            .collect::<Vec<_>>();
+        let key_values = (0..512)
+            .map(|index| index as f32 * -0.25 + 3.0)
+            .collect::<Vec<_>>();
+        let value_values = (0..512)
+            .map(|index| index as f32 / 17.0)
+            .collect::<Vec<_>>();
+        let bytes = |pointer: *const u8, length: usize| unsafe {
+            std::slice::from_raw_parts(pointer, length)
+        };
+        let residual_bytes = bytes(
+            residual_values.as_ptr().cast(),
+            std::mem::size_of_val(residual_values.as_slice()),
+        );
+        let key_bytes = bytes(
+            key_values.as_ptr().cast(),
+            std::mem::size_of_val(key_values.as_slice()),
+        );
+        let value_bytes = bytes(
+            value_values.as_ptr().cast(),
+            std::mem::size_of_val(value_values.as_slice()),
+        );
+        let residual = context
+            .allocate_runtime_buffer(residual_bytes.len())
+            .unwrap();
+        let kv = context
+            .allocate_runtime_buffer(key_bytes.len() + value_bytes.len())
+            .unwrap();
+        let output = context.allocate_runtime_buffer(64).unwrap();
+        context
+            .write_runtime_buffer(&residual, residual_bytes)
+            .unwrap();
+        context
+            .write_runtime_buffer(&kv.subregion(0, key_bytes.len()).unwrap(), key_bytes)
+            .unwrap();
+        context
+            .write_runtime_buffer(
+                &kv.subregion(key_bytes.len(), value_bytes.len()).unwrap(),
+                value_bytes,
+            )
+            .unwrap();
+        let mut graph = context.begin_decode().unwrap();
+        let key_offsets = [0; 24];
+        let mut value_offsets = [0; 24];
+        let mut key_widths = [0; 24];
+        let mut value_widths = [0; 24];
+        value_offsets[0] = key_bytes.len() as u32;
+        key_widths[0] = key_bytes.len() as u32;
+        value_widths[0] = value_bytes.len() as u32;
+        graph
+            .encode_verification_hashes(
+                &context,
+                &residual,
+                &kv,
+                &output,
+                11,
+                1,
+                residual_bytes.len(),
+                1,
+                key_offsets,
+                value_offsets,
+                key_widths,
+                value_widths,
+            )
+            .unwrap();
+        graph.finish(&context).unwrap();
+        let observed = context.read_runtime_bytes(&output);
+        let state = qx_commit::state_hash_v1(residual_bytes).unwrap();
+        let kv = qx_commit::kv_leaf_hash_v1(0, 11, key_bytes, value_bytes).unwrap();
+        assert_eq!(&observed[..32], state);
+        assert_eq!(&observed[32..], kv);
+    }
 
     #[test]
     fn every_quant_type_has_a_kernel() {

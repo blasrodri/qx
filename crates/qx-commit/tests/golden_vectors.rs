@@ -1,7 +1,8 @@
 use qx_commit::{
     CheckpointV1, D_BATCH, D_JOB, D_KV, D_TOKEN, D_WEIGHT_TREE, HashAlgorithm, InferenceReceiptV1,
     MerkleTree, ModelSpecV1, ProtocolVersion, WeightLeafV1, granite_architecture_root,
-    granite_execution_spec, hash_domain, input_hash_v1, output_hash_v1,
+    granite_execution_spec, hash_domain, input_hash_v1, kv_leaf_hash_v1, output_hash_v1,
+    state_hash_v1,
 };
 
 fn hex(value: [u8; 32]) -> String {
@@ -66,12 +67,7 @@ fn protocol_v1_golden_vectors() {
     };
     let key = f32_bytes(&[1.0, -2.0, 0.5, -0.0]);
     let value = f32_bytes(&[3.0, 4.0, -5.0, 6.0]);
-    let kv_leaf = hash_domain(
-        algorithm,
-        D_KV,
-        &[&2_u16.to_le_bytes(), &9_u32.to_le_bytes(), &key, &value],
-    )
-    .unwrap();
+    let kv_leaf = kv_leaf_hash_v1(2, 9, &key, &value).unwrap();
     let kv_other = hash_domain(algorithm, D_KV, &[b"other-kv-leaf"]).unwrap();
     let kv_root = MerkleTree::new(algorithm, D_KV, &[kv_leaf, kv_other])
         .unwrap()
@@ -80,8 +76,7 @@ fn protocol_v1_golden_vectors() {
         job_id: [0x11; 32],
         token_index: 9,
         layer_index: 2,
-        residual_hash: hash_domain(algorithm, qx_commit::D_STATE, &[&f32_bytes(&[0.25, -1.5])])
-            .unwrap(),
+        residual_hash: state_hash_v1(&f32_bytes(&[0.25, -1.5])).unwrap(),
         global_kv_root: kv_root,
     }
     .hash()
@@ -134,27 +129,27 @@ fn protocol_v1_golden_vectors() {
         (
             "kv_leaf",
             kv_leaf,
-            "7cf0943ec8e37d6c10f02a97d79277b7ecca104d066edf774cacbffb88be6382",
+            "e0b263b4cc4e3ad6840885a70e3bbd5b1f99aead9d8138e46152724cb24add83",
         ),
         (
             "kv_root",
             kv_root,
-            "9397d4bdaa9c15117bbc393e5749e381eabf240287b489a7cada2ff3aefc4492",
+            "aece4ec1f72ec39eef2e9c5c47a43cef40b33cef80c0ad0c1e0fba2464b556ed",
         ),
         (
             "checkpoint",
             checkpoint,
-            "3f6d49a11fb729ab12869749cf5b77b39ed024df8fc7035334a80d3f64ea2b94",
+            "721e055e203280d3459842836ea99b0d18da782e121b061d1444843fffeb01db",
         ),
         (
             "token_root",
             token_root,
-            "f03ad52d23aacb1ed03683a190d09e90ecca9ee242e2df59509403d5ced772c2",
+            "7fcc68424c7303a35b6f3cd841d8baeb1ecea0a8c42f7e9e4a3d2ecda6145054",
         ),
         (
             "job_root",
             job_root,
-            "19a0b3ba62fddb16f77625296952189d32d959f4a98e1412f3b26454ee0826e3",
+            "8abb0da549b004d123f78c78590b05dd574a724b425c1a7fbdbaff87c96d6f1b",
         ),
         (
             "input_hash",
@@ -169,12 +164,12 @@ fn protocol_v1_golden_vectors() {
         (
             "receipt_hash",
             receipt,
-            "14179fd10e467c391cd01668736d849ddb6083235c95a4e17a6ba809f2f80e3b",
+            "f7f60781cf573efb1a95a7495ffde11bd1e806d020b79a46ea82ccbeff50b4f1",
         ),
         (
             "batch_root",
             batch_root,
-            "d8a672dd01fa236d86869b199418361a9baa0d0c1fdf2da1145a9faa98f5e288",
+            "c2d8a194ded611326be14ea2b7e487b5fd4436265a655419017c20cb960264c0",
         ),
     ];
     for (name, digest, expected) in vectors {

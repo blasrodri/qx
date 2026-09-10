@@ -30,3 +30,4 @@ objc2-metal = { version = "0.3.2", features = [
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 half.workspace = true
+qx-commit = { path = "../qx-commit" }

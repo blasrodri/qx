@@ -9,6 +9,7 @@ mod hash;
 mod merkle;
 mod model;
 mod receipt;
+mod state;
 mod weights;
 
 pub use execution::{CheckpointV1, CommitmentMetrics, ExecutionCommitterV1, ExecutionTraceV1};
@@ -16,6 +17,7 @@ pub use hash::{Digest, HashAlgorithm, ProtocolVersion, hash_domain, hash_domain_
 pub use merkle::{FixedMerkleAccumulator, MerkleProof, MerkleTree, MutableMerkleTree};
 pub use model::{ModelSpecV1, granite_architecture_root, granite_execution_spec};
 pub use receipt::{InferenceReceiptV1, SignedInferenceReceiptV1, input_hash_v1, output_hash_v1};
+pub use state::{STATE_CHUNK_BYTES, kv_leaf_hash_v1, state_hash_v1};
 pub use weights::{
     WeightCommitmentV1, WeightLeafV1, WeightProofV1, commit_q4_artifact, prove_q4_artifact_leaf,
 };
@@ -26,6 +28,11 @@ pub const D_MERKLE: &[u8] = b"QX:MERKLE:V1";
 pub const D_MERKLE_EMPTY: &[u8] = b"QX:MERKLE:EMPTY:V1";
 pub const D_KV: &[u8] = b"QX:KV:V1";
 pub const D_STATE: &[u8] = b"QX:STATE:V1";
+pub const D_STATE_CHUNK: &[u8] = b"QX:STATE:CHUNK:V1";
+pub const D_KV_KEY_CHUNK: &[u8] = b"QX:KV:KEY:CHUNK:V1";
+pub const D_KV_KEY_TREE: &[u8] = b"QX:KV:KEY:TREE:V1";
+pub const D_KV_VALUE_CHUNK: &[u8] = b"QX:KV:VALUE:CHUNK:V1";
+pub const D_KV_VALUE_TREE: &[u8] = b"QX:KV:VALUE:TREE:V1";
 pub const D_CHECKPOINT: &[u8] = b"QX:CHECKPOINT:V1";
 pub const D_TOKEN: &[u8] = b"QX:TOKEN:V1";
 pub const D_JOB: &[u8] = b"QX:JOB:V1";

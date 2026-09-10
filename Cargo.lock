@@ -666,6 +666,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
+ "qx-commit",
  "qx-quant",
 ]
 
@@ -770,6 +771,7 @@ dependencies = [
 name = "qx-runtime-v2"
 version = "0.1.0"
 dependencies = [
+ "qx-commit",
  "qx-format",
  "qx-metal",
  "qx-model",
@@ -839,6 +841,7 @@ dependencies = [
  "anyhow",
  "clap",
  "qx-commit",
+ "qx-runtime-v2",
 ]
 
 [[package]]

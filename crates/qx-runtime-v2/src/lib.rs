@@ -1863,6 +1863,30 @@ impl PreparedAttentionStack {
         end_layer: usize,
         resolved_plan: Option<&ResolvedExecutionPlan>,
     ) -> Result<(), String> {
+        self.encode_full_layer_range_with_plan_and_commitments(
+            graph,
+            buffers,
+            moe,
+            position,
+            start_layer,
+            end_layer,
+            resolved_plan,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_full_layer_range_with_plan_and_commitments(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        buffers: &GpuRuntimeBuffers,
+        moe: &PreparedMoeStack,
+        position: usize,
+        start_layer: usize,
+        end_layer: usize,
+        resolved_plan: Option<&ResolvedExecutionPlan>,
+        commitment_residuals: Option<&qx_metal::platform::RuntimeBuffer>,
+    ) -> Result<(), String> {
         if start_layer > end_layer || end_layer > LAYERS {
             return Err(format!(
                 "layer range {start_layer}..{end_layer} is outside 0..{LAYERS}"
@@ -1995,14 +2019,30 @@ impl PreparedAttentionStack {
                     moe_consumer_plan,
                 )?;
             }
-            graph.encode_residual_rms_scalar(
-                context,
-                buffers.buffer(output),
-                buffers.buffer(BufferId::MoeOutput),
-                buffers.buffer(output),
-                buffers.buffer(BufferId::MoeScratch),
-                qx_model::RESIDUAL_MULTIPLIER,
-            )?;
+            if let Some(commitment_residuals) = commitment_residuals {
+                let snapshot = commitment_residuals.subregion(
+                    layer * HIDDEN * std::mem::size_of::<f32>(),
+                    HIDDEN * std::mem::size_of::<f32>(),
+                )?;
+                graph.encode_residual_rms_scalar_snapshot(
+                    context,
+                    buffers.buffer(output),
+                    buffers.buffer(BufferId::MoeOutput),
+                    buffers.buffer(output),
+                    buffers.buffer(BufferId::MoeScratch),
+                    &snapshot,
+                    qx_model::RESIDUAL_MULTIPLIER,
+                )?;
+            } else {
+                graph.encode_residual_rms_scalar(
+                    context,
+                    buffers.buffer(output),
+                    buffers.buffer(BufferId::MoeOutput),
+                    buffers.buffer(output),
+                    buffers.buffer(BufferId::MoeScratch),
+                    qx_model::RESIDUAL_MULTIPLIER,
+                )?;
+            }
             if isolate_moe && layer + 1 < LAYERS && moe_boundary_enabled("cb-exit") {
                 // Keep the routed expert block separate from the next dense
                 // block, so the experiment measures command-boundary effects
@@ -2078,6 +2118,34 @@ impl PreparedAttentionStack {
         position: usize,
         resolved_plan: Option<&ResolvedExecutionPlan>,
     ) -> Result<(), String> {
+        self.encode_token_from_to_with_plan_and_commitments(
+            graph,
+            buffers,
+            moe,
+            token_input,
+            token_output,
+            position,
+            resolved_plan,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_token_from_to_with_plan_and_commitments(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        buffers: &GpuRuntimeBuffers,
+        moe: &PreparedMoeStack,
+        token_input: &qx_metal::platform::RuntimeBuffer,
+        token_output: &qx_metal::platform::RuntimeBuffer,
+        position: usize,
+        resolved_plan: Option<&ResolvedExecutionPlan>,
+        commitment_buffers: Option<(
+            &qx_metal::platform::RuntimeBuffer,
+            &qx_metal::platform::RuntimeBuffer,
+            usize,
+        )>,
+    ) -> Result<(), String> {
         let context = buffers.context().as_ref();
         graph.encode_q4_embedding_lookup(
             &self.embedding_lookup,
@@ -2091,7 +2159,7 @@ impl PreparedAttentionStack {
         for segment in 0..command_buffers {
             let start = segment * LAYERS / command_buffers;
             let end = (segment + 1) * LAYERS / command_buffers;
-            self.encode_full_layer_range_with_plan(
+            self.encode_full_layer_range_with_plan_and_commitments(
                 graph,
                 buffers,
                 moe,
@@ -2099,10 +2167,49 @@ impl PreparedAttentionStack {
                 start,
                 end,
                 resolved_plan,
+                commitment_buffers.map(|(residuals, _, _)| residuals),
             )?;
             if segment + 1 < command_buffers {
                 graph.begin_next_command_buffer(context)?;
             }
+        }
+        if let Some((residuals, digests, checkpoint_interval)) = commitment_buffers {
+            let mut key_offsets = [0_u32; LAYERS];
+            let mut value_offsets = [0_u32; LAYERS];
+            let mut key_bytes = [0_u32; LAYERS];
+            let mut value_bytes = [0_u32; LAYERS];
+            for layer in 0..LAYERS {
+                let key_width = KV_HEADS * HEAD_DIM * buffers.plan.kv_key_element_bytes[layer];
+                let value_width = KV_HEADS * HEAD_DIM * buffers.plan.kv_value_element_bytes[layer];
+                key_offsets[layer] =
+                    u32::try_from(buffers.kv_layer_offset(layer) + position * key_width)
+                        .map_err(|_| "verification key offset exceeds u32".to_owned())?;
+                value_offsets[layer] = u32::try_from(
+                    buffers.kv_layer_offset(layer)
+                        + GpuRuntimeBuffers::key_layer_bytes(&buffers.plan, layer)
+                        + position * value_width,
+                )
+                .map_err(|_| "verification value offset exceeds u32".to_owned())?;
+                key_bytes[layer] = u32::try_from(key_width)
+                    .map_err(|_| "verification key width exceeds u32".to_owned())?;
+                value_bytes[layer] = u32::try_from(value_width)
+                    .map_err(|_| "verification value width exceeds u32".to_owned())?;
+            }
+            graph.encode_verification_hashes(
+                context,
+                residuals,
+                buffers.kv_buffer(),
+                digests,
+                u32::try_from(position)
+                    .map_err(|_| "verification token index exceeds u32".to_owned())?,
+                LAYERS,
+                HIDDEN * std::mem::size_of::<f32>(),
+                checkpoint_interval,
+                key_offsets,
+                value_offsets,
+                key_bytes,
+                value_bytes,
+            )?;
         }
         let final_hidden = if LAYERS.is_multiple_of(2) {
             BufferId::HiddenA
@@ -2156,6 +2263,34 @@ impl PreparedAttentionStack {
             }
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_token_with_plan_and_commitments(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        buffers: &GpuRuntimeBuffers,
+        moe: &PreparedMoeStack,
+        position: usize,
+        resolved_plan: Option<&ResolvedExecutionPlan>,
+        commitment_residuals: &qx_metal::platform::RuntimeBuffer,
+        commitment_digests: &qx_metal::platform::RuntimeBuffer,
+        checkpoint_interval: usize,
+    ) -> Result<(), String> {
+        self.encode_token_from_to_with_plan_and_commitments(
+            graph,
+            buffers,
+            moe,
+            buffers.buffer(BufferId::TokenOutput),
+            buffers.buffer(BufferId::TokenOutput),
+            position,
+            resolved_plan,
+            Some((
+                commitment_residuals,
+                commitment_digests,
+                checkpoint_interval,
+            )),
+        )
     }
 }
 
@@ -2489,6 +2624,9 @@ pub struct GraniteV2Generator {
     // Greedy rollout must not pay for speculative/diagnostic state. The
     // K-wide allocation is created on first verifier or exit-probe use.
     verifier_buffers: Option<KWideVerifierBuffers>,
+    verification_residuals: Option<qx_metal::platform::RuntimeBuffer>,
+    verification_digests: Option<qx_metal::platform::RuntimeBuffer>,
+    verification_checkpoint_interval: usize,
     stack: PreparedAttentionStack,
     moe: PreparedMoeStack,
     position: usize,
@@ -2556,6 +2694,9 @@ impl GraniteV2Generator {
             resolved_plan,
             buffers,
             verifier_buffers: None,
+            verification_residuals: None,
+            verification_digests: None,
+            verification_checkpoint_interval: 1,
             stack,
             moe,
             position: 0,
@@ -2578,6 +2719,77 @@ impl GraniteV2Generator {
 
     pub fn position(&self) -> usize {
         self.position
+    }
+
+    /// Enable or disable production commitments. Enabling adds one batched
+    /// SHA-256 dispatch per token plus 98,304 transient residual-snapshot
+    /// bytes and 1,536 compact digest bytes.
+    pub fn set_verification_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled && self.verification_digests.is_none() {
+            self.verification_residuals = Some(
+                self.context
+                    .allocate_runtime_buffer(LAYERS * HIDDEN * std::mem::size_of::<f32>())?,
+            );
+            self.verification_digests = Some(self.context.allocate_runtime_buffer(LAYERS * 64)?);
+        } else if !enabled {
+            self.verification_residuals = None;
+            self.verification_digests = None;
+        }
+        Ok(())
+    }
+
+    pub fn set_verification_checkpoint_interval(&mut self, interval: usize) -> Result<(), String> {
+        if !matches!(interval, 1 | 2 | 4) {
+            return Err("verification checkpoint interval must be 1, 2, or 4".to_owned());
+        }
+        self.verification_checkpoint_interval = interval;
+        self.set_verification_enabled(true)
+    }
+
+    /// Execute one token, read back only its compact per-layer digests, and
+    /// fold them into the CPU Merkle frontier.
+    pub fn step_verified(
+        &mut self,
+        token: u32,
+        committer: &mut qx_commit::ExecutionCommitterV1,
+    ) -> Result<u32, String> {
+        if self.verification_checkpoint_interval != 1 {
+            return Err("trace construction currently requires every-layer checkpoints".to_owned());
+        }
+        self.set_verification_enabled(true)?;
+        let token_index = self.position;
+        let predicted = self.step(token)?;
+        let buffer = self
+            .verification_digests
+            .as_ref()
+            .ok_or_else(|| "verification digest buffer is unavailable".to_owned())?;
+        let bytes = self.context.read_runtime_bytes(buffer);
+        if bytes.len() != LAYERS * 64 {
+            return Err("verification digest buffer has an invalid length".to_owned());
+        }
+        for layer in 0..LAYERS {
+            let offset = layer * 64;
+            let residual_hash: [u8; 32] = bytes[offset..offset + 32]
+                .try_into()
+                .map_err(|_| "invalid residual digest width".to_owned())?;
+            let kv_hash: [u8; 32] = bytes[offset + 32..offset + 64]
+                .try_into()
+                .map_err(|_| "invalid KV digest width".to_owned())?;
+            let canonical_bytes = HIDDEN * std::mem::size_of::<f32>()
+                + KV_HEADS * HEAD_DIM * self.buffers.plan.kv_key_element_bytes[layer]
+                + KV_HEADS * HEAD_DIM * self.buffers.plan.kv_value_element_bytes[layer];
+            committer
+                .commit_layer_hashes(
+                    u32::try_from(token_index)
+                        .map_err(|_| "verification token index exceeds u32".to_owned())?,
+                    layer as u16,
+                    residual_hash,
+                    kv_hash,
+                    canonical_bytes,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(predicted)
     }
 
     pub fn optional_verifier_bytes(&self) -> usize {
@@ -3591,13 +3803,30 @@ impl GraniteV2Generator {
             &token.to_le_bytes(),
         )?;
         let mut graph = self.buffers.begin_token()?;
-        self.stack.encode_token_with_plan(
-            &mut graph,
-            &self.buffers,
-            &self.moe,
-            self.position,
-            Some(&self.resolved_plan),
-        )?;
+        if let Some(digests) = self.verification_digests.as_ref() {
+            let residuals = self
+                .verification_residuals
+                .as_ref()
+                .ok_or_else(|| "verification residual buffer is unavailable".to_owned())?;
+            self.stack.encode_token_with_plan_and_commitments(
+                &mut graph,
+                &self.buffers,
+                &self.moe,
+                self.position,
+                Some(&self.resolved_plan),
+                residuals,
+                digests,
+                self.verification_checkpoint_interval,
+            )?;
+        } else {
+            self.stack.encode_token_with_plan(
+                &mut graph,
+                &self.buffers,
+                &self.moe,
+                self.position,
+                Some(&self.resolved_plan),
+            )?;
+        }
         self.buffers.finish_token(graph)?;
         self.position += 1;
         Ok(())
