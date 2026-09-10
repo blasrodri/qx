@@ -12,8 +12,9 @@ to decide whether the selected inference is checked.
 
 This separates three costs:
 
-1. every inference pays the 3.203% measured commitment cost in the selected
-   two-layer checkpoint profile (3.445% for every-layer checkpoints);
+1. every inference pays 2.904% measured commitment cost inside the selected
+   precise two-layer checkpoint profile; migrating from fast uncommitted
+   execution to precise committed execution currently costs 8.820%;
 2. the network pays approximately `audited receipts / epoch receipts` in extra
    off-chain inference work, adjusted for the lengths of the selected jobs;
 3. Solana pays only when a selected replay disagrees and a bonded dispute is
@@ -120,13 +121,19 @@ The deployable SBF prototype uses two instructions:
 
 | Instruction | Data | CU | Purpose |
 |---|---:|---:|---|
-| `stage_q4_weight_v1` | 873 bytes | 7,108 | Verify 26 SHA-256 Merkle levels against the registered 41,755,744-leaf weight root and store the decoded weight |
-| `verify_staged_q4_fma_v1` | 340 bytes | 1,877 | Verify 5 BLAKE3 activation levels and execute one exact FP32 fused multiply-add |
-| Total | 1,213 bytes over two transactions | 8,985 | Complete terminal arithmetic check |
+| `stage_q4_weight_v1` | 873 bytes | 7,444 | Verify 26 SHA-256 Merkle levels and stage a dispute-bound decoded weight |
+| `verify_staged_q4_fma_v1` | 300 bytes | 2,336 | Verify the dispute-bound activation and select the objectively correct claim |
+| Terminal total | 1,173 bytes over two transactions | 9,780 | Complete terminal arithmetic check |
 
-The test touched 36 bytes of model-root data and a 20-byte temporary staged
-weight account. A deliberately false accumulator was rejected after 1,875 CU.
-The SBF binary was 30,864 bytes. Measurements used `cargo-build-sbf 4.1.0`,
+Opening a miner-signed receipt against its epoch root costs 2,772 CU and binding
+the mutually agreed terminal boundary costs 1,100 CU. The complete measured
+path is 13,652 CU, plus 1,842 CU once per model+epoch registration in this test.
+
+The program uses a 56-byte epoch account, 72-byte model account, 304-byte active
+dispute account, and 52-byte temporary staged-weight account. A staged weight
+cannot be replayed into another dispute; forged receipt signatures, bad receipt
+openings, bad activation openings, early timeouts, and false arithmetic are
+rejected. Measurements used `cargo-build-sbf 4.1.0`,
 Solana CLI 4.2.2, and Mollusk's SVM executor; they are executed CU measurements,
 not host estimates. The test command is:
 
@@ -154,20 +161,19 @@ the active dispute PDA, so a proof cannot be replayed into another dispute.
 | Grind or choose entropy | can sharply reduce detection | entropy is fixed, delayed, and not miner-selectable |
 | Withhold a dispute response | cannot be decided by arithmetic alone | outer on-chain deadline must award the loss automatically |
 
-## The remaining consensus blocker
+## Consensus arithmetic status
 
-The current production Metal kernels use `simd_sum` for 32-lane floating-point
-reductions. Apple specifies that the operation sums active lanes, but does not
-specify a consensus-visible rounding tree. The lane-local FMA verified here is
-exact and executable on Solana; the final connection from 32 lane accumulators
-to the committed matrix output is not yet protocol-safe.
+`QX_EXEC_METAL_V1` now replaces native `simd_sum`/`simd_max` with an explicit
+32-lane shuffle-down tree in the Q4, dense, decode, and dynamic-MoE kernels.
+Metal fast math is disabled by default, and the host verifier contains the
+matching FP32 sum oracle. Live Metal tests pass, and the execution-spec digest
+binds the tree and precise-math requirement.
 
-Before slashing can be enabled, `QX_EXEC_METAL_V1` must replace those
-consensus-relevant reductions with an explicit shuffle/add tree (and prevent
-compiler reassociation), then re-run inference parity and the <5% overhead
-benchmark. The same treatment is required for reduction-heavy primitives such
-as RMSNorm and softmax. Empirical repeatability on one M5 is necessary but is
-not a substitute for specifying the arithmetic tree.
+This removes the previously unspecified reduction order, but costs 5.749% over
+the explicit tree compiled in fast mode. Precise execution plus commitments is
+8.820% slower than fast uncommitted execution. Deterministic decompositions and
+terminal instructions are still needed for rsqrt, exp/softmax, RoPE, KV append,
+and the remaining verification IR before a complete inference can be slashed.
 
 Accordingly, the current code proves these pieces:
 
@@ -178,9 +184,13 @@ Accordingly, the current code proves these pieces:
 - authenticated terminal Q4 FMA on actual SBF with measured CU;
 - rejection of corrupted arithmetic, openings, and false ordering claims.
 
-It does not yet justify automatic slashing for a complete Metal inference.
-That line should remain disabled until the explicit reduction profile and the
-outer dispute-PDA transition checks are implemented and tested end to end.
+The SBF path now authenticates the receipt signature and epoch inclusion and
+binds the model, parties, activation root, arithmetic claims, and staged weight
+to a single dispute account. It still uses a two-party terminal-boundary
+agreement as the handoff from off-chain narrowing. Automatic slashing remains
+disabled until on-chain token/layer/operator bisection can reach that same
+terminal phase without miner cooperation and the remaining IR operations are
+deterministically covered.
 
 ## Platform references
 

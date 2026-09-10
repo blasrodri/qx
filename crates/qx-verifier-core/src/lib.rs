@@ -199,6 +199,39 @@ pub fn proves_router_selection_wrong_v1(
     Ok(challenger > selected || (challenger == selected && challenger_expert < selected_expert))
 }
 
+/// Reproduce the consensus Metal 32-lane shuffle-down reduction exactly.
+/// Every stage reads the prior stage's lanes, matching SIMD lockstep.
+pub fn ordered_simd_sum_32_v1(lane_bits: [u32; 32]) -> Result<u32, VerificationError> {
+    let mut lanes = lane_bits.map(f32::from_bits);
+    if lanes.iter().any(|value| !value.is_finite()) {
+        return Err(VerificationError::InvalidWitness(
+            "non-finite reduction lane",
+        ));
+    }
+    for offset in [16_usize, 8, 4, 2, 1] {
+        let prior = lanes;
+        for lane in 0..offset {
+            lanes[lane] = prior[lane] + prior[lane + offset];
+            if !lanes[lane].is_finite() {
+                return Err(VerificationError::InvalidWitness(
+                    "non-finite reduction result",
+                ));
+            }
+        }
+    }
+    Ok(lanes[0].to_bits())
+}
+
+pub fn verify_ordered_simd_sum_32_v1(
+    lane_bits: [u32; 32],
+    claimed_sum_bits: u32,
+) -> Result<(), VerificationError> {
+    if ordered_simd_sum_32_v1(lane_bits)? != claimed_sum_bits {
+        return Err(VerificationError::ArithmeticClaimFailed);
+    }
+    Ok(())
+}
+
 fn finite_order_key(bits: u32) -> Result<u32, VerificationError> {
     if bits & 0x7f80_0000 == 0x7f80_0000 {
         return Err(VerificationError::InvalidWitness("non-finite router score"));
@@ -323,6 +356,24 @@ mod tests {
         assert!(
             !proves_router_selection_wrong_v1(31, 2.0_f32.to_bits(), 21, 1.0_f32.to_bits())
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn ordered_reduction_matches_the_registered_tree() {
+        let lanes = std::array::from_fn(|index| {
+            let value = if index % 3 == 0 {
+                1.0e7_f32
+            } else {
+                index as f32 / 7.0
+            };
+            value.to_bits()
+        });
+        let sum = ordered_simd_sum_32_v1(lanes).unwrap();
+        verify_ordered_simd_sum_32_v1(lanes, sum).unwrap();
+        assert_eq!(
+            verify_ordered_simd_sum_32_v1(lanes, sum ^ 1),
+            Err(VerificationError::ArithmeticClaimFailed)
         );
     }
 

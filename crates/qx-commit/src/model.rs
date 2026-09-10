@@ -129,7 +129,7 @@ pub fn granite_architecture_root() -> Result<Digest, CommitError> {
     hash_domain(HashAlgorithm::Sha256V1, D_ARCHITECTURE, &[&bytes])
 }
 
-/// Digest of the pinned CPU-oracle semantics used by Phase 3.
+/// Digest of the pinned Metal/CPU-oracle semantics used by verification V1.
 pub fn granite_execution_spec() -> Result<Digest, CommitError> {
     granite_execution_spec_with_checkpoint_interval(1)
 }
@@ -145,7 +145,7 @@ pub fn granite_execution_spec_with_checkpoint_interval(
         ));
     }
     let mut bytes = Vec::with_capacity(64);
-    bytes.extend_from_slice(b"QX_EXEC_GRANITE_CPU_V1");
+    bytes.extend_from_slice(b"QX_EXEC_METAL_V1");
     bytes.push(1); // activation FP32
     bytes.push(1); // accumulator FP32
     bytes.push(1); // IEEE round-to-nearest-ties-even at f32 operations
@@ -162,6 +162,10 @@ pub fn granite_execution_spec_with_checkpoint_interval(
     bytes.extend_from_slice(&256_u16.to_le_bytes()); // state hash chunk bytes
     bytes.push(1); // raw BLAKE3(left || right) state-tree parent
     bytes.push(HashAlgorithm::Blake3V1 as u8); // hot KV/checkpoint/token/job trees
+    bytes.push(32); // SIMD width
+    bytes.extend_from_slice(&[16, 8, 4, 2, 1]); // fixed shuffle-down reduction tree
+    bytes.push(1); // Metal fast math disabled
+    bytes.push(1); // precise FP32 math functions
     if checkpoint_interval != 1 {
         bytes.extend_from_slice(b"CHECKPOINT_INTERVAL");
         bytes.push(checkpoint_interval);

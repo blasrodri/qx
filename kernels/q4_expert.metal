@@ -1,6 +1,15 @@
 #include <metal_stdlib>
 using namespace metal;
 
+inline float qx_ordered_simd_sum(float value) {
+    value = value + simd_shuffle_down(value, 16u);
+    value = value + simd_shuffle_down(value, 8u);
+    value = value + simd_shuffle_down(value, 4u);
+    value = value + simd_shuffle_down(value, 2u);
+    value = value + simd_shuffle_down(value, 1u);
+    return simd_broadcast(value, 0u);
+}
+
 inline uint qx_group_offset(uint row, uint group, uint groups, uint bytes_per_group, uint layout) {
     if (layout == 0) {
         return row * groups * bytes_per_group + group * bytes_per_group;
@@ -81,7 +90,7 @@ kernel void qx_q4_simd_gemv(
             * float(scales[qx_scale_offset(row, group, groups, layout)]);
         sum += weight * float(input[column]);
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[row] = half(sum);
 }
 

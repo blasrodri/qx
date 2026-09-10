@@ -72,8 +72,8 @@ pub mod platform {
     pub use objc2_metal::MTLSize;
     use objc2_metal::{
         MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-        MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePipelineState,
-        MTLCounter, MTLCounterResultTimestamp, MTLCounterSampleBuffer,
+        MTLCommonCounterSetTimestamp, MTLCompileOptions, MTLComputeCommandEncoder,
+        MTLComputePipelineState, MTLCounter, MTLCounterResultTimestamp, MTLCounterSampleBuffer,
         MTLCounterSampleBufferDescriptor, MTLCounterSamplingPoint, MTLCounterSet,
         MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLStorageMode,
     };
@@ -88,6 +88,21 @@ pub mod platform {
     const HIDDEN: usize = 1024;
     const INTERMEDIATE: usize = 512;
     const GROUP_SIZE: usize = 32;
+
+    fn consensus_compile_options() -> Option<Retained<MTLCompileOptions>> {
+        if matches!(
+            std::env::var("QX_METAL_PRECISE_MATH").ok().as_deref(),
+            Some("0" | "false" | "no")
+        ) {
+            return None;
+        }
+        let options = MTLCompileOptions::new();
+        // QX_EXEC_METAL_V1 requires IEEE-safe expression evaluation so the
+        // compiler cannot reassociate the explicit SIMD reduction tree.
+        #[allow(deprecated)]
+        options.setFastMathEnabled(false);
+        Some(options)
+    }
 
     fn qwen_split_moe_enabled() -> bool {
         !matches!(
@@ -9547,7 +9562,7 @@ pub mod platform {
             let source = NSString::from_str(DYNAMIC_MOE_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal dynamic-MoE library compilation failed".to_owned())?;
             let mut names = Vec::new();
             for index in 0..library.functionNames().count() {
@@ -9845,7 +9860,7 @@ pub mod platform {
             let source = NSString::from_str(kernel_source(quant_type));
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal library compilation failed".to_owned())?;
             let function_name = match quant_type {
                 QuantType::Q2S4 => "qx_q2s4_expert".to_owned(),
@@ -9874,7 +9889,7 @@ pub mod platform {
             let source = NSString::from_str(Q2_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal Qwen Q2S4 library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_q2s4_qwen_expert");
             let function = library
@@ -9899,7 +9914,7 @@ pub mod platform {
             let source = NSString::from_str(QWEN_ATTENTION_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal Qwen attention library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_qwen_qk_norm_rope");
             let function = library
@@ -9924,7 +9939,7 @@ pub mod platform {
             let source = NSString::from_str(QWEN_ATTENTION_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal Qwen GQA library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_qwen_gqa_attention");
             let function = library
@@ -9960,7 +9975,10 @@ pub mod platform {
             }
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&NSString::from_str(source), None)
+                .newLibraryWithSource_options_error(
+                    &NSString::from_str(source),
+                    consensus_compile_options().as_deref(),
+                )
                 .map_err(|_| format!("Metal {name} library compilation failed"))?;
             let function = library
                 .newFunctionWithName(&NSString::from_str(name))
@@ -10088,7 +10106,7 @@ pub mod platform {
             let source = NSString::from_str(kernel_source(QuantType::Q4));
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal Q4 stage library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_q4_gemv");
             let function = library
@@ -10113,7 +10131,7 @@ pub mod platform {
             let source = NSString::from_str(kernel_source(QuantType::Q4));
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal SIMD Q4 stage library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_q4_simd_gemv");
             let function = library
@@ -10138,7 +10156,7 @@ pub mod platform {
             let source = NSString::from_str(Q4_DENSE_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| {
                     "Metal normalized SIMD Q4 stage library compilation failed".to_owned()
                 })?;
@@ -10171,7 +10189,7 @@ pub mod platform {
             let source = NSString::from_str(kernel_source(quant_type));
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal aggregate library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_moe_accumulate");
             let function = library
@@ -10251,7 +10269,7 @@ pub mod platform {
             let source = NSString::from_str(LOGITS_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal logits library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_logits");
             let function = library
@@ -10276,7 +10294,7 @@ pub mod platform {
             let source = NSString::from_str(DENSE_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal dense library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_dense_gemv");
             let function = library
@@ -10301,7 +10319,7 @@ pub mod platform {
             let source = NSString::from_str(F16_DENSE_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal FP16 dense library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_f16_dense_gemv");
             let function = library
@@ -10326,7 +10344,7 @@ pub mod platform {
             let source = NSString::from_str(Q4_DENSE_KERNEL_SOURCE);
             let value = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal Q4 dense library compilation failed".to_owned())?;
             *library = Some(value.clone());
             Ok(value)
@@ -10727,7 +10745,7 @@ pub mod platform {
             let source = NSString::from_str(DYNAMIC_MOE_KERNEL_SOURCE);
             let value = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal dynamic MoE library compilation failed".to_owned())?;
             *library = Some(value.clone());
             Ok(value)
@@ -10796,7 +10814,7 @@ pub mod platform {
             let source = NSString::from_str(Q4_EMBEDDING_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal Q4 embedding library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_q4_embedding_lookup");
             let function = library
@@ -10821,7 +10839,7 @@ pub mod platform {
             let source = NSString::from_str(Q4_EMBEDDING_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal Q4 embedding library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_q4_embedding_lookup_batch");
             let function = library
@@ -10846,7 +10864,7 @@ pub mod platform {
             let source = NSString::from_str(Q4_EMBEDDING_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal superblock embedding library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_q4_embedding_superblock144_lookup");
             let function = library
@@ -10871,7 +10889,7 @@ pub mod platform {
             let source = NSString::from_str(Q4_EMBEDDING_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| {
                     "Metal batch superblock embedding library compilation failed".to_owned()
                 })?;
@@ -10900,7 +10918,7 @@ pub mod platform {
             let source = NSString::from_str(ARGMAX_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal argmax library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_argmax_partial");
             let function = library
@@ -10925,7 +10943,7 @@ pub mod platform {
             let source = NSString::from_str(ARGMAX_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal argmax library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_argmax_reduce");
             let function = library
@@ -10950,7 +10968,7 @@ pub mod platform {
             let source = NSString::from_str(ARGMAX_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal argmax library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_argmax_reduce_partials");
             let function = library.newFunctionWithName(&name).ok_or_else(|| {
@@ -11113,7 +11131,7 @@ pub mod platform {
             let source = NSString::from_str(V2_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal V2 decode library compilation failed".to_owned())?;
             let name = NSString::from_str(match kernel {
                 DecodeKernel::RmsNorm => "qx_v2_rmsnorm",
@@ -11183,7 +11201,7 @@ pub mod platform {
             let source = NSString::from_str(crate::VERIFICATION_HASH_KERNEL_SOURCE);
             let library = self
                 .device
-                .newLibraryWithSource_options_error(&source, None)
+                .newLibraryWithSource_options_error(&source, consensus_compile_options().as_deref())
                 .map_err(|_| "Metal verification hash library compilation failed".to_owned())?;
             let name = NSString::from_str("qx_verification_hash_state_kv");
             let function = library

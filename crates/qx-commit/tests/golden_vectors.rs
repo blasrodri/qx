@@ -115,7 +115,7 @@ fn protocol_v1_golden_vectors() {
         (
             "model_id",
             model_id,
-            "9cc6a4729f516c340998cff7a3e2964f5f218c87d541a815507ac30a7cc74fb7",
+            "58ff98263d543f4ed19968df17d10083e7c575e19414383f1765a8eac6d11402",
         ),
         (
             "weight_leaf",
@@ -155,7 +155,7 @@ fn protocol_v1_golden_vectors() {
         (
             "input_hash",
             input_hash,
-            "c04599cacc0338a35a8a3a8c4b3f3874a51867f4c6bda0693ce612e2c17e9869",
+            "704596ef880471e8bc2c649963a0084427094f14a7cbd47484ad38b5a14e3b95",
         ),
         (
             "output_hash",
@@ -165,12 +165,12 @@ fn protocol_v1_golden_vectors() {
         (
             "receipt_hash",
             receipt,
-            "c67ff92ec8d7051cd068ea24869d8ab7028d2b853bca4d4a7166dee5682e38aa",
+            "9b283c36b91e97c32a531c314ae5231b3e978e57a85d211e057be33974b8a51f",
         ),
         (
             "batch_root",
             batch_root,
-            "5959886605f9f2eeea0d9ce91123ad97149a52ec436e77bfbcc2a0f47935b362",
+            "80edf33f230e0f5f661574bb7d560f684f503f2a65ae84fc91f0abb4087cb60d",
         ),
     ];
     if std::env::var_os("QX_PRINT_GOLDEN").is_some() {

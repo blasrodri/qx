@@ -1,6 +1,26 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Consensus reduction for QX_EXEC_METAL_V1. Lane 0 observes the fixed tree
+// (((0+16)+(8+24))+...) and broadcasts that exact FP32 result.
+inline float qx_ordered_simd_sum(float value) {
+    value = value + simd_shuffle_down(value, 16u);
+    value = value + simd_shuffle_down(value, 8u);
+    value = value + simd_shuffle_down(value, 4u);
+    value = value + simd_shuffle_down(value, 2u);
+    value = value + simd_shuffle_down(value, 1u);
+    return simd_broadcast(value, 0u);
+}
+
+inline float qx_ordered_simd_max(float value) {
+    value = max(value, simd_shuffle_down(value, 16u));
+    value = max(value, simd_shuffle_down(value, 8u));
+    value = max(value, simd_shuffle_down(value, 4u));
+    value = max(value, simd_shuffle_down(value, 2u));
+    value = max(value, simd_shuffle_down(value, 1u));
+    return simd_broadcast(value, 0u);
+}
+
 kernel void qx_residual_rms_scalar(
     device const float* left [[buffer(0)]],
     device const float* right [[buffer(1)]],
@@ -17,12 +37,12 @@ kernel void qx_residual_rms_scalar(
         output[i] = value;
         square_sum += value * value;
     }
-    square_sum = simd_sum(square_sum);
+    square_sum = qx_ordered_simd_sum(square_sum);
     if (lane == 0u) partials[simdgroup] = square_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simdgroup == 0u) {
         float total = lane < 8u ? partials[lane] : 0.0f;
-        total = simd_sum(total);
+        total = qx_ordered_simd_sum(total);
         if (lane == 0u) inverse_rms[0] = rsqrt(total / 1024.0f + 1.0e-5f);
     }
 }
@@ -45,12 +65,12 @@ kernel void qx_residual_rms_scalar_snapshot(
         snapshot[i] = value;
         square_sum += value * value;
     }
-    square_sum = simd_sum(square_sum);
+    square_sum = qx_ordered_simd_sum(square_sum);
     if (lane == 0u) partials[simdgroup] = square_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simdgroup == 0u) {
         float total = lane < 8u ? partials[lane] : 0.0f;
-        total = simd_sum(total);
+        total = qx_ordered_simd_sum(total);
         if (lane == 0u) inverse_rms[0] = rsqrt(total / 1024.0f + 1.0e-5f);
     }
 }
@@ -70,7 +90,7 @@ kernel void qx_attention_softmax_onepass_simd(
     for (uint position = tid; position < length; position += 256u) {
         local_max = max(local_max, scores[q_head * max_context + position]);
     }
-    local_max = simd_max(local_max);
+    local_max = qx_ordered_simd_max(local_max);
     if (lane == 0u) reductions[simdgroup] = local_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simdgroup == 0u && lane == 0u) {
@@ -83,7 +103,7 @@ kernel void qx_attention_softmax_onepass_simd(
     for (uint position = tid; position < length; position += 256u) {
         local_sum += exp(scores[q_head * max_context + position] - maximum);
     }
-    local_sum = simd_sum(local_sum);
+    local_sum = qx_ordered_simd_sum(local_sum);
     if (lane == 0u) reductions[simdgroup] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simdgroup == 0u && lane == 0u) {
@@ -155,7 +175,7 @@ kernel void qx_q4_dense_simd_gemv(
         float weight = float(int(code) - qmax) * float(scales[row * groups + group]);
         sum += weight * input[column];
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) {
         output[row] = sum * multiplier;
     }
@@ -224,8 +244,8 @@ inline void qx_q4_dense_superblock_body(
             }
         }
     }
-    sum0 = simd_sum(sum0);
-    sum1 = simd_sum(sum1);
+    sum0 = qx_ordered_simd_sum(sum0);
+    sum1 = qx_ordered_simd_sum(sum1);
     if (lane == 0u && row0 < rows) {
         output[row0] = sum0 * multiplier;
         if (row1 < rows) output[row1] = sum1 * multiplier;
@@ -316,7 +336,7 @@ kernel void qx_q4_dense_simd_gemm_k(
         float weight = float(int(code) - qmax) * float(scales[row * groups + group]);
         sum += weight * input[input_base + column];
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) {
         output[token * rows + row] = sum * multiplier;
     }
@@ -366,7 +386,7 @@ kernel void qx_q4_dense_weight_stationary_gemm_k(
     }
     for (uint token = 0; token < 4; ++token) {
         if (token >= tokens) break;
-        float sum = simd_sum(accum[token]) * multiplier;
+        float sum = qx_ordered_simd_sum(accum[token]) * multiplier;
         if (lane == 0) output[token * rows + row] = sum;
     }
 }
@@ -418,7 +438,7 @@ kernel void qx_q4_dense_argmax_partial(
             float weight = float(int(code) - qmax) * float(scales[row * groups + group]);
             sum += weight * input[column];
         }
-        sum = simd_sum(sum) * multiplier;
+        sum = qx_ordered_simd_sum(sum) * multiplier;
     }
     if (lane == 0) {
         values[simdgroup] = row < rows ? sum : -3.402823466e+38f;
@@ -487,7 +507,7 @@ kernel void qx_q4_dense_argmax_norm_partial(
             float activation = input[column] * inverse * norm_weights[column];
             sum += weight * activation;
         }
-        sum = simd_sum(sum) * multiplier;
+        sum = qx_ordered_simd_sum(sum) * multiplier;
     }
     if (lane == 0) {
         values[simdgroup] = row < rows ? sum : -3.402823466e+38f;
@@ -559,7 +579,7 @@ inline void qx_q4_dense_superblock_argmax_body(
         }
         #pragma unroll
         for (uint row_offset = 0; row_offset < 4u; ++row_offset) {
-            sums[row_offset] = simd_sum(sums[row_offset]) * multiplier;
+            sums[row_offset] = qx_ordered_simd_sum(sums[row_offset]) * multiplier;
         }
     }
     if (lane == 0u) {
@@ -698,7 +718,7 @@ kernel void qx_q4_dense_argmax_unique_packet_partial(
                 sum += float(int(hi) - qmax) * selected_scale * input[input_base + 1u];
             }
         }
-        sum = simd_sum(sum) * multiplier;
+        sum = qx_ordered_simd_sum(sum) * multiplier;
     }
     if (lane == 0) {
         values[simdgroup] = row < rows ? sum : -3.402823466e+38f;
@@ -778,7 +798,7 @@ kernel void qx_q4_dense_argmax_unique_packet_norm_partial(
                 sum += float(int(hi) - qmax) * selected_scale * activation;
             }
         }
-        sum = simd_sum(sum) * multiplier;
+        sum = qx_ordered_simd_sum(sum) * multiplier;
     }
     if (lane == 0) {
         values[simdgroup] = row < rows ? sum : -3.402823466e+38f;
@@ -839,7 +859,7 @@ kernel void qx_q4_simd_norm_gemv(
         float weight = float(int(code) - qmax) * float(scales[row * groups + group]);
         sum += weight * cached_input[column];
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[row] = sum * multiplier;
 }
 
@@ -889,7 +909,7 @@ kernel void qx_q4_dense_sweep_gemv(
             float activation = cache_input != 0 ? cached_input[column] : input[column];
             sum += weight * activation;
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0) output[row] = sum * multiplier;
     }
 }
@@ -1018,7 +1038,7 @@ kernel void qx_q4_qkv_simd_gemv(
         uint code = (byte >> ((local % 2) * 4)) & 0xf;
         sum += float(int(code) - 7) * float(scales[row * groups + group]) * cached_input[column];
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[row] = sum * multiplier;
 }
 
@@ -1087,7 +1107,7 @@ kernel void qx_q4_qkv_simd_norm_gemv(
         uint code = (byte >> ((local % 2) * 4)) & 0xf;
         sum += float(int(code) - 7) * float(scales[row * groups + group]) * cached_input[column];
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[row] = sum * multiplier;
 }
 
@@ -1151,8 +1171,8 @@ inline void qx_q4_qkv_superblock_body(
         sum0 = qx_q4_dense_superblock_dot8(packed0, x0, x1, scale0, sum0);
         sum1 = qx_q4_dense_superblock_dot8(packed1, x0, x1, scale1, sum1);
     }
-    sum0 = simd_sum(sum0);
-    sum1 = simd_sum(sum1);
+    sum0 = qx_ordered_simd_sum(sum0);
+    sum1 = qx_ordered_simd_sum(sum1);
     if (lane == 0u) {
         output[row0] = sum0 * multiplier;
         output[row1] = sum1 * multiplier;
@@ -1292,7 +1312,7 @@ kernel void qx_q4_qkv_sweep_gemv(
                     : input[column] * (normalize != 0 ? inverse_rms * norm_weights[column] : 1.0f);
                 sum += float(int(code) - qmax) * float(q_scales[current_row * groups + group]) * activation;
             }
-            sum = simd_sum(sum);
+            sum = qx_ordered_simd_sum(sum);
             if (lane == 0) query[current_row] = sum * multiplier;
         }
     } else if (region == 1) {
@@ -1311,7 +1331,7 @@ kernel void qx_q4_qkv_sweep_gemv(
                     : input[column] * (normalize != 0 ? inverse_rms * norm_weights[column] : 1.0f);
                 sum += float(int(code) - qmax) * float(k_scales[current_row * groups + group]) * activation;
             }
-            sum = simd_sum(sum);
+            sum = qx_ordered_simd_sum(sum);
             if (lane == 0) key[current_row] = sum * multiplier;
         }
     } else {
@@ -1330,7 +1350,7 @@ kernel void qx_q4_qkv_sweep_gemv(
                     : input[column] * (normalize != 0 ? inverse_rms * norm_weights[column] : 1.0f);
                 sum += float(int(code) - qmax) * float(v_scales[current_row * groups + group]) * activation;
             }
-            sum = simd_sum(sum);
+            sum = qx_ordered_simd_sum(sum);
             if (lane == 0) value[current_row] = sum * multiplier;
         }
     }

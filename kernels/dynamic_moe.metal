@@ -1,6 +1,24 @@
 #include <metal_stdlib>
 using namespace metal;
 
+inline float qx_ordered_simd_sum(float value) {
+    value = value + simd_shuffle_down(value, 16u);
+    value = value + simd_shuffle_down(value, 8u);
+    value = value + simd_shuffle_down(value, 4u);
+    value = value + simd_shuffle_down(value, 2u);
+    value = value + simd_shuffle_down(value, 1u);
+    return simd_broadcast(value, 0u);
+}
+
+inline float qx_ordered_simd_max(float value) {
+    value = max(value, simd_shuffle_down(value, 16u));
+    value = max(value, simd_shuffle_down(value, 8u));
+    value = max(value, simd_shuffle_down(value, 4u));
+    value = max(value, simd_shuffle_down(value, 2u));
+    value = max(value, simd_shuffle_down(value, 1u));
+    return simd_broadcast(value, 0u);
+}
+
 inline uint qx_dynamic_group_offset(uint row, uint group, uint groups, uint bytes_per_group, uint layout) {
     if (layout == 0) {
         return row * groups * bytes_per_group + group * bytes_per_group;
@@ -100,7 +118,7 @@ inline void qx_dynamic_q4_gate_up_inline_packet_body(
                 * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -155,7 +173,7 @@ kernel void qx_verifier_q4_moe_gate_up_batch(
                 * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[pair * hidden + row] = sum;
 }
 
@@ -224,7 +242,7 @@ kernel void qx_verifier_q4_moe_gate_up_expert_major(
         }
     }
     for (uint token_slot = 0; token_slot < active; ++token_slot) {
-        sums[token_slot] = simd_sum(sums[token_slot]);
+        sums[token_slot] = qx_ordered_simd_sum(sums[token_slot]);
         if (lane == 0) {
             uint pair = bucket_pairs[begin + token_slot];
             output[pair * hidden + row] = sums[token_slot];
@@ -283,7 +301,7 @@ kernel void qx_verifier_q4_moe_gate_up_expert_major_direct(
         }
     }
     for (uint token_slot = 0; token_slot < active; ++token_slot) {
-        sums[token_slot] = simd_sum(sums[token_slot]);
+        sums[token_slot] = qx_ordered_simd_sum(sums[token_slot]);
         if (lane == 0) {
             uint pair = bucket_pairs[begin + token_slot];
             output[pair * hidden + row] = sums[token_slot];
@@ -364,7 +382,7 @@ kernel void qx_verifier_q4_moe_gate_up_expert_major_unique_packet(
         }
     }
     for (uint token_slot = 0; token_slot < active; ++token_slot) {
-        sums[token_slot] = simd_sum(sums[token_slot]);
+        sums[token_slot] = qx_ordered_simd_sum(sums[token_slot]);
         if (lane == 0) {
             uint pair = bucket_pairs[begin + token_slot];
             output[pair * hidden + row] = sums[token_slot];
@@ -486,7 +504,7 @@ kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet(
         }
     }
     for (uint token_slot = 0; token_slot < active; ++token_slot) {
-        sums[token_slot] = simd_sum(sums[token_slot]);
+        sums[token_slot] = qx_ordered_simd_sum(sums[token_slot]);
         if (lane == 0) {
             uint pair = bucket_pairs[bucket_base + token_slot];
             output[pair * hidden + row] = sums[token_slot];
@@ -560,7 +578,7 @@ kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet_k2(
         }
     }
     for (uint token_slot = 0; token_slot < active; ++token_slot) {
-        sums[token_slot] = simd_sum(sums[token_slot]);
+        sums[token_slot] = qx_ordered_simd_sum(sums[token_slot]);
         if (lane == 0) {
             uint pair = bucket_pairs[bucket_base + token_slot];
             output[pair * hidden + row] = sums[token_slot];
@@ -651,10 +669,10 @@ kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_vector(
             sums += x0 * weight0 + x1 * weight1;
         }
     }
-    if (active > 0) sums.x = simd_sum(sums.x);
-    if (active > 1) sums.y = simd_sum(sums.y);
-    if (active > 2) sums.z = simd_sum(sums.z);
-    if (active > 3) sums.w = simd_sum(sums.w);
+    if (active > 0) sums.x = qx_ordered_simd_sum(sums.x);
+    if (active > 1) sums.y = qx_ordered_simd_sum(sums.y);
+    if (active > 2) sums.z = qx_ordered_simd_sum(sums.z);
+    if (active > 3) sums.w = qx_ordered_simd_sum(sums.w);
     if (lane == 0) {
         if (active > 0) output[bucket_pairs[bucket_base] * hidden + row] = sums.x;
         if (active > 1) output[bucket_pairs[bucket_base + 1u] * hidden + row] = sums.y;
@@ -739,8 +757,8 @@ kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_split_accum(
                     + weight1 * cached_input[token1 * hidden + input_base + 1u];
             }
         }
-        if (token0 < active) sum0 = simd_sum(sum0);
-        if (token1 < active) sum1 = simd_sum(sum1);
+        if (token0 < active) sum0 = qx_ordered_simd_sum(sum0);
+        if (token1 < active) sum1 = qx_ordered_simd_sum(sum1);
         if (lane == 0) {
             if (token0 < active) {
                 output[bucket_pairs[bucket_base + token0] * hidden + row] = sum0;
@@ -819,10 +837,10 @@ kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_direct_activatio
             }
         }
     }
-    if (active > 0) sums.x = simd_sum(sums.x);
-    if (active > 1) sums.y = simd_sum(sums.y);
-    if (active > 2) sums.z = simd_sum(sums.z);
-    if (active > 3) sums.w = simd_sum(sums.w);
+    if (active > 0) sums.x = qx_ordered_simd_sum(sums.x);
+    if (active > 1) sums.y = qx_ordered_simd_sum(sums.y);
+    if (active > 2) sums.z = qx_ordered_simd_sum(sums.z);
+    if (active > 3) sums.w = qx_ordered_simd_sum(sums.w);
     if (lane == 0) {
         if (active > 0) output[bucket_pairs[bucket_base] * hidden + row] = sums.x;
         if (active > 1) output[bucket_pairs[bucket_base + 1u] * hidden + row] = sums.y;
@@ -913,10 +931,10 @@ kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_rows16(
             }
         }
     }
-    if (active > 0) sums.x = simd_sum(sums.x);
-    if (active > 1) sums.y = simd_sum(sums.y);
-    if (active > 2) sums.z = simd_sum(sums.z);
-    if (active > 3) sums.w = simd_sum(sums.w);
+    if (active > 0) sums.x = qx_ordered_simd_sum(sums.x);
+    if (active > 1) sums.y = qx_ordered_simd_sum(sums.y);
+    if (active > 2) sums.z = qx_ordered_simd_sum(sums.z);
+    if (active > 3) sums.w = qx_ordered_simd_sum(sums.w);
     if (lane == 0 && row < hidden) {
         if (active > 0) output[bucket_pairs[bucket_base] * hidden + row] = sums.x;
         if (active > 1) output[bucket_pairs[bucket_base + 1u] * hidden + row] = sums.y;
@@ -1026,10 +1044,10 @@ kernel void qx_verifier_q4_moe_gate_up_compact_unique_packet_k4_unroll4(
             }
         }
     }
-    if (active > 0) sums.x = simd_sum(sums.x);
-    if (active > 1) sums.y = simd_sum(sums.y);
-    if (active > 2) sums.z = simd_sum(sums.z);
-    if (active > 3) sums.w = simd_sum(sums.w);
+    if (active > 0) sums.x = qx_ordered_simd_sum(sums.x);
+    if (active > 1) sums.y = qx_ordered_simd_sum(sums.y);
+    if (active > 2) sums.z = qx_ordered_simd_sum(sums.z);
+    if (active > 3) sums.w = qx_ordered_simd_sum(sums.w);
     if (lane == 0 && row < hidden) {
         if (active > 0) output[bucket_pairs[bucket_base] * hidden + row] = sums.x;
         if (active > 1) output[bucket_pairs[bucket_base + 1u] * hidden + row] = sums.y;
@@ -1098,7 +1116,7 @@ kernel void qx_verifier_q4_moe_down_batch(
                 * activated[pair * intermediate + input_base + 1u];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && row < hidden) output[pair * hidden + row] = sum;
 }
 
@@ -1169,7 +1187,7 @@ kernel void qx_verifier_q4_moe_down_compact_unique_packet(
         }
     }
     for (uint token_slot = 0; token_slot < active; ++token_slot) {
-        sums[token_slot] = simd_sum(sums[token_slot]);
+        sums[token_slot] = qx_ordered_simd_sum(sums[token_slot]);
         if (lane == 0) {
             uint pair = bucket_pairs[bucket_base + token_slot];
             output[pair * hidden + row] = sums[token_slot];
@@ -1264,7 +1282,7 @@ kernel void qx_verifier_q4_moe_down_compact_unique_packet_k4_unroll4(
         }
     }
     for (uint token_slot = 0; token_slot < active; ++token_slot) {
-        sums[token_slot] = simd_sum(sums[token_slot]);
+        sums[token_slot] = qx_ordered_simd_sum(sums[token_slot]);
         if (lane == 0) {
             uint pair = bucket_pairs[bucket_base + token_slot];
             output[pair * hidden + row] = sums[token_slot];
@@ -1402,7 +1420,7 @@ kernel void qx_dynamic_q4_moe_gate_up_inline_simd(
                 * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -1446,7 +1464,7 @@ kernel void qx_dynamic_q4_moe_gate_up_inline_norm_simd(
                 * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -1496,7 +1514,7 @@ inline void qx_dynamic_q4_gate_up_inline_unique_packet_body(
             sum += float(int(hi) - 7) * selected_scale * cached_input[input_base + 1u];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -1587,7 +1605,7 @@ inline void qx_dynamic_q4_gate_up_two_row_unique_packet_body(
         }
     }
 
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && expert < 32 && first_row < hidden) {
         output[slot * hidden + first_row] = sum;
     }
@@ -2037,7 +2055,7 @@ inline void qx_dynamic_q4_gate_up_llama_like_body(
                     * cached_input[column];
             }
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0 && expert < 32 && row < hidden) {
             output[slot * hidden + row] = sum;
         }
@@ -2134,7 +2152,7 @@ inline void qx_dynamic_q4_gate_up_decode_direct_body(
                     * value;
             }
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0 && expert < 32 && row < hidden) {
             output[slot * hidden + row] = sum;
         }
@@ -2226,7 +2244,7 @@ inline void qx_dynamic_q4_gate_up_two_row_dataflow_body(
     }
 
     for (uint row_offset = 0; row_offset < rows_per_simdgroup; ++row_offset) {
-        sums[row_offset] = simd_sum(sums[row_offset]);
+        sums[row_offset] = qx_ordered_simd_sum(sums[row_offset]);
         uint row = first_row + row_offset;
         if (lane == 0 && expert < 32 && row < hidden) {
             output[slot * hidden + row] = sums[row_offset];
@@ -2319,7 +2337,7 @@ inline void qx_dynamic_q4_gate_up_fused_block_body(
                     * cached_input[group * 32 + local];
             }
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0 && expert < 32 && row < hidden) {
             output[slot * hidden + row] = sum;
         }
@@ -2483,7 +2501,7 @@ inline void qx_dynamic_q4_superblock_gate_up_body(
     }
     #pragma unroll
     for (uint row_offset = 0; row_offset < 4u; ++row_offset) {
-        sums[row_offset] = simd_sum(sums[row_offset]);
+        sums[row_offset] = qx_ordered_simd_sum(sums[row_offset]);
     }
     if (lane == 0u && expert < 32u) {
         #pragma unroll
@@ -2584,7 +2602,7 @@ kernel void qx_dynamic_q4_moe_down_superblock144_simd(
     }
     #pragma unroll
     for (uint row_offset = 0; row_offset < 4u; ++row_offset) {
-        sums[row_offset] = simd_sum(sums[row_offset]);
+        sums[row_offset] = qx_ordered_simd_sum(sums[row_offset]);
     }
     if (lane == 0u && expert < 32u) {
         #pragma unroll
@@ -2706,7 +2724,7 @@ inline void qx_dynamic_mixed_superblock_gate_up_body(
     }
     #pragma unroll
     for (uint row_offset = 0; row_offset < 4u; ++row_offset) {
-        sums[row_offset] = simd_sum(sums[row_offset]);
+        sums[row_offset] = qx_ordered_simd_sum(sums[row_offset]);
     }
     if (lane == 0u && valid) {
         #pragma unroll
@@ -2896,7 +2914,7 @@ inline void qx_dynamic_mixed_superblock_down_body(
     }
     #pragma unroll
     for (uint row_offset = 0; row_offset < 4u; ++row_offset) {
-        sums[row_offset] = simd_sum(sums[row_offset]);
+        sums[row_offset] = qx_ordered_simd_sum(sums[row_offset]);
     }
     if (lane == 0u && valid) {
         #pragma unroll
@@ -2988,7 +3006,7 @@ kernel void qx_dynamic_q4_moe_gate_up_cross_expert_simd(
                     * cached_input[column];
             }
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0) output[slot * hidden + row] = sum;
     }
 }
@@ -3035,7 +3053,7 @@ kernel void qx_dynamic_q4_moe_gate_up_cross_expert_norm_simd(
                     * cached_input[column];
             }
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0) output[slot * hidden + row] = sum;
     }
 }
@@ -3091,7 +3109,7 @@ inline void qx_dynamic_q4_cross_expert_tile8_gate_up_body(
                     * cached_input[group * 32 + lane];
             }
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0 && row < hidden) {
             output[simdgroup * hidden + row] = sum;
         }
@@ -3191,7 +3209,7 @@ inline void qx_dynamic_q4_gate_up_row_stream_body(
                     * cached_input[group * 32 + lane];
             }
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0) {
             output[simdgroup * hidden + row] = sum;
         }
@@ -3284,7 +3302,7 @@ kernel void qx_dynamic_q4_moe_gate_up_inline_vec4_simd(
             }
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -3333,7 +3351,7 @@ kernel void qx_dynamic_q4_moe_gate_up_inline_vec4_norm_simd(
             }
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -3371,7 +3389,7 @@ kernel void qx_dynamic_q4_moe_gate_up_inline_nocache_simd(
                 * input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -3410,7 +3428,7 @@ kernel void qx_dynamic_q4_moe_gate_up_inline_nocache_norm_simd(
                 * normalized;
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -3545,7 +3563,7 @@ kernel void qx_dynamic_q4_moe_simd(
                 float weight = float(int(code) - int(qmax)) * float(gate_up_scales[scale]);
                 gate_up_sum += weight * cached_input[column];
             }
-            gate_up_sum = simd_sum(gate_up_sum);
+            gate_up_sum = qx_ordered_simd_sum(gate_up_sum);
             if (lane == 0) gate_up[row] = gate_up_sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3579,7 +3597,7 @@ kernel void qx_dynamic_q4_moe_simd(
                 float weight = float(int(code) - int(qmax)) * float(down_scales[scale]);
                 down_sum += weight * activated[column];
             }
-            down_sum = simd_sum(down_sum);
+            down_sum = qx_ordered_simd_sum(down_sum);
             if (lane == 0) {
                 accumulated_output[row] += expert_weights[slot] * down_sum;
             }
@@ -3635,7 +3653,7 @@ kernel void qx_dynamic_q4_moe_gate_up_simd(
             sum += float(int(code) - 7) * float(scales[scale]) * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -3685,7 +3703,7 @@ kernel void qx_dynamic_q4_moe_gate_up_norm_simd(
             sum += float(int(code) - 7) * float(scales[scale]) * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -3732,7 +3750,7 @@ kernel void qx_dynamic_q4_moe_gate_up_wide_simd(
             uint scale = scale_base + qx_dynamic_scale_offset(row, group, groups, layout);
             sum += float(int(code) - 7) * float(scales[scale]) * cached_input[column];
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0) output[slot * hidden + row] = sum;
     }
 }
@@ -3778,7 +3796,7 @@ kernel void qx_dynamic_q4_moe_gate_up_wide_norm_simd(
             uint scale = scale_base + qx_dynamic_scale_offset(row, group, groups, layout);
             sum += float(int(code) - 7) * float(scales[scale]) * cached_input[column];
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0) output[slot * hidden + row] = sum;
     }
 }
@@ -3849,7 +3867,7 @@ kernel void qx_dynamic_q4k_moe_gate_up_simd(
                 * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -3889,7 +3907,7 @@ kernel void qx_dynamic_q4k_moe_gate_up_norm_simd(
                 * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -3937,7 +3955,7 @@ inline void qx_dynamic_q4k_mature_body_simple(
             sum += qx_q4k_weight(
                 packed, scales, packed_base, scale_base, row, blocks, column) * value;
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0) output[slot * rows + row] = sum;
     }
 }
@@ -4039,7 +4057,7 @@ inline void qx_dynamic_q4k_mature_body(
                 - float(dm[1]) * (sumy[0] * sc8[2] + sumy[1] * sc8[3]
                 + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0) output[slot * rows + row] = sum;
     }
 }
@@ -4088,7 +4106,7 @@ inline void qx_dynamic_q4k_mature_down_body(
         sum += qx_q4k_weight(
             packed, scales, packed_base, scale_base, row, blocks, column) * input[slot * 512 + column];
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * rows + row] = sum;
 }
 
@@ -4166,7 +4184,7 @@ kernel void qx_dynamic_q3_moe_gate_up_simd(
             sum += weight * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -4211,7 +4229,7 @@ kernel void qx_dynamic_q3_moe_gate_up_norm_simd(
             sum += weight * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -4258,7 +4276,7 @@ kernel void qx_dynamic_q3_moe_down_simd(
             sum += weight * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -4306,7 +4324,7 @@ kernel void qx_dynamic_q4_moe_gate_up_expertwise_simd(
             sum += float(int(code) - 7) * float(scales[scale_base + row * groups + group]) * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && active) output[slot * hidden + row] = sum;
 }
 
@@ -4352,7 +4370,7 @@ kernel void qx_dynamic_q4_moe_gate_up_expertwise_norm_simd(
             sum += float(int(code) - 7) * float(scales[scale_base + row * groups + group]) * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && active) output[slot * hidden + row] = sum;
 }
 
@@ -4393,7 +4411,7 @@ kernel void qx_dynamic_q4_moe_gate_up_expertwise_inline_simd(
             sum += float(int(code) - 7) * qx_q4_inline_scale(stream, group_base + 16) * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && active) output[slot * hidden + row] = sum;
 }
 
@@ -4437,7 +4455,7 @@ kernel void qx_dynamic_q4_moe_gate_up_expertwise_inline_norm_simd(
             sum += float(int(code) - 7) * qx_q4_inline_scale(stream, group_base + 16) * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && active) output[slot * hidden + row] = sum;
 }
 
@@ -4480,7 +4498,7 @@ kernel void qx_dynamic_q3_moe_gate_up_expertwise_simd(
             sum += float(int(code) - int(qmax)) * float(scales[scale_base + row * groups + group]) * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && active) output[slot * hidden + row] = sum;
 }
 
@@ -4526,7 +4544,7 @@ kernel void qx_dynamic_q3_moe_gate_up_expertwise_norm_simd(
             sum += float(int(code) - int(qmax)) * float(scales[scale_base + row * groups + group]) * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && active) output[slot * hidden + row] = sum;
 }
 
@@ -4566,7 +4584,7 @@ kernel void qx_dynamic_q4_moe_down_expertwise_simd(
             sum += float(int(code) - 7) * float(scales[scale_base + row * groups + group]) * activated[slot * intermediate + column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && active) output[slot * hidden + row] = sum;
 }
 
@@ -4604,7 +4622,7 @@ kernel void qx_dynamic_q4_moe_down_expertwise_inline_simd(
             sum += float(int(code) - 7) * qx_q4_inline_scale(stream, group_base + 16) * activated[slot * intermediate + column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && active) output[slot * hidden + row] = sum;
 }
 
@@ -4644,7 +4662,7 @@ kernel void qx_dynamic_q3_moe_down_expertwise_simd(
             sum += float(int(code) - int(qmax)) * float(scales[scale_base + row * groups + group]) * activated[slot * intermediate + column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && active) output[slot * hidden + row] = sum;
 }
 
@@ -4882,7 +4900,7 @@ kernel void qx_dynamic_q4_moe_gate_up_synthetic(
             sum += synthetic_weight * input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -4910,7 +4928,7 @@ kernel void qx_dynamic_q4_moe_gate_up_synthetic_norm(
             sum += synthetic_weight * normalized;
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -4960,7 +4978,7 @@ kernel void qx_dynamic_q4_moe_projection_simd(
             sum += float(int(code) - 7) * float(scales[scale]) * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && row < rows) {
         output[slot * 1024 + output_base + row] = sum;
     }
@@ -5012,7 +5030,7 @@ kernel void qx_dynamic_q4_moe_projection_norm_simd(
             sum += float(int(code) - 7) * float(scales[scale]) * cached_input[column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && row < rows) {
         output[slot * 1024 + output_base + row] = sum;
     }
@@ -5066,7 +5084,7 @@ kernel void qx_dynamic_q4_moe_down_simd(
             sum += float(int(code) - 7) * float(scales[scale]) * activated[slot * intermediate + column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -5102,7 +5120,7 @@ kernel void qx_dynamic_q4_moe_down_inline_simd(
                 * activated[slot * intermediate + column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 
@@ -5156,7 +5174,7 @@ inline void qx_dynamic_q4_down_inline_unique_packet_body(
                 * activated[slot * intermediate + input_base + 1u];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && expert < 32 && row < hidden) {
         output[slot * hidden + row] = sum;
     }
@@ -5217,7 +5235,7 @@ inline void qx_dynamic_q4_down_cluster_body(
             }
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0 && expert < 32 && row < hidden) {
         output[slot * hidden + row] = sum;
     }
@@ -5291,7 +5309,7 @@ kernel void qx_dynamic_q4_moe_down_decode_direct_simd(
                     * activated[slot * intermediate + column];
             }
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0 && expert < 32 && row < hidden) {
             output[slot * hidden + row] = sum;
         }
@@ -5349,7 +5367,7 @@ kernel void qx_dynamic_q4_moe_down_cross_expert_tile8_simd(
                 }
             }
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0 && row < hidden) {
             output[simdgroup * hidden + row] = sum;
         }
@@ -5396,7 +5414,7 @@ kernel void qx_dynamic_q4_moe_down_wide_simd(
             uint scale = scale_base + qx_dynamic_scale_offset(row, group, groups, layout);
             sum += float(int(code) - 7) * float(scales[scale]) * cached_activated[column];
         }
-        sum = simd_sum(sum);
+        sum = qx_ordered_simd_sum(sum);
         if (lane == 0) output[slot * hidden + row] = sum;
     }
 }
@@ -5429,7 +5447,7 @@ kernel void qx_dynamic_q4k_moe_down_simd(
                 * activated[slot * intermediate + column];
         }
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[slot * hidden + row] = sum;
 }
 

@@ -1,9 +1,9 @@
 # QX verification benchmark report
 
 For epoch sampling economics and the terminal Solana fraud-proof benchmark,
-see `docs/verification-protocol.md`. The current executed SBF costs are 7,108
-CU for a production-depth weight opening and 1,877 CU for an activation opening
-plus one exact Q4 FP32 FMA (8,985 CU total over two transportable instructions).
+see `docs/verification-protocol.md`. The receipt-bound SBF path costs 13,652 CU
+from challenge opening through resolution. Its terminal two-instruction portion
+costs 9,780 CU.
 
 - Date: 2026-09-10
 - Machine/runtime: local Apple Metal device, release build
@@ -48,6 +48,28 @@ therefore widens initial dispute replay from one layer to two without sampling
 or omitting any K/V history. Its deterministic trace root was
 `63caefd734814b80e90ebfc78888a61a89c16141853b8c8777850e0e4d382dcb`.
 
+## Consensus arithmetic cost
+
+The original measurements above used Metal's native `simd_sum`. The registered
+execution profile now replaces every SIMD sum/max in the supported kernels with
+a fixed shuffle-down tree (`16, 8, 4, 2, 1`) and disables Metal fast-math
+reassociation. A matching CPU reduction oracle checks the same stage order.
+
+Fresh 31-repeat measurements for the selected two-layer checkpoint profile:
+
+| Arithmetic mode | Baseline | Verified | Commitment overhead | Trace root |
+|:---|---:|---:|---:|:---|
+| explicit tree, fast compiler | 98.400 ms | 101.570 ms | 3.222% | `144df0fb...e779f28` |
+| explicit tree, precise compiler | 104.057 ms | 107.079 ms | **2.904%** | `e70da1d9...429606` |
+
+Precise arithmetic itself costs 5.749% relative to the same explicit tree under
+the fast compiler. Comparing the deployable precise+commitment path (107.079
+ms) with the fast uncommitted path (98.400 ms) gives **8.820% total migration
+cost**. Thus commitment overhead now meets the desired 3% target, while total
+consensus-mode overhead does not yet meet the original 5% ceiling. The
+`QX_METAL_PRECISE_MATH=0` escape hatch is diagnostic only and must not identify
+a slashable execution profile.
+
 ## SHA-256 frequency experiment
 
 | Checkpoint interval | Baseline total | Verified total | Overhead | Baseline tok/s | Verified tok/s | Status |
@@ -89,11 +111,10 @@ of magnitude. The frequency sweep is almost flat at intervals 2 and 4, showing
 that incremental K/V SHA-256 is now the limiting work rather than checkpoint
 frequency, CPU work, synchronization, or residual copies.
 
-The required `<5%` gate is **achieved**. The `<=3%` desired target is not yet
-achieved; the best robust run is 3.203%, and the four-layer profile did not
-improve it. Solana exposes `sol_blake3`, and the actual terminal program is now
-measured at 8,985 CU across two transportable instructions; see the protocol
-document for the proof and account sizes.
+The commitment-only `<5%` gate is achieved and its `<=3%` desired target is now
+achieved in precise mode. The stricter, more honest comparison against the old
+fast execution path is 8.820%, so the complete performance gate remains open.
+See the protocol document for the receipt-bound Solana measurements.
 
 Reproduction command:
 

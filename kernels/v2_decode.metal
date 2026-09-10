@@ -1,6 +1,24 @@
 #include <metal_stdlib>
 using namespace metal;
 
+inline float qx_ordered_simd_sum(float value) {
+    value = value + simd_shuffle_down(value, 16u);
+    value = value + simd_shuffle_down(value, 8u);
+    value = value + simd_shuffle_down(value, 4u);
+    value = value + simd_shuffle_down(value, 2u);
+    value = value + simd_shuffle_down(value, 1u);
+    return simd_broadcast(value, 0u);
+}
+
+inline float qx_ordered_simd_max(float value) {
+    value = max(value, simd_shuffle_down(value, 16u));
+    value = max(value, simd_shuffle_down(value, 8u));
+    value = max(value, simd_shuffle_down(value, 4u));
+    value = max(value, simd_shuffle_down(value, 2u));
+    value = max(value, simd_shuffle_down(value, 1u));
+    return simd_broadcast(value, 0u);
+}
+
 struct NormParams {
     uint n;
     float epsilon;
@@ -68,13 +86,13 @@ kernel void qx_v2_rmsnorm_simd(
     for (uint i = tid; i < params.n; i += 256) {
         sum += input[i] * input[i];
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) partials[simdgroup] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simdgroup == 0) {
         float total = lane < 8 ? partials[lane] : 0.0f;
-        total = simd_sum(total);
+        total = qx_ordered_simd_sum(total);
         if (lane == 0) partials[0] = rsqrt(total / float(params.n) + params.epsilon);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -96,13 +114,13 @@ kernel void qx_v2_rmsnorm_scalar(
     threadgroup float partials[8];
     float sum = 0.0f;
     for (uint i = tid; i < params.n; i += 256) sum += input[i] * input[i];
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) partials[simdgroup] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simdgroup == 0) {
         float total = lane < 8 ? partials[lane] : 0.0f;
-        total = simd_sum(total);
+        total = qx_ordered_simd_sum(total);
         if (lane == 0) output[0] = rsqrt(total / float(params.n) + params.epsilon);
     }
 }
@@ -126,12 +144,12 @@ kernel void qx_v2_rmsnorm_batch(
         float value = input[base + i];
         sum += value * value;
     }
-    sum = simd_sum(sum);
+    sum = qx_ordered_simd_sum(sum);
     if (lane == 0) partials[simdgroup] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simdgroup == 0) {
         float total = lane < 8 ? partials[lane] : 0.0f;
-        total = simd_sum(total);
+        total = qx_ordered_simd_sum(total);
         if (lane == 0) partials[0] = rsqrt(total / float(params.n) + params.epsilon);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -924,9 +942,9 @@ kernel void qx_v2_attention_stream_gqa(
         uint cache_offset = (position * kv_heads + kv_head) * head_dim;
         float k0 = key_cache[cache_offset + dim0];
         float k1 = key_cache[cache_offset + dim1];
-        float dot0 = simd_sum(query[query0 + dim0] * k0
+        float dot0 = qx_ordered_simd_sum(query[query0 + dim0] * k0
                             + query[query0 + dim1] * k1);
-        float dot1 = simd_sum(query[query1 + dim0] * k0
+        float dot1 = qx_ordered_simd_sum(query[query1 + dim0] * k0
                             + query[query1 + dim1] * k1);
         dot0 = simd_broadcast(dot0 * scale, 0);
         dot1 = simd_broadcast(dot1 * scale, 0);
@@ -1001,9 +1019,9 @@ kernel void qx_v2_attention_chunked_gqa(
         uint cache_offset = (position * kv_heads + kv_head) * head_dim;
         float k0 = key_cache[cache_offset + dim0];
         float k1 = key_cache[cache_offset + dim1];
-        float dot0 = simd_broadcast(simd_sum(
+        float dot0 = simd_broadcast(qx_ordered_simd_sum(
             query[query0 + dim0] * k0 + query[query0 + dim1] * k1) * scale, 0);
-        float dot1 = simd_broadcast(simd_sum(
+        float dot1 = simd_broadcast(qx_ordered_simd_sum(
             query[query1 + dim0] * k0 + query[query1 + dim1] * k1) * scale, 0);
         float new_max0 = max(max0, dot0);
         float new_max1 = max(max1, dot1);
@@ -1112,7 +1130,7 @@ kernel void qx_v2_attention_softmax_max(
          position += 32) {
         maximum = max(maximum, scores[q_head * max_context + position]);
     }
-    maximum = simd_max(maximum);
+    maximum = qx_ordered_simd_max(maximum);
     if (lane == 0) partial_max[q_head * chunks + chunk_id] = maximum;
     (void)q_heads;
 }
@@ -1147,7 +1165,7 @@ kernel void qx_v2_attention_softmax_simd(
     for (uint position = tid; position < params.length; position += 256) {
         local_sum += exp(scores[group_id * max_context + position] - maximum);
     }
-    local_sum = simd_sum(local_sum);
+    local_sum = qx_ordered_simd_sum(local_sum);
     if (lane == 0) sum_reductions[simdgroup] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simdgroup == 0 && lane == 0) {

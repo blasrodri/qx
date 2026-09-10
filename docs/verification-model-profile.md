@@ -158,10 +158,11 @@ snapshots are overwritten each token and are never receipt or permanent trace
 storage. A single token-end hash dispatch processes all 24 layers and returns
 only 1,536 digest bytes after the runtime's existing token synchronization.
 
-This closes the byte-level compatibility gap. With GPU-oriented BLAKE3 state
-leaves, raw BLAKE3 state-tree parents, and BLAKE3 for the hot CPU trace trees,
-the robust measured overhead is 3.445% for every-layer checkpoints and 3.203%
-for the selected two-layer profile. Both are below the 5% hard ceiling. The
-execution-spec digest binds the hash design and gives different checkpoint
-intervals distinct identities. See `docs/verification-benchmarks.md` for exact
-commands and profiling history.
+This closes the byte-level commitment gap. Consensus arithmetic now uses an
+explicit 32-lane shuffle-down reduction tree and disables Metal fast math; a
+CPU verifier primitive reproduces the same sum order. Commitment overhead in
+that precise profile is 2.904%. Precise committed execution is currently
+8.820% slower than fast uncommitted execution, so the complete <5% gate is open
+again even though commitment work itself is below 3%. The execution-spec
+digest binds the hash design, reduction tree, math mode, and checkpoint
+interval. See `docs/verification-benchmarks.md` for exact measurements.
