@@ -6,6 +6,7 @@ members = [
     "crates/qx-metal",
     "crates/qx-runtime",
     "crates/qx-runtime-v2",
+    "crates/qx-commit",
     "crates/qx-format",
     "crates/qx-safetensors",
     "crates/qx-tokenizer",
@@ -25,6 +26,7 @@ members = [
     "tools/qx-quality-corpus",
     "tools/qx-task-eval",
     "tools/qx-route-cache",
+    "tools/qx-verify",
 ]
 resolver = "2"
 
@@ -55,3 +57,5 @@ safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+blake3 = "1"
+ed25519-dalek = "2"

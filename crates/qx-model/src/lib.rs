@@ -102,7 +102,7 @@ impl ModelShape {
         if self.active_experts > self.experts {
             errors.push("active_experts exceeds experts".to_owned());
         }
-        if self.attention_heads % self.key_value_heads != 0 {
+        if !self.attention_heads.is_multiple_of(self.key_value_heads) {
             errors.push("attention_heads is not divisible by key_value_heads".to_owned());
         }
         // Do not require hidden_size == attention_heads * head_dim. Qwen3
@@ -214,6 +214,11 @@ impl GraniteConfig {
                 "intermediate_size",
                 self.intermediate_size == Some(EXPERT_INTERMEDIATE),
             ),
+            (
+                "max_position_embeddings",
+                self.max_position_embeddings == Some(MAX_CONTEXT),
+            ),
+            ("vocab_size", self.vocab_size == Some(VOCAB)),
         ];
         let mismatches = checks
             .iter()
@@ -354,5 +359,24 @@ mod tests {
         let mut shape = ModelShape::granite_v0();
         shape.key_value_heads = 3;
         assert!(shape.validate().unwrap_err().contains("not divisible"));
+    }
+
+    #[test]
+    fn granite_profile_checks_context_and_vocabulary_metadata() {
+        let mut config = GraniteConfig {
+            model_type: Some("granitemoe".to_owned()),
+            num_hidden_layers: Some(LAYERS),
+            hidden_size: Some(HIDDEN),
+            num_attention_heads: Some(ATTENTION_HEADS),
+            num_key_value_heads: Some(KV_HEADS),
+            num_local_experts: Some(EXPERTS),
+            num_experts_per_tok: Some(TOP_K),
+            intermediate_size: Some(EXPERT_INTERMEDIATE),
+            max_position_embeddings: Some(MAX_CONTEXT),
+            vocab_size: Some(VOCAB),
+        };
+        config.validate_v0().unwrap();
+        config.vocab_size = Some(VOCAB + 1);
+        assert!(config.validate_v0().unwrap_err().contains("vocab_size"));
     }
 }

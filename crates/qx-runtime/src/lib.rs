@@ -3,6 +3,9 @@
 //! This exposes the fixed-shape CPU reference path and the macOS Metal-backed
 //! path for experts stored in a memory-mapped QX artifact.
 
+use qx_commit::{
+    CommitmentMetrics, ExecutionCommitterV1, InferenceReceiptV1, input_hash_v1, output_hash_v1,
+};
 use qx_compiler::QuantizedExpert;
 use qx_format::{MappedArtifact, TensorKind};
 use qx_model::{
@@ -109,6 +112,21 @@ pub struct GenerationTrace {
     pub token_ids: Vec<u32>,
     pub logits: Vec<Vec<f32>>,
     pub stats: GenerationStats,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerificationRequestV1 {
+    pub job_id: [u8; 32],
+    pub model_id: [u8; 32],
+    pub miner_pubkey: [u8; 32],
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct VerifiedGenerationV1 {
+    pub generation: GenerationTrace,
+    pub receipt: InferenceReceiptV1,
+    pub commitment_metrics: CommitmentMetrics,
 }
 
 /// Layer intermediates for one canonical forward pass. These are exposed for
@@ -248,6 +266,21 @@ impl KvCache {
     fn value(&self, position: usize, head: usize) -> &[f32] {
         let start = (position * KV_HEADS + head) * HEAD_DIM;
         &self.values[start..start + HEAD_DIM]
+    }
+
+    fn token(&self, position: usize) -> Result<(&[f32], &[f32]), String> {
+        if position >= self.length {
+            return Err(format!(
+                "KV position {position} is outside committed length {}",
+                self.length
+            ));
+        }
+        let width = KV_HEADS * HEAD_DIM;
+        let start = position * width;
+        Ok((
+            &self.keys[start..start + width],
+            &self.values[start..start + width],
+        ))
     }
 }
 
@@ -695,6 +728,7 @@ impl GraniteModel {
             ));
         }
         let model_dir = model_dir.as_ref();
+        validate_granite_metadata(model_dir)?;
         let checkpoint = Checkpoint::open(model_dir).map_err(|error| error.to_string())?;
         let tokenizer = RuntimeTokenizer::from_model_dir(model_dir)?;
         let embeddings =
@@ -762,6 +796,7 @@ impl GraniteModel {
             ));
         }
         let model_dir = model_dir.as_ref();
+        validate_granite_metadata(model_dir)?;
         let checkpoint = Checkpoint::open(model_dir).map_err(|error| error.to_string())?;
         let tokenizer = RuntimeTokenizer::from_model_dir(model_dir)?;
         let embeddings =
@@ -847,6 +882,64 @@ impl GraniteModel {
         max_new_tokens: usize,
         stop_on_eos: bool,
     ) -> Result<GenerationTrace, String> {
+        self.generate_tokens_with_trace_mode_internal(
+            prompt_tokens,
+            max_new_tokens,
+            stop_on_eos,
+            None,
+        )
+    }
+
+    /// Execute the existing reference path while constructing Phase-3 CPU
+    /// commitments. Every consumed prompt/output token contributes one token
+    /// root; the final predicted output token is committed by the preceding
+    /// model step and is therefore not executed a second time.
+    pub fn generate_tokens_with_verification(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        stop_on_eos: bool,
+        request: VerificationRequestV1,
+    ) -> Result<VerifiedGenerationV1, String> {
+        let mut committer = ExecutionCommitterV1::new(request.job_id, LAYERS, self.max_context)
+            .map_err(|error| error.to_string())?;
+        let generation = self.generate_tokens_with_trace_mode_internal(
+            prompt_tokens,
+            max_new_tokens,
+            stop_on_eos,
+            Some(&mut committer),
+        )?;
+        let execution = committer.finish().map_err(|error| error.to_string())?;
+        let receipt = InferenceReceiptV1 {
+            protocol_version: 1,
+            job_id: request.job_id,
+            model_id: request.model_id,
+            input_hash: input_hash_v1(&request.model_id, prompt_tokens)
+                .map_err(|error| error.to_string())?,
+            output_hash: output_hash_v1(&generation.token_ids)
+                .map_err(|error| error.to_string())?,
+            trace_root: execution.trace_root,
+            input_token_count: u32::try_from(prompt_tokens.len())
+                .map_err(|_| "input token count exceeds u32".to_owned())?,
+            output_token_count: u32::try_from(generation.token_ids.len())
+                .map_err(|_| "output token count exceeds u32".to_owned())?,
+            miner_pubkey: request.miner_pubkey,
+            sequence: request.sequence,
+        };
+        Ok(VerifiedGenerationV1 {
+            generation,
+            receipt,
+            commitment_metrics: execution.metrics,
+        })
+    }
+
+    fn generate_tokens_with_trace_mode_internal(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        stop_on_eos: bool,
+        mut commitments: Option<&mut ExecutionCommitterV1>,
+    ) -> Result<GenerationTrace, String> {
         let total_start = Instant::now();
         if prompt_tokens.is_empty() {
             return Err("prompt produced no tokens".to_owned());
@@ -861,7 +954,15 @@ impl GraniteModel {
         let mut logits = Vec::new();
         let prefill_start = Instant::now();
         for (position, token) in prompt_tokens.iter().copied().enumerate() {
-            logits = self.step(token, position)?;
+            logits = self.step_internal(
+                token,
+                position,
+                None,
+                None,
+                None,
+                None,
+                commitments.as_deref_mut(),
+            )?;
         }
         let prefill = prefill_start.elapsed();
         let mut tokens = Vec::with_capacity(prompt_tokens.len() + max_new_tokens);
@@ -879,7 +980,15 @@ impl GraniteModel {
             if stop_on_eos && Some(next) == self.tokenizer.eos_id() {
                 break;
             }
-            logits = self.step(next, position)?;
+            logits = self.step_internal(
+                next,
+                position,
+                None,
+                None,
+                None,
+                None,
+                commitments.as_deref_mut(),
+            )?;
         }
         let decode = decode_start.elapsed();
         let text = self.tokenizer.decode(&tokens)?;
@@ -942,6 +1051,7 @@ impl GraniteModel {
                 None,
                 Some(profile.layers.as_mut_slice()),
                 Some(&mut profile.lm_head),
+                None,
             )?;
             profile.tokens += 1;
         }
@@ -963,6 +1073,7 @@ impl GraniteModel {
                 None,
                 Some(profile.layers.as_mut_slice()),
                 Some(&mut profile.lm_head),
+                None,
             )?;
             profile.tokens += 1;
         }
@@ -1006,6 +1117,7 @@ impl GraniteModel {
                 position,
                 is_last.then_some(layers.as_mut_slice()),
                 is_last.then_some(&mut final_hidden),
+                None,
                 None,
                 None,
             )?;
@@ -1053,7 +1165,7 @@ impl GraniteModel {
     }
 
     fn step(&mut self, token: u32, position: usize) -> Result<Vec<f32>, String> {
-        self.step_internal(token, position, None, None, None, None)
+        self.step_internal(token, position, None, None, None, None, None)
     }
 
     fn step_internal(
@@ -1064,6 +1176,7 @@ impl GraniteModel {
         final_hidden: Option<&mut Vec<f32>>,
         mut timings: Option<&mut [LayerTiming]>,
         lm_head: Option<&mut Duration>,
+        mut commitments: Option<&mut ExecutionCommitterV1>,
     ) -> Result<Vec<f32>, String> {
         if token as usize >= VOCAB {
             return Err(format!("token {token} is outside vocabulary"));
@@ -1087,6 +1200,19 @@ impl GraniteModel {
                 trace,
                 timing,
             )?;
+            if let Some(committer) = commitments.as_deref_mut() {
+                let (key, value) = self.caches[index].token(position)?;
+                committer
+                    .commit_layer(
+                        u32::try_from(position)
+                            .map_err(|_| "token position exceeds u32".to_owned())?,
+                        index as u16,
+                        &hidden,
+                        key,
+                        value,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
         }
         let hidden = rms_norm(&hidden, &self.final_norm);
         if let Some(final_hidden) = final_hidden {
@@ -1136,6 +1262,15 @@ fn load_vector(checkpoint: &Checkpoint, name: &str, length: usize) -> Result<Vec
         ));
     }
     Ok(values)
+}
+
+fn validate_granite_metadata(model_dir: &Path) -> Result<(), String> {
+    let config_path = model_dir.join("config.json");
+    let bytes = std::fs::read(&config_path)
+        .map_err(|error| format!("read {}: {error}", config_path.display()))?;
+    let config: qx_model::GraniteConfig = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", config_path.display()))?;
+    config.validate_v0()
 }
 
 fn rms_norm(input: &[f32; HIDDEN], weight: &[f32]) -> [f32; HIDDEN] {

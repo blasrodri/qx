@@ -276,6 +276,40 @@ pub struct QuantizedTensor {
 }
 
 impl QuantizedTensor {
+    /// Borrow one logical quantization group in row-major model order.
+    ///
+    /// Physical artifact layouts may tile or interleave groups for Metal, but
+    /// consensus commitments must remain invariant under those transport-only
+    /// transformations. This accessor is the single canonical bridge from a
+    /// physical QX tensor to its logical packed codes and FP16 scale.
+    pub fn logical_group(&self, row: usize, group: usize) -> Result<(&[u8], u16), String> {
+        if row >= self.rows {
+            return Err(format!(
+                "row {row} is outside tensor with {} rows",
+                self.rows
+            ));
+        }
+        let groups = self.cols.div_ceil(self.group_size);
+        if group >= groups {
+            return Err(format!("group {group} is outside row with {groups} groups"));
+        }
+        let logical_len = (self.cols - group * self.group_size).min(self.group_size);
+        let byte_len = packed_len(logical_len, self.quant_type);
+        let (data_offset, scale_offset) = self.group_location(row, group);
+        let data_end = data_offset
+            .checked_add(byte_len)
+            .ok_or_else(|| "quantized group offset overflows".to_owned())?;
+        let packed = self
+            .data
+            .get(data_offset..data_end)
+            .ok_or_else(|| "quantized group points outside packed data".to_owned())?;
+        let scale = self
+            .scales
+            .get(scale_offset)
+            .ok_or_else(|| "quantized group points outside scale data".to_owned())?;
+        Ok((packed, scale.to_bits()))
+    }
+
     pub fn quantize(
         src: &[f32],
         rows: usize,

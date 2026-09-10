@@ -1,0 +1,160 @@
+# QX verification model profile (protocol V1)
+
+This profile was locked from the repository constants, the installed Granite
+`config.json`, and the current full QX artifact before consensus code was
+introduced. Runtime loaders reject metadata that differs from these values.
+
+## Registered model
+
+| Field | Exact value |
+|---|---:|
+| Upstream model | `ibm-granite-3.0-1b-a400m-instruct` |
+| Architecture | `GraniteMoeForCausalLM` / `granitemoe` |
+| Transformer layers | 24 |
+| Hidden size | 1,024 |
+| Attention heads | 16 |
+| KV heads | 8 |
+| Head dimension | 64 |
+| Local experts per layer | 32 |
+| Selected experts per token | 8 |
+| Expert intermediate size | 512 |
+| Vocabulary | 49,155 |
+| Maximum context | 4,096 tokens |
+| Tied input/output embedding | yes |
+| Router weights normalized | yes, softmax over selected top-8 |
+| RMS epsilon | `1e-6` (FP32 bits `0x358637bd`) |
+| RoPE theta | `10000.0` |
+| Attention multiplier | `0.015625` |
+| Embedding multiplier | `12.0` |
+| Residual multiplier | `0.22` |
+| Logits scaling | `6.0` |
+| Generation | batch 1, greedy |
+| Top-K tie break | lowest expert ID |
+| Argmax tie break | lowest token ID |
+
+Sources in the repository are `qx_model::ModelShape::granite_v0`,
+`GraniteConfig::validate_v0`, the V1 `GraniteModel` loader, and the V2 artifact
+execution-plan validation. The V1 loader now reads and validates `config.json`
+before loading any tensor. V2 rejects a sealed `model_shape` other than the
+same `granite_v0` shape.
+
+The inspected production-control artifact is
+`external/models/granite-m5-pro-q4-rowmajor-nocopy-v2.qx` (not committed). Its
+observed metadata is:
+
+| Field | Exact value |
+|---|---:|
+| Target | `apple-m5-pro` |
+| File bytes | 751,009,792 |
+| Tensor entries | 1,706 |
+| Q4 entries | 1,657 |
+| Raw FP32 entries | 49 |
+| Gate-up / down entries | 768 / 768 |
+| Expert payload | 679,477,248 bytes |
+| Dense quantized payload | 71,222,976 bytes |
+| Raw norm vectors | 200,704 bytes |
+| Logical weight payload | 750,900,928 bytes |
+
+The Phase-2 canonical commitment for that artifact is:
+
+```text
+weights_root = c31f3758efc5be3b410c0747bea880128a026d3bb7f38a1fd51e1a8949072d43
+weight_leaves = 41,755,744
+tensor_count = 1,706
+```
+
+## Existing runtime map
+
+- Model loading: V1 `GraniteModel::from_paths` reads the Hugging Face
+  checkpoint for dense tensors and a mapped QX artifact for experts. V2
+  `GraniteV2Generator::load` loads the complete mapped artifact and activates
+  its sealed execution plan.
+- Quantization: `qx-quant::QuantizedTensor`; artifact mapping and physical
+  layout decoding are in `qx-format::MappedArtifact`.
+- Metal entrypoint: V2 `GraniteV2Generator::step` and
+  `PreparedAttentionStack::encode_token_with_plan`.
+- Transformer loop: V1 `GraniteModel::step_internal`; V2
+  `PreparedAttentionStack::encode_full_layer_range_with_plan`.
+- KV cache: V1 `KvCache` uses per-layer contiguous FP32 K and V arrays. V2
+  `GpuRuntimeBuffers` uses one GPU arena with a sealed `KvPrecision`.
+- MoE routing/execution: V1 `GraniteLayerWeights::route_from_logits` and
+  `granite_moe_decode`; V2 uses `encode_topk` and the dynamic Q4 MoE kernels.
+- Token generation: V1 `generate_tokens_with_trace_mode`; V2
+  `generate_tokens_host_synchronized` and GPU-resident rollout variants.
+- Greedy selection: V1 `argmax` uses `f32::total_cmp` and lowest-ID tie
+  breaking; V2 uses the Metal argmax reduction.
+- Tests: crate-local Rust unit tests, Metal parity tests in `qx-metal` and
+  `qx-runtime-v2`, benchmark contracts under `benchmarks/`, and C Q4_K
+  reference vectors under `tests/`.
+
+## Quantization and weight commitment
+
+Protocol V1 accepts only QX symmetric Q4 with group size 32 for quantized
+matrices. For each logical row/group:
+
+- scale = FP16(`max(abs(group)) / 7`), with zero groups using `1.0`;
+- 32 signed values are rounded and clamped to `[-7, 7]`;
+- stored code = quantized value + 7;
+- two 4-bit codes share one byte, least-significant nibble first;
+- a full group is 16 packed-code bytes plus one 2-byte FP16 scale.
+
+Physical row-major, MetalTile32, row-inline, transaction, cross-expert, and
+superblock arrangements are transport details. `WeightLeafV1` always commits
+the same logical `(tensor_id, row, group, Q4, packed codes, scale bits)`.
+Raw FP32 norm vectors are committed in logical 32-value chunks with type 0 and
+scale bits 0.
+
+Tensor IDs are assigned after sorting in this semantic order:
+
+1. tied embedding;
+2. each layer in ascending order: input norm, Q, K, V, O, post-attention norm,
+   router, all gate/up experts by ID, all down experts by ID, query norm, key
+   norm;
+3. final norm and an explicit LM head if the model is not tied.
+
+Leaves are ordered by tensor ID, row, then group. Their already-domain-separated
+hashes form a binary tree padded to the next power of two with
+`QX:MERKLE:EMPTY:V1` leaves. Internal nodes use `QX:MERKLE:V1` and include the
+tree domain `QX:WEIGHT:TREE:V1`. Construction keeps only O(log N) hashes;
+inclusion proofs can be regenerated by replaying the immutable artifact.
+
+## Phase-3 checkpoint state
+
+After every transformer layer and before final normalization, the CPU oracle
+commits:
+
+1. the exact 1,024 FP32 values of the post-MoE residual stream;
+2. the exact rotated 8 × 64 FP32 key values appended by that layer;
+3. the exact 8 × 64 FP32 value values appended by that layer;
+4. token position, layer index, job ID, and the incrementally updated global
+   per-layer KV root.
+
+This is 8,192 canonical bytes per layer and **196,608 canonical activation/KV
+bytes per executed token** (`24 × (1024 + 512 + 512) × 4`). Only digests and
+Merkle frontiers remain after a token; no activation tensor is retained.
+Generation executes and commits `input_token_count + output_token_count - 1`
+tokens in the usual non-EOS case because the final output is the prediction of
+the preceding step.
+
+`InferenceReceiptV1` is 210 canonical bytes. Adding an Ed25519 signature makes
+the signed receipt exactly **274 bytes**, below the 512-byte target.
+
+## Known CPU/Metal compatibility gap
+
+The CPU commitment format is deterministic and covered by golden vectors, but
+full CPU/Metal execution-root equality is not yet established:
+
+- V1 stores both K and V as FP32; the current sealed M5 V2 profile stores K as
+  FP32 and V as FP16.
+- V1's artifact MoE boundary converts its FP32 input/output through FP16,
+  while other V1 dense operations retain FP32 host state.
+- V2 keeps layer residuals and KV state GPU-resident and currently exposes no
+  commitment kernel or compact per-layer digest output.
+- Accelerate/CPU reductions and Metal reductions are not promised to be
+  bit-identical merely because their mathematical expressions agree.
+
+Therefore `QX_EXEC_GRANITE_CPU_V1` is a CPU oracle profile, not a claim that the
+current V2 Metal graph already has the same trace root. Phase 4 must define and
+measure a sealed Metal profile, add GPU hashing without activation readback,
+and demonstrate CPU hashing of the same canonical GPU bytes matches the Metal
+digest before any on-chain dispute implementation is considered valid.

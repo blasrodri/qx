@@ -1,0 +1,16 @@
+[package]
+name = "qx-commit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+ed25519-dalek.workspace = true
+qx-format.workspace = true
+qx-model.workspace = true
+qx-quant.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+half.workspace = true
