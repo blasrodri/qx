@@ -4,7 +4,9 @@
 //! path for experts stored in a memory-mapped QX artifact.
 
 use qx_commit::{
-    CommitmentMetrics, ExecutionCommitterV1, InferenceReceiptV1, input_hash_v1, output_hash_v1,
+    CommitmentMetrics, Digest, ExecutionCommitterV1, GraniteMacroOpcodeV1, InferenceReceiptV1,
+    activation_hash_v1, granite_final_head_macro_program_v1, granite_layer_macro_program_v1,
+    input_hash_v1, kv_leaf_hash_v1, output_hash_v1,
 };
 use qx_compiler::QuantizedExpert;
 use qx_format::{MappedArtifact, TensorKind};
@@ -192,6 +194,124 @@ pub struct ForwardTrace {
     pub layers: Vec<LayerTrace>,
     pub final_hidden: Vec<f32>,
     pub logits: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraniteMacroOutputV1 {
+    pub opcode: GraniteMacroOpcodeV1,
+    pub output_root: Digest,
+}
+
+fn canonical_f32_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_bits().to_le_bytes())
+        .collect()
+}
+
+fn macro_activation_root(values: &[f32]) -> Result<Digest, String> {
+    activation_hash_v1(&canonical_f32_bytes(values)).map_err(|error| error.to_string())
+}
+
+impl LayerTrace {
+    /// Commit the dispute-only outputs in exactly the order emitted by the
+    /// registered Granite macro compiler. These roots are regenerated only
+    /// for a challenged token and are never retained by normal inference.
+    pub fn macro_outputs_v1(&self, token_index: u32) -> Result<Vec<GraniteMacroOutputV1>, String> {
+        let program =
+            granite_layer_macro_program_v1(self.layer).map_err(|error| error.to_string())?;
+        let mut rope = self.rotated_query.clone();
+        rope.extend_from_slice(&self.rotated_key);
+        let mut routing = Vec::with_capacity(TOP_K * 5);
+        for (expert, weight) in self.routed_experts.iter().zip(self.router_weights) {
+            routing.push(*expert);
+            routing.extend_from_slice(&weight.to_bits().to_le_bytes());
+        }
+        let key = canonical_f32_bytes(&self.rotated_key);
+        let value = canonical_f32_bytes(&self.value);
+        let roots = [
+            macro_activation_root(&self.normalized)?,
+            macro_activation_root(&self.query)?,
+            macro_activation_root(&self.key)?,
+            macro_activation_root(&self.value)?,
+            macro_activation_root(&rope)?,
+            kv_leaf_hash_v1(self.layer, token_index, &key, &value)
+                .map_err(|error| error.to_string())?,
+            macro_activation_root(&self.attention)?,
+            macro_activation_root(&self.attention_projection)?,
+            macro_activation_root(&self.post_attention)?,
+            macro_activation_root(&self.moe_input)?,
+            macro_activation_root(&self.router_logits)?,
+            activation_hash_v1(&routing).map_err(|error| error.to_string())?,
+            macro_activation_root(&self.moe)?,
+            macro_activation_root(&self.output)?,
+        ];
+        program
+            .into_iter()
+            .zip(roots)
+            .map(|(instruction, output_root)| {
+                let opcode = match instruction.opcode {
+                    65 => GraniteMacroOpcodeV1::RmsNorm,
+                    66 => GraniteMacroOpcodeV1::Dense,
+                    67 => GraniteMacroOpcodeV1::Rope,
+                    68 => GraniteMacroOpcodeV1::KvAppend,
+                    69 => GraniteMacroOpcodeV1::Attention,
+                    70 => GraniteMacroOpcodeV1::Residual,
+                    71 => GraniteMacroOpcodeV1::TopK,
+                    72 => GraniteMacroOpcodeV1::Moe,
+                    _ => return Err("layer macro compiler emitted an invalid opcode".to_owned()),
+                };
+                Ok(GraniteMacroOutputV1 {
+                    opcode,
+                    output_root,
+                })
+            })
+            .collect()
+    }
+}
+
+impl ForwardTrace {
+    pub fn final_head_macro_outputs_v1(&self) -> Result<Vec<GraniteMacroOutputV1>, String> {
+        let program = granite_final_head_macro_program_v1().map_err(|error| error.to_string())?;
+        let (token, logit) = self
+            .logits
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|(left_index, left), (right_index, right)| {
+                left.total_cmp(right)
+                    .then_with(|| right_index.cmp(left_index))
+            })
+            .ok_or_else(|| "Granite logits are empty".to_owned())?;
+        let mut winner = Vec::with_capacity(8);
+        winner.extend_from_slice(&logit.to_bits().to_le_bytes());
+        winner.extend_from_slice(
+            &u32::try_from(token)
+                .map_err(|_| "winning token exceeds u32".to_owned())?
+                .to_le_bytes(),
+        );
+        let roots = [
+            macro_activation_root(&self.final_hidden)?,
+            macro_activation_root(&self.logits)?,
+            activation_hash_v1(&winner).map_err(|error| error.to_string())?,
+        ];
+        program
+            .into_iter()
+            .zip(roots)
+            .map(|(instruction, output_root)| {
+                let opcode = match instruction.opcode {
+                    65 => GraniteMacroOpcodeV1::RmsNorm,
+                    73 => GraniteMacroOpcodeV1::FinalLogits,
+                    74 => GraniteMacroOpcodeV1::ArgMax,
+                    _ => return Err("head macro compiler emitted an invalid opcode".to_owned()),
+                };
+                Ok(GraniteMacroOutputV1 {
+                    opcode,
+                    output_root,
+                })
+            })
+            .collect()
+    }
 }
 
 impl GenerationStats {
@@ -1766,6 +1886,19 @@ mod tests {
         let mut model = GraniteModel::from_paths(model, artifact, 128).unwrap();
         let output = model.generate("Hello", 1).unwrap();
         assert!(output.starts_with("Hello"));
+        let prompt = model.encode_text("Hello").unwrap();
+        let trace = model.forward_trace(&prompt).unwrap();
+        assert_eq!(trace.layers.len(), LAYERS);
+        for layer in &trace.layers {
+            let outputs = layer
+                .macro_outputs_v1(u32::try_from(prompt.len() - 1).unwrap())
+                .unwrap();
+            assert_eq!(outputs.len(), 14);
+            assert!(outputs.iter().all(|output| output.output_root != [0; 32]));
+        }
+        let head = trace.final_head_macro_outputs_v1().unwrap();
+        assert_eq!(head.len(), 3);
+        assert!(head.iter().all(|output| output.output_root != [0; 32]));
     }
 
     #[cfg(target_os = "macos")]

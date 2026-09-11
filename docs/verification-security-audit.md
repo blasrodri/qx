@@ -51,6 +51,7 @@ claim.
 | Final-head output binding | shared final checkpoint starts both registered traces; distinct output-state hashes bind each trace to its claimed prediction | Implemented end to end on SBF |
 | Objective arithmetic library | Q4 FMA plus fixed add/mul/div/exp/rsqrt/sin/cos/reduction primitives | Implemented; fixed sine is executed on SBF, but not every family is wired into the chained VM |
 | Granite macro schedule | 14 steps per layer, 28 per selected interval, three for the final head; exact tensor map validated against the 1,706-entry production artifact | Implemented off-chain; nested macro-state dispute is not yet on-chain |
+| Dispute-only macro outputs | real runtime captures normalized/Q/K/V/rotated-QK/attention/router/routing/MoE/residual roots, the derived K/V leaf, and final hidden/logits/winner in compiler order | Implemented and complete-model tested; rolling live-state commitment is still required |
 | CPU verified generation | complete checkpoint+artifact execution emits a nonzero receipt root | Implemented and complete-model tested; a missing `begin_token` call was fixed by this audit |
 | Turn liveness | every unilateral move has a deadline and either non-responder loses | Implemented and tested |
 
