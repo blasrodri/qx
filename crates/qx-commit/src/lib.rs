@@ -14,6 +14,7 @@ mod merkle;
 mod model;
 mod receipt;
 mod state;
+mod vm;
 mod weights;
 
 pub use dispute::{EpochBlockSeedV2, FmaStateV1};
@@ -42,6 +43,7 @@ pub use state::{
     ACTIVATION_CHUNK_BYTES, STATE_CHUNK_BYTES, StateChunkProofV1, StateTreeKindV1,
     activation_hash_v1, kv_leaf_hash_v1, prove_state_chunk_v1, state_hash_v1,
 };
+pub use vm::{VmInstructionV1, VmMemoryOpeningV1, VmStateV1};
 pub use weights::{
     WeightCommitmentV1, WeightLeafV1, WeightProofV1, commit_q4_artifact, prove_q4_artifact_leaf,
 };
@@ -79,6 +81,10 @@ pub const D_AUDIT_SEED_V2: &[u8] = b"QX:AUDIT:SEED:V2";
 pub const D_AUDIT_DRAW: &[u8] = b"QX:AUDIT:DRAW:V1";
 pub const D_DISPUTE_TRACE: &[u8] = b"QX:DISPUTE:TRACE:V1";
 pub const D_FMA_STATE: &[u8] = b"QX:FMA:STATE:V1";
+pub const D_VM_STATE: &[u8] = b"QX:VM:STATE:V1";
+pub const D_VM_INSTRUCTION: &[u8] = b"QX:VM:INSTRUCTION:V1";
+pub const D_PROGRAM_TREE: &[u8] = b"QX:PROGRAM:TREE:V1";
+pub const D_OPERATOR_TREE: &[u8] = b"QX:OPERATOR:V1";
 
 pub const MAX_MERKLE_DEPTH: usize = 32;
 /// Hot per-token commitment trees use the Solana-supported BLAKE3 syscall;

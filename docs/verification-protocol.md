@@ -32,9 +32,11 @@ requester-signed immutable job payload (310 bytes, off chain)
   -> first produced Solana block after epoch close
   -> per-job Bernoulli audit draw
   -> independent challenger/miner Merkle openings
-  -> unilateral logarithmic bisection with turn-specific timeouts
-  -> authenticated Q4 weight + activation opening
-  -> objective FP32 FMA result
+  -> job-token and checkpoint bisection with exact preimage reveals
+  -> checkpoint-bound dispute-local operator traces
+  -> unilateral logarithmic operator bisection with turn-specific timeouts
+  -> registered instruction + runtime residual-chunk opening
+  -> objective state-root update
 ```
 
 There is no miner signature per job. The requester's job signature is checked
@@ -49,30 +51,31 @@ The current live-SBF measurements are:
 
 | Operation | Compute units |
 |---|---:|
-| Finalize epoch seed (once/epoch) | 1,786 |
-| Authenticate job/result and open challenge | 5,870 |
-| Both boundary openings + one midpoint round | 10,208 |
-| Weight proof + objective FMA | 9,485 |
+| Finalize epoch seed (once/epoch) | 1,784 |
+| Authenticate job/result and open challenge | 8,397 |
+| Both boundary openings + one midpoint round | 10,329 |
+| Bind both operator traces to checkpoints | 7,655 |
+| Chained runtime-chunk scalar terminal | 4,342 |
+| Compatibility staged Q4/FMA terminal | 9,533 |
 
 Each additional binary-search level costs one challenger and one miner
-midpoint instruction. The complete three-state synthetic dispute is 29,364 CU,
+midpoint instruction. The complete three-state synthetic dispute is 32,075 CU,
 including both terminal-state reveals. The full test also exercises both
 timeout directions, rejects an unselected result, rejects duplicate epoch
 submission, and convicts an incorrect accumulator without a miner co-signature.
 
-The outer bisection now accepts the production `QX:JOB:V1` domain and an SBF
-test reaches the first differing real `TokenResultV1`. Canonical job and token
-genesis leaves make index-zero corruption bisectable; compact streaming roots
-make `trace_length` proofs match the runtime. The program rejects a result
-whose trace length is not exactly `input_token_count + output_token_count`.
+The SBF production-format test now traverses a `QX:JOB:V1` root, reveals the
+differing `TokenResultV1`, traverses its `QX:TOKEN:V1` checkpoint root, binds
+both `QX:OPERATOR:V1` traces to the agreed runtime checkpoint roots, and
+convicts an incorrect update to the same 256-byte chunk tree used by normal
+execution. Compact roots and exact lengths prevent trace shortening.
 
-Four production gates remain deliberately disabled: collateral transfer and
-settlement, descent from the differing token through checkpoints into a
-chained operator-state trace, structured append-only KV witnesses, and durable
-job input availability. Therefore this code demonstrates adversarial
-attribution, sampling, production-root bisection, and isolated objective
-terminal transitions; it is not safe to enable automatic slashing for a full
-inference. See `docs/verification-security-audit.md` for the readiness audit.
+Automatic slashing remains disabled. The generic hierarchy and chained scalar
+mechanism work, but the registered Granite VM still lacks a canonical
+first-segment genesis, chained authenticated Q4 weight operations, structured
+KV append, and final-head/argmax settlement. Collateral transfer and durable
+input availability are also outside this proof milestone. See
+`docs/verification-security-audit.md` for the exact readiness gate.
 
 ## Epoch selection
 
@@ -195,7 +198,7 @@ the mutually agreed terminal boundary costs 1,100 CU. The complete measured
 path is 13,652 CU, plus 1,842 CU once per model+epoch registration in this test.
 
 The compatibility path uses a 56-byte epoch account, the shared registry now
-uses a 140-byte model account, and the path uses a 304-byte active dispute
+uses a 148-byte model account, and the path uses a 304-byte active dispute
 account and 52-byte temporary staged-weight account. A staged weight
 cannot be replayed into another dispute; forged receipt signatures, bad receipt
 openings, bad activation openings, early timeouts, and false arithmetic are
@@ -242,7 +245,7 @@ binds the fixed-math and commitment-shape profile.
 The scalar terminal IR now objectively evaluates FMA/dot steps, add, multiply,
 ordered sum/max, compare, select, division, fixed exp, and fixed rsqrt. An
 actual SBF fixed-exp dispute, including verification-program authentication,
-consumes 10,756 CU across both terminal reveals and resolution. RoPE
+consumes 10,803 CU across both terminal reveals and resolution. RoPE
 decomposes into multiply/add steps; softmax and RMSNorm use the
 fixed exp/rsqrt/div primitives. Argmax and Top-K decompose into compare/select.
 KV leaf hashing exists, but its append/frontier-update witness and the nested
@@ -275,10 +278,10 @@ The V2 path authenticates the requester job signature lazily, attributes an
 unsigned result through the miner's epoch, and binds the model, parties,
 activation root, arithmetic claims, and staged weight to one dispute account.
 It no longer needs mutual agreement or a miner signature per result.
-Automatic slashing remains disabled until hierarchical token/layer/operator
-bisection reaches this terminal phase from the production runtime root, the
-remaining IR operations are deterministically covered, and collateral/bond
-settlement is implemented.
+Hierarchical bisection now reaches a chained scalar terminal from a
+production-format runtime root. Automatic slashing remains disabled until the
+registered VM covers genesis, every Granite operation family, KV append, and
+final argmax, and collateral/bond settlement is implemented.
 
 ## Platform references
 

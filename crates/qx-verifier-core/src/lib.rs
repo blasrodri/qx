@@ -127,6 +127,74 @@ pub fn evaluate_scalar_op_v1(op: QxOpV1, operands: [u32; 3]) -> Result<u32, Veri
     Ok(result.to_bits())
 }
 
+/// Complete witness for one chained verification-VM scalar transition. The
+/// registered instruction binds addresses while each value is authenticated
+/// against the common pre-state memory root. The destination's old opening is
+/// reused to calculate the unique post-state root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmScalarWitnessV1 {
+    pub pre_state: qx_commit::VmStateV1,
+    pub instruction: qx_commit::VmInstructionV1,
+    pub instruction_proof: qx_commit::MerkleProof,
+    pub memory: qx_commit::VmMemoryOpeningV1,
+}
+
+pub fn verify_vm_scalar_transition_v1(
+    registered_program_root: Digest,
+    witness: &VmScalarWitnessV1,
+) -> Result<qx_commit::VmStateV1, VerificationError> {
+    let pc = witness.pre_state.program_counter;
+    if witness.instruction_proof.leaf_index != pc
+        || !witness
+            .instruction_proof
+            .verify(
+                qx_commit::HashAlgorithm::Blake3V1,
+                qx_commit::D_PROGRAM_TREE,
+                witness.instruction.hash(pc).map_err(commitment_error)?,
+                registered_program_root,
+            )
+            .map_err(commitment_error)?
+    {
+        return Err(VerificationError::AuthenticationFailed(
+            "verification instruction",
+        ));
+    }
+    if !witness
+        .memory
+        .verify(witness.pre_state.residual_root)
+        .map_err(commitment_error)?
+    {
+        return Err(VerificationError::AuthenticationFailed(
+            "VM residual memory",
+        ));
+    }
+    let addresses = [
+        witness.instruction.source_a,
+        witness.instruction.source_b,
+        witness.instruction.source_c,
+    ];
+    let mut operands = [0_u32; 3];
+    for (index, address) in addresses.into_iter().enumerate() {
+        operands[index] = witness
+            .memory
+            .scalar_bits(address)
+            .map_err(commitment_error)?;
+    }
+    let result = evaluate_scalar_op_v1(QxOpV1::try_from(witness.instruction.opcode)?, operands)?;
+    let residual_root = witness
+        .memory
+        .root_after_scalar_write(witness.instruction.destination, result)
+        .map_err(commitment_error)?;
+    witness
+        .pre_state
+        .successor(residual_root)
+        .map_err(commitment_error)
+}
+
+fn commitment_error(error: qx_commit::CommitError) -> VerificationError {
+    VerificationError::Commitment(error.to_string())
+}
+
 #[inline(always)]
 fn libm_fma(a: f32, b: f32, c: f32) -> f32 {
     // qx-consensus-math already pins libm's software-exact fmaf dependency;
@@ -595,8 +663,9 @@ pub fn locate_first_disagreement<T: Eq>(
 #[cfg(test)]
 mod tests {
     use qx_commit::{
-        HashAlgorithm, MerkleTree, ProtocolVersion, StateTreeKindV1, WeightCommitmentV1,
-        WeightLeafV1, WeightProofV1, activation_hash_v1, prove_state_chunk_v1,
+        HashAlgorithm, MerkleTree, ProtocolVersion, StateTreeKindV1, VmInstructionV1, VmStateV1,
+        WeightCommitmentV1, WeightLeafV1, WeightProofV1, activation_hash_v1, prove_state_chunk_v1,
+        state_hash_v1,
     };
 
     use super::*;
@@ -680,6 +749,52 @@ mod tests {
             evaluate_scalar_op_v1(QxOpV1::Select, [bits(1.0), bits(7.0), bits(9.0)]).unwrap(),
             bits(7.0)
         );
+    }
+
+    #[test]
+    fn chained_vm_transition_binds_program_operands_and_memory_update() {
+        let mut memory = vec![0_u8; 512];
+        for (index, value) in [2.0_f32, 3.0, 0.0, -1.0].iter().enumerate() {
+            memory[index * 4..index * 4 + 4].copy_from_slice(&value.to_bits().to_le_bytes());
+        }
+        let memory_root = state_hash_v1(&memory).unwrap();
+        let opening = prove_state_chunk_v1(StateTreeKindV1::Residual, &memory, 0).unwrap();
+        let instruction = VmInstructionV1 {
+            opcode: QxOpV1::Add as u8,
+            source_a: 0,
+            source_b: 4,
+            source_c: 8,
+            destination: 12,
+        };
+        let instruction_leaf = instruction.hash(0).unwrap();
+        let program = MerkleTree::new(
+            HashAlgorithm::Blake3V1,
+            qx_commit::D_PROGRAM_TREE,
+            &[instruction_leaf],
+        )
+        .unwrap();
+        let witness = VmScalarWitnessV1 {
+            pre_state: VmStateV1 {
+                job_hash: [7; 32],
+                token_index: 3,
+                segment_index: 11,
+                program_counter: 0,
+                residual_root: memory_root,
+                global_kv_root: [8; 32],
+            },
+            instruction,
+            instruction_proof: program.proof(0).unwrap(),
+            memory: opening,
+        };
+        let post = verify_vm_scalar_transition_v1(program.root(), &witness).unwrap();
+        memory[12..16].copy_from_slice(&5.0_f32.to_bits().to_le_bytes());
+        let expected_memory = state_hash_v1(&memory).unwrap();
+        assert_eq!(post.program_counter, 1);
+        assert_eq!(post.residual_root, expected_memory);
+
+        let mut forged = witness;
+        forged.memory.chunk[0..4].copy_from_slice(&9.0_f32.to_bits().to_le_bytes());
+        assert!(verify_vm_scalar_transition_v1(program.root(), &forged).is_err());
     }
 
     #[test]

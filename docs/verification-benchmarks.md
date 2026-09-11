@@ -15,12 +15,13 @@ executed tokens, 8 warmups, and the fixed consensus math profile. This passes
 the 5% ceiling but not the desired 3% target.
 
 For epoch sampling economics and the terminal Solana fraud-proof benchmark,
-see `docs/verification-protocol.md`. The adversarial V2 path uses 1,786 CU once
-per epoch to finalize entropy, 5,870 CU to authenticate and open a challenged
-result, 10,208 CU for both boundary proofs plus one midpoint round, and 9,485
-CU for the staged Q4 weight proof plus objective FMA. Each further binary
-search level adds another two-party midpoint round. The complete three-state
-synthetic test dispute, including both terminal-state reveals, is 29,364 CU.
+see `docs/verification-protocol.md`. The adversarial V2 path currently uses
+1,784 CU once per epoch to finalize entropy, 8,397 CU to authenticate and open
+a challenged result, 10,329 CU for both boundary proofs plus one midpoint
+round, 7,655 CU to bind both operator traces to checkpoint endpoints, and
+4,342 CU for the chained runtime-state-chunk scalar decision. Each further
+binary-search level adds another two-party midpoint round. The compatibility
+three-state Q4/FMA dispute is 32,075 CU.
 
 - Date: 2026-09-10
 - Machine/runtime: local Apple Metal device, release build

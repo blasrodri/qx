@@ -27,7 +27,7 @@ const Q4_GROUP_SIZE: u32 = 32;
 const Q4_TYPE: u8 = 4;
 const ACTIVATION_CHUNK_BYTES: usize = 128;
 const RECEIPT_BYTES: usize = 210;
-const MODEL_ACCOUNT_BYTES: usize = 140;
+const MODEL_ACCOUNT_BYTES: usize = 148;
 const EPOCH_ACCOUNT_BYTES: usize = 56;
 const DISPUTE_ACCOUNT_BYTES: usize = 304;
 const STAGED_WEIGHT_BYTES: usize = 52;
@@ -130,6 +130,21 @@ pub fn process_instruction(
         }
         v2::OP_MINER_SCALAR_V2 => v2::submit_miner_scalar(program_id, accounts, &mut cursor),
         v2::OP_RESOLVE_SCALAR_V2 => v2::resolve_scalar(program_id, accounts, &mut cursor),
+        v2::OP_RESOLVE_VM_SCALAR_V2 => v2::resolve_vm_scalar(program_id, accounts, &mut cursor),
+        v2::OP_CHALLENGER_TOKEN_V2 => {
+            v2::submit_challenger_token(program_id, accounts, &mut cursor)
+        }
+        v2::OP_MINER_TOKEN_V2 => v2::submit_miner_token(program_id, accounts, &mut cursor),
+        v2::OP_CHALLENGER_CHECKPOINT_V2 => {
+            v2::submit_challenger_checkpoint(program_id, accounts, &mut cursor)
+        }
+        v2::OP_MINER_CHECKPOINT_V2 => {
+            v2::submit_miner_checkpoint(program_id, accounts, &mut cursor)
+        }
+        v2::OP_CHALLENGER_OPERATOR_V2 => {
+            v2::submit_challenger_operator(program_id, accounts, &mut cursor)
+        }
+        v2::OP_MINER_OPERATOR_V2 => v2::submit_miner_operator(program_id, accounts, &mut cursor),
         _ => Err(QxError::InvalidEncoding.into()),
     }
 }
@@ -155,11 +170,18 @@ fn register_model(
     let execution_spec = cursor.array_32()?;
     let verification_program_root = cursor.array_32()?;
     let verification_program_leaves = cursor.u32()?;
+    let checkpoint_count = cursor.u32()?;
+    let model_layers = cursor.u16()?;
+    let checkpoint_interval = cursor.u16()?;
     if !cursor.is_empty()
         || weight_leaves == 0
         || execution_spec == [0; 32]
         || verification_program_root == [0; 32]
         || verification_program_leaves == 0
+        || model_layers == 0
+        || checkpoint_interval == 0
+        || !model_layers.is_multiple_of(checkpoint_interval)
+        || checkpoint_count != u32::from(model_layers / checkpoint_interval) + 1
     {
         return Err(QxError::InvalidEncoding.into());
     }
@@ -174,6 +196,9 @@ fn register_model(
     put(&mut state, 72, &execution_spec)?;
     put(&mut state, 104, &verification_program_root)?;
     put(&mut state, 136, &verification_program_leaves.to_le_bytes())?;
+    put(&mut state, 140, &checkpoint_count.to_le_bytes())?;
+    put(&mut state, 144, &model_layers.to_le_bytes())?;
+    put(&mut state, 146, &checkpoint_interval.to_le_bytes())?;
     Ok(())
 }
 

@@ -4,18 +4,19 @@ Date: 2026-09-11
 
 ## Verdict
 
-The protocol is **not ready for automatic settlement or permissionless
-production inference**. Its normal execution commitments, epoch sampling,
-authorization, outer job-tree bisection, timeouts, and isolated arithmetic
-verifiers work. A real runtime job root now reaches the on-chain bisection
-logic. However, the proof path stops at the first differing `TokenResultV1`.
-There is no authenticated descent from that token leaf through its checkpoint
-tree into a chained operator trace, and there is no collateral settlement.
+The generic fraud-proof mechanism is now demonstrated end to end for an
+in-place scalar transition, but the complete Granite inference program is
+**not ready for automatic settlement or permissionless production inference**.
+A real runtime-format job root descends through the token and checkpoint trees,
+binds both dispute-local operator traces to the agreed checkpoint and each
+party's endpoint, and lets SBF convict the incorrect state update using the
+same 256-byte residual commitment emitted by normal execution.
 
-This is a hard security boundary, not a documentation issue. The current SBF
-FMA and scalar tests prove that Solana can decide an already-authenticated tiny
-claim. They do not prove that the tiny claim was produced by the challenged
-model inference.
+The remaining boundary is model coverage rather than the bisection primitive:
+the registered VM still needs authenticated Q4 weight loads, first-segment
+genesis, KV append, and final-head/argmax transitions. Without those transition
+families, the test proves the mechanism and one real commitment update, not the
+entire model's `Execute(M, E, X)` claim.
 
 ## What is implemented and checked
 
@@ -32,8 +33,11 @@ model inference.
 | First-token/checkpoint faults are bisectable | canonical genesis leaves exist in both job and token trees | Implemented in commitments |
 | Trace shape cannot be shortened | SBF enforces `trace_length = input_count + output_count` | Implemented and tested |
 | Token tree shape is committed | `TokenResultV1` commits its checkpoint leaf count | Implemented in the runtime commitment |
+| Token/checkpoint descent | exact token and checkpoint preimages are authenticated; model-fixed counts/layers prevent challenger-chosen geometry | Implemented and tested on SBF for non-genesis segments |
+| Checkpoint-to-operator binding | both operator traces must open the agreed start checkpoint and their respective end checkpoint under `QX:OPERATOR:V1` | Implemented and tested on SBF |
 | Verification opcode is registered | scalar terminal opcode is opened against the model's verification-program root | Implemented on SBF |
-| Objective arithmetic | Q4 FMA plus fixed add/mul/div/exp/rsqrt/reduction primitives | Implemented and tested in isolation |
+| Chained objective scalar update | instruction, runtime-format residual chunk, old/new root, token, segment, PC, and unchanged KV root are bound | Implemented end to end on SBF |
+| Objective arithmetic library | Q4 FMA plus fixed add/mul/div/exp/rsqrt/reduction primitives | Implemented; not every family is wired into the chained VM |
 | Turn liveness | every unilateral move has a deadline and either non-responder loses | Implemented and tested |
 
 Two bugs found by this audit were deployment-critical:
@@ -64,10 +68,12 @@ to the fixed consensus profile. The previous same-machine measurement for
 that arithmetic migration plus commitments was 8.820%. It also excludes
 duplicate auditors, data distribution, failed jobs, and dispute replay.
 
-The live three-leaf synthetic SBF dispute consumes 29,364 CU. Epoch entropy
-finalization consumes 1,786 CU once per epoch; opening the challenged job costs
-5,870 CU. Larger traces add a challenger/miner midpoint pair for every binary
-search level. These costs occur only after a sampled replay disagrees.
+The current live three-leaf synthetic SBF dispute consumes 32,075 CU. Epoch
+entropy finalization consumes 1,784 CU once per epoch; opening the challenged
+job costs 8,397 CU. A two-party operator-boundary submission costs 7,655 CU,
+and the runtime-state-chunk scalar terminal costs 4,342 CU. Larger traces add a
+challenger/miner midpoint pair for every binary-search level (10,329 CU in the
+three-leaf test). These costs occur only after a sampled replay disagrees.
 
 Sampling is detection, not certainty. With one fully available auditor:
 
@@ -86,20 +92,19 @@ high-value job.
 
 ## What remains before confidence
 
-### P0: authenticated hierarchical fraud proof
+### P0: complete registered VM lowering
 
-After job bisection, both parties must reveal the differing 76-byte token
-preimage and prove its hash. The program must then bisect the committed
-`QX:TOKEN:V1` checkpoint roots, reveal the adjacent checkpoint preimages, and
-start a dispute-local operator trace whose first and last machine states are
-cryptographically tied to those checkpoints.
+The job→token→checkpoint→operator→scalar chain is implemented. Complete the
+registered Granite program with terminal witnesses for authenticated Q4 weight
+loads/FMA, cross-chunk moves, attention/RoPE/RMSNorm/router/MoE state updates,
+and the final head. The first checkpoint interval also needs a canonical
+pre-layer VM genesis tied to the exact input token and prior-token KV state;
+the current program deliberately fails closed if disagreement occurs between
+the opaque token-genesis leaf and the first checkpoint.
 
-That operator trace must use a chained state such as `(program_counter,
-memory_root)`. Each terminal operation must authenticate the registered
-instruction, operand memory openings, and destination memory-root update.
-Without this chaining, a valid scalar calculation can be unrelated to the
-model execution. The final-head argmax and its lowest-token-ID tie rule must be
-inside the same path, not merely stored as `predicted_token`.
+The final-head argmax and its lowest-token-ID tie rule must be inside this same
+chained path, not merely stored as `predicted_token`. Equal checkpoint roots
+with different predicted tokens are therefore not yet settlement-safe.
 
 ### P0: KV append proof
 

@@ -325,7 +325,7 @@ impl Fixture {
             };
             position >>= 1;
         }
-        let mut model_data = Vec::with_capacity(140);
+        let mut model_data = Vec::with_capacity(148);
         model_data.extend_from_slice(b"QXM1");
         model_data.extend_from_slice(&model_id);
         model_data.extend_from_slice(&weight_root);
@@ -333,6 +333,9 @@ impl Fixture {
         model_data.extend_from_slice(&[7; 32]);
         model_data.extend_from_slice(&[8; 32]);
         model_data.extend_from_slice(&1_u32.to_le_bytes());
+        model_data.extend_from_slice(&3_u32.to_le_bytes());
+        model_data.extend_from_slice(&4_u16.to_le_bytes());
+        model_data.extend_from_slice(&2_u16.to_le_bytes());
 
         let mut stage_weight = vec![1];
         stage_weight.extend_from_slice(&column.to_le_bytes());
@@ -438,7 +441,7 @@ impl Fixture {
                 &model_ix_data,
                 vec![AccountMeta::new(self.model_key, true)],
             ),
-            &[(self.model_key, owned_account(vec![0; 140], self.program_id))],
+            &[(self.model_key, owned_account(vec![0; 148], self.program_id))],
         );
         assert!(
             model_result.program_result.is_ok(),

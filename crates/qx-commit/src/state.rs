@@ -109,6 +109,71 @@ impl StateChunkProofV1 {
             .and_then(|value| value.checked_add(self.siblings.len() * 32))
             .ok_or(CommitError::ArithmeticOverflow)
     }
+
+    /// Read one aligned FP32 word addressed in the canonical byte image.
+    /// VM instructions use byte addresses so the same commitment can cover
+    /// residual vectors and any execution-spec-defined scratch region.
+    pub fn scalar_bits(&self, byte_address: u32) -> Result<u32, CommitError> {
+        if self.kind != StateTreeKindV1::Residual || byte_address & 3 != 0 {
+            return Err(CommitError::InvalidMerkleProof);
+        }
+        let address = usize::try_from(byte_address).map_err(|_| CommitError::ArithmeticOverflow)?;
+        let image_len =
+            usize::try_from(self.byte_length).map_err(|_| CommitError::ArithmeticOverflow)?;
+        let chunk_start = usize::try_from(self.chunk_index)
+            .map_err(|_| CommitError::ArithmeticOverflow)?
+            .checked_mul(STATE_CHUNK_BYTES)
+            .ok_or(CommitError::ArithmeticOverflow)?;
+        if address
+            .checked_add(4)
+            .ok_or(CommitError::ArithmeticOverflow)?
+            > image_len
+            || address < chunk_start
+            || address + 4 > chunk_start + self.chunk.len()
+        {
+            return Err(CommitError::InvalidMerkleProof);
+        }
+        let offset = address - chunk_start;
+        Ok(u32::from_le_bytes(
+            self.chunk[offset..offset + 4]
+                .try_into()
+                .map_err(|_| CommitError::InvalidMerkleProof)?,
+        ))
+    }
+
+    /// Calculate the unique residual root after replacing one authenticated
+    /// FP32 word. Callers must verify this opening against the pre-state root.
+    pub fn root_after_scalar_write(
+        &self,
+        byte_address: u32,
+        value_bits: u32,
+    ) -> Result<Digest, CommitError> {
+        self.scalar_bits(byte_address)?;
+        let chunk_start = usize::try_from(self.chunk_index)
+            .map_err(|_| CommitError::ArithmeticOverflow)?
+            .checked_mul(STATE_CHUNK_BYTES)
+            .ok_or(CommitError::ArithmeticOverflow)?;
+        let offset = usize::try_from(byte_address).map_err(|_| CommitError::ArithmeticOverflow)?
+            - chunk_start;
+        let mut chunk = self.chunk.clone();
+        chunk[offset..offset + 4].copy_from_slice(&value_bits.to_le_bytes());
+        let mut node = hash_domain(
+            HashAlgorithm::Blake3V1,
+            D_STATE_CHUNK,
+            &[&self.chunk_index.to_le_bytes(), &chunk],
+        )?;
+        let mut position =
+            usize::try_from(self.chunk_index).map_err(|_| CommitError::ArithmeticOverflow)?;
+        for sibling in &self.siblings {
+            node = if position & 1 == 0 {
+                state_parent_v1(&node, sibling)
+            } else {
+                state_parent_v1(sibling, &node)
+            };
+            position >>= 1;
+        }
+        Ok(node)
+    }
 }
 
 fn state_parent_v1(left: &Digest, right: &Digest) -> Digest {
