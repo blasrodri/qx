@@ -17,6 +17,8 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print consensus hashes and fixed protocol cost parameters.
+    ProtocolProfile,
     /// Stream the canonical V1 weight root without retaining model weights.
     ArtifactRoot {
         #[arg(value_name = "ARTIFACT")]
@@ -45,11 +47,27 @@ enum Command {
         cheated: u32,
         #[arg(long, value_delimiter = ',', default_value = "10,25,50,100,250,500")]
         audits: Vec<u32>,
+        /// Per-job Bernoulli audit probability used by the live protocol.
+        #[arg(long, default_value_t = 10_000)]
+        probability_ppm: u32,
+        /// Chance that at least one honest auditor completes a selected replay.
+        #[arg(long, default_value_t = 1_000_000)]
+        auditor_availability_ppm: u32,
+        /// Independent honest replays per selected job.
+        #[arg(long, default_value_t = 1)]
+        auditor_redundancy: u32,
+        /// Maximum value obtained by cheating on one job, in arbitrary units.
+        #[arg(long, default_value_t = 1_000)]
+        cheating_gain: u64,
+        /// Integer margin applied to the break-even collateral.
+        #[arg(long, default_value_t = 4)]
+        safety_factor: u32,
     },
 }
 
 fn main() -> Result<()> {
     match Args::parse().command {
+        Command::ProtocolProfile => protocol_profile()?,
         Command::ArtifactRoot { artifact } => {
             let commitment = qx_commit::commit_q4_artifact(artifact)?;
             println!("weights_root={}", hex(&commitment.root));
@@ -75,12 +93,77 @@ fn main() -> Result<()> {
             receipts,
             cheated,
             audits,
-        } => sampling_cost(receipts, cheated, &audits)?,
+            probability_ppm,
+            auditor_availability_ppm,
+            auditor_redundancy,
+            cheating_gain,
+            safety_factor,
+        } => sampling_cost(
+            receipts,
+            cheated,
+            &audits,
+            probability_ppm,
+            auditor_availability_ppm,
+            auditor_redundancy,
+            cheating_gain,
+            safety_factor,
+        )?,
     }
     Ok(())
 }
 
-fn sampling_cost(receipts: u32, cheated: u32, audits: &[u32]) -> Result<()> {
+fn protocol_profile() -> Result<()> {
+    println!(
+        "granite_execution_spec_interval_1={}",
+        hex(&qx_commit::granite_execution_spec_with_checkpoint_interval(
+            1
+        )?)
+    );
+    println!(
+        "granite_execution_spec_interval_2={}",
+        hex(&qx_commit::granite_execution_spec_with_checkpoint_interval(
+            2
+        )?)
+    );
+    println!(
+        "granite_execution_spec_interval_4={}",
+        hex(&qx_commit::granite_execution_spec_with_checkpoint_interval(
+            4
+        )?)
+    );
+    println!(
+        "minimum_audit_probability_ppm={}",
+        qx_commit::MIN_AUDIT_PROBABILITY_PPM_V1
+    );
+    println!(
+        "job_payload_bytes={}",
+        qx_commit::JobPayloadV1::CANONICAL_SIZE
+    );
+    println!(
+        "result_leaf_bytes={}",
+        qx_commit::ResultLeafV1::CANONICAL_SIZE
+    );
+    println!(
+        "token_result_bytes={}",
+        qx_commit::TokenResultV1::CANONICAL_SIZE
+    );
+    println!(
+        "checkpoint_bytes={}",
+        qx_commit::CheckpointV1::CANONICAL_SIZE
+    );
+    Ok(())
+}
+
+fn sampling_cost(
+    receipts: u32,
+    cheated: u32,
+    audits: &[u32],
+    probability_ppm: u32,
+    auditor_availability_ppm: u32,
+    auditor_redundancy: u32,
+    cheating_gain: u64,
+    safety_factor: u32,
+) -> Result<()> {
     use anyhow::bail;
 
     if receipts == 0 || cheated == 0 || cheated > receipts {
@@ -92,6 +175,22 @@ fn sampling_cost(receipts: u32, cheated: u32, audits: &[u32]) -> Result<()> {
         "cheated_fraction_percent={:.6}",
         f64::from(cheated) * 100.0 / f64::from(receipts)
     );
+    let effective =
+        qx_commit::effective_detection_probability(probability_ppm, auditor_availability_ppm)?;
+    let replay = qx_commit::replay_overhead_fraction(probability_ppm, auditor_redundancy)?;
+    let collateral = qx_commit::minimum_deterrent_collateral(
+        cheating_gain,
+        probability_ppm,
+        auditor_availability_ppm,
+        safety_factor,
+    )?;
+    println!("bernoulli_audit_probability_ppm={probability_ppm}");
+    println!("auditor_availability_ppm={auditor_availability_ppm}");
+    println!("effective_detection_percent={:.6}", effective * 100.0);
+    println!("expected_replay_overhead_percent={:.6}", replay * 100.0);
+    println!("cheating_gain={cheating_gain}");
+    println!("safety_factor={safety_factor}");
+    println!("minimum_deterrent_collateral={collateral}");
     for &audit_count in audits {
         let probability = qx_commit::audit_detection_probability(receipts, cheated, audit_count)?;
         println!(

@@ -2,9 +2,10 @@ use ed25519_dalek::{Signer, SigningKey};
 use half::f16;
 use mollusk_svm::Mollusk;
 use qx_commit::{
-    activation_hash_v1, hash_domain, prove_state_chunk_v1, EpochBlockSeedV2, FmaStateV1,
-    HashAlgorithm, JobPayloadV1, MerkleProof, MerkleTree, ProtocolVersion, ResultLeafV1,
-    StateTreeKindV1, WeightLeafV1, D_BATCH, D_DISPUTE_TRACE, D_MERKLE, D_WEIGHT_TREE,
+    activation_hash_v1, hash_domain, job_genesis_hash_v1, prove_state_chunk_v1, EpochBlockSeedV2,
+    FmaStateV1, HashAlgorithm, JobPayloadV1, MerkleProof, MerkleTree, ProtocolVersion,
+    ResultLeafV1, StateTreeKindV1, TokenResultV1, WeightLeafV1, D_BATCH, D_JOB, D_MERKLE,
+    D_WEIGHT_TREE,
 };
 use solana_account::Account;
 use solana_hash::Hash;
@@ -15,6 +16,7 @@ const EPOCH_BYTES: usize = 152;
 const DISPUTE_BYTES: usize = 448;
 const STAGED_BYTES: usize = 52;
 const MINER_BYTES: usize = 16;
+const MODEL_BYTES: usize = 140;
 const WEIGHT_LEAVES: u32 = 41_755_744;
 
 #[test]
@@ -139,12 +141,35 @@ fn fixed_exp_scalar_transition_convicts_wrong_miner_on_sbf() {
     let common = scalar_state_hash(job_hash, transition, op, a, b, c, None);
     let challenger_end = scalar_state_hash(job_hash, transition, op, a, b, c, Some(honest));
     let defender_end = scalar_state_hash(job_hash, transition, op, a, b, c, Some(dishonest));
+    let program_leaves = (0..=transition)
+        .map(|index| {
+            let instruction_op = if index == transition { op } else { 2 };
+            hash_domain(
+                HashAlgorithm::Blake3V1,
+                b"QX:PROGRAM:INSTRUCTION:V1",
+                &[&index.to_le_bytes(), &[instruction_op]],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let program_tree = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        b"QX:PROGRAM:TREE:V1",
+        &program_leaves,
+    )
+    .unwrap();
+    let program_proof = program_tree.proof(transition as usize).unwrap();
+    let mut model = owned(MODEL_BYTES, f.program);
+    model.data[..4].copy_from_slice(b"QXM1");
+    model.data[104..136].copy_from_slice(&program_tree.root());
+    model.data[136..140].copy_from_slice(&(program_leaves.len() as u32).to_le_bytes());
 
     let mut dispute = owned(DISPUTE_BYTES, f.program);
     dispute.data[..4].copy_from_slice(b"QXD2");
     dispute.data[4] = 5;
     dispute.data[6] = 2;
     dispute.data[72..104].copy_from_slice(&job_hash);
+    dispute.data[40..72].copy_from_slice(f.model.as_ref());
     dispute.data[104..136].copy_from_slice(f.miner.as_ref());
     dispute.data[136..168].copy_from_slice(f.challenger.as_ref());
     dispute.data[232..264].copy_from_slice(&common);
@@ -160,16 +185,27 @@ fn fixed_exp_scalar_transition_convicts_wrong_miner_on_sbf() {
     challenger_body.extend_from_slice(&b.to_le_bytes());
     challenger_body.extend_from_slice(&c.to_le_bytes());
     challenger_body.extend_from_slice(&honest.to_le_bytes());
+    challenger_body.extend_from_slice(&transition.to_le_bytes());
+    challenger_body.extend_from_slice(&(program_leaves.len() as u32).to_le_bytes());
+    challenger_body.push(program_proof.siblings.len() as u8);
+    for sibling in &program_proof.siblings {
+        challenger_body.extend_from_slice(sibling);
+    }
     let challenger = vm.process_instruction(
         &f.ix(
             21,
             vec![
+                AccountMeta::new_readonly(f.model, false),
                 AccountMeta::new(f.dispute, false),
                 AccountMeta::new_readonly(f.challenger, true),
             ],
             &challenger_body,
         ),
-        &[(f.dispute, dispute), (f.challenger, Account::default())],
+        &[
+            (f.model, model),
+            (f.dispute, dispute),
+            (f.challenger, Account::default()),
+        ],
     );
     assert_ok(&challenger.program_result);
     let dispute = account(&challenger.resulting_accounts, f.dispute);
@@ -263,7 +299,7 @@ fn sbf_timeout_awards_the_other_party_for_each_turn() {
 
 #[test]
 fn sbf_rejects_a_result_that_epoch_sampling_did_not_select() {
-    let f = Fixture::with_audit_probability(0);
+    let f = Fixture::with_audit_probability(10_000);
     let mut vm = f.vm();
     let (model, epoch, _) = f.seeded_epoch(&mut vm);
     let opened = vm.process_transaction_instructions(
@@ -331,6 +367,83 @@ fn sbf_miner_identity_rejects_duplicate_epoch_grinding() {
     assert!(duplicate.program_result.is_err());
 }
 
+#[test]
+fn sbf_bisects_the_actual_runtime_job_leaf_format() {
+    let mut f = Fixture::new();
+    let genesis = job_genesis_hash_v1(&f.job.job_id).unwrap();
+    let token = |index, checkpoint_root, predicted_token| {
+        TokenResultV1 {
+            job_id: f.job.job_id,
+            token_index: index,
+            checkpoint_root,
+            predicted_token,
+            checkpoint_count: 2,
+        }
+        .hash()
+        .unwrap()
+    };
+    let common = token(0, [8; 32], 41);
+    let honest_end = token(1, [9; 32], 42);
+    let miner_end = token(1, [10; 32], 99);
+    f.honest_tree = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        D_JOB,
+        &[genesis, common, honest_end],
+    )
+    .unwrap();
+    f.miner_tree = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        D_JOB,
+        &[genesis, common, miner_end],
+    )
+    .unwrap();
+    f.result.trace_root = f.miner_tree.root();
+    f.results = MerkleTree::new(
+        HashAlgorithm::Sha256V1,
+        D_BATCH,
+        &[f.result.hash().unwrap(), [99; 32]],
+    )
+    .unwrap();
+
+    let mut vm = f.vm();
+    let (model, epoch, _) = f.seeded_epoch(&mut vm);
+    let (dispute, _) = f.open(&vm, epoch, model);
+    let (dispute, _) = f.bounds_hashes(&vm, dispute, true, genesis, honest_end);
+    let (dispute, _) = f.bounds_hashes(&vm, dispute, false, genesis, miner_end);
+    let (dispute, _) = f.midpoint_hash(&vm, dispute, true, common);
+    let (dispute, _) = f.midpoint_hash(&vm, dispute, false, common);
+    assert_eq!(dispute.data[4], 5);
+    assert_eq!(
+        (u32_at(&dispute.data, 376), u32_at(&dispute.data, 380)),
+        (1, 2)
+    );
+}
+
+#[test]
+fn sbf_rejects_result_trace_length_inconsistent_with_job_shape() {
+    let mut f = Fixture::new();
+    f.result.trace_length = 4;
+    f.results = MerkleTree::new(
+        HashAlgorithm::Sha256V1,
+        D_BATCH,
+        &[f.result.hash().unwrap(), [99; 32]],
+    )
+    .unwrap();
+    let mut vm = f.vm();
+    let (model, epoch, _) = f.seeded_epoch(&mut vm);
+    let opened = vm.process_transaction_instructions(
+        &[f.job_signature_ix(), f.open_ix()],
+        &[
+            (f.epoch, epoch),
+            (f.model, model),
+            (f.dispute, owned(DISPUTE_BYTES, f.program)),
+            (f.challenger, Account::default()),
+            ed25519_program_account(),
+        ],
+    );
+    assert!(opened.program_result.is_err());
+}
+
 struct Fixture {
     program: Pubkey,
     model: Pubkey,
@@ -384,7 +497,7 @@ impl Fixture {
             model_id: [2; 32],
             execution_spec: [3; 32],
             input_hash: [4; 32],
-            input_token_count: 8,
+            input_token_count: 1,
             max_output_tokens: 16,
             payment: 1_000,
             slashable_exposure: 2_000,
@@ -408,7 +521,7 @@ impl Fixture {
         let make_tree = |states: &[FmaStateV1]| {
             MerkleTree::new(
                 HashAlgorithm::Blake3V1,
-                D_DISPUTE_TRACE,
+                D_JOB,
                 &states
                     .iter()
                     .map(FmaStateV1::hash)
@@ -423,7 +536,7 @@ impl Fixture {
             job_hash,
             output_hash: [5; 32],
             trace_root: miner_tree.root(),
-            output_token_count: 4,
+            output_token_count: 2,
             trace_length: 3,
         };
         let results = MerkleTree::new(
@@ -530,9 +643,12 @@ impl Fixture {
         model_body.extend_from_slice(&self.job.model_id);
         model_body.extend_from_slice(&self.weight_root);
         model_body.extend_from_slice(&WEIGHT_LEAVES.to_le_bytes());
+        model_body.extend_from_slice(&self.job.execution_spec);
+        model_body.extend_from_slice(&[7; 32]);
+        model_body.extend_from_slice(&1_u32.to_le_bytes());
         let r = vm.process_instruction(
             &self.ix(6, vec![AccountMeta::new(self.model, true)], &model_body),
-            &[(self.model, owned(72, self.program))],
+            &[(self.model, owned(MODEL_BYTES, self.program))],
         );
         assert_ok(&r.program_result);
         let model = account(&r.resulting_accounts, self.model);
@@ -610,16 +726,38 @@ impl Fixture {
     }
 
     fn bounds(&self, vm: &Mollusk, dispute: Account, honest: bool) -> (Account, u64) {
-        let (op, party, states, tree) = if honest {
-            (12, self.challenger, &self.honest_states, &self.honest_tree)
+        let (start, end) = if honest {
+            (
+                self.honest_states[0].hash().unwrap(),
+                self.honest_states[2].hash().unwrap(),
+            )
         } else {
-            (13, self.miner, &self.miner_states, &self.miner_tree)
+            (
+                self.miner_states[0].hash().unwrap(),
+                self.miner_states[2].hash().unwrap(),
+            )
+        };
+        self.bounds_hashes(vm, dispute, honest, start, end)
+    }
+
+    fn bounds_hashes(
+        &self,
+        vm: &Mollusk,
+        dispute: Account,
+        honest: bool,
+        start_hash: [u8; 32],
+        end_hash: [u8; 32],
+    ) -> (Account, u64) {
+        let (op, party, tree) = if honest {
+            (12, self.challenger, &self.honest_tree)
+        } else {
+            (13, self.miner, &self.miner_tree)
         };
         let start = tree.proof(0).unwrap();
         let end = tree.proof(2).unwrap();
         let mut body = Vec::new();
-        body.extend_from_slice(&states[0].hash().unwrap());
-        body.extend_from_slice(&states[2].hash().unwrap());
+        body.extend_from_slice(&start_hash);
+        body.extend_from_slice(&end_hash);
         body.push(start.siblings.len() as u8);
         append_siblings(&mut body, &start);
         append_siblings(&mut body, &end);
@@ -642,22 +780,27 @@ impl Fixture {
     }
 
     fn midpoint(&self, vm: &Mollusk, dispute: Account, honest: bool) -> (Account, u64) {
-        let (op, party, state, proof) = if honest {
-            (
-                14,
-                self.challenger,
-                self.honest_states[1],
-                self.honest_tree.proof(1).unwrap(),
-            )
+        let claim = if honest {
+            self.honest_states[1].hash().unwrap()
         } else {
-            (
-                15,
-                self.miner,
-                self.miner_states[1],
-                self.miner_tree.proof(1).unwrap(),
-            )
+            self.miner_states[1].hash().unwrap()
         };
-        let mut body = state.hash().unwrap().to_vec();
+        self.midpoint_hash(vm, dispute, honest, claim)
+    }
+
+    fn midpoint_hash(
+        &self,
+        vm: &Mollusk,
+        dispute: Account,
+        honest: bool,
+        claim: [u8; 32],
+    ) -> (Account, u64) {
+        let (op, party, proof) = if honest {
+            (14, self.challenger, self.honest_tree.proof(1).unwrap())
+        } else {
+            (15, self.miner, self.miner_tree.proof(1).unwrap())
+        };
+        let mut body = claim.to_vec();
         body.push(proof.siblings.len() as u8);
         append_siblings(&mut body, &proof);
         let r = vm.process_instruction(

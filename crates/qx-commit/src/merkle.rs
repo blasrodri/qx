@@ -202,13 +202,34 @@ impl FixedMerkleAccumulator {
     }
 
     pub fn root(&self) -> Result<Digest, CommitError> {
-        let capacity = 1_usize << self.depth;
+        self.root_at_depth(self.depth)
+    }
+
+    /// Root of the smallest complete tree that contains every appended leaf.
+    /// This is the root authenticated by a `MerkleProof` whose `leaf_count`
+    /// equals `len()`, even when the accumulator was provisioned with a much
+    /// larger maximum capacity.
+    pub fn compact_root(&self) -> Result<Digest, CommitError> {
+        if self.count == 0 {
+            return Err(CommitError::EmptyTree);
+        }
+        self.root_at_depth(depth_for_leaves(self.count)?)
+    }
+
+    fn root_at_depth(&self, depth: usize) -> Result<Digest, CommitError> {
+        if depth > self.depth {
+            return Err(CommitError::InvalidMerkleDepth(depth));
+        }
+        let capacity = 1_usize << depth;
+        if self.count > capacity {
+            return Err(CommitError::TreeCapacityExceeded);
+        }
         if self.count == capacity {
-            return self.frontier[self.depth].ok_or(CommitError::InvalidMerkleProof);
+            return self.frontier[depth].ok_or(CommitError::InvalidMerkleProof);
         }
         let mut node = self.empty_subtrees[0];
         let mut index = self.count;
-        for level in 0..self.depth {
+        for level in 0..depth {
             node = if index & 1 == 1 {
                 let left = self.frontier[level].ok_or(CommitError::InvalidMerkleProof)?;
                 parent(self.algorithm, self.tree_domain, &left, &node)?
@@ -324,6 +345,29 @@ mod tests {
                 stream.append(*leaf).unwrap();
             }
             assert_eq!(stream.root().unwrap(), tree.root());
+        }
+    }
+
+    #[test]
+    fn compact_streaming_root_ignores_unused_maximum_capacity() {
+        for count in 1..=8 {
+            let leaves = (0..count)
+                .map(|value| {
+                    hash_domain(
+                        HashAlgorithm::Blake3V1,
+                        b"QX:TEST:LEAF:V1",
+                        &[&(value as u64).to_le_bytes()],
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let tree = MerkleTree::new(HashAlgorithm::Blake3V1, D_TEST, &leaves).unwrap();
+            let mut stream =
+                FixedMerkleAccumulator::new(HashAlgorithm::Blake3V1, D_TEST, 12).unwrap();
+            for leaf in &leaves {
+                stream.append(*leaf).unwrap();
+            }
+            assert_eq!(stream.compact_root().unwrap(), tree.root());
         }
     }
 }

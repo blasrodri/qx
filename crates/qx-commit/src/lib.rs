@@ -5,6 +5,7 @@
 //! a future Metal implementation must match its golden vectors byte-for-byte.
 
 mod dispute;
+mod economics;
 mod epoch;
 mod execution;
 mod hash;
@@ -16,15 +17,20 @@ mod state;
 mod weights;
 
 pub use dispute::{EpochBlockSeedV2, FmaStateV1};
+pub use economics::{
+    PPM_DENOMINATOR, effective_detection_probability, minimum_deterrent_collateral,
+    repeated_cheat_detection_probability, replay_overhead_fraction,
+};
 pub use epoch::{
     AuditEpochV1, audit_detection_probability, audit_selected_v1, derive_audit_seed_v1,
     required_audit_count, sample_receipt_indices_v1,
 };
 pub use execution::{
     CheckpointV1, CommitmentMetrics, ExecutionCommitterV1, ExecutionTraceV1, TokenResultV1,
+    job_genesis_hash_v1, token_genesis_hash_v1,
 };
 pub use hash::{Digest, HashAlgorithm, ProtocolVersion, hash_domain, hash_domain_input_len};
-pub use job::{JobPayloadV1, ResultLeafV1};
+pub use job::{JobEnvelopeV1, JobPayloadV1, MIN_AUDIT_PROBABILITY_PPM_V1, ResultLeafV1};
 pub use merkle::{FixedMerkleAccumulator, MerkleProof, MerkleTree, MutableMerkleTree};
 pub use model::{
     GraniteMathFunctionsV1, GraniteMathModeV1, ModelSpecV1, granite_architecture_root,
@@ -57,6 +63,8 @@ pub const D_CHECKPOINT: &[u8] = b"QX:CHECKPOINT:V1";
 pub const D_TOKEN: &[u8] = b"QX:TOKEN:V1";
 pub const D_TOKEN_RESULT: &[u8] = b"QX:TOKEN:RESULT:V1";
 pub const D_JOB: &[u8] = b"QX:JOB:V1";
+pub const D_JOB_GENESIS: &[u8] = b"QX:JOB:GENESIS:V1";
+pub const D_TOKEN_GENESIS: &[u8] = b"QX:TOKEN:GENESIS:V1";
 pub const D_JOB_PAYLOAD: &[u8] = b"QX:JOB:PAYLOAD:V1";
 pub const D_RESULT: &[u8] = b"QX:RESULT:V1";
 pub const D_RECEIPT: &[u8] = b"QX:RECEIPT:V1";

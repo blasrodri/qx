@@ -1,8 +1,20 @@
 use crate::{
-    CommitError, D_CHECKPOINT, D_JOB, D_KV, D_TOKEN, D_TOKEN_RESULT, Digest,
-    FixedMerkleAccumulator, MerkleTree, MutableMerkleTree, TRACE_HASH_ALGORITHM, hash_domain,
-    kv_leaf_hash_v1, state_hash_v1,
+    CommitError, D_CHECKPOINT, D_JOB, D_JOB_GENESIS, D_KV, D_TOKEN, D_TOKEN_GENESIS,
+    D_TOKEN_RESULT, Digest, FixedMerkleAccumulator, MerkleTree, MutableMerkleTree,
+    TRACE_HASH_ALGORITHM, hash_domain, kv_leaf_hash_v1, state_hash_v1,
 };
+
+pub fn job_genesis_hash_v1(job_id: &Digest) -> Result<Digest, CommitError> {
+    hash_domain(TRACE_HASH_ALGORITHM, D_JOB_GENESIS, &[job_id])
+}
+
+pub fn token_genesis_hash_v1(job_id: &Digest, token_index: u32) -> Result<Digest, CommitError> {
+    hash_domain(
+        TRACE_HASH_ALGORITHM,
+        D_TOKEN_GENESIS,
+        &[job_id, &token_index.to_le_bytes()],
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckpointV1 {
@@ -45,10 +57,12 @@ pub struct TokenResultV1 {
     pub token_index: u32,
     pub checkpoint_root: Digest,
     pub predicted_token: u32,
+    /// Leaves under `checkpoint_root`, including the canonical token genesis.
+    pub checkpoint_count: u32,
 }
 
 impl TokenResultV1 {
-    pub const CANONICAL_SIZE: usize = 72;
+    pub const CANONICAL_SIZE: usize = 76;
 
     pub fn canonical_bytes(&self) -> [u8; Self::CANONICAL_SIZE] {
         let mut bytes = [0; Self::CANONICAL_SIZE];
@@ -56,10 +70,16 @@ impl TokenResultV1 {
         bytes[32..36].copy_from_slice(&self.token_index.to_le_bytes());
         bytes[36..68].copy_from_slice(&self.checkpoint_root);
         bytes[68..72].copy_from_slice(&self.predicted_token.to_le_bytes());
+        bytes[72..76].copy_from_slice(&self.checkpoint_count.to_le_bytes());
         bytes
     }
 
     pub fn hash(&self) -> Result<Digest, CommitError> {
+        if self.checkpoint_count < 2 {
+            return Err(CommitError::InvalidShape(
+                "token result requires genesis plus at least one checkpoint".to_owned(),
+            ));
+        }
         hash_domain(
             TRACE_HASH_ALGORITHM,
             D_TOKEN_RESULT,
@@ -86,8 +106,32 @@ impl CommitmentMetrics {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionTraceV1 {
     pub trace_root: Digest,
+    /// Job-tree leaves, including the canonical genesis at index zero.
+    pub trace_length: u32,
     pub executed_tokens: u32,
     pub metrics: CommitmentMetrics,
+}
+
+impl ExecutionTraceV1 {
+    /// Construct the unsigned result committed under the miner's epoch root.
+    /// Keeping this beside the committer prevents callers from accidentally
+    /// publishing a fixed-capacity root or a mismatched trace length.
+    pub fn result_leaf(
+        &self,
+        job_hash: Digest,
+        output_tokens: &[u32],
+    ) -> Result<crate::ResultLeafV1, CommitError> {
+        let result = crate::ResultLeafV1 {
+            job_hash,
+            output_hash: crate::output_hash_v1(output_tokens)?,
+            trace_root: self.trace_root,
+            output_token_count: u32::try_from(output_tokens.len())
+                .map_err(|_| CommitError::ArithmeticOverflow)?,
+            trace_length: self.trace_length,
+        };
+        result.hash()?;
+        Ok(result)
+    }
 }
 
 /// CPU reference commitment state for one sequential batch-1 execution.
@@ -101,7 +145,7 @@ pub struct ExecutionCommitterV1 {
     kv_trees: Vec<FixedMerkleAccumulator>,
     global_kv: MutableMerkleTree,
     token_checkpoints: Vec<Digest>,
-    pending_token_root: Option<Digest>,
+    pending_token_root: Option<(Digest, u32)>,
     job_tree: FixedMerkleAccumulator,
     metrics: CommitmentMetrics,
 }
@@ -133,12 +177,16 @@ impl ExecutionCommitterV1 {
             )));
         }
         let context_capacity = max_context
+            .checked_add(1)
+            .ok_or(CommitError::ArithmeticOverflow)?
             .checked_next_power_of_two()
             .ok_or(CommitError::ArithmeticOverflow)?;
         let context_depth = context_capacity.trailing_zeros() as usize;
         let kv_trees = (0..layers)
             .map(|_| FixedMerkleAccumulator::new(TRACE_HASH_ALGORITHM, D_KV, context_depth))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut job_tree = FixedMerkleAccumulator::new(TRACE_HASH_ALGORITHM, D_JOB, context_depth)?;
+        job_tree.append(job_genesis_hash_v1(&job_id)?)?;
         Ok(Self {
             job_id,
             layers,
@@ -150,7 +198,7 @@ impl ExecutionCommitterV1 {
             global_kv: MutableMerkleTree::new(TRACE_HASH_ALGORITHM, D_KV, layers)?,
             token_checkpoints: Vec::with_capacity(layers),
             pending_token_root: None,
-            job_tree: FixedMerkleAccumulator::new(TRACE_HASH_ALGORITHM, D_JOB, context_depth)?,
+            job_tree,
             metrics: CommitmentMetrics::default(),
         })
     }
@@ -228,6 +276,10 @@ impl ExecutionCommitterV1 {
         if token_index as usize >= self.max_context {
             return Err(CommitError::TreeCapacityExceeded);
         }
+        if self.expected_layer == 0 && self.token_checkpoints.is_empty() {
+            self.token_checkpoints
+                .push(token_genesis_hash_v1(&self.job_id, token_index)?);
+        }
         let kv_tree = &mut self.kv_trees[layer_index as usize];
         kv_tree.append(kv_leaf)?;
         self.global_kv
@@ -265,7 +317,11 @@ impl ExecutionCommitterV1 {
         if self.expected_layer == self.layers {
             let token_tree =
                 MerkleTree::new(TRACE_HASH_ALGORITHM, D_TOKEN, &self.token_checkpoints)?;
-            self.pending_token_root = Some(token_tree.root());
+            self.pending_token_root = Some((
+                token_tree.root(),
+                u32::try_from(self.token_checkpoints.len())
+                    .map_err(|_| CommitError::ArithmeticOverflow)?,
+            ));
             self.token_checkpoints.clear();
             self.expected_layer = 0;
         }
@@ -285,14 +341,16 @@ impl ExecutionCommitterV1 {
                 self.expected_token
             )));
         }
-        let checkpoint_root = self.pending_token_root.take().ok_or_else(|| {
-            CommitError::InvalidExecution("token layers are not complete".to_owned())
-        })?;
+        let (checkpoint_root, checkpoint_count) =
+            self.pending_token_root.take().ok_or_else(|| {
+                CommitError::InvalidExecution("token layers are not complete".to_owned())
+            })?;
         let leaf = TokenResultV1 {
             job_id: self.job_id,
             token_index,
             checkpoint_root,
             predicted_token,
+            checkpoint_count,
         }
         .hash()?;
         self.job_tree.append(leaf)?;
@@ -314,13 +372,17 @@ impl ExecutionCommitterV1 {
                 "cannot finish a partially committed token or unbound prediction".to_owned(),
             ));
         }
-        if self.job_tree.is_empty() {
+        if self.expected_token == 0 {
             return Err(CommitError::InvalidExecution(
                 "cannot finish an empty execution".to_owned(),
             ));
         }
         Ok(ExecutionTraceV1 {
-            trace_root: self.job_tree.root()?,
+            trace_root: self.job_tree.compact_root()?,
+            trace_length: self
+                .expected_token
+                .checked_add(1)
+                .ok_or(CommitError::ArithmeticOverflow)?,
             executed_tokens: self.expected_token,
             metrics: self.metrics,
         })
@@ -369,6 +431,7 @@ mod tests {
         }
         assert_eq!(run(false), run(false));
         assert_ne!(run(false).trace_root, run(true).trace_root);
+        assert_eq!(run(false).trace_length, 3);
         assert_eq!(run(false).metrics.canonical_state_bytes, 192);
     }
 
@@ -384,6 +447,7 @@ mod tests {
         state.commit_output_token(0, 17).unwrap();
         let trace = state.finish().unwrap();
         assert_eq!(trace.metrics.checkpoint_count, 2);
+        assert_eq!(trace.trace_length, 2);
         // Four 16-byte K/V pairs plus two 16-byte residuals.
         assert_eq!(trace.metrics.canonical_state_bytes, 96);
         assert_ne!(
@@ -401,5 +465,56 @@ mod tests {
             state.finish().unwrap().trace_root
         }
         assert_ne!(root(11), root(12));
+    }
+
+    #[test]
+    fn accelerator_digest_path_uses_the_same_genesis_leaves() {
+        let job_id = [7; 32];
+        let mut cpu = ExecutionCommitterV1::new(job_id, 1, 2).unwrap();
+        cpu.commit_layer(0, 0, &[1.0], &[2.0], &[3.0]).unwrap();
+        cpu.commit_output_token(0, 9).unwrap();
+
+        let residual_hash = state_hash_v1(&1.0_f32.to_bits().to_le_bytes()).unwrap();
+        let kv_leaf = kv_leaf_hash_v1(
+            0,
+            0,
+            &2.0_f32.to_bits().to_le_bytes(),
+            &3.0_f32.to_bits().to_le_bytes(),
+        )
+        .unwrap();
+        let mut accelerator = ExecutionCommitterV1::new(job_id, 1, 2).unwrap();
+        accelerator
+            .commit_layer_hashes(0, 0, residual_hash, kv_leaf, 12)
+            .unwrap();
+        accelerator.commit_output_token(0, 9).unwrap();
+
+        assert_eq!(cpu.finish().unwrap(), accelerator.finish().unwrap());
+    }
+
+    #[test]
+    fn execution_trace_builds_a_shape_consistent_result_leaf() {
+        let mut state = ExecutionCommitterV1::new([8; 32], 1, 4).unwrap();
+        state.commit_layer(0, 0, &[1.0], &[2.0], &[3.0]).unwrap();
+        state.commit_output_token(0, 9).unwrap();
+        let trace = state.finish().unwrap();
+        let result = trace.result_leaf([5; 32], &[9]).unwrap();
+        assert_eq!(result.trace_root, trace.trace_root);
+        assert_eq!(result.trace_length, 2);
+        assert_eq!(result.output_token_count, 1);
+        assert!(trace.result_leaf([5; 32], &[]).is_err());
+    }
+
+    #[test]
+    fn token_result_rejects_an_unprovable_checkpoint_shape() {
+        let mut result = TokenResultV1 {
+            job_id: [1; 32],
+            token_index: 0,
+            checkpoint_root: [2; 32],
+            predicted_token: 3,
+            checkpoint_count: 1,
+        };
+        assert!(result.hash().is_err());
+        result.checkpoint_count = 2;
+        result.hash().unwrap();
     }
 }

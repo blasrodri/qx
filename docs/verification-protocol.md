@@ -12,8 +12,8 @@ to decide whether the selected inference is checked.
 
 This separates three costs:
 
-1. every inference pays 2.792% measured commitment cost inside the selected
-   precise two-layer checkpoint profile, including output-token binding; the
+1. every inference pays 3.130–3.258% measured commitment cost inside the selected
+   fixed-math two-layer checkpoint profile, including output-token binding; the
    earlier fast-uncommitted to precise-committed migration measurement was
    8.820%, so arithmetic mode remains a separate deployment cost;
 2. the network pays approximately `audited receipts / epoch receipts` in extra
@@ -50,22 +50,29 @@ The current live-SBF measurements are:
 | Operation | Compute units |
 |---|---:|
 | Finalize epoch seed (once/epoch) | 1,786 |
-| Authenticate job/result and open challenge | 5,840 |
-| Both boundary openings + one midpoint round | 10,154 |
+| Authenticate job/result and open challenge | 5,870 |
+| Both boundary openings + one midpoint round | 10,208 |
 | Weight proof + objective FMA | 9,485 |
 
 Each additional binary-search level costs one challenger and one miner
-midpoint instruction. The complete three-state test dispute is 29,280 CU,
+midpoint instruction. The complete three-state synthetic dispute is 29,364 CU,
 including both terminal-state reveals. The full test also exercises both
 timeout directions, rejects an unselected result, rejects duplicate epoch
 submission, and convicts an incorrect accumulator without a miner co-signature.
 
-Three production gates remain deliberately disabled: collateral transfer and
-settlement, the hierarchical bridge from the runtime's job/token/layer root to
-the dispute-local operator trace, and structured terminal witnesses for
-append-only KV updates. Therefore this code demonstrates adversarial
-attribution, sampling, bisection, and one objective terminal transition; it is
-not yet safe to enable automatic slashing for an arbitrary full inference.
+The outer bisection now accepts the production `QX:JOB:V1` domain and an SBF
+test reaches the first differing real `TokenResultV1`. Canonical job and token
+genesis leaves make index-zero corruption bisectable; compact streaming roots
+make `trace_length` proofs match the runtime. The program rejects a result
+whose trace length is not exactly `input_token_count + output_token_count`.
+
+Four production gates remain deliberately disabled: collateral transfer and
+settlement, descent from the differing token through checkpoints into a
+chained operator-state trace, structured append-only KV witnesses, and durable
+job input availability. Therefore this code demonstrates adversarial
+attribution, sampling, production-root bisection, and isolated objective
+terminal transitions; it is not safe to enable automatic slashing for a full
+inference. See `docs/verification-security-audit.md` for the readiness audit.
 
 ## Epoch selection
 
@@ -187,8 +194,9 @@ Opening a miner-signed receipt against its epoch root costs 2,772 CU and binding
 the mutually agreed terminal boundary costs 1,100 CU. The complete measured
 path is 13,652 CU, plus 1,842 CU once per model+epoch registration in this test.
 
-The program uses a 56-byte epoch account, 72-byte model account, 304-byte active
-dispute account, and 52-byte temporary staged-weight account. A staged weight
+The compatibility path uses a 56-byte epoch account, the shared registry now
+uses a 140-byte model account, and the path uses a 304-byte active dispute
+account and 52-byte temporary staged-weight account. A staged weight
 cannot be replayed into another dispute; forged receipt signatures, bad receipt
 openings, bad activation openings, early timeouts, and false arithmetic are
 rejected. Measurements used `cargo-build-sbf 4.1.0`,
@@ -227,14 +235,15 @@ Metal fast math is disabled by default, and the host verifier contains the
 matching FP32 sum oracle. It also replaces native `exp` and `rsqrt` throughout
 the model kernels with protocol-defined fixed-operation implementations. Rust,
 Metal, and the SBF terminal evaluator share identical constants and operation
-order. Live Metal bit-parity tests pass, and execution-spec
-`160456e4bd0da974fcc6515c8c5ebddaddb2a63d4f180d0fb3ad6fa7dda2c521`
-binds the fixed-math profile.
+order. Live Metal bit-parity tests pass. The selected interval-2 execution-spec
+`2f8ab3141938f906004637107276c18ef73601a8467944ef0736646ace9e3246`
+binds the fixed-math and commitment-shape profile.
 
 The scalar terminal IR now objectively evaluates FMA/dot steps, add, multiply,
 ordered sum/max, compare, select, division, fixed exp, and fixed rsqrt. An
-actual SBF fixed-exp dispute consumes 8,110 CU across both terminal reveals and
-resolution. RoPE decomposes into multiply/add steps; softmax and RMSNorm use the
+actual SBF fixed-exp dispute, including verification-program authentication,
+consumes 10,756 CU across both terminal reveals and resolution. RoPE
+decomposes into multiply/add steps; softmax and RMSNorm use the
 fixed exp/rsqrt/div primitives. Argmax and Top-K decompose into compare/select.
 KV leaf hashing exists, but its append/frontier-update witness and the nested
 layer-to-operator trace bridge remain required before complete inference is

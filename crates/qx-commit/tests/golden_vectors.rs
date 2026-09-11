@@ -91,6 +91,7 @@ fn protocol_v1_golden_vectors() {
         token_index: 9,
         checkpoint_root: token_root,
         predicted_token: 42,
+        checkpoint_count: 2,
     }
     .hash()
     .unwrap();
@@ -123,7 +124,7 @@ fn protocol_v1_golden_vectors() {
         (
             "model_id",
             model_id,
-            "2e9db2ccd7fdb5e6c6bb33e72c773c4adeea157a21f14b5006867071008f880a",
+            "bc3837dd2f4657a74b8c5cfdf0459633a233c44fe726d08370b93d1cfeca0e30",
         ),
         (
             "weight_leaf",
@@ -158,17 +159,17 @@ fn protocol_v1_golden_vectors() {
         (
             "token_result",
             token_result,
-            "10f001d850f188c201806809383b54bf43b4b7dfe929ebdbb7876f8bb1f03cad",
+            "ac0f9c304fcee19fb42743cbf0458a778dc706255736cc62f5c84625c50d2d6a",
         ),
         (
             "job_root",
             job_root,
-            "857538b381b8f832e22b36ee7b6bede7b0a89eef13d7172cb0f88bde97859c3e",
+            "ae1dc5b1f6871042973bbb1585da16264b7247a030e6d31e648c51a55040dca2",
         ),
         (
             "input_hash",
             input_hash,
-            "2247165b0f63eff9bd051f28c65c2e5e102f03c9d77a59025171b932bc9b1ec1",
+            "250e4cf06b9c06c895a2120a9e43ba509c515223e4b1e514e0b91b7945042fc3",
         ),
         (
             "output_hash",
@@ -178,12 +179,12 @@ fn protocol_v1_golden_vectors() {
         (
             "receipt_hash",
             receipt,
-            "0fea770d8a555ab41904d982953395887bb13598af6ea86d4af78ccb65fb6d8f",
+            "97a231429ac7ef00d0ecb043b5372d2208329d485ed96ad46c51c235bb82cc8e",
         ),
         (
             "batch_root",
             batch_root,
-            "342fbc678412c15ba855dfd55281a36357a55adbc6b76540dd28327212ac737f",
+            "affc049f738ed35b126946b452ece2676872aa57d29b6f4926e73709602ff0a0",
         ),
     ];
     if std::env::var_os("QX_PRINT_GOLDEN").is_some() {

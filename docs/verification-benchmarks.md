@@ -1,12 +1,26 @@
 # QX verification benchmark report
 
+## Current hardened commitment format
+
+On 2026-09-11, after adding canonical job/token genesis leaves, compact job
+roots, and committed checkpoint-tree lengths, two independent 31-repeat runs
+measured 103.794/107.176 ms and 101.832/105.019 ms uncommitted/committed:
+**3.258% and 3.130% commitment overhead** (mean 3.194%). The interval-2
+execution spec was
+`2f8ab3141938f906004637107276c18ef73601a8467944ef0736646ace9e3246`
+and the trace root was
+`306b3c3df074aebfdf8fbc8ef94d356a05798b6c34106c9b63c6c137e1e6e59b`.
+The 23-command-buffer run used 8 prompt tokens, 16 returned tokens, 23
+executed tokens, 8 warmups, and the fixed consensus math profile. This passes
+the 5% ceiling but not the desired 3% target.
+
 For epoch sampling economics and the terminal Solana fraud-proof benchmark,
 see `docs/verification-protocol.md`. The adversarial V2 path uses 1,786 CU once
-per epoch to finalize entropy, 5,840 CU to authenticate and open a challenged
-result, 10,154 CU for both boundary proofs plus one midpoint round, and 9,485
+per epoch to finalize entropy, 5,870 CU to authenticate and open a challenged
+result, 10,208 CU for both boundary proofs plus one midpoint round, and 9,485
 CU for the staged Q4 weight proof plus objective FMA. Each further binary
 search level adds another two-party midpoint round. The complete three-state
-test dispute, including both terminal-state reveals, is 29,280 CU.
+synthetic test dispute, including both terminal-state reveals, is 29,364 CU.
 
 - Date: 2026-09-10
 - Machine/runtime: local Apple Metal device, release build

@@ -27,7 +27,7 @@ const Q4_GROUP_SIZE: u32 = 32;
 const Q4_TYPE: u8 = 4;
 const ACTIVATION_CHUNK_BYTES: usize = 128;
 const RECEIPT_BYTES: usize = 210;
-const MODEL_ACCOUNT_BYTES: usize = 72;
+const MODEL_ACCOUNT_BYTES: usize = 140;
 const EPOCH_ACCOUNT_BYTES: usize = 56;
 const DISPUTE_ACCOUNT_BYTES: usize = 304;
 const STAGED_WEIGHT_BYTES: usize = 52;
@@ -152,7 +152,15 @@ fn register_model(
     let model_id = cursor.array_32()?;
     let weights_root = cursor.array_32()?;
     let weight_leaves = cursor.u32()?;
-    if !cursor.is_empty() || weight_leaves == 0 {
+    let execution_spec = cursor.array_32()?;
+    let verification_program_root = cursor.array_32()?;
+    let verification_program_leaves = cursor.u32()?;
+    if !cursor.is_empty()
+        || weight_leaves == 0
+        || execution_spec == [0; 32]
+        || verification_program_root == [0; 32]
+        || verification_program_leaves == 0
+    {
         return Err(QxError::InvalidEncoding.into());
     }
     let mut state = model.try_borrow_mut_data()?;
@@ -163,6 +171,9 @@ fn register_model(
     put(&mut state, 4, &model_id)?;
     put(&mut state, 36, &weights_root)?;
     put(&mut state, 68, &weight_leaves.to_le_bytes())?;
+    put(&mut state, 72, &execution_spec)?;
+    put(&mut state, 104, &verification_program_root)?;
+    put(&mut state, 136, &verification_program_leaves.to_le_bytes())?;
     Ok(())
 }
 

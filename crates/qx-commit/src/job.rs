@@ -1,5 +1,36 @@
 use crate::{CommitError, Digest, HashAlgorithm, ProtocolVersion, hash_domain};
 
+/// Fixed V1 sampling floor. At one percent, honest audit replay adds one
+/// percent expected inference work while a one-shot cheat must put roughly
+/// 99x its gain at risk before auditor rewards and block-bias margins.
+pub const MIN_AUDIT_PROBABILITY_PPM_V1: u32 = 10_000;
+
+/// Transport envelope containing the exact canonical input committed by the
+/// signed fixed-width header. The tokens stay off-chain, but miners and
+/// challengers receive the same self-authenticating payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobEnvelopeV1 {
+    pub header: JobPayloadV1,
+    pub input_tokens: Vec<u32>,
+}
+
+impl JobEnvelopeV1 {
+    pub fn validate(&self) -> Result<(), CommitError> {
+        self.header.validate()?;
+        if usize::try_from(self.header.input_token_count)
+            .map_err(|_| CommitError::ArithmeticOverflow)?
+            != self.input_tokens.len()
+            || crate::input_hash_v1(&self.header.model_id, &self.input_tokens)?
+                != self.header.input_hash
+        {
+            return Err(CommitError::InvalidExecution(
+                "job input tokens do not match the signed header".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Immutable request data. The requester or scheduling protocol authorizes
 /// this payload; a miner does not sign it again per result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,7 +69,7 @@ impl JobPayloadV1 {
         if self.input_token_count == 0
             || self.max_output_tokens == 0
             || self.slashable_exposure == 0
-            || self.audit_probability_ppm > 1_000_000
+            || !(MIN_AUDIT_PROBABILITY_PPM_V1..=1_000_000).contains(&self.audit_probability_ppm)
         {
             return Err(CommitError::InvalidShape(
                 "invalid job counts, exposure, or audit probability".to_owned(),
@@ -171,6 +202,22 @@ mod tests {
         let mut invalid = job();
         invalid.audit_probability_ppm = 1_000_001;
         assert!(invalid.hash().is_err());
+        invalid.audit_probability_ppm = MIN_AUDIT_PROBABILITY_PPM_V1 - 1;
+        assert!(invalid.hash().is_err());
+    }
+
+    #[test]
+    fn envelope_binds_and_carries_the_exact_input() {
+        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let mut header = job();
+        header.input_hash = crate::input_hash_v1(&header.model_id, &tokens).unwrap();
+        let mut envelope = JobEnvelopeV1 {
+            header,
+            input_tokens: tokens,
+        };
+        envelope.validate().unwrap();
+        envelope.input_tokens[3] ^= 1;
+        assert!(envelope.validate().is_err());
     }
 
     #[test]

@@ -136,8 +136,9 @@ executed token** (`24 × (1024 + 512 + 512) × 4`). The selected two-layer
 profile covers every K/V append plus 12 residuals, or **147,456 bytes/token**.
 Only digests and Merkle frontiers remain after a token; no activation tensor is
 retained.
-Each completed token adds a 72-byte canonical token-result preimage binding the
-job ID, token index, checkpoint root, and greedy predicted token. Its hash,
+Each completed token adds a 76-byte canonical token-result preimage binding the
+job ID, token index, checkpoint root, checkpoint leaf count, and greedy
+predicted token. Its hash,
 rather than the bare checkpoint root, is the job-tree leaf. This prevents
 attaching a different output sequence to an honest execution trace and adds no
 permanent activation storage.
@@ -166,12 +167,15 @@ only 1,536 digest bytes after the runtime's existing token synchronization.
 This closes the byte-level commitment gap. Consensus arithmetic now uses an
 explicit 32-lane shuffle-down reduction tree, protocol-defined fixed-operation
 `exp` and `rsqrt`, and safe Metal arithmetic; CPU and SBF primitives reproduce
-the same operation order. The fixed profile measured 2.829% commitment
-overhead. Its 512-position PTB PPL differed from native precise math by only
-`4.8735e-8` relatively, with complete sampled top-k agreement. Execution-spec
-`160456e4bd0da974fcc6515c8c5ebddaddb2a63d4f180d0fb3ad6fa7dda2c521`
-binds the hash design, reduction tree, math mode, fixed functions, and
-checkpoint interval. See `docs/verification-benchmarks.md` for exact
+the same operation order. After trace-shape hardening, two independent
+31-repeat runs measured 3.130% and 3.258% commitment overhead. Its
+512-position PTB PPL differed from native precise math by only
+`4.8735e-8` relatively, with complete sampled top-k agreement. The selected
+interval-2 execution-spec is
+`2f8ab3141938f906004637107276c18ef73601a8467944ef0736646ace9e3246`.
+It binds the hash design, reduction tree, math mode, fixed functions,
+checkpoint interval, canonical genesis leaves, checkpoint-tree length, and
+compact job-root semantics. See `docs/verification-benchmarks.md` for exact
 measurements.
 
 A distinct relaxed-arithmetic/precise-functions candidate now measures 3.734%

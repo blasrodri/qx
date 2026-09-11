@@ -33,6 +33,7 @@ pub const MINER_V2_ACCOUNT_BYTES: usize = 16;
 pub const CHALLENGE_WINDOW_SLOTS: u64 = 216_000;
 /// Roughly eight minutes at a 400 ms slot for each interactive response.
 pub const RESPONSE_WINDOW_SLOTS: u64 = 1_200;
+pub const MIN_AUDIT_PROBABILITY_PPM: u32 = 10_000;
 
 const JOB_MAGIC: &[u8; 4] = b"QXJ2";
 const EPOCH_MAGIC_V2: &[u8; 4] = b"QXE2";
@@ -56,6 +57,7 @@ const JOB_INSTANCE_OFFSET: usize = 2;
 const JOB_REQUESTER_OFFSET: usize = 66;
 const JOB_MINER_OFFSET: usize = 98;
 const JOB_MODEL_OFFSET: usize = 130;
+const JOB_EXECUTION_SPEC_OFFSET: usize = 162;
 const JOB_INPUT_COUNT_OFFSET: usize = 226;
 const JOB_MAX_OUTPUT_OFFSET: usize = 230;
 const JOB_EXPOSURE_OFFSET: usize = 242;
@@ -73,9 +75,13 @@ const D_JOB_PAYLOAD: &[u8] = b"QX:JOB:PAYLOAD:V1";
 const D_RESULT: &[u8] = b"QX:RESULT:V1";
 const D_AUDIT_SEED: &[u8] = b"QX:AUDIT:SEED:V2";
 const D_AUDIT_DRAW: &[u8] = b"QX:AUDIT:DRAW:V1";
-const D_TRACE_TREE: &[u8] = b"QX:DISPUTE:TRACE:V1";
+// The outer bisection opens the production job tree directly. Nested token
+// and operator trees use explicit domains in their descent instructions.
+const D_TRACE_TREE: &[u8] = b"QX:JOB:V1";
 const D_FMA_STATE: &[u8] = b"QX:FMA:STATE:V1";
 const D_SCALAR_STATE: &[u8] = b"QX:SCALAR:STATE:V1";
+const D_PROGRAM_TREE: &[u8] = b"QX:PROGRAM:TREE:V1";
+const D_PROGRAM_INSTRUCTION: &[u8] = b"QX:PROGRAM:INSTRUCTION:V1";
 
 const PHASE_CHALLENGER_BOUNDS: u8 = 1;
 const PHASE_MINER_BOUNDS: u8 = 2;
@@ -152,7 +158,8 @@ pub(super) fn register_job(
         || u32_from(payload, JOB_MAX_OUTPUT_OFFSET)? == 0
         || u64_from(payload, JOB_EXPOSURE_OFFSET)? == 0
         || u64_from(payload, JOB_DEADLINE_OFFSET)? <= Clock::get()?.slot
-        || u32_from(payload, JOB_AUDIT_PPM_OFFSET)? > 1_000_000
+        || !(MIN_AUDIT_PROBABILITY_PPM..=1_000_000)
+            .contains(&u32_from(payload, JOB_AUDIT_PPM_OFFSET)?)
     {
         return Err(QxError::InvalidEncoding.into());
     }
@@ -346,13 +353,16 @@ pub(super) fn open_challenge(
         || job_payload[JOB_INSTANCE_OFFSET..JOB_INSTANCE_OFFSET + 32] != program_id.to_bytes()
         || job_payload[JOB_MINER_OFFSET..JOB_MINER_OFFSET + 32] != miner
         || job_payload[JOB_MODEL_OFFSET..JOB_MODEL_OFFSET + 32] != model.try_borrow_data()?[4..36]
+        || job_payload[JOB_EXECUTION_SPEC_OFFSET..JOB_EXECUTION_SPEC_OFFSET + 32]
+            != model.try_borrow_data()?[72..104]
         || job_payload[JOB_MODEL_REGISTRY_OFFSET..JOB_MODEL_REGISTRY_OFFSET + 32]
             != model.key.to_bytes()
         || u64_from(job_payload, JOB_EPOCH_OFFSET)? != epoch_number
         || u32_from(job_payload, JOB_INPUT_COUNT_OFFSET)? == 0
         || u32_from(job_payload, JOB_MAX_OUTPUT_OFFSET)? == 0
         || u64_from(job_payload, JOB_EXPOSURE_OFFSET)? == 0
-        || u32_from(job_payload, JOB_AUDIT_PPM_OFFSET)? > 1_000_000
+        || !(MIN_AUDIT_PROBABILITY_PPM..=1_000_000)
+            .contains(&u32_from(job_payload, JOB_AUDIT_PPM_OFFSET)?)
         || u64_from(job_payload, JOB_DEADLINE_OFFSET)? < epoch_close_slot
     {
         return Err(QxError::InvalidState.into());
@@ -363,10 +373,18 @@ pub(super) fn open_challenge(
         .map_err(|_| QxError::InvalidEncoding)?;
     verify_prior_ed25519(instruction_sysvar, &requester, &job_hash)?;
     let max_output = u32_from(job_payload, JOB_MAX_OUTPUT_OFFSET)?;
+    let input_count = u32_from(job_payload, JOB_INPUT_COUNT_OFFSET)?;
+    let output_count = u32_from(result, RESULT_OUTPUT_COUNT_OFFSET)?;
     let audit_probability_ppm = u32_from(job_payload, JOB_AUDIT_PPM_OFFSET)?;
     if result[RESULT_JOB_OFFSET..RESULT_JOB_OFFSET + 32] != job_hash
-        || u32_from(result, RESULT_OUTPUT_COUNT_OFFSET)? == 0
-        || u32_from(result, RESULT_OUTPUT_COUNT_OFFSET)? > max_output
+        || output_count == 0
+        || output_count > max_output
+        // Executed steps are input + output - 1, and the compact job tree has
+        // one additional genesis leaf, hence input + output exactly.
+        || input_count
+            .checked_add(output_count)
+            .ok_or(QxError::InvalidEncoding)?
+            != trace_length
     {
         return Err(QxError::InvalidState.into());
     }
@@ -807,9 +825,12 @@ pub(super) fn submit_challenger_scalar(
     accounts: &[AccountInfo],
     cursor: &mut Cursor<'_>,
 ) -> ProgramResult {
-    let [dispute, challenger] = accounts else {
+    let [model, dispute, challenger] = accounts else {
         return Err(QxError::InvalidEncoding.into());
     };
+    if model.owner != program_id || model.data_len() != MODEL_ACCOUNT_BYTES {
+        return Err(QxError::InvalidEncoding.into());
+    }
     let mut state = checked_party_state(
         program_id,
         dispute,
@@ -822,11 +843,42 @@ pub(super) fn submit_challenger_scalar(
     let b = cursor.u32()?;
     let c = cursor.u32()?;
     let challenger_result = cursor.u32()?;
+    let instruction_index = cursor.u32()?;
+    let instruction_count = cursor.u32()?;
+    let instruction_depth = usize::from(cursor.u8()?);
+    let instruction_siblings = cursor.take(
+        instruction_depth
+            .checked_mul(32)
+            .ok_or(QxError::InvalidEncoding)?,
+    )?;
     if !cursor.is_empty() || !scalar_op_supported(op) {
         return Err(QxError::InvalidEncoding.into());
     }
     let job_hash = array_at(&state, D_JOB_HASH_OFFSET)?;
     let transition = u32_at(&state, D_LOW_OFFSET)?;
+    if state[D_MODEL_OFFSET..D_MODEL_OFFSET + 32] != model.key.to_bytes()
+        || instruction_index != transition
+    {
+        return Err(QxError::Unauthorized.into());
+    }
+    let model_data = model.try_borrow_data()?;
+    if &model_data[..4] != MODEL_MAGIC || instruction_count != u32_at(&model_data, 136)? {
+        return Err(QxError::InvalidState.into());
+    }
+    let instruction_hash = blake3_domain(
+        D_PROGRAM_INSTRUCTION,
+        &[&instruction_index.to_le_bytes(), &[op]],
+    );
+    verify_merkle_blake3(
+        instruction_hash,
+        instruction_index,
+        instruction_count,
+        instruction_depth,
+        instruction_siblings,
+        array_at(&model_data, 104)?,
+        D_PROGRAM_TREE,
+    )?;
+    drop(model_data);
     let common = scalar_state_hash(&job_hash, transition, op, a, b, c, None);
     let challenger_output =
         scalar_state_hash(&job_hash, transition, op, a, b, c, Some(challenger_result));
@@ -1007,7 +1059,15 @@ fn parse_and_verify_bounds(
     if !cursor.is_empty() || merkle_depth(trace_length)? != depth {
         return Err(QxError::InvalidEncoding.into());
     }
-    verify_merkle_blake3(start, 0, trace_length, depth, start_siblings, root)?;
+    verify_merkle_blake3(
+        start,
+        0,
+        trace_length,
+        depth,
+        start_siblings,
+        root,
+        D_TRACE_TREE,
+    )?;
     verify_merkle_blake3(
         end,
         trace_length - 1,
@@ -1015,6 +1075,7 @@ fn parse_and_verify_bounds(
         depth,
         end_siblings,
         root,
+        D_TRACE_TREE,
     )?;
     Ok((start, end))
 }
@@ -1031,7 +1092,15 @@ fn parse_and_verify_trace_opening(
     if !cursor.is_empty() || merkle_depth(trace_length)? != depth {
         return Err(QxError::InvalidEncoding.into());
     }
-    verify_merkle_blake3(claim, index, trace_length, depth, siblings, root)?;
+    verify_merkle_blake3(
+        claim,
+        index,
+        trace_length,
+        depth,
+        siblings,
+        root,
+        D_TRACE_TREE,
+    )?;
     Ok(claim)
 }
 
@@ -1073,6 +1142,7 @@ fn verify_merkle_blake3(
     depth: usize,
     siblings: &[u8],
     root: [u8; 32],
+    tree_domain: &[u8],
 ) -> ProgramResult {
     if leaf_count == 0
         || index >= leaf_count
@@ -1084,9 +1154,9 @@ fn verify_merkle_blake3(
     for sibling in siblings.chunks_exact(32) {
         let sibling: &[u8; 32] = sibling.try_into().map_err(|_| QxError::InvalidEncoding)?;
         node = if index & 1 == 0 {
-            blake3_merkle_parent(&node, sibling)
+            blake3_merkle_parent(tree_domain, &node, sibling)
         } else {
-            blake3_merkle_parent(sibling, &node)
+            blake3_merkle_parent(tree_domain, sibling, &node)
         };
         index >>= 1;
     }
@@ -1096,8 +1166,8 @@ fn verify_merkle_blake3(
     Ok(())
 }
 
-fn blake3_merkle_parent(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    blake3_domain(D_MERKLE, &[D_TRACE_TREE, left, right])
+fn blake3_merkle_parent(tree_domain: &[u8], left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    blake3_domain(D_MERKLE, &[tree_domain, left, right])
 }
 
 fn parse_activation(
