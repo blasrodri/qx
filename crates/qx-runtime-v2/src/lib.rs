@@ -2034,7 +2034,7 @@ impl PreparedAttentionStack {
             });
             if let Some((commitment_residuals, _)) = commitment_residuals.filter(|_| checkpoint) {
                 let snapshot = commitment_residuals.subregion(
-                    layer * HIDDEN * std::mem::size_of::<f32>(),
+                    (layer + 1) * HIDDEN * std::mem::size_of::<f32>(),
                     HIDDEN * std::mem::size_of::<f32>(),
                 )?;
                 graph.encode_residual_rms_scalar_snapshot(
@@ -2160,10 +2160,14 @@ impl PreparedAttentionStack {
         )>,
     ) -> Result<(), String> {
         let context = buffers.context().as_ref();
+        let genesis_snapshot = commitment_buffers
+            .map(|(residuals, _, _)| residuals.subregion(0, HIDDEN * std::mem::size_of::<f32>()))
+            .transpose()?;
         graph.encode_q4_embedding_lookup(
             &self.embedding_lookup,
             token_input,
             buffers.buffer(BufferId::HiddenA),
+            genesis_snapshot.as_ref(),
             qx_model::EMBEDDING_MULTIPLIER,
         )?;
         let command_buffers = resolved_plan
@@ -2735,15 +2739,16 @@ impl GraniteV2Generator {
     }
 
     /// Enable or disable production commitments. Enabling adds one batched
-    /// BLAKE3 dispatch per token plus 98,304 transient residual-snapshot
-    /// bytes and 1,536 compact digest bytes.
+    /// BLAKE3 dispatch per token plus 102,400 transient residual-snapshot
+    /// bytes and 1,600 compact digest bytes.
     pub fn set_verification_enabled(&mut self, enabled: bool) -> Result<(), String> {
         if enabled && self.verification_digests.is_none() {
             self.verification_residuals = Some(
                 self.context
-                    .allocate_runtime_buffer(LAYERS * HIDDEN * std::mem::size_of::<f32>())?,
+                    .allocate_runtime_buffer((LAYERS + 1) * HIDDEN * std::mem::size_of::<f32>())?,
             );
-            self.verification_digests = Some(self.context.allocate_runtime_buffer(LAYERS * 64)?);
+            self.verification_digests =
+                Some(self.context.allocate_runtime_buffer((LAYERS + 1) * 64)?);
         } else if !enabled {
             self.verification_residuals = None;
             self.verification_digests = None;
@@ -2774,11 +2779,21 @@ impl GraniteV2Generator {
             .as_ref()
             .ok_or_else(|| "verification digest buffer is unavailable".to_owned())?;
         let bytes = self.context.read_runtime_bytes(buffer);
-        if bytes.len() != LAYERS * 64 {
+        if bytes.len() != (LAYERS + 1) * 64 {
             return Err("verification digest buffer has an invalid length".to_owned());
         }
+        committer
+            .begin_token_hash(
+                u32::try_from(token_index)
+                    .map_err(|_| "verification token index exceeds u32".to_owned())?,
+                bytes[..32]
+                    .try_into()
+                    .map_err(|_| "invalid token genesis digest width".to_owned())?,
+                HIDDEN * std::mem::size_of::<f32>(),
+            )
+            .map_err(|error| error.to_string())?;
         for layer in 0..LAYERS {
-            let offset = layer * 64;
+            let offset = (layer + 1) * 64;
             let residual_hash: [u8; 32] = bytes[offset..offset + 32]
                 .try_into()
                 .map_err(|_| "invalid residual digest width".to_owned())?;
@@ -3122,6 +3137,7 @@ impl GraniteV2Generator {
             &self.stack.embedding_lookup,
             self.buffers.buffer(BufferId::TokenOutput),
             self.buffers.buffer(BufferId::HiddenA),
+            None,
             qx_model::EMBEDDING_MULTIPLIER,
         )?;
         self.stack.encode_full_layer_range_with_plan(

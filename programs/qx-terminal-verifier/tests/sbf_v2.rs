@@ -3,10 +3,10 @@ use half::f16;
 use mollusk_svm::Mollusk;
 use qx_commit::{
     activation_hash_v1, hash_domain, job_genesis_hash_v1, prove_state_chunk_v1, state_hash_v1,
-    token_genesis_hash_v1, CheckpointV1, EpochBlockSeedV2, FmaStateV1, HashAlgorithm, JobPayloadV1,
-    MerkleProof, MerkleTree, ProtocolVersion, ResultLeafV1, StateTreeKindV1, TokenResultV1,
-    VmInstructionV1, VmStateV1, WeightLeafV1, D_BATCH, D_JOB, D_MERKLE, D_OPERATOR_TREE,
-    D_PROGRAM_TREE, D_TOKEN, D_WEIGHT_TREE,
+    CheckpointV1, EpochBlockSeedV2, FmaStateV1, HashAlgorithm, JobPayloadV1, MerkleProof,
+    MerkleTree, ProtocolVersion, ResultLeafV1, StateTreeKindV1, TokenResultV1, VmInstructionV1,
+    VmStateV1, WeightLeafV1, D_BATCH, D_JOB, D_MERKLE, D_OPERATOR_TREE, D_PROGRAM_TREE, D_TOKEN,
+    D_WEIGHT_TREE,
 };
 use solana_account::Account;
 use solana_hash::Hash;
@@ -510,12 +510,12 @@ fn sbf_bisects_the_actual_runtime_job_leaf_format() {
     let common_checkpoint = CheckpointV1 {
         job_id: f.job.job_id,
         token_index: 1,
-        layer_index: 1,
+        layer_index: u16::MAX,
         residual_hash: common_residual,
         global_kv_root: common_kv,
     };
     let honest_checkpoint = CheckpointV1 {
-        layer_index: 3,
+        layer_index: 1,
         residual_hash: honest_residual,
         ..common_checkpoint
     };
@@ -523,24 +523,41 @@ fn sbf_bisects_the_actual_runtime_job_leaf_format() {
         residual_hash: miner_residual,
         ..honest_checkpoint
     };
-    let token_genesis = token_genesis_hash_v1(&f.job.job_id, 1).unwrap();
     let common_checkpoint_hash = common_checkpoint.hash().unwrap();
     let honest_checkpoint_hash = honest_checkpoint.hash().unwrap();
     let miner_checkpoint_hash = miner_checkpoint.hash().unwrap();
+    let honest_final_hash = CheckpointV1 {
+        layer_index: 3,
+        residual_hash: [21; 32],
+        ..honest_checkpoint
+    }
+    .hash()
+    .unwrap();
+    let miner_final_hash = CheckpointV1 {
+        layer_index: 3,
+        residual_hash: [22; 32],
+        ..miner_checkpoint
+    }
+    .hash()
+    .unwrap();
     let honest_checkpoint_tree = MerkleTree::new(
         HashAlgorithm::Blake3V1,
         D_TOKEN,
         &[
-            token_genesis,
             common_checkpoint_hash,
             honest_checkpoint_hash,
+            honest_final_hash,
         ],
     )
     .unwrap();
     let miner_checkpoint_tree = MerkleTree::new(
         HashAlgorithm::Blake3V1,
         D_TOKEN,
-        &[token_genesis, common_checkpoint_hash, miner_checkpoint_hash],
+        &[
+            common_checkpoint_hash,
+            miner_checkpoint_hash,
+            miner_final_hash,
+        ],
     )
     .unwrap();
     let common_token = TokenResultV1 {
@@ -632,30 +649,30 @@ fn sbf_bisects_the_actual_runtime_job_leaf_format() {
         dispute,
         true,
         &honest_checkpoint_tree,
-        token_genesis,
-        honest_checkpoint_hash,
+        common_checkpoint_hash,
+        honest_final_hash,
     );
     let (dispute, _) = f.bounds_tree(
         &vm,
         dispute,
         false,
         &miner_checkpoint_tree,
-        token_genesis,
-        miner_checkpoint_hash,
+        common_checkpoint_hash,
+        miner_final_hash,
     );
     let (dispute, _) = f.midpoint_tree(
         &vm,
         dispute,
         true,
         &honest_checkpoint_tree,
-        common_checkpoint_hash,
+        honest_checkpoint_hash,
     );
     let (dispute, _) = f.midpoint_tree(
         &vm,
         dispute,
         false,
         &miner_checkpoint_tree,
-        common_checkpoint_hash,
+        miner_checkpoint_hash,
     );
     assert_eq!(dispute.data[4], 11);
 
@@ -715,7 +732,7 @@ fn sbf_bisects_the_actual_runtime_job_leaf_format() {
     let pre = VmStateV1 {
         job_hash: f.job.hash().unwrap(),
         token_index: 1,
-        segment_index: 2,
+        segment_index: 1,
         program_counter: 0,
         residual_root: common_residual,
         global_kv_root: common_kv,

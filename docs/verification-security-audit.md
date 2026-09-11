@@ -13,8 +13,8 @@ party's endpoint, and lets SBF convict the incorrect state update using the
 same 256-byte residual commitment emitted by normal execution.
 
 The remaining boundary is model coverage rather than the bisection primitive:
-the registered VM still needs authenticated Q4 weight loads, first-segment
-genesis, KV append, and final-head/argmax transitions. Without those transition
+the registered VM still needs authenticated Q4 weight loads, KV append, and
+final-head/argmax transitions. Without those transition
 families, the test proves the mechanism and one real commitment update, not the
 entire model's `Execute(M, E, X)` claim.
 
@@ -54,13 +54,13 @@ registered spec.
 
 ## Cost at massive scale
 
-Two independent 31-repeat fixed-math runs add **3.130–3.258%** to inference on
-the tested M5 Pro (mean **3.194%**). At the mandatory 1% sampling floor with one auditor, replay adds
+Two independent 31-repeat fixed-math runs of the genesis-complete format add
+**2.939–4.201%** to inference on the tested M5 Pro (mean **3.570%**). At the mandatory 1% sampling floor with one auditor, replay adds
 1% of baseline inference work. If auditors use the same committed path, total
 network compute is approximately:
 
 ```text
-(1 + 0.03194) * (1 + 0.01) - 1 = 4.2259%
+(1 + 0.03570) * (1 + 0.01) - 1 = 4.6057%
 ```
 
 This excludes the one-time migration from a fast, non-consensus math profile
@@ -70,7 +70,7 @@ duplicate auditors, data distribution, failed jobs, and dispute replay.
 
 The current live three-leaf synthetic SBF dispute consumes 32,075 CU. Epoch
 entropy finalization consumes 1,784 CU once per epoch; opening the challenged
-job costs 8,397 CU. A two-party operator-boundary submission costs 7,655 CU,
+job costs 8,397 CU. A two-party operator-boundary submission costs 7,656 CU,
 and the runtime-state-chunk scalar terminal costs 4,342 CU. Larger traces add a
 challenger/miner midpoint pair for every binary-search level (10,329 CU in the
 three-leaf test). These costs occur only after a sampled replay disagrees.
@@ -97,10 +97,9 @@ high-value job.
 The job→token→checkpoint→operator→scalar chain is implemented. Complete the
 registered Granite program with terminal witnesses for authenticated Q4 weight
 loads/FMA, cross-chunk moves, attention/RoPE/RMSNorm/router/MoE state updates,
-and the final head. The first checkpoint interval also needs a canonical
-pre-layer VM genesis tied to the exact input token and prior-token KV state;
-the current program deliberately fails closed if disagreement occurs between
-the opaque token-genesis leaf and the first checkpoint.
+and the final head. The canonical pre-layer checkpoint now binds the embedding
+residual and prior-token global KV root, and the SBF hierarchy test exercises
+a disagreement in the first checkpoint interval.
 
 The final-head argmax and its lowest-token-ID tie rule must be inside this same
 chained path, not merely stored as `predicted_token`. Equal checkpoint roots

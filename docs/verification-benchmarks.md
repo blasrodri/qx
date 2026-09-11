@@ -2,6 +2,15 @@
 
 ## Current hardened commitment format
 
+The canonical token genesis is now a real pre-layer checkpoint containing the
+embedding residual and prior-token KV root. Its snapshot is fused into the
+embedding lookup, so verified execution still adds only 23 dispatches. Two
+independent 31-repeat runs measured **2.939% and 4.201%** overhead (mean
+**3.570%**) with identical trace root
+`651e0f2f9e4b236b1add34d98bf69c35dd79ca610771c43e25375921d26cc2bd`.
+The new interval-2 execution spec is
+`01e47ff99355d9eca97bde30253739fe38fdfb70049871d4307daa89ffb9cd1d`.
+
 On 2026-09-11, after adding canonical job/token genesis leaves, compact job
 roots, and committed checkpoint-tree lengths, two independent 31-repeat runs
 measured 103.794/107.176 ms and 101.832/105.019 ms uncommitted/committed:
@@ -18,7 +27,7 @@ For epoch sampling economics and the terminal Solana fraud-proof benchmark,
 see `docs/verification-protocol.md`. The adversarial V2 path currently uses
 1,784 CU once per epoch to finalize entropy, 8,397 CU to authenticate and open
 a challenged result, 10,329 CU for both boundary proofs plus one midpoint
-round, 7,655 CU to bind both operator traces to checkpoint endpoints, and
+round, 7,656 CU to bind both operator traces to checkpoint endpoints, and
 4,342 CU for the chained runtime-state-chunk scalar decision. Each further
 binary-search level adds another two-party midpoint round. The compatibility
 three-state Q4/FMA dispute is 32,075 CU.

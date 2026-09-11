@@ -133,7 +133,8 @@ commits:
 
 The every-layer profile covers **196,608 canonical activation/KV bytes per
 executed token** (`24 × (1024 + 512 + 512) × 4`). The selected two-layer
-profile covers every K/V append plus 12 residuals, or **147,456 bytes/token**.
+profile covers every K/V append, 12 post-layer residuals, and the pre-layer
+embedding residual, or **151,552 bytes/token**.
 Only digests and Merkle frontiers remain after a token; no activation tensor is
 retained.
 Each completed token adds a 76-byte canonical token-result preimage binding the
@@ -158,7 +159,7 @@ the signed receipt exactly **274 bytes**, below the 512-byte target.
 
 The current sealed M5 V2 artifact stores both K and V as FP32. Metal now hashes
 the exact GPU-resident bytes and matches the CPU BLAKE3 oracle in a golden
-parity test. Post-layer residual snapshots use 98,304 transient bytes per
+parity test. Pre/post-layer residual snapshots use 102,400 transient bytes per
 runtime instance and are written by the existing final residual kernel; the
 snapshots are overwritten each token and are never receipt or permanent trace
 storage. A single token-end hash dispatch processes all 24 layers and returns
@@ -168,11 +169,11 @@ This closes the byte-level commitment gap. Consensus arithmetic now uses an
 explicit 32-lane shuffle-down reduction tree, protocol-defined fixed-operation
 `exp` and `rsqrt`, and safe Metal arithmetic; CPU and SBF primitives reproduce
 the same operation order. After trace-shape hardening, two independent
-31-repeat runs measured 3.130% and 3.258% commitment overhead. Its
+31-repeat runs measured 2.939% and 4.201% commitment overhead. Its
 512-position PTB PPL differed from native precise math by only
 `4.8735e-8` relatively, with complete sampled top-k agreement. The selected
 interval-2 execution-spec is
-`2f8ab3141938f906004637107276c18ef73601a8467944ef0736646ace9e3246`.
+`01e47ff99355d9eca97bde30253739fe38fdfb70049871d4307daa89ffb9cd1d`.
 It binds the hash design, reduction tree, math mode, fixed functions,
 checkpoint interval, canonical genesis leaves, checkpoint-tree length, and
 compact job-root semantics. See `docs/verification-benchmarks.md` for exact

@@ -4041,6 +4041,7 @@ fn encode_differential_token_with_probe(
             &stack.embedding_lookup,
             buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
             buffers.buffer(qx_runtime_v2::BufferId::HiddenA),
+            None,
             EMBEDDING_MULTIPLIER,
         )
         .map_err(anyhow::Error::msg)?;
@@ -4580,6 +4581,7 @@ fn capture_route_trace(
                 &stack.embedding_lookup,
                 buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
                 buffers.buffer(qx_runtime_v2::BufferId::HiddenA),
+                None,
                 EMBEDDING_MULTIPLIER,
             )
             .map_err(anyhow::Error::msg)?;
@@ -5693,6 +5695,7 @@ fn encode_canonical_pre_moe(
             &stack.embedding_lookup,
             buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
             buffers.buffer(qx_runtime_v2::BufferId::HiddenA),
+            None,
             EMBEDDING_MULTIPLIER,
         )
         .map_err(anyhow::Error::msg)?;
@@ -8543,6 +8546,7 @@ fn benchmark_v2_kernel_profile(
                     &stack.embedding_lookup,
                     buffers.buffer(qx_runtime_v2::BufferId::TokenOutput),
                     buffers.buffer(qx_runtime_v2::BufferId::HiddenA),
+                    None,
                     qx_model::EMBEDDING_MULTIPLIER,
                 )
                 .map_err(anyhow::Error::msg)

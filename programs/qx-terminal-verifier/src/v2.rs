@@ -857,9 +857,13 @@ pub(super) fn submit_challenger_checkpoint(
         .checked_mul(checkpoint_interval)
         .and_then(|value| value.checked_sub(1))
         .ok_or(QxError::InvalidState)?;
-    let expected_common_layer = expected_layer
-        .checked_sub(checkpoint_interval)
-        .ok_or(QxError::InvalidState)?;
+    let expected_common_layer = if checkpoint_position == 1 {
+        u32::from(u16::MAX)
+    } else {
+        expected_layer
+            .checked_sub(checkpoint_interval)
+            .ok_or(QxError::InvalidState)?
+    };
     if !cursor.is_empty()
         || state[D_MODEL_OFFSET..D_MODEL_OFFSET + 32] != model.key.to_bytes()
         || expected_layer >= model_layers
@@ -1667,12 +1671,6 @@ fn trace_domain(state: &[u8]) -> Result<&'static [u8], ProgramError> {
 fn set_terminal_phase(state: &mut [u8]) -> ProgramResult {
     let phase = match state[D_RESOLUTION_FLAGS_OFFSET] {
         TRACE_KIND_JOB => PHASE_CHALLENGER_TOKEN,
-        // Token index zero is currently an opaque genesis hash rather than a
-        // checkpoint preimage. A first-segment disagreement cannot yet be
-        // bound to an objective VM start state, so freeze without a winner.
-        TRACE_KIND_TOKEN if u32_at(state, D_HIGH_OFFSET)? == 1 => {
-            return set_phase(state, PHASE_UNSUPPORTED, PARTY_NONE);
-        }
         TRACE_KIND_TOKEN => PHASE_CHALLENGER_CHECKPOINT,
         TRACE_KIND_OPERATOR => PHASE_CHALLENGER_TERMINAL,
         _ => return Err(QxError::InvalidState.into()),
@@ -2138,14 +2136,14 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_first_segment_has_no_timeout_winner() {
+    fn first_segment_reaches_checkpoint_reveal() {
         let mut state = [0_u8; DISPUTE_V2_ACCOUNT_BYTES];
         state[..4].copy_from_slice(DISPUTE_MAGIC_V2);
         state[D_RESOLUTION_FLAGS_OFFSET] = TRACE_KIND_TOKEN;
         state[D_HIGH_OFFSET..D_HIGH_OFFSET + 4].copy_from_slice(&1_u32.to_le_bytes());
         set_terminal_phase(&mut state).unwrap();
-        assert_eq!(state[D_PHASE_OFFSET], PHASE_UNSUPPORTED);
-        assert_eq!(state[D_EXPECTED_PARTY_OFFSET], PARTY_NONE);
+        assert_eq!(state[D_PHASE_OFFSET], PHASE_CHALLENGER_CHECKPOINT);
+        assert_eq!(state[D_EXPECTED_PARTY_OFFSET], PARTY_CHALLENGER);
         assert_eq!(state[D_WINNER_OFFSET], PARTY_NONE);
     }
 }

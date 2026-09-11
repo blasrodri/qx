@@ -9,6 +9,8 @@ kernel void qx_q4_embedding_lookup(
     constant uint& rows [[buffer(4)]],
     constant uint& columns [[buffer(5)]],
     constant float& multiplier [[buffer(6)]],
+    device float* snapshot [[buffer(7)]],
+    constant uint& capture_snapshot [[buffer(8)]],
     uint tid [[thread_position_in_threadgroup]]) {
     if (token[0] >= rows) return;
     constexpr uint group_size = 32;
@@ -22,7 +24,9 @@ kernel void qx_q4_embedding_lookup(
         uchar byte = packed[row * groups * bytes_per_group + group * bytes_per_group + local / 2];
         uint code = (byte >> ((local % 2) * 4)) & 0xf;
         float weight = float(int(code) - qmax) * float(scales[row * groups + group]);
-        output[column] = weight * multiplier;
+        float result = weight * multiplier;
+        output[column] = result;
+        if (capture_snapshot != 0) snapshot[column] = result;
     }
 }
 

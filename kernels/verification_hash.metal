@@ -431,20 +431,22 @@ kernel void qx_verification_hash_state_kv(
     device uchar* outputs [[buffer(2)]],
     constant VerificationHashParams& params [[buffer(3)]],
     uint tid [[thread_index_in_threadgroup]],
-    uint layer [[threadgroup_position_in_grid]]) {
-    if (layer >= params.layers) return;
+    uint position [[threadgroup_position_in_grid]]) {
+    if (position > params.layers) return;
+    bool genesis = position == 0;
+    uint layer = genesis ? 0 : position - 1;
     threadgroup uint state_nodes[16 * 8];
     threadgroup uint key_nodes[8 * 8];
     threadgroup uint value_nodes[8 * 8];
-    device const uchar* residual = residual_snapshots + layer * params.residual_stride;
+    device const uchar* residual = residual_snapshots + position * params.residual_stride;
     device const uchar* key = kv_arena + params.key_offsets[layer];
     device const uchar* value = kv_arena + params.value_offsets[layer];
-    device uchar* output = outputs + layer * 64;
-    bool checkpoint = ((layer + 1) % params.checkpoint_interval == 0)
+    device uchar* output = outputs + position * 64;
+    bool checkpoint = genesis || ((layer + 1) % params.checkpoint_interval == 0)
         || layer + 1 == params.layers;
     uint state_chunks = checkpoint ? params.residual_stride / 256 : 1;
-    uint key_chunks = params.key_bytes[layer] / 256;
-    uint value_chunks = params.value_bytes[layer] / 256;
+    uint key_chunks = genesis ? 1 : params.key_bytes[layer] / 256;
+    uint value_chunks = genesis ? 1 : params.value_bytes[layer] / 256;
     uint group = tid / 32;
     uint lane = tid % 32;
 
@@ -456,11 +458,11 @@ kernel void qx_verification_hash_state_kv(
         for (uint word = 0; word < 8; ++word) state_nodes[lane * 8 + word] = digest[word];
     } else if (group == 0 && !checkpoint && lane == 0) {
         for (uint word = 0; word < 8; ++word) state_nodes[word] = 0;
-    } else if (group == 1 && lane < key_chunks) {
+    } else if (!genesis && group == 1 && lane < key_chunks) {
         uint digest[8];
         hash_chunk(key, lane, KV_KEY_CHUNK_DOMAIN, 18, digest);
         for (uint word = 0; word < 8; ++word) key_nodes[lane * 8 + word] = digest[word];
-    } else if (group == 2 && lane < value_chunks) {
+    } else if (!genesis && group == 2 && lane < value_chunks) {
         uint digest[8];
         hash_chunk(value, lane, KV_VALUE_CHUNK_DOMAIN, 20, digest);
         for (uint word = 0; word < 8; ++word) value_nodes[lane * 8 + word] = digest[word];
@@ -498,6 +500,10 @@ kernel void qx_verification_hash_state_kv(
 
     if (tid == 0) {
         b3_store_threadgroup_device(state_nodes, output);
+        if (genesis) {
+            for (uint byte = 0; byte < 32; ++byte) output[32 + byte] = 0;
+            return;
+        }
         Blake3Context kv;
         b3_init(kv);
         b3_constant_bytes(kv, KV_DOMAIN, 8);

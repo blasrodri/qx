@@ -1,20 +1,18 @@
 use crate::{
-    CommitError, D_CHECKPOINT, D_JOB, D_JOB_GENESIS, D_KV, D_TOKEN, D_TOKEN_GENESIS,
-    D_TOKEN_RESULT, Digest, FixedMerkleAccumulator, MerkleTree, MutableMerkleTree,
-    TRACE_HASH_ALGORITHM, hash_domain, kv_leaf_hash_v1, state_hash_v1,
+    CommitError, D_CHECKPOINT, D_JOB, D_JOB_GENESIS, D_KV, D_TOKEN, D_TOKEN_RESULT, Digest,
+    FixedMerkleAccumulator, MerkleTree, MutableMerkleTree, TRACE_HASH_ALGORITHM, hash_domain,
+    kv_leaf_hash_v1, state_hash_v1,
 };
 
 pub fn job_genesis_hash_v1(job_id: &Digest) -> Result<Digest, CommitError> {
     hash_domain(TRACE_HASH_ALGORITHM, D_JOB_GENESIS, &[job_id])
 }
 
-pub fn token_genesis_hash_v1(job_id: &Digest, token_index: u32) -> Result<Digest, CommitError> {
-    hash_domain(
-        TRACE_HASH_ALGORITHM,
-        D_TOKEN_GENESIS,
-        &[job_id, &token_index.to_le_bytes()],
-    )
-}
+/// Sentinel layer used by the canonical pre-layer checkpoint. Unlike the old
+/// opaque token genesis, this checkpoint carries the embedding residual and
+/// the exact pre-token global KV root, so corruption in the first checkpoint
+/// interval has an objective VM boundary.
+pub const TOKEN_GENESIS_LAYER_V1: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckpointV1 {
@@ -251,6 +249,52 @@ impl ExecutionCommitterV1 {
         )
     }
 
+    pub fn begin_token(
+        &mut self,
+        token_index: u32,
+        initial_residual: &[f32],
+    ) -> Result<Digest, CommitError> {
+        let bytes = canonical_f32(initial_residual)?;
+        let root = state_hash_v1(&bytes)?;
+        self.begin_token_hash(token_index, root, bytes.len())
+    }
+
+    pub fn begin_token_hash(
+        &mut self,
+        token_index: u32,
+        initial_residual_hash: Digest,
+        canonical_bytes: usize,
+    ) -> Result<Digest, CommitError> {
+        if token_index != self.expected_token
+            || self.expected_layer != 0
+            || !self.token_checkpoints.is_empty()
+            || self.pending_token_root.is_some()
+            || token_index as usize >= self.max_context
+            || canonical_bytes == 0
+        {
+            return Err(CommitError::InvalidExecution(
+                "token genesis is out of sequence or empty".to_owned(),
+            ));
+        }
+        let checkpoint = CheckpointV1 {
+            job_id: self.job_id,
+            token_index,
+            layer_index: TOKEN_GENESIS_LAYER_V1,
+            residual_hash: initial_residual_hash,
+            global_kv_root: self.global_kv.root(),
+        }
+        .hash()?;
+        self.token_checkpoints.push(checkpoint);
+        self.metrics.canonical_state_bytes = self
+            .metrics
+            .canonical_state_bytes
+            .checked_add(
+                u64::try_from(canonical_bytes).map_err(|_| CommitError::ArithmeticOverflow)?,
+            )
+            .ok_or(CommitError::ArithmeticOverflow)?;
+        Ok(checkpoint)
+    }
+
     /// Consume state/KV digests produced by a compatible accelerator. The
     /// caller supplies the number of canonical tensor bytes covered so
     /// receipts retain auditable accounting without retaining those tensors.
@@ -277,8 +321,9 @@ impl ExecutionCommitterV1 {
             return Err(CommitError::TreeCapacityExceeded);
         }
         if self.expected_layer == 0 && self.token_checkpoints.is_empty() {
-            self.token_checkpoints
-                .push(token_genesis_hash_v1(&self.job_id, token_index)?);
+            return Err(CommitError::InvalidExecution(
+                "begin_token must commit the pre-layer residual first".to_owned(),
+            ));
         }
         let kv_tree = &mut self.kv_trees[layer_index as usize];
         kv_tree.append(kv_leaf)?;
@@ -410,6 +455,9 @@ mod tests {
         fn run(corrupt: bool) -> ExecutionTraceV1 {
             let mut state = ExecutionCommitterV1::new([9; 32], 3, 8).unwrap();
             for token in 0..2 {
+                state
+                    .begin_token(token, &[token as f32, 0.0, 0.0, 0.0])
+                    .unwrap();
                 for layer in 0..3 {
                     let mut residual = vec![token as f32, layer as f32, 0.25, -0.0];
                     if corrupt && token == 1 && layer == 2 {
@@ -432,13 +480,14 @@ mod tests {
         assert_eq!(run(false), run(false));
         assert_ne!(run(false).trace_root, run(true).trace_root);
         assert_eq!(run(false).trace_length, 3);
-        assert_eq!(run(false).metrics.canonical_state_bytes, 192);
+        assert_eq!(run(false).metrics.canonical_state_bytes, 224);
     }
 
     #[test]
     fn coarser_checkpoints_keep_every_kv_leaf_and_reduce_residual_hashing() {
         let mut state =
             ExecutionCommitterV1::new_with_checkpoint_interval([4; 32], 4, 8, 2).unwrap();
+        state.begin_token(0, &[0.0; 4]).unwrap();
         for layer in 0..4 {
             state
                 .commit_layer(0, layer, &[layer as f32; 4], &[1.0, 2.0], &[3.0, 4.0])
@@ -448,8 +497,8 @@ mod tests {
         let trace = state.finish().unwrap();
         assert_eq!(trace.metrics.checkpoint_count, 2);
         assert_eq!(trace.trace_length, 2);
-        // Four 16-byte K/V pairs plus two 16-byte residuals.
-        assert_eq!(trace.metrics.canonical_state_bytes, 96);
+        // Four 16-byte K/V pairs, two 16-byte residuals, and genesis residual.
+        assert_eq!(trace.metrics.canonical_state_bytes, 112);
         assert_ne!(
             crate::granite_execution_spec().unwrap(),
             crate::granite_execution_spec_with_checkpoint_interval(2).unwrap()
@@ -460,6 +509,7 @@ mod tests {
     fn prediction_is_bound_into_the_job_trace() {
         fn root(predicted_token: u32) -> Digest {
             let mut state = ExecutionCommitterV1::new([6; 32], 1, 2).unwrap();
+            state.begin_token(0, &[0.0]).unwrap();
             state.commit_layer(0, 0, &[1.0], &[2.0], &[3.0]).unwrap();
             state.commit_output_token(0, predicted_token).unwrap();
             state.finish().unwrap().trace_root
@@ -471,6 +521,7 @@ mod tests {
     fn accelerator_digest_path_uses_the_same_genesis_leaves() {
         let job_id = [7; 32];
         let mut cpu = ExecutionCommitterV1::new(job_id, 1, 2).unwrap();
+        cpu.begin_token(0, &[0.0]).unwrap();
         cpu.commit_layer(0, 0, &[1.0], &[2.0], &[3.0]).unwrap();
         cpu.commit_output_token(0, 9).unwrap();
 
@@ -484,6 +535,13 @@ mod tests {
         .unwrap();
         let mut accelerator = ExecutionCommitterV1::new(job_id, 1, 2).unwrap();
         accelerator
+            .begin_token_hash(
+                0,
+                state_hash_v1(&0.0_f32.to_bits().to_le_bytes()).unwrap(),
+                4,
+            )
+            .unwrap();
+        accelerator
             .commit_layer_hashes(0, 0, residual_hash, kv_leaf, 12)
             .unwrap();
         accelerator.commit_output_token(0, 9).unwrap();
@@ -494,6 +552,7 @@ mod tests {
     #[test]
     fn execution_trace_builds_a_shape_consistent_result_leaf() {
         let mut state = ExecutionCommitterV1::new([8; 32], 1, 4).unwrap();
+        state.begin_token(0, &[0.0]).unwrap();
         state.commit_layer(0, 0, &[1.0], &[2.0], &[3.0]).unwrap();
         state.commit_output_token(0, 9).unwrap();
         let trace = state.finish().unwrap();

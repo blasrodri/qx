@@ -12,7 +12,7 @@ to decide whether the selected inference is checked.
 
 This separates three costs:
 
-1. every inference pays 3.130–3.258% measured commitment cost inside the selected
+1. every inference pays 2.939–4.201% measured commitment cost inside the selected
    fixed-math two-layer checkpoint profile, including output-token binding; the
    earlier fast-uncommitted to precise-committed migration measurement was
    8.820%, so arithmetic mode remains a separate deployment cost;
@@ -54,7 +54,7 @@ The current live-SBF measurements are:
 | Finalize epoch seed (once/epoch) | 1,784 |
 | Authenticate job/result and open challenge | 8,397 |
 | Both boundary openings + one midpoint round | 10,329 |
-| Bind both operator traces to checkpoints | 7,655 |
+| Bind both operator traces to checkpoints | 7,656 |
 | Chained runtime-chunk scalar terminal | 4,342 |
 | Compatibility staged Q4/FMA terminal | 9,533 |
 
@@ -71,8 +71,8 @@ convicts an incorrect update to the same 256-byte chunk tree used by normal
 execution. Compact roots and exact lengths prevent trace shortening.
 
 Automatic slashing remains disabled. The generic hierarchy and chained scalar
-mechanism work, but the registered Granite VM still lacks a canonical
-first-segment genesis, chained authenticated Q4 weight operations, structured
+mechanism work, including a canonical first-segment checkpoint, but the
+registered Granite VM still lacks chained authenticated Q4 weight operations, structured
 KV append, and final-head/argmax settlement. Collateral transfer and durable
 input availability are also outside this proof milestone. See
 `docs/verification-security-audit.md` for the exact readiness gate.
@@ -239,7 +239,7 @@ matching FP32 sum oracle. It also replaces native `exp` and `rsqrt` throughout
 the model kernels with protocol-defined fixed-operation implementations. Rust,
 Metal, and the SBF terminal evaluator share identical constants and operation
 order. Live Metal bit-parity tests pass. The selected interval-2 execution-spec
-`2f8ab3141938f906004637107276c18ef73601a8467944ef0736646ace9e3246`
+`01e47ff99355d9eca97bde30253739fe38fdfb70049871d4307daa89ffb9cd1d`
 binds the fixed-math and commitment-shape profile.
 
 The scalar terminal IR now objectively evaluates FMA/dot steps, add, multiply,

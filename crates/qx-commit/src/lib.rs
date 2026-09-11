@@ -27,8 +27,8 @@ pub use epoch::{
     required_audit_count, sample_receipt_indices_v1,
 };
 pub use execution::{
-    CheckpointV1, CommitmentMetrics, ExecutionCommitterV1, ExecutionTraceV1, TokenResultV1,
-    job_genesis_hash_v1, token_genesis_hash_v1,
+    CheckpointV1, CommitmentMetrics, ExecutionCommitterV1, ExecutionTraceV1,
+    TOKEN_GENESIS_LAYER_V1, TokenResultV1, job_genesis_hash_v1,
 };
 pub use hash::{Digest, HashAlgorithm, ProtocolVersion, hash_domain, hash_domain_input_len};
 pub use job::{JobEnvelopeV1, JobPayloadV1, MIN_AUDIT_PROBABILITY_PPM_V1, ResultLeafV1};
@@ -66,7 +66,6 @@ pub const D_TOKEN: &[u8] = b"QX:TOKEN:V1";
 pub const D_TOKEN_RESULT: &[u8] = b"QX:TOKEN:RESULT:V1";
 pub const D_JOB: &[u8] = b"QX:JOB:V1";
 pub const D_JOB_GENESIS: &[u8] = b"QX:JOB:GENESIS:V1";
-pub const D_TOKEN_GENESIS: &[u8] = b"QX:TOKEN:GENESIS:V1";
 pub const D_JOB_PAYLOAD: &[u8] = b"QX:JOB:PAYLOAD:V1";
 pub const D_RESULT: &[u8] = b"QX:RESULT:V1";
 pub const D_RECEIPT: &[u8] = b"QX:RECEIPT:V1";

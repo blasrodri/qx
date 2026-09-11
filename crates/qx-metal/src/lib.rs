@@ -7414,10 +7414,14 @@ pub mod platform {
             prepared: &PreparedQ4Embedding,
             token: &RuntimeBuffer,
             output: &RuntimeBuffer,
+            snapshot: Option<&RuntimeBuffer>,
             multiplier: f32,
         ) -> Result<(), String> {
             if token.length < std::mem::size_of::<u32>()
                 || output.length < prepared.columns * std::mem::size_of::<f32>()
+                || snapshot.is_some_and(|buffer| {
+                    buffer.length < prepared.columns * std::mem::size_of::<f32>()
+                })
             {
                 return Err("V2 embedding buffer is smaller than its fixed shape".to_owned());
             }
@@ -7453,6 +7457,18 @@ pub mod platform {
                     NonNull::from(&multiplier).cast(),
                     std::mem::size_of_val(&multiplier),
                     6,
+                );
+                let snapshot_buffer = snapshot.unwrap_or(output);
+                self.encoder.setBuffer_offset_atIndex(
+                    Some(&snapshot_buffer.buffer),
+                    snapshot_buffer.offset,
+                    7,
+                );
+                let capture_snapshot = u32::from(snapshot.is_some());
+                self.encoder.setBytes_length_atIndex(
+                    NonNull::from(&capture_snapshot).cast(),
+                    std::mem::size_of_val(&capture_snapshot),
+                    8,
                 );
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
@@ -9260,10 +9276,10 @@ pub mod platform {
                     "verification checkpoint interval {checkpoint_interval} is outside 1..={layers}"
                 ));
             }
-            if output.len() < layers * 64 {
+            if output.len() < (layers + 1) * 64 {
                 return Err("verification digest output is too small".to_owned());
             }
-            if residual_snapshots.len() < layers * residual_stride {
+            if residual_snapshots.len() < (layers + 1) * residual_stride {
                 return Err("verification residual snapshot buffer is too small".to_owned());
             }
             const VERIFICATION_CHUNK_BYTES: usize = 256;
@@ -9328,7 +9344,7 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: layers,
+                    width: layers + 1,
                     height: 1,
                     depth: 1,
                 },
@@ -15508,14 +15524,25 @@ mod tests {
             std::mem::size_of_val(value_values.as_slice()),
         );
         let residual = context
-            .allocate_runtime_buffer(residual_bytes.len())
+            .allocate_runtime_buffer(residual_bytes.len() * 2)
             .unwrap();
         let kv = context
             .allocate_runtime_buffer(key_bytes.len() + value_bytes.len())
             .unwrap();
-        let output = context.allocate_runtime_buffer(64).unwrap();
+        let output = context.allocate_runtime_buffer(128).unwrap();
         context
-            .write_runtime_buffer(&residual, residual_bytes)
+            .write_runtime_buffer(
+                &residual.subregion(0, residual_bytes.len()).unwrap(),
+                residual_bytes,
+            )
+            .unwrap();
+        context
+            .write_runtime_buffer(
+                &residual
+                    .subregion(residual_bytes.len(), residual_bytes.len())
+                    .unwrap(),
+                residual_bytes,
+            )
             .unwrap();
         context
             .write_runtime_buffer(&kv.subregion(0, key_bytes.len()).unwrap(), key_bytes)
@@ -15555,7 +15582,8 @@ mod tests {
         let state = qx_commit::state_hash_v1(residual_bytes).unwrap();
         let kv = qx_commit::kv_leaf_hash_v1(0, 11, key_bytes, value_bytes).unwrap();
         assert_eq!(&observed[..32], state);
-        assert_eq!(&observed[32..], kv);
+        assert_eq!(&observed[64..96], state);
+        assert_eq!(&observed[96..128], kv);
     }
 
     #[test]
