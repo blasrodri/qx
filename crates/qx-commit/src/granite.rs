@@ -4,8 +4,10 @@ use qx_format::TensorKind;
 use qx_quant::QuantType;
 
 use crate::{
-    CommitError, MerkleTree, SemanticTensorV1, VmInstructionV1, VmSegmentProgramV1,
-    artifact_semantic_tensors_v1, vm_program_tree_v1, vm_segment_schedule_v1,
+    CommitError, D_MACRO_STATE, D_MACRO_WORKSPACE, D_MACRO_WORKSPACE_SLOT, D_OPERATOR_TREE, Digest,
+    HashAlgorithm, MerkleTree, SemanticTensorV1, VmInstructionV1, VmOutputStateV1,
+    VmSegmentProgramV1, VmStateV1, artifact_semantic_tensors_v1, hash_domain, vm_program_tree_v1,
+    vm_segment_schedule_v1,
 };
 
 /// Each Granite layer has seven shared tensors followed by 32 gate/up and 32
@@ -32,6 +34,29 @@ pub enum GraniteMacroOpcodeV1 {
     ArgMax = 74,
 }
 
+impl TryFrom<u8> for GraniteMacroOpcodeV1 {
+    type Error = CommitError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            64 => Ok(Self::Reserved),
+            65 => Ok(Self::RmsNorm),
+            66 => Ok(Self::Dense),
+            67 => Ok(Self::Rope),
+            68 => Ok(Self::KvAppend),
+            69 => Ok(Self::Attention),
+            70 => Ok(Self::Residual),
+            71 => Ok(Self::TopK),
+            72 => Ok(Self::Moe),
+            73 => Ok(Self::FinalLogits),
+            74 => Ok(Self::ArgMax),
+            _ => Err(CommitError::InvalidExecution(
+                "unknown Granite macro opcode".to_owned(),
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum GraniteDenseOutputV1 {
@@ -40,6 +65,110 @@ pub enum GraniteDenseOutputV1 {
     Value = 3,
     Attention = 4,
     Router = 5,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraniteMacroOutputV1 {
+    pub opcode: GraniteMacroOpcodeV1,
+    pub output_root: Digest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum GraniteWorkspaceSlotV1 {
+    Residual = 0,
+    Normalized = 1,
+    Query = 2,
+    Key = 3,
+    Value = 4,
+    RotatedQueryKey = 5,
+    KvLeaf = 6,
+    Attention = 7,
+    AttentionProjection = 8,
+    PostAttention = 9,
+    MoeInput = 10,
+    RouterLogits = 11,
+    Routes = 12,
+    Moe = 13,
+    Logits = 14,
+    Winner = 15,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraniteMacroWorkspaceV1 {
+    slots: [Digest; 16],
+}
+
+impl GraniteMacroWorkspaceV1 {
+    pub fn new(residual_root: Digest) -> Self {
+        let mut slots = [[0; 32]; 16];
+        slots[GraniteWorkspaceSlotV1::Residual as usize] = residual_root;
+        Self { slots }
+    }
+
+    pub fn set(&mut self, slot: GraniteWorkspaceSlotV1, root: Digest) {
+        self.slots[slot as usize] = root;
+    }
+
+    pub fn get(&self, slot: GraniteWorkspaceSlotV1) -> Digest {
+        self.slots[slot as usize]
+    }
+
+    pub fn root(&self) -> Result<Digest, CommitError> {
+        let leaves = self
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(index, root)| {
+                hash_domain(
+                    HashAlgorithm::Blake3V1,
+                    D_MACRO_WORKSPACE_SLOT,
+                    &[
+                        &u32::try_from(index)
+                            .map_err(|_| CommitError::ArithmeticOverflow)?
+                            .to_le_bytes(),
+                        root,
+                    ],
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(MerkleTree::new(HashAlgorithm::Blake3V1, D_MACRO_WORKSPACE, &leaves)?.root())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraniteMacroStateV1 {
+    pub job_hash: Digest,
+    pub token_index: u32,
+    pub segment_index: u32,
+    pub program_counter: u32,
+    pub workspace_root: Digest,
+    pub global_kv_root: Digest,
+}
+
+impl GraniteMacroStateV1 {
+    pub fn hash(&self) -> Result<Digest, CommitError> {
+        hash_domain(
+            HashAlgorithm::Blake3V1,
+            D_MACRO_STATE,
+            &[
+                &self.job_hash,
+                &self.token_index.to_le_bytes(),
+                &self.segment_index.to_le_bytes(),
+                &self.program_counter.to_le_bytes(),
+                &self.workspace_root,
+                &self.global_kv_root,
+            ],
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GraniteMacroTraceV1 {
+    pub state_hashes: Vec<Digest>,
+    pub tree: MerkleTree,
+    pub final_residual_root: Digest,
+    pub final_global_kv_root: Digest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -457,6 +586,152 @@ pub fn granite_macro_plan_v1(checkpoint_interval: u8) -> Result<GraniteMacroPlan
     })
 }
 
+fn macro_slot(instruction: VmInstructionV1) -> Result<GraniteWorkspaceSlotV1, CommitError> {
+    Ok(match instruction.opcode {
+        value if value == GraniteMacroOpcodeV1::RmsNorm as u8 => {
+            if instruction.source_a == u32::MAX {
+                GraniteWorkspaceSlotV1::Normalized
+            } else if instruction.source_b % GRANITE_TENSORS_PER_LAYER_V1 == 6 {
+                GraniteWorkspaceSlotV1::MoeInput
+            } else {
+                GraniteWorkspaceSlotV1::Normalized
+            }
+        }
+        value if value == GraniteMacroOpcodeV1::Dense as u8 => match instruction.destination {
+            value if value == GraniteDenseOutputV1::Query as u32 => GraniteWorkspaceSlotV1::Query,
+            value if value == GraniteDenseOutputV1::Key as u32 => GraniteWorkspaceSlotV1::Key,
+            value if value == GraniteDenseOutputV1::Value as u32 => GraniteWorkspaceSlotV1::Value,
+            value if value == GraniteDenseOutputV1::Attention as u32 => {
+                GraniteWorkspaceSlotV1::AttentionProjection
+            }
+            value if value == GraniteDenseOutputV1::Router as u32 => {
+                GraniteWorkspaceSlotV1::RouterLogits
+            }
+            _ => {
+                return Err(CommitError::InvalidExecution(
+                    "unknown dense output".to_owned(),
+                ));
+            }
+        },
+        value if value == GraniteMacroOpcodeV1::Rope as u8 => {
+            GraniteWorkspaceSlotV1::RotatedQueryKey
+        }
+        value if value == GraniteMacroOpcodeV1::KvAppend as u8 => GraniteWorkspaceSlotV1::KvLeaf,
+        value if value == GraniteMacroOpcodeV1::Attention as u8 => {
+            GraniteWorkspaceSlotV1::Attention
+        }
+        value if value == GraniteMacroOpcodeV1::Residual as u8 => {
+            if instruction.source_c == 0 {
+                GraniteWorkspaceSlotV1::PostAttention
+            } else {
+                GraniteWorkspaceSlotV1::Residual
+            }
+        }
+        value if value == GraniteMacroOpcodeV1::TopK as u8 => GraniteWorkspaceSlotV1::Routes,
+        value if value == GraniteMacroOpcodeV1::Moe as u8 => GraniteWorkspaceSlotV1::Moe,
+        value if value == GraniteMacroOpcodeV1::FinalLogits as u8 => GraniteWorkspaceSlotV1::Logits,
+        value if value == GraniteMacroOpcodeV1::ArgMax as u8 => GraniteWorkspaceSlotV1::Winner,
+        _ => {
+            return Err(CommitError::InvalidExecution(
+                "unknown Granite macro opcode".to_owned(),
+            ));
+        }
+    })
+}
+
+/// Fold challenge-only macro outputs into a rolling commitment to every live
+/// tensor root. `kv_roots` contains the authenticated global root after each
+/// `KvAppend`, in program order. First and last leaves retain the existing VM
+/// state hashes so receipt checkpoint formats do not change.
+pub fn granite_macro_trace_v1(
+    pre_state: VmStateV1,
+    program: &[VmInstructionV1],
+    outputs: &[GraniteMacroOutputV1],
+    kv_roots: &[Digest],
+    predicted_token: Option<u32>,
+) -> Result<GraniteMacroTraceV1, CommitError> {
+    if pre_state.program_counter != 0 || program.len() != outputs.len() || program.is_empty() {
+        return Err(CommitError::InvalidExecution(
+            "macro trace shape does not match its segment program".to_owned(),
+        ));
+    }
+    let expected_kv = program
+        .iter()
+        .filter(|instruction| instruction.opcode == GraniteMacroOpcodeV1::KvAppend as u8)
+        .count();
+    if expected_kv != kv_roots.len() {
+        return Err(CommitError::InvalidExecution(
+            "macro trace K/V frontier count is inconsistent".to_owned(),
+        ));
+    }
+    let mut state_hashes = Vec::with_capacity(program.len() + 1);
+    state_hashes.push(pre_state.hash()?);
+    let mut workspace = GraniteMacroWorkspaceV1::new(pre_state.residual_root);
+    let mut global_kv_root = pre_state.global_kv_root;
+    let mut kv_index = 0;
+    for (index, (instruction, output)) in program.iter().zip(outputs).enumerate() {
+        if instruction.opcode != output.opcode as u8 {
+            return Err(CommitError::InvalidExecution(
+                "macro output opcode does not match its registered instruction".to_owned(),
+            ));
+        }
+        workspace.set(macro_slot(*instruction)?, output.output_root);
+        if instruction.opcode == GraniteMacroOpcodeV1::KvAppend as u8 {
+            global_kv_root = kv_roots[kv_index];
+            kv_index += 1;
+        }
+        let next_pc = u32::try_from(index + 1).map_err(|_| CommitError::ArithmeticOverflow)?;
+        let last = index + 1 == program.len();
+        let hash = if last {
+            if let Some(predicted_token) = predicted_token {
+                VmOutputStateV1 {
+                    job_hash: pre_state.job_hash,
+                    token_index: pre_state.token_index,
+                    segment_index: pre_state.segment_index,
+                    program_counter: next_pc,
+                    residual_root: workspace.root()?,
+                    global_kv_root,
+                    predicted_token,
+                }
+                .hash()?
+            } else {
+                VmStateV1 {
+                    job_hash: pre_state.job_hash,
+                    token_index: pre_state.token_index,
+                    segment_index: pre_state.segment_index,
+                    program_counter: next_pc,
+                    residual_root: workspace.get(GraniteWorkspaceSlotV1::Residual),
+                    global_kv_root,
+                }
+                .hash()?
+            }
+        } else {
+            GraniteMacroStateV1 {
+                job_hash: pre_state.job_hash,
+                token_index: pre_state.token_index,
+                segment_index: pre_state.segment_index,
+                program_counter: next_pc,
+                workspace_root: workspace.root()?,
+                global_kv_root,
+            }
+            .hash()?
+        };
+        state_hashes.push(hash);
+    }
+    let final_residual_root = if predicted_token.is_some() {
+        workspace.root()?
+    } else {
+        workspace.get(GraniteWorkspaceSlotV1::Residual)
+    };
+    let tree = MerkleTree::new(HashAlgorithm::Blake3V1, D_OPERATOR_TREE, &state_hashes)?;
+    Ok(GraniteMacroTraceV1 {
+        state_hashes,
+        tree,
+        final_residual_root,
+        final_global_kv_root: global_kv_root,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,5 +792,51 @@ mod tests {
         if artifact.exists() {
             validate_granite_macro_artifact_v1(artifact).unwrap();
         }
+    }
+
+    #[test]
+    fn rolling_workspace_binds_every_live_macro_output() {
+        let program = granite_layer_macro_program_v1(0).unwrap();
+        let outputs = program
+            .iter()
+            .enumerate()
+            .map(|(index, instruction)| GraniteMacroOutputV1 {
+                opcode: GraniteMacroOpcodeV1::try_from(instruction.opcode).unwrap(),
+                output_root: [u8::try_from(index + 1).unwrap(); 32],
+            })
+            .collect::<Vec<_>>();
+        let pre_state = VmStateV1 {
+            job_hash: [1; 32],
+            token_index: 2,
+            segment_index: 3,
+            program_counter: 0,
+            residual_root: [4; 32],
+            global_kv_root: [5; 32],
+        };
+        let trace =
+            granite_macro_trace_v1(pre_state, &program, &outputs, &[[6; 32]], None).unwrap();
+        assert_eq!(trace.state_hashes.len(), program.len() + 1);
+        assert_eq!(trace.state_hashes[0], pre_state.hash().unwrap());
+        assert_eq!(
+            trace.final_residual_root,
+            outputs.last().unwrap().output_root
+        );
+        assert_eq!(trace.final_global_kv_root, [6; 32]);
+        let expected_end = VmStateV1 {
+            program_counter: program.len() as u32,
+            residual_root: trace.final_residual_root,
+            global_kv_root: [6; 32],
+            ..pre_state
+        }
+        .hash()
+        .unwrap();
+        assert_eq!(*trace.state_hashes.last().unwrap(), expected_end);
+
+        let mut corrupt = outputs.clone();
+        corrupt[1].output_root[0] ^= 1;
+        let corrupt_trace =
+            granite_macro_trace_v1(pre_state, &program, &corrupt, &[[6; 32]], None).unwrap();
+        assert_ne!(trace.tree.root(), corrupt_trace.tree.root());
+        assert_eq!(trace.state_hashes.last(), corrupt_trace.state_hashes.last());
     }
 }

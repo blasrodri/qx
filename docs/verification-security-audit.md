@@ -51,7 +51,7 @@ claim.
 | Final-head output binding | shared final checkpoint starts both registered traces; distinct output-state hashes bind each trace to its claimed prediction | Implemented end to end on SBF |
 | Objective arithmetic library | Q4 FMA plus fixed add/mul/div/exp/rsqrt/sin/cos/reduction primitives | Implemented; fixed sine is executed on SBF, but not every family is wired into the chained VM |
 | Granite macro schedule | 14 steps per layer, 28 per selected interval, three for the final head; exact tensor map validated against the 1,706-entry production artifact | Implemented off-chain; nested macro-state dispute is not yet on-chain |
-| Dispute-only macro outputs | real runtime captures normalized/Q/K/V/rotated-QK/attention/router/routing/MoE/residual roots, the derived K/V leaf, and final hidden/logits/winner in compiler order | Implemented and complete-model tested; rolling live-state commitment is still required |
+| Dispute-only macro trace | real runtime captures normalized/Q/K/V/rotated-QK/attention/router/routing/MoE/residual roots, the derived K/V leaf, and final hidden/logits/winner in compiler order; a 16-slot Merkle workspace retains every live root | Implemented and complete-model tested; macro-to-scalar on-chain descent is still required |
 | CPU verified generation | complete checkpoint+artifact execution emits a nonzero receipt root | Implemented and complete-model tested; a missing `begin_token` call was fixed by this audit |
 | Turn liveness | every unilateral move has a deadline and either non-responder loses | Implemented and tested |
 
@@ -120,8 +120,10 @@ interval now authenticates its own program root, so layer-specific Granite
 weights cannot be swapped through one generic program. The deterministic
 macro compiler now emits RMSNorm, Q/K/V/O/router projection, RoPE, KV append,
 attention, Top-K, MoE, residual, final-logit, and argmax steps with exact
-artifact tensor IDs. Complete the macro-state trace and the second bisection
-from one disputed macro into the existing scalar terminals. The canonical
+artifact tensor IDs. A rolling 16-slot workspace now binds every simultaneously
+live macro value while retaining the existing checkpoint hashes as trace
+endpoints. Complete the second bisection from one disputed macro into the
+existing scalar terminals. The canonical
 pre-layer checkpoint now binds the embedding
 residual and prior-token global KV root, and the SBF hierarchy test exercises
 a disagreement in the first checkpoint interval.

@@ -163,9 +163,11 @@ The canonical macro compiler emits 28 instructions per two-layer interval
 against the installed 1,706-entry artifact without reading the weight payload.
 The challenge-only runtime emits matching roots for normalized/Q/K/V,
 rotated-QK, K/V leaf, attention, router, selected routes, MoE, residual,
-final-hidden, logits, and the winning `[logit, token]` record. The remaining
-implementation gate is a rolling commitment to all simultaneously live macro
-values and descent of the one disputed macro into scalar terminals on chain.
+final-hidden, logits, and the winning `[logit, token]` record. A 16-slot Merkle
+workspace rolls those roots forward and collapses back to the existing
+checkpoint state at the end of a layer segment; this is complete-model tested.
+The remaining implementation gate is descent of the one disputed macro into
+scalar terminals on chain.
 Generation executes and commits `input_token_count + output_token_count - 1`
 tokens in the usual non-EOS case because the final output is the prediction of
 the preceding step.
