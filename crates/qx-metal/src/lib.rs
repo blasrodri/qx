@@ -13928,9 +13928,10 @@ pub mod platform {
             )?;
             Ok(outputs
                 .iter()
-                .map(|output| {
+                .zip(prepared)
+                .map(|(output, matrix)| {
                     let contents = output.contents().as_ptr() as *const f32;
-                    unsafe { std::slice::from_raw_parts(contents, output.length() / 4).to_vec() }
+                    unsafe { std::slice::from_raw_parts(contents, matrix.rows).to_vec() }
                 })
                 .collect())
         }
@@ -15493,6 +15494,23 @@ mod tests {
             ]
         });
         assert_eq!(observed, expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepared_dense_readback_uses_logical_rows_after_scratch_reuse() {
+        let context = platform::MetalContext::system_default().expect("Metal device");
+        let wide = context
+            .prepare_dense(&vec![1.0; 1024 * 4], 1024, 4)
+            .unwrap();
+        let narrow = context.prepare_dense(&vec![2.0; 32 * 4], 32, 4).unwrap();
+        assert_eq!(
+            context.run_prepared_dense(&wide, &[1.0; 4]).unwrap().len(),
+            1024
+        );
+        let output = context.run_prepared_dense(&narrow, &[1.0; 4]).unwrap();
+        assert_eq!(output.len(), 32);
+        assert!(output.iter().all(|value| *value == 8.0));
     }
 
     #[cfg(target_os = "macos")]
