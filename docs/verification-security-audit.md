@@ -40,12 +40,13 @@ claim.
 | Checkpoint-to-operator binding | both operator traces must open the agreed start checkpoint and their respective end checkpoint under `QX:OPERATOR:V1` | Implemented and tested on SBF |
 | Verification opcode is registered | the disputed segment descriptor authenticates its own instruction root and length; the terminal opcode opens against that root | Implemented on SBF |
 | Chained objective scalar update | instruction, runtime-format residual chunk, old/new root, token, segment, PC, and unchanged KV root are bound | Implemented end to end on SBF |
-| Cross-chunk scalar update | operand subsets are authenticated over multiple bounded transactions and tied to one dispute/state/instruction; destination opening derives the post-root | Implemented on SBF; 10,369 CU for two source chunks plus destination |
-| Chained authenticated Q4 update | registered instruction selects an exact model-weight leaf; its 26-level proof is staged and the VM memory/root update is objective | Implemented end to end on SBF; 11,881 CU |
-| Cross-chunk Q4 update | weight, activation, and accumulator are independently authenticated; a separate destination opening derives the post-root | Implemented on SBF; 18,467 CU across four bounded instructions |
+| Cross-chunk scalar update | operand subsets are authenticated over multiple bounded transactions and tied to one dispute/state/instruction; destination opening derives the post-root | Implemented on SBF; 10,365 CU for two source chunks plus destination |
+| Chained authenticated Q4 update | registered instruction selects an exact model-weight leaf; its 26-level proof is staged and the VM memory/root update is objective | Implemented end to end on SBF; 11,885 CU |
+| Cross-chunk Q4 update | weight, activation, and accumulator are independently authenticated; a separate destination opening derives the post-root | Implemented on SBF; 18,473 CU across four bounded instructions |
+| Raw FP32 weight update | one finite value is selected from an authenticated canonical raw-weight leaf and combined with staged operands | Implemented on SBF for Granite norm tensors; 15,014 CU |
 | Structured KV append | proves the exact token slot was empty, preserves the layer frontier, and updates the authenticated global layer root | Implemented on SBF; K/V root production still needs Granite lowering |
 | Pairwise greedy argmax | authenticated `[logit, token]` records select the higher score, exact ties select the lower token ID, and both fields are copied for tournament reduction | Implemented on SBF and reached from an equal-checkpoint prediction dispute |
-| Cross-chunk argmax | two source records are staged independently and the destination can occupy a third chunk; the last reduction binds the selected token into the output state | Implemented on SBF; 10,558 CU |
+| Cross-chunk argmax | two source records are staged independently and the destination can occupy a third chunk; the last reduction binds the selected token into the output state | Implemented on SBF; 10,554 CU |
 | Final-head output binding | shared final checkpoint starts both registered traces; distinct output-state hashes bind each trace to its claimed prediction | Implemented end to end on SBF |
 | Objective arithmetic library | Q4 FMA plus fixed add/mul/div/exp/rsqrt/reduction primitives | Implemented; not every family is wired into the chained VM |
 | Turn liveness | every unilateral move has a deadline and either non-responder loses | Implemented and tested |
@@ -78,14 +79,14 @@ to the fixed consensus profile. The previous same-machine measurement for
 that arithmetic migration plus commitments was 8.820%. It also excludes
 duplicate auditors, data distribution, failed jobs, and dispute replay.
 
-The current live three-leaf synthetic SBF dispute consumes 32,361 CU. Epoch
+The current live three-leaf synthetic SBF dispute consumes 32,363 CU. Epoch
 entropy finalization consumes 1,786 CU once per epoch; opening the challenged
 job costs 8,676 CU. A two-party segment-program/operator-boundary submission
-costs 8,914 CU, the runtime-state-chunk scalar terminal costs 4,343 CU, the
-chained Q4 terminal costs 11,881 CU, structured KV append costs 9,412 CU, and
-an intermediate pairwise argmax with a two-leaf registered program costs 4,472
-CU. Submitting both sides of the final-head boundary costs 10,408 CU; its final argmax costs
-4,111 CU.
+costs 8,915 CU, the runtime-state-chunk scalar terminal costs 4,343 CU, the
+chained Q4 terminal costs 11,885 CU, structured KV append costs 9,412 CU, and
+an intermediate pairwise argmax with a two-leaf registered program costs 4,471
+CU. Submitting both sides of the final-head boundary costs 10,409 CU; its final argmax costs
+4,110 CU.
 Larger traces add a
 challenger/miner midpoint pair for every binary-search level (10,332 CU in the
 three-leaf test). These costs occur only after a sampled replay disagrees.

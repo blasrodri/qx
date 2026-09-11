@@ -24,6 +24,7 @@ pub enum QxOpV1 {
     KvAppend = 11,
     Div = 12,
     Select = 13,
+    RawWeightFma = 14,
 }
 
 impl TryFrom<u8> for QxOpV1 {
@@ -44,6 +45,7 @@ impl TryFrom<u8> for QxOpV1 {
             11 => Ok(Self::KvAppend),
             12 => Ok(Self::Div),
             13 => Ok(Self::Select),
+            14 => Ok(Self::RawWeightFma),
             _ => Err(VerificationError::InvalidWitness("unknown QX operation")),
         }
     }
@@ -115,7 +117,7 @@ pub fn evaluate_scalar_op_v1(op: QxOpV1, operands: [u32; 3]) -> Result<u32, Veri
                 ));
             }
         },
-        QxOpV1::ArgMax | QxOpV1::KvAppend => {
+        QxOpV1::ArgMax | QxOpV1::KvAppend | QxOpV1::RawWeightFma => {
             return Err(VerificationError::InvalidWitness(
                 "operation requires a structured terminal witness",
             ));

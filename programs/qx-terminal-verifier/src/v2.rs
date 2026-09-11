@@ -40,6 +40,7 @@ pub(super) const OP_RESOLVE_STAGED_VM_SCALAR_V2: u8 = 39;
 pub(super) const OP_RESOLVE_STAGED_VM_Q4_V2: u8 = 40;
 pub(super) const OP_STAGE_VM_ARGMAX_V2: u8 = 41;
 pub(super) const OP_RESOLVE_STAGED_VM_ARGMAX_V2: u8 = 42;
+pub(super) const OP_STAGE_VM_RAW_WEIGHT_V2: u8 = 43;
 
 pub const JOB_PAYLOAD_BYTES: usize = 310;
 pub const JOB_ACCOUNT_BYTES: usize = 314;
@@ -1816,8 +1817,8 @@ pub(super) fn stage_vm_scalar(
             .checked_mul(32)
             .ok_or(QxError::InvalidEncoding)?,
     )?;
-    if !scalar_op_supported(opcode)
-        || (opcode == 4 && role_mask & !3 != 0)
+    if (!scalar_op_supported(opcode) && opcode != 14)
+        || (matches!(opcode, 4 | 14) && role_mask & !3 != 0)
         || instruction_count != u32_at(&state, D_SEGMENT_INSTRUCTION_COUNT_OFFSET)?
     {
         return Err(QxError::InvalidState.into());
@@ -1936,7 +1937,7 @@ pub(super) fn resolve_staged_vm_scalar(
     if &staged_data[..4] != STAGED_SCALAR_MAGIC
         || staged_data[4..36] != dispute.key.to_bytes()
         || staged_data[89] != 7
-        || staged_data[72] == 4
+        || matches!(staged_data[72], 4 | 14)
     {
         return Err(QxError::Unauthorized.into());
     }
@@ -2178,6 +2179,127 @@ pub(super) fn stage_vm_q4(
     Ok(())
 }
 
+/// Authenticate one FP32 value from a canonical raw-weight leaf. Raw leaves
+/// contain up to 32 values (128 bytes) and cover Granite's norm vectors.
+pub(super) fn stage_vm_raw_weight(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [model, dispute, staged] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    if model.owner != program_id
+        || model.data_len() != MODEL_ACCOUNT_BYTES
+        || dispute.owner != program_id
+        || dispute.data_len() != DISPUTE_V2_ACCOUNT_BYTES
+        || staged.owner != program_id
+        || !staged.is_writable
+        || staged.data_len() != STAGED_WEIGHT_BYTES
+    {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let state = dispute.try_borrow_data()?;
+    require_dispute(&state, PHASE_CHALLENGER_TERMINAL)?;
+    require_deadline(&state)?;
+    if state[D_MODEL_OFFSET..D_MODEL_OFFSET + 32] != model.key.to_bytes() {
+        return Err(QxError::Unauthorized.into());
+    }
+    let program_counter = cursor.u32()?;
+    let opcode = cursor.u8()?;
+    let source_a = cursor.u32()?;
+    let source_b = cursor.u32()?;
+    let source_c = cursor.u32()?;
+    let destination = cursor.u32()?;
+    let instruction_count = cursor.u32()?;
+    let instruction_depth = usize::from(cursor.u8()?);
+    let instruction_siblings = cursor.take(
+        instruction_depth
+            .checked_mul(32)
+            .ok_or(QxError::InvalidEncoding)?,
+    )?;
+    if opcode != 14 || program_counter != u32_at(&state, D_LOW_OFFSET)? || source_a & 3 != 0 {
+        return Err(QxError::InvalidState.into());
+    }
+    let model_data = model.try_borrow_data()?;
+    if &model_data[..4] != MODEL_MAGIC
+        || instruction_count != u32_at(&state, D_SEGMENT_INSTRUCTION_COUNT_OFFSET)?
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    let instruction = vm_instruction_bytes(opcode, source_a, source_b, source_c, destination);
+    verify_merkle_blake3(
+        blake3_domain(
+            D_VM_INSTRUCTION,
+            &[&program_counter.to_le_bytes(), &instruction],
+        ),
+        program_counter,
+        instruction_count,
+        instruction_depth,
+        instruction_siblings,
+        array_at(&state, D_SEGMENT_PROGRAM_ROOT_OFFSET)?,
+        D_PROGRAM_TREE,
+    )?;
+
+    let leaf_index = cursor.u32()?;
+    let tensor = cursor.u32()?;
+    let row = cursor.u32()?;
+    let group = cursor.u32()?;
+    let quantization_type = cursor.u8()?;
+    let scale_bits = cursor.u16()?;
+    let packed_len = usize::from(cursor.u16()?);
+    let packed = cursor.take(packed_len)?;
+    let weight_depth = usize::from(cursor.u8()?);
+    let weight_siblings = cursor.take(
+        weight_depth
+            .checked_mul(32)
+            .ok_or(QxError::InvalidEncoding)?,
+    )?;
+    let selected_leaf = source_c >> 5;
+    let local = usize::try_from(source_c & 31).map_err(|_| QxError::InvalidEncoding)?;
+    if !cursor.is_empty()
+        || selected_leaf != leaf_index
+        || quantization_type != 0
+        || scale_bits != 0
+        || packed_len == 0
+        || packed_len > 128
+        || !packed_len.is_multiple_of(4)
+        || local >= packed_len / 4
+    {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    verify_merkle_sha(
+        D_WEIGHT_TREE,
+        weight_leaf_hash(tensor, row, group, quantization_type, packed, scale_bits),
+        leaf_index,
+        u32_at(&model_data, 68)?,
+        weight_depth,
+        weight_siblings,
+        array_at(&model_data, 36)?,
+    )?;
+    drop(model_data);
+    drop(state);
+    let weight_bits = u32::from_le_bytes(
+        packed[local * 4..local * 4 + 4]
+            .try_into()
+            .map_err(|_| QxError::InvalidEncoding)?,
+    );
+    if !f32::from_bits(weight_bits).is_finite() {
+        return Err(QxError::NonFinite.into());
+    }
+    let mut staged_data = staged.try_borrow_mut_data()?;
+    staged_data.fill(0);
+    staged_data[..4].copy_from_slice(STAGED_WEIGHT_MAGIC);
+    put(&mut staged_data, 4, dispute.key.as_ref())?;
+    put(&mut staged_data, 36, &program_counter.to_le_bytes())?;
+    put(&mut staged_data, 40, &source_a.to_le_bytes())?;
+    put(&mut staged_data, 44, &source_b.to_le_bytes())?;
+    put(&mut staged_data, 48, &destination.to_le_bytes())?;
+    put(&mut staged_data, 52, &weight_bits.to_le_bytes())?;
+    put(&mut staged_data, 56, &leaf_index.to_le_bytes())?;
+    Ok(())
+}
+
 /// Resolve one checkpoint-bound VM Q4 FMA using the staged authenticated
 /// model weight and one opening of the common runtime state chunk.
 pub(super) fn resolve_vm_q4(
@@ -2358,7 +2480,7 @@ pub(super) fn resolve_staged_vm_q4(
     let instruction: [u8; 17] = operand_data[72..89]
         .try_into()
         .map_err(|_| QxError::InvalidEncoding)?;
-    if instruction[0] != 4
+    if !matches!(instruction[0], 4 | 14)
         || u32_from(&instruction, 1)? != source_a
         || u32_from(&instruction, 5)? != source_b
         || u32_from(&instruction, 13)? != destination

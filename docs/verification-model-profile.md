@@ -102,7 +102,9 @@ Physical row-major, MetalTile32, row-inline, transaction, cross-expert, and
 superblock arrangements are transport details. `WeightLeafV1` always commits
 the same logical `(tensor_id, row, group, Q4, packed codes, scale bits)`.
 Raw FP32 norm vectors are committed in logical 32-value chunks with type 0 and
-scale bits 0.
+scale bits 0. The SBF verifier can authenticate an exact finite FP32 value from
+such a leaf and apply it through the same staged weighted-FMA transition used
+for cross-chunk Q4 operands.
 
 Tensor IDs are assigned after sorting in this semantic order:
 
