@@ -544,7 +544,7 @@ fn chained_vm_argmax_enforces_lowest_token_tie_on_sbf() {
     let program = MerkleTree::new(
         HashAlgorithm::Blake3V1,
         D_PROGRAM_TREE,
-        &[instruction.hash(0).unwrap()],
+        &[instruction.hash(0).unwrap(), instruction.hash(1).unwrap()],
     )
     .unwrap();
     let pre = VmStateV1 {
@@ -568,12 +568,13 @@ fn chained_vm_argmax_enforces_lowest_token_tie_on_sbf() {
     let mut model = owned(MODEL_BYTES, f.program);
     model.data[..4].copy_from_slice(b"QXM1");
     model.data[104..136].copy_from_slice(&program.root());
-    model.data[136..140].copy_from_slice(&1_u32.to_le_bytes());
+    model.data[136..140].copy_from_slice(&2_u32.to_le_bytes());
     model.data[152..156].copy_from_slice(&49_155_u32.to_le_bytes());
     let mut dispute = owned(DISPUTE_BYTES, f.program);
     dispute.data[..4].copy_from_slice(b"QXD2");
     dispute.data[4] = 5;
     dispute.data[6] = 2;
+    dispute.data[7] = 4;
     dispute.data[40..72].copy_from_slice(f.model.as_ref());
     dispute.data[72..104].copy_from_slice(&pre.job_hash);
     dispute.data[232..264].copy_from_slice(&pre.hash().unwrap());
@@ -591,7 +592,7 @@ fn chained_vm_argmax_enforces_lowest_token_tie_on_sbf() {
     body.extend_from_slice(&pre.residual_root);
     body.extend_from_slice(&pre.global_kv_root);
     body.extend_from_slice(&instruction.canonical_bytes());
-    body.extend_from_slice(&1_u32.to_le_bytes());
+    body.extend_from_slice(&2_u32.to_le_bytes());
     body.push(instruction_proof.siblings.len() as u8);
     append_siblings(&mut body, &instruction_proof);
     body.extend_from_slice(&opening.byte_length.to_le_bytes());

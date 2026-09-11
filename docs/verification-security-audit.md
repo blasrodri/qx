@@ -79,8 +79,10 @@ The current live three-leaf synthetic SBF dispute consumes 32,079 CU. Epoch
 entropy finalization consumes 1,785 CU once per epoch; opening the challenged
 job costs 8,396 CU. A two-party operator-boundary submission costs 7,656 CU,
 the runtime-state-chunk scalar terminal costs 4,341 CU, the chained Q4 terminal
-costs 11,881 CU, structured KV append costs 9,410 CU, and pairwise argmax costs
-4,043 CU. Submitting both sides of the final-head boundary costs 9,156 CU.
+costs 11,881 CU, structured KV append costs 9,410 CU, and an intermediate
+pairwise argmax with a two-leaf registered program costs 4,469 CU. Submitting
+both sides of the final-head boundary costs 9,156 CU; its final argmax costs
+4,110 CU.
 Larger traces add a
 challenger/miner midpoint pair for every binary-search level (10,329 CU in the
 three-leaf test). These costs occur only after a sampled replay disagrees.

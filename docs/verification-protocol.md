@@ -58,8 +58,9 @@ The current live-SBF measurements are:
 | Chained runtime-chunk scalar terminal | 4,341 |
 | Chained authenticated Q4 terminal (two instructions) | 11,881 |
 | Chained structured KV append (two instructions) | 9,410 |
-| Chained pairwise argmax terminal | 4,043 |
+| Intermediate pairwise argmax in a two-leaf registered program | 4,469 |
 | Bind both final-head traces to shared checkpoint and claimed outputs | 9,156 |
+| Final-head token-deciding argmax | 4,110 |
 | Compatibility staged Q4/FMA terminal | 9,533 |
 
 Each additional binary-search level costs one challenger and one miner
