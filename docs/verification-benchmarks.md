@@ -25,12 +25,14 @@ the 5% ceiling but not the desired 3% target.
 
 For epoch sampling economics and the terminal Solana fraud-proof benchmark,
 see `docs/verification-protocol.md`. The adversarial V2 path currently uses
-1,784 CU once per epoch to finalize entropy, 8,397 CU to authenticate and open
+1,785 CU once per epoch to finalize entropy, 8,396 CU to authenticate and open
 a challenged result, 10,329 CU for both boundary proofs plus one midpoint
 round, 7,656 CU to bind both operator traces to checkpoint endpoints, and
-4,342 CU for the chained runtime-state-chunk scalar decision. Each further
-binary-search level adds another two-party midpoint round. The compatibility
-three-state Q4/FMA dispute is 32,075 CU.
+4,341 CU for the chained runtime-state-chunk scalar decision. The chained
+authenticated Q4 and structured KV terminals cost 11,881 and 9,410 CU over
+two instructions respectively; pairwise argmax costs 3,972 CU. Each further binary-search level adds another
+two-party midpoint round. The compatibility three-state Q4/FMA dispute is
+32,079 CU.
 
 - Date: 2026-09-10
 - Machine/runtime: local Apple Metal device, release build

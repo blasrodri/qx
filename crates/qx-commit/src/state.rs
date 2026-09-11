@@ -141,6 +141,33 @@ impl StateChunkProofV1 {
         ))
     }
 
+    /// Read authenticated bytes wholly contained in this residual chunk.
+    /// Structured VM operations use this for fixed-size roots without
+    /// interpreting their bytes as floating-point values.
+    pub fn bytes_at(&self, byte_address: u32, length: usize) -> Result<&[u8], CommitError> {
+        if self.kind != StateTreeKindV1::Residual {
+            return Err(CommitError::InvalidMerkleProof);
+        }
+        let address = usize::try_from(byte_address).map_err(|_| CommitError::ArithmeticOverflow)?;
+        let image_len =
+            usize::try_from(self.byte_length).map_err(|_| CommitError::ArithmeticOverflow)?;
+        let chunk_start = usize::try_from(self.chunk_index)
+            .map_err(|_| CommitError::ArithmeticOverflow)?
+            .checked_mul(STATE_CHUNK_BYTES)
+            .ok_or(CommitError::ArithmeticOverflow)?;
+        let end = address
+            .checked_add(length)
+            .ok_or(CommitError::ArithmeticOverflow)?;
+        if length == 0
+            || end > image_len
+            || address < chunk_start
+            || end > chunk_start + self.chunk.len()
+        {
+            return Err(CommitError::InvalidMerkleProof);
+        }
+        Ok(&self.chunk[address - chunk_start..end - chunk_start])
+    }
+
     /// Calculate the unique residual root after replacing one authenticated
     /// FP32 word. Callers must verify this opening against the pre-state root.
     pub fn root_after_scalar_write(
@@ -317,6 +344,17 @@ pub fn kv_leaf_hash_v1(
         D_KV_VALUE_CHUNK,
         D_KV_VALUE_TREE,
     )?;
+    kv_leaf_hash_from_roots_v1(layer_index, token_index, key_root, value_root)
+}
+
+/// Construct the canonical KV leaf from already authenticated K/V chunk-tree
+/// roots. This is the form used by a structured append fraud proof.
+pub fn kv_leaf_hash_from_roots_v1(
+    layer_index: u16,
+    token_index: u32,
+    key_root: Digest,
+    value_root: Digest,
+) -> Result<Digest, CommitError> {
     hash_domain(
         HashAlgorithm::Blake3V1,
         D_KV,

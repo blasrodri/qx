@@ -15,9 +15,10 @@ use solana_pubkey::Pubkey;
 
 const EPOCH_BYTES: usize = 152;
 const DISPUTE_BYTES: usize = 728;
-const STAGED_BYTES: usize = 52;
+const STAGED_BYTES: usize = 64;
+const STAGED_KV_BYTES: usize = 144;
 const MINER_BYTES: usize = 16;
-const MODEL_BYTES: usize = 148;
+const MODEL_BYTES: usize = 156;
 const WEIGHT_LEAVES: u32 = 41_755_744;
 
 #[test]
@@ -362,6 +363,261 @@ fn chained_vm_scalar_transition_convicts_wrong_miner_on_sbf() {
 }
 
 #[test]
+fn chained_vm_kv_append_convicts_wrong_frontier_on_sbf() {
+    let f = Fixture::new();
+    let vm = f.vm();
+    let key_root = [0x31; 32];
+    let value_root = [0x52; 32];
+    let mut memory = vec![0_u8; 256];
+    memory[..32].copy_from_slice(&key_root);
+    memory[32..64].copy_from_slice(&value_root);
+    let memory_root = state_hash_v1(&memory).unwrap();
+    let opening = prove_state_chunk_v1(StateTreeKindV1::Residual, &memory, 0).unwrap();
+    let empty = hash_domain(
+        HashAlgorithm::Blake3V1,
+        qx_commit::D_MERKLE_EMPTY,
+        &[qx_commit::D_KV],
+    )
+    .unwrap();
+    let layer_tree =
+        MerkleTree::new(HashAlgorithm::Blake3V1, qx_commit::D_KV, &[empty; 4]).unwrap();
+    let global_tree = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        qx_commit::D_KV,
+        &[layer_tree.root(); 3],
+    )
+    .unwrap();
+    let kv_leaf = qx_commit::kv_leaf_hash_from_roots_v1(1, 1, key_root, value_root).unwrap();
+    let new_layer_tree = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        qx_commit::D_KV,
+        &[empty, kv_leaf, empty, empty],
+    )
+    .unwrap();
+    let new_global_tree = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        qx_commit::D_KV,
+        &[layer_tree.root(), new_layer_tree.root(), layer_tree.root()],
+    )
+    .unwrap();
+    let instruction = VmInstructionV1 {
+        opcode: 11,
+        source_a: 0,
+        source_b: 32,
+        source_c: 1,
+        destination: 0,
+    };
+    let program = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        D_PROGRAM_TREE,
+        &[instruction.hash(0).unwrap()],
+    )
+    .unwrap();
+    let pre = VmStateV1 {
+        job_hash: [0x71; 32],
+        token_index: 1,
+        segment_index: 7,
+        program_counter: 0,
+        residual_root: memory_root,
+        global_kv_root: global_tree.root(),
+    };
+    let honest_post = pre
+        .successor_with_roots(memory_root, new_global_tree.root())
+        .unwrap();
+    let miner_post = pre.successor_with_roots(memory_root, [0x99; 32]).unwrap();
+
+    let mut model = owned(MODEL_BYTES, f.program);
+    model.data[..4].copy_from_slice(b"QXM1");
+    model.data[104..136].copy_from_slice(&program.root());
+    model.data[136..140].copy_from_slice(&1_u32.to_le_bytes());
+    model.data[144..146].copy_from_slice(&3_u16.to_le_bytes());
+    model.data[148..152].copy_from_slice(&3_u32.to_le_bytes());
+    let mut dispute = owned(DISPUTE_BYTES, f.program);
+    dispute.data[..4].copy_from_slice(b"QXD2");
+    dispute.data[4] = 5;
+    dispute.data[6] = 2;
+    dispute.data[40..72].copy_from_slice(f.model.as_ref());
+    dispute.data[72..104].copy_from_slice(&pre.job_hash);
+    dispute.data[232..264].copy_from_slice(&pre.hash().unwrap());
+    dispute.data[264..296].copy_from_slice(&miner_post.hash().unwrap());
+    dispute.data[296..328].copy_from_slice(&honest_post.hash().unwrap());
+    dispute.data[360..368].copy_from_slice(&1_000_u64.to_le_bytes());
+    dispute.data[368..376].copy_from_slice(&1_200_u64.to_le_bytes());
+    dispute.data[376..380].copy_from_slice(&0_u32.to_le_bytes());
+    dispute.data[516..520].copy_from_slice(&pre.token_index.to_le_bytes());
+
+    let layer_proof = layer_tree.proof(1).unwrap();
+    let global_proof = global_tree.proof(1).unwrap();
+    let mut stage_body = Vec::new();
+    stage_body.extend_from_slice(&pre.segment_index.to_le_bytes());
+    stage_body.extend_from_slice(&pre.program_counter.to_le_bytes());
+    stage_body.extend_from_slice(&pre.residual_root);
+    stage_body.extend_from_slice(&pre.global_kv_root);
+    stage_body.extend_from_slice(&1_u16.to_le_bytes());
+    stage_body.extend_from_slice(&key_root);
+    stage_body.extend_from_slice(&value_root);
+    stage_body.push(layer_proof.siblings.len() as u8);
+    append_siblings(&mut stage_body, &layer_proof);
+    stage_body.push(global_proof.siblings.len() as u8);
+    append_siblings(&mut stage_body, &global_proof);
+    let staged = vm.process_instruction(
+        &f.ix(
+            33,
+            vec![
+                AccountMeta::new_readonly(f.model, false),
+                AccountMeta::new_readonly(f.dispute, false),
+                AccountMeta::new(f.staged, false),
+            ],
+            &stage_body,
+        ),
+        &[
+            (f.model, model.clone()),
+            (f.dispute, dispute.clone()),
+            (f.staged, owned(STAGED_KV_BYTES, f.program)),
+        ],
+    );
+    assert_ok(&staged.program_result);
+    let stage_cu = staged.compute_units_consumed;
+    let staged_kv = account(&staged.resulting_accounts, f.staged);
+
+    let instruction_proof = program.proof(0).unwrap();
+    let mut resolve_body = Vec::new();
+    resolve_body.extend_from_slice(&pre.segment_index.to_le_bytes());
+    resolve_body.extend_from_slice(&pre.residual_root);
+    resolve_body.extend_from_slice(&pre.global_kv_root);
+    resolve_body.extend_from_slice(&instruction.canonical_bytes());
+    resolve_body.extend_from_slice(&1_u32.to_le_bytes());
+    resolve_body.push(instruction_proof.siblings.len() as u8);
+    append_siblings(&mut resolve_body, &instruction_proof);
+    resolve_body.extend_from_slice(&opening.byte_length.to_le_bytes());
+    resolve_body.extend_from_slice(&opening.chunk_index.to_le_bytes());
+    resolve_body.extend_from_slice(&(opening.chunk.len() as u16).to_le_bytes());
+    resolve_body.extend_from_slice(&opening.chunk);
+    resolve_body.push(opening.siblings.len() as u8);
+    for sibling in &opening.siblings {
+        resolve_body.extend_from_slice(sibling);
+    }
+    let resolved = vm.process_instruction(
+        &f.ix(
+            34,
+            vec![
+                AccountMeta::new_readonly(f.model, false),
+                AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.staged, false),
+            ],
+            &resolve_body,
+        ),
+        &[
+            (f.model, model),
+            (f.dispute, dispute),
+            (f.staged, staged_kv),
+        ],
+    );
+    assert_ok(&resolved.program_result);
+    let dispute = account(&resolved.resulting_accounts, f.dispute);
+    assert_eq!((dispute.data[4], dispute.data[5]), (8, 2));
+    println!(
+        "v2_chained_vm_kv_append_cu={}",
+        stage_cu + resolved.compute_units_consumed
+    );
+}
+
+#[test]
+fn chained_vm_argmax_enforces_lowest_token_tie_on_sbf() {
+    let f = Fixture::new();
+    let vm = f.vm();
+    let mut memory = vec![0_u8; 256];
+    memory[..4].copy_from_slice(&7.0_f32.to_le_bytes());
+    memory[4..8].copy_from_slice(&42_u32.to_le_bytes());
+    memory[8..12].copy_from_slice(&7.0_f32.to_le_bytes());
+    memory[12..16].copy_from_slice(&9_u32.to_le_bytes());
+    memory[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+    let memory_root = state_hash_v1(&memory).unwrap();
+    let opening = prove_state_chunk_v1(StateTreeKindV1::Residual, &memory, 0).unwrap();
+    let instruction = VmInstructionV1 {
+        opcode: 8,
+        source_a: 0,
+        source_b: 8,
+        source_c: 0,
+        destination: 16,
+    };
+    let program = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        D_PROGRAM_TREE,
+        &[instruction.hash(0).unwrap()],
+    )
+    .unwrap();
+    let pre = VmStateV1 {
+        job_hash: [0x81; 32],
+        token_index: 2,
+        segment_index: 8,
+        program_counter: 0,
+        residual_root: memory_root,
+        global_kv_root: [0x91; 32],
+    };
+    let honest_root = opening.root_after_scalar_write(16, 9).unwrap();
+    let miner_root = opening.root_after_scalar_write(16, 42).unwrap();
+    let honest_post = pre.successor(honest_root).unwrap();
+    let miner_post = pre.successor(miner_root).unwrap();
+    let mut model = owned(MODEL_BYTES, f.program);
+    model.data[..4].copy_from_slice(b"QXM1");
+    model.data[104..136].copy_from_slice(&program.root());
+    model.data[136..140].copy_from_slice(&1_u32.to_le_bytes());
+    model.data[152..156].copy_from_slice(&49_155_u32.to_le_bytes());
+    let mut dispute = owned(DISPUTE_BYTES, f.program);
+    dispute.data[..4].copy_from_slice(b"QXD2");
+    dispute.data[4] = 5;
+    dispute.data[6] = 2;
+    dispute.data[40..72].copy_from_slice(f.model.as_ref());
+    dispute.data[72..104].copy_from_slice(&pre.job_hash);
+    dispute.data[232..264].copy_from_slice(&pre.hash().unwrap());
+    dispute.data[264..296].copy_from_slice(&miner_post.hash().unwrap());
+    dispute.data[296..328].copy_from_slice(&honest_post.hash().unwrap());
+    dispute.data[360..368].copy_from_slice(&1_000_u64.to_le_bytes());
+    dispute.data[368..376].copy_from_slice(&1_200_u64.to_le_bytes());
+    dispute.data[376..380].copy_from_slice(&0_u32.to_le_bytes());
+    dispute.data[516..520].copy_from_slice(&pre.token_index.to_le_bytes());
+
+    let instruction_proof = program.proof(0).unwrap();
+    let mut body = Vec::new();
+    body.extend_from_slice(&pre.segment_index.to_le_bytes());
+    body.extend_from_slice(&pre.program_counter.to_le_bytes());
+    body.extend_from_slice(&pre.residual_root);
+    body.extend_from_slice(&pre.global_kv_root);
+    body.extend_from_slice(&instruction.canonical_bytes());
+    body.extend_from_slice(&1_u32.to_le_bytes());
+    body.push(instruction_proof.siblings.len() as u8);
+    append_siblings(&mut body, &instruction_proof);
+    body.extend_from_slice(&opening.byte_length.to_le_bytes());
+    body.extend_from_slice(&opening.chunk_index.to_le_bytes());
+    body.extend_from_slice(&(opening.chunk.len() as u16).to_le_bytes());
+    body.extend_from_slice(&opening.chunk);
+    body.push(opening.siblings.len() as u8);
+    for sibling in &opening.siblings {
+        body.extend_from_slice(sibling);
+    }
+    let resolved = vm.process_instruction(
+        &f.ix(
+            35,
+            vec![
+                AccountMeta::new_readonly(f.model, false),
+                AccountMeta::new(f.dispute, false),
+            ],
+            &body,
+        ),
+        &[(f.model, model), (f.dispute, dispute)],
+    );
+    assert_ok(&resolved.program_result);
+    let dispute = account(&resolved.resulting_accounts, f.dispute);
+    assert_eq!((dispute.data[4], dispute.data[5]), (8, 2));
+    assert_eq!(u32_at(&dispute.data, 436), 9);
+    println!(
+        "v2_chained_vm_argmax_cu={}",
+        resolved.compute_units_consumed
+    );
+}
+
+#[test]
 fn pure_state_machine_timeout_penalizes_each_non_responder() {
     let mut miner_due =
         qx_verifier_core::BisectionGameV1::open(3, [1; 32], [2; 32], 10, 3).unwrap();
@@ -492,16 +748,25 @@ fn sbf_miner_identity_rejects_duplicate_epoch_grinding() {
 #[test]
 fn sbf_bisects_the_actual_runtime_job_leaf_format() {
     let mut f = Fixture::new();
+    let instruction = VmInstructionV1 {
+        opcode: 4,
+        source_a: 136,
+        source_b: 4,
+        source_c: qx_commit::q4_weight_selector_v1(f.weight_index, 2).unwrap(),
+        destination: 12,
+    };
+    f.verification_instruction = instruction;
     let job_genesis = job_genesis_hash_v1(&f.job.job_id).unwrap();
     let mut common_memory = vec![0_u8; 512];
     for (index, value) in [2.0_f32, 3.0, 0.0, -1.0].iter().enumerate() {
         common_memory[index * 4..index * 4 + 4].copy_from_slice(&value.to_bits().to_le_bytes());
     }
+    common_memory[136..140].copy_from_slice(&2.0_f32.to_bits().to_le_bytes());
     let common_residual = state_hash_v1(&common_memory).unwrap();
     let common_opening =
         prove_state_chunk_v1(StateTreeKindV1::Residual, &common_memory, 0).unwrap();
     let honest_residual = common_opening
-        .root_after_scalar_write(12, 5.0_f32.to_bits())
+        .root_after_scalar_write(12, 4.0_f32.to_bits())
         .unwrap();
     let miner_residual = common_opening
         .root_after_scalar_write(12, 6.0_f32.to_bits())
@@ -716,13 +981,6 @@ fn sbf_bisects_the_actual_runtime_job_leaf_format() {
     assert_eq!(&dispute.data[536..568], &honest_checkpoint.residual_hash);
     assert_eq!(&dispute.data[600..632], &miner_checkpoint.residual_hash);
 
-    let instruction = VmInstructionV1 {
-        opcode: 2,
-        source_a: 0,
-        source_b: 4,
-        source_c: 8,
-        destination: 12,
-    };
     let program = MerkleTree::new(
         HashAlgorithm::Blake3V1,
         D_PROGRAM_TREE,
@@ -835,15 +1093,46 @@ fn sbf_bisects_the_actual_runtime_job_leaf_format() {
     assert_eq!(dispute.data[4], 5);
 
     let instruction_proof = program.proof(0).unwrap();
+    let mut stage_body = Vec::new();
+    stage_body.extend_from_slice(&pre.program_counter.to_le_bytes());
+    stage_body.extend_from_slice(&instruction.canonical_bytes());
+    stage_body.extend_from_slice(&1_u32.to_le_bytes());
+    stage_body.push(instruction_proof.siblings.len() as u8);
+    append_siblings(&mut stage_body, &instruction_proof);
+    stage_body.extend_from_slice(&f.weight_index.to_le_bytes());
+    stage_body.extend_from_slice(&f.weight.tensor_id.to_le_bytes());
+    stage_body.extend_from_slice(&f.weight.row.to_le_bytes());
+    stage_body.extend_from_slice(&f.weight.group.to_le_bytes());
+    stage_body.push(f.weight.quantization_type);
+    stage_body.extend_from_slice(&f.weight.scale_bits.to_le_bytes());
+    stage_body.extend_from_slice(&f.weight.packed_values);
+    stage_body.push(f.weight_siblings.len() as u8);
+    for sibling in &f.weight_siblings {
+        stage_body.extend_from_slice(sibling);
+    }
+    let staged = vm.process_instruction(
+        &f.ix(
+            31,
+            vec![
+                AccountMeta::new_readonly(f.model, false),
+                AccountMeta::new_readonly(f.dispute, false),
+                AccountMeta::new(f.staged, false),
+            ],
+            &stage_body,
+        ),
+        &[
+            (f.model, model),
+            (f.dispute, dispute.clone()),
+            (f.staged, owned(STAGED_BYTES, f.program)),
+        ],
+    );
+    assert_ok(&staged.program_result);
+    let staged_cu = staged.compute_units_consumed;
+    let staged_weight = account(&staged.resulting_accounts, f.staged);
     let mut terminal = Vec::new();
     terminal.extend_from_slice(&pre.segment_index.to_le_bytes());
-    terminal.extend_from_slice(&pre.program_counter.to_le_bytes());
     terminal.extend_from_slice(&pre.residual_root);
     terminal.extend_from_slice(&pre.global_kv_root);
-    terminal.extend_from_slice(&instruction.canonical_bytes());
-    terminal.extend_from_slice(&1_u32.to_le_bytes());
-    terminal.push(instruction_proof.siblings.len() as u8);
-    append_siblings(&mut terminal, &instruction_proof);
     terminal.extend_from_slice(&common_opening.byte_length.to_le_bytes());
     terminal.extend_from_slice(&common_opening.chunk_index.to_le_bytes());
     terminal.extend_from_slice(&(common_opening.chunk.len() as u16).to_le_bytes());
@@ -854,21 +1143,21 @@ fn sbf_bisects_the_actual_runtime_job_leaf_format() {
     }
     let resolved = vm.process_instruction(
         &f.ix(
-            24,
+            32,
             vec![
-                AccountMeta::new_readonly(f.model, false),
                 AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.staged, false),
             ],
             &terminal,
         ),
-        &[(f.model, model), (f.dispute, dispute)],
+        &[(f.dispute, dispute), (f.staged, staged_weight)],
     );
     assert_ok(&resolved.program_result);
     let dispute = account(&resolved.resulting_accounts, f.dispute);
     assert_eq!((dispute.data[4], dispute.data[5]), (8, 2));
     println!(
-        "v2_production_hierarchy_terminal_cu={}",
-        resolved.compute_units_consumed
+        "v2_production_hierarchy_q4_terminal_cu={}",
+        staged_cu + resolved.compute_units_consumed
     );
     println!(
         "v2_operator_boundary_cu={}",
@@ -923,6 +1212,7 @@ struct Fixture {
     weight_index: u32,
     weight_siblings: Vec<[u8; 32]>,
     weight_root: [u8; 32],
+    verification_instruction: VmInstructionV1,
 }
 
 impl Fixture {
@@ -1034,6 +1324,13 @@ impl Fixture {
             };
             pos >>= 1;
         }
+        let verification_instruction = VmInstructionV1 {
+            opcode: 2,
+            source_a: 0,
+            source_b: 4,
+            source_c: 8,
+            destination: 12,
+        };
         Self {
             program,
             model,
@@ -1056,6 +1353,7 @@ impl Fixture {
             weight_index,
             weight_siblings,
             weight_root,
+            verification_instruction,
         }
     }
 
@@ -1096,17 +1394,10 @@ impl Fixture {
     }
 
     fn register(&self, vm: &Mollusk) -> (Account, Account, Account) {
-        let verification_instruction = VmInstructionV1 {
-            opcode: 2,
-            source_a: 0,
-            source_b: 4,
-            source_c: 8,
-            destination: 12,
-        };
         let verification_program = MerkleTree::new(
             HashAlgorithm::Blake3V1,
             D_PROGRAM_TREE,
-            &[verification_instruction.hash(0).unwrap()],
+            &[self.verification_instruction.hash(0).unwrap()],
         )
         .unwrap();
         let mut model_body = Vec::new();
@@ -1119,6 +1410,8 @@ impl Fixture {
         model_body.extend_from_slice(&3_u32.to_le_bytes());
         model_body.extend_from_slice(&4_u16.to_le_bytes());
         model_body.extend_from_slice(&2_u16.to_le_bytes());
+        model_body.extend_from_slice(&4096_u32.to_le_bytes());
+        model_body.extend_from_slice(&49_155_u32.to_le_bytes());
         let r = vm.process_instruction(
             &self.ix(6, vec![AccountMeta::new(self.model, true)], &model_body),
             &[(self.model, owned(MODEL_BYTES, self.program))],

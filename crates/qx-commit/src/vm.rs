@@ -1,5 +1,27 @@
 use crate::{CommitError, Digest, HashAlgorithm, StateChunkProofV1, hash_domain};
 
+pub const Q4_SELECTOR_LOCAL_BITS: u32 = 5;
+
+/// Pack an exact weight-tree leaf and one of its 32 Q4 values into the VM's
+/// `source_c` field, leaving activation memory placement independent of model
+/// tensor coordinates.
+pub fn q4_weight_selector_v1(leaf_index: u32, local_index: u8) -> Result<u32, CommitError> {
+    if local_index >= 32 {
+        return Err(CommitError::InvalidIndex {
+            index: usize::from(local_index),
+            length: 32,
+        });
+    }
+    leaf_index
+        .checked_mul(1 << Q4_SELECTOR_LOCAL_BITS)
+        .and_then(|value| value.checked_add(u32::from(local_index)))
+        .ok_or(CommitError::ArithmeticOverflow)
+}
+
+pub fn decode_q4_weight_selector_v1(selector: u32) -> (u32, u8) {
+    (selector >> Q4_SELECTOR_LOCAL_BITS, (selector & 31) as u8)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VmStateV1 {
     pub job_hash: Digest,
@@ -27,12 +49,21 @@ impl VmStateV1 {
     }
 
     pub fn successor(&self, residual_root: Digest) -> Result<Self, CommitError> {
+        self.successor_with_roots(residual_root, self.global_kv_root)
+    }
+
+    pub fn successor_with_roots(
+        &self,
+        residual_root: Digest,
+        global_kv_root: Digest,
+    ) -> Result<Self, CommitError> {
         Ok(Self {
             program_counter: self
                 .program_counter
                 .checked_add(1)
                 .ok_or(CommitError::ArithmeticOverflow)?,
             residual_root,
+            global_kv_root,
             ..*self
         })
     }
@@ -113,5 +144,13 @@ mod tests {
         changed.destination = 2;
         assert_ne!(root, changed.hash(9).unwrap());
         assert_ne!(root, instruction.hash(10).unwrap());
+    }
+
+    #[test]
+    fn q4_selector_keeps_leaf_and_local_coordinate() {
+        let selector = q4_weight_selector_v1(41_755_743, 31).unwrap();
+        assert_eq!(decode_q4_weight_selector_v1(selector), (41_755_743, 31));
+        assert!(q4_weight_selector_v1(u32::MAX, 0).is_err());
+        assert!(q4_weight_selector_v1(0, 32).is_err());
     }
 }

@@ -12,11 +12,14 @@ binds both dispute-local operator traces to the agreed checkpoint and each
 party's endpoint, and lets SBF convict the incorrect state update using the
 same 256-byte residual commitment emitted by normal execution.
 
-The remaining boundary is model coverage rather than the bisection primitive:
-the registered VM still needs authenticated Q4 weight loads, KV append, and
-final-head/argmax transitions. Without those transition
-families, the test proves the mechanism and one real commitment update, not the
-entire model's `Execute(M, E, X)` claim.
+The remaining boundary is complete model lowering rather than the bisection
+primitive. Chained authenticated Q4 and structured KV-frontier transitions now
+work, but the real Granite operator schedule, its dispute-local working-memory
+commitments, K/V root production, and final-head descent are not wired. The
+pairwise argmax terminal itself is implemented and enforces the lowest-token-ID
+tie rule.
+The tests therefore do not yet prove the entire model's `Execute(M, E, X)`
+claim.
 
 ## What is implemented and checked
 
@@ -33,10 +36,13 @@ entire model's `Execute(M, E, X)` claim.
 | First-token/checkpoint faults are bisectable | canonical genesis leaves exist in both job and token trees | Implemented in commitments |
 | Trace shape cannot be shortened | SBF enforces `trace_length = input_count + output_count` | Implemented and tested |
 | Token tree shape is committed | `TokenResultV1` commits its checkpoint leaf count | Implemented in the runtime commitment |
-| Token/checkpoint descent | exact token and checkpoint preimages are authenticated; model-fixed counts/layers prevent challenger-chosen geometry | Implemented and tested on SBF for non-genesis segments |
+| Token/checkpoint descent | exact token and checkpoint preimages are authenticated; model-fixed counts/layers prevent challenger-chosen geometry | Implemented and tested on SBF, including the genesis segment |
 | Checkpoint-to-operator binding | both operator traces must open the agreed start checkpoint and their respective end checkpoint under `QX:OPERATOR:V1` | Implemented and tested on SBF |
 | Verification opcode is registered | scalar terminal opcode is opened against the model's verification-program root | Implemented on SBF |
 | Chained objective scalar update | instruction, runtime-format residual chunk, old/new root, token, segment, PC, and unchanged KV root are bound | Implemented end to end on SBF |
+| Chained authenticated Q4 update | registered instruction selects an exact model-weight leaf; its 26-level proof is staged and the VM memory/root update is objective | Implemented end to end on SBF; 11,881 CU |
+| Structured KV append | proves the exact token slot was empty, preserves the layer frontier, and updates the authenticated global layer root | Implemented on SBF; K/V root production still needs Granite lowering |
+| Pairwise greedy argmax | authenticated logits select the higher score and exact ties select the lower token ID | Implemented on SBF; not yet reachable from equal-checkpoint prediction disputes |
 | Objective arithmetic library | Q4 FMA plus fixed add/mul/div/exp/rsqrt/reduction primitives | Implemented; not every family is wired into the chained VM |
 | Turn liveness | every unilateral move has a deadline and either non-responder loses | Implemented and tested |
 
@@ -68,10 +74,12 @@ to the fixed consensus profile. The previous same-machine measurement for
 that arithmetic migration plus commitments was 8.820%. It also excludes
 duplicate auditors, data distribution, failed jobs, and dispute replay.
 
-The current live three-leaf synthetic SBF dispute consumes 32,075 CU. Epoch
-entropy finalization consumes 1,784 CU once per epoch; opening the challenged
-job costs 8,397 CU. A two-party operator-boundary submission costs 7,656 CU,
-and the runtime-state-chunk scalar terminal costs 4,342 CU. Larger traces add a
+The current live three-leaf synthetic SBF dispute consumes 32,079 CU. Epoch
+entropy finalization consumes 1,785 CU once per epoch; opening the challenged
+job costs 8,396 CU. A two-party operator-boundary submission costs 7,656 CU,
+the runtime-state-chunk scalar terminal costs 4,341 CU, the chained Q4 terminal
+costs 11,881 CU, structured KV append costs 9,410 CU, and pairwise argmax costs
+3,972 CU. Larger traces add a
 challenger/miner midpoint pair for every binary-search level (10,329 CU in the
 three-leaf test). These costs occur only after a sampled replay disagrees.
 
@@ -94,10 +102,11 @@ high-value job.
 
 ### P0: complete registered VM lowering
 
-The job→token→checkpoint→operator→scalar chain is implemented. Complete the
-registered Granite program with terminal witnesses for authenticated Q4 weight
-loads/FMA, cross-chunk moves, attention/RoPE/RMSNorm/router/MoE state updates,
-and the final head. The canonical pre-layer checkpoint now binds the embedding
+The job→token→checkpoint→operator chain plus scalar, authenticated-Q4, and KV
+append terminals is implemented. Complete the registered Granite program,
+cross-chunk working-memory operations, attention/RoPE/RMSNorm/router/MoE state
+updates, K/V vector-root production, and the final head. The canonical
+pre-layer checkpoint now binds the embedding
 residual and prior-token global KV root, and the SBF hierarchy test exercises
 a disagreement in the first checkpoint interval.
 
@@ -105,12 +114,13 @@ The final-head argmax and its lowest-token-ID tie rule must be inside this same
 chained path, not merely stored as `predicted_token`. Equal checkpoint roots
 with different predicted tokens are therefore not yet settlement-safe.
 
-### P0: KV append proof
+### P0: bind K/V root production
 
-The verifier needs a structured witness proving that a new key/value leaf was
-appended at exactly `(layer, token)`, the old frontier was preserved, and the
-per-layer root update produced the committed global KV root. A plain hash
-comparison is insufficient.
+The structured witness now proves that a new key/value leaf is appended at
+exactly `(layer, token)`, preserves the old frontier, and derives the committed
+global root. The registered Granite trace must still derive the authenticated
+K/V vector roots from Q/K/V projection and RoPE outputs; accepting unattached
+roots would not prove inference.
 
 ### P0: collateral and settlement
 

@@ -41,9 +41,13 @@ pub use model::{
 pub use receipt::{InferenceReceiptV1, SignedInferenceReceiptV1, input_hash_v1, output_hash_v1};
 pub use state::{
     ACTIVATION_CHUNK_BYTES, STATE_CHUNK_BYTES, StateChunkProofV1, StateTreeKindV1,
-    activation_hash_v1, kv_leaf_hash_v1, prove_state_chunk_v1, state_hash_v1,
+    activation_hash_v1, kv_leaf_hash_from_roots_v1, kv_leaf_hash_v1, prove_state_chunk_v1,
+    state_hash_v1,
 };
-pub use vm::{VmInstructionV1, VmMemoryOpeningV1, VmStateV1};
+pub use vm::{
+    Q4_SELECTOR_LOCAL_BITS, VmInstructionV1, VmMemoryOpeningV1, VmStateV1,
+    decode_q4_weight_selector_v1, q4_weight_selector_v1,
+};
 pub use weights::{
     WeightCommitmentV1, WeightLeafV1, WeightProofV1, commit_q4_artifact, prove_q4_artifact_leaf,
 };

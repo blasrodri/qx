@@ -51,15 +51,18 @@ The current live-SBF measurements are:
 
 | Operation | Compute units |
 |---|---:|
-| Finalize epoch seed (once/epoch) | 1,784 |
-| Authenticate job/result and open challenge | 8,397 |
+| Finalize epoch seed (once/epoch) | 1,785 |
+| Authenticate job/result and open challenge | 8,396 |
 | Both boundary openings + one midpoint round | 10,329 |
 | Bind both operator traces to checkpoints | 7,656 |
-| Chained runtime-chunk scalar terminal | 4,342 |
+| Chained runtime-chunk scalar terminal | 4,341 |
+| Chained authenticated Q4 terminal (two instructions) | 11,881 |
+| Chained structured KV append (two instructions) | 9,410 |
+| Chained pairwise argmax terminal | 3,972 |
 | Compatibility staged Q4/FMA terminal | 9,533 |
 
 Each additional binary-search level costs one challenger and one miner
-midpoint instruction. The complete three-state synthetic dispute is 32,075 CU,
+midpoint instruction. The complete three-state synthetic dispute is 32,079 CU,
 including both terminal-state reveals. The full test also exercises both
 timeout directions, rejects an unselected result, rejects duplicate epoch
 submission, and convicts an incorrect accumulator without a miner co-signature.
@@ -70,11 +73,13 @@ both `QX:OPERATOR:V1` traces to the agreed runtime checkpoint roots, and
 convicts an incorrect update to the same 256-byte chunk tree used by normal
 execution. Compact roots and exact lengths prevent trace shortening.
 
-Automatic slashing remains disabled. The generic hierarchy and chained scalar
-mechanism work, including a canonical first-segment checkpoint, but the
-registered Granite VM still lacks chained authenticated Q4 weight operations, structured
-KV append, and final-head/argmax settlement. Collateral transfer and durable
-input availability are also outside this proof milestone. See
+Automatic slashing remains disabled. The generic hierarchy, canonical
+first-segment checkpoint, chained scalar/Q4/KV terminals, and the pairwise
+lowest-token-ID argmax primitive work. The real Granite computation is not
+lowered into the registered dispute VM yet, K/V vector roots are not yet
+produced through that lowering, and prediction disagreements do not yet
+descend into a final-head trace. Collateral transfer and durable input
+availability are also outside this proof milestone. See
 `docs/verification-security-audit.md` for the exact readiness gate.
 
 ## Epoch selection
@@ -189,17 +194,17 @@ prototype uses two instructions:
 
 | Instruction | Data | CU | Purpose |
 |---|---:|---:|---|
-| `stage_q4_weight_v1` | 873 bytes | 7,444 | Verify 26 SHA-256 Merkle levels and stage a dispute-bound decoded weight |
-| `verify_staged_q4_fma_v1` | 300 bytes | 2,336 | Verify the dispute-bound activation and select the objectively correct claim |
-| Terminal total | 1,173 bytes over two transactions | 9,780 | Complete terminal arithmetic check |
+| `stage_q4_weight_v1` | 873 bytes | 7,420 | Verify 26 SHA-256 Merkle levels and stage a dispute-bound decoded weight |
+| `verify_staged_q4_fma_v1` | 300 bytes | 2,351 | Verify the dispute-bound activation and select the objectively correct claim |
+| Terminal total | 1,173 bytes over two transactions | 9,771 | Complete terminal arithmetic check |
 
-Opening a miner-signed receipt against its epoch root costs 2,772 CU and binding
-the mutually agreed terminal boundary costs 1,100 CU. The complete measured
-path is 13,652 CU, plus 1,842 CU once per model+epoch registration in this test.
+Opening a miner-signed receipt against its epoch root costs 2,746 CU and binding
+the mutually agreed terminal boundary costs 1,117 CU. The complete measured
+path is 13,634 CU, plus 2,507 CU once per model+epoch registration in this test.
 
 The compatibility path uses a 56-byte epoch account, the shared registry now
-uses a 148-byte model account, and the path uses a 304-byte active dispute
-account and 52-byte temporary staged-weight account. A staged weight
+uses a 156-byte model account, and the path uses a 304-byte active dispute
+account and 64-byte temporary staged-weight account. A staged weight
 cannot be replayed into another dispute; forged receipt signatures, bad receipt
 openings, bad activation openings, early timeouts, and false arithmetic are
 rejected. Measurements used `cargo-build-sbf 4.1.0`,

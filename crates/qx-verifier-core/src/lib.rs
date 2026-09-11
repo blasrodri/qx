@@ -191,6 +191,343 @@ pub fn verify_vm_scalar_transition_v1(
         .map_err(commitment_error)
 }
 
+/// Complete host-oracle witness for a Q4 FMA in the checkpoint-bound VM.
+/// `source_c` packs the canonical weight-leaf index and its five-bit local Q4
+/// position; `source_a` is independent dispute-local activation memory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmQ4WitnessV1 {
+    pub pre_state: qx_commit::VmStateV1,
+    pub instruction: qx_commit::VmInstructionV1,
+    pub instruction_proof: qx_commit::MerkleProof,
+    pub memory: qx_commit::VmMemoryOpeningV1,
+    pub weight: WeightProofV1,
+}
+
+pub fn verify_vm_q4_transition_v1(
+    registered_program_root: Digest,
+    registered_weights_root: Digest,
+    witness: &VmQ4WitnessV1,
+) -> Result<qx_commit::VmStateV1, VerificationError> {
+    let pc = witness.pre_state.program_counter;
+    let (weight_leaf_index, local) =
+        qx_commit::decode_q4_weight_selector_v1(witness.instruction.source_c);
+    if witness.instruction.opcode != QxOpV1::QuantizedFma as u8
+        || witness.instruction.source_a & 3 != 0
+        || weight_leaf_index != witness.weight.proof.leaf_index
+        || witness.instruction_proof.leaf_index != pc
+        || !witness
+            .instruction_proof
+            .verify(
+                qx_commit::HashAlgorithm::Blake3V1,
+                qx_commit::D_PROGRAM_TREE,
+                witness.instruction.hash(pc).map_err(commitment_error)?,
+                registered_program_root,
+            )
+            .map_err(commitment_error)?
+    {
+        return Err(VerificationError::AuthenticationFailed(
+            "Q4 verification instruction",
+        ));
+    }
+    if witness.weight.commitment.root != registered_weights_root
+        || !witness.weight.verify().map_err(commitment_error)?
+    {
+        return Err(VerificationError::AuthenticationFailed("Q4 weight"));
+    }
+    let leaf = &witness.weight.leaf;
+    if leaf.quantization_type != Q4_QUANTIZATION_TYPE || leaf.packed_values.len() != 16 {
+        return Err(VerificationError::InvalidWitness("Q4 weight coordinates"));
+    }
+    if !witness
+        .memory
+        .verify(witness.pre_state.residual_root)
+        .map_err(commitment_error)?
+    {
+        return Err(VerificationError::AuthenticationFailed(
+            "VM residual memory",
+        ));
+    }
+    let activation = finite_f32(
+        witness
+            .memory
+            .scalar_bits(witness.instruction.source_a)
+            .map_err(commitment_error)?,
+    )?;
+    let accumulator = finite_f32(
+        witness
+            .memory
+            .scalar_bits(witness.instruction.source_b)
+            .map_err(commitment_error)?,
+    )?;
+    let local = usize::from(local);
+    let packed = leaf.packed_values[local / 2];
+    let code = if local & 1 == 0 {
+        packed & 0x0f
+    } else {
+        packed >> 4
+    };
+    let scale = f16::from_bits(leaf.scale_bits).to_f32();
+    if !scale.is_finite() {
+        return Err(VerificationError::InvalidWitness("non-finite Q4 scale"));
+    }
+    let weight = f32::from(code as i8 - 7) * scale;
+    let result = libm_fma(weight, activation, accumulator);
+    if !result.is_finite() {
+        return Err(VerificationError::InvalidWitness("non-finite result"));
+    }
+    let residual_root = witness
+        .memory
+        .root_after_scalar_write(witness.instruction.destination, result.to_bits())
+        .map_err(commitment_error)?;
+    witness
+        .pre_state
+        .successor(residual_root)
+        .map_err(commitment_error)
+}
+
+/// Structured append witness for one layer's fixed-capacity KV tree and the
+/// small global tree of per-layer roots. The opened VM memory authenticates
+/// the K/V vector roots produced by the preceding dispute-local computation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmKvAppendWitnessV1 {
+    pub pre_state: qx_commit::VmStateV1,
+    pub instruction: qx_commit::VmInstructionV1,
+    pub instruction_proof: qx_commit::MerkleProof,
+    pub memory: qx_commit::VmMemoryOpeningV1,
+    pub max_context_tokens: u32,
+    pub num_layers: u16,
+    pub layer_siblings: Vec<Digest>,
+    pub global_siblings: Vec<Digest>,
+}
+
+pub fn verify_vm_kv_append_transition_v1(
+    registered_program_root: Digest,
+    witness: &VmKvAppendWitnessV1,
+) -> Result<qx_commit::VmStateV1, VerificationError> {
+    let pc = witness.pre_state.program_counter;
+    if witness.instruction.opcode != QxOpV1::KvAppend as u8
+        || witness.instruction.destination != 0
+        || witness.instruction.source_c >= u32::from(witness.num_layers)
+        || witness.pre_state.token_index >= witness.max_context_tokens
+        || witness.instruction_proof.leaf_index != pc
+        || !witness
+            .instruction_proof
+            .verify(
+                qx_commit::HashAlgorithm::Blake3V1,
+                qx_commit::D_PROGRAM_TREE,
+                witness.instruction.hash(pc).map_err(commitment_error)?,
+                registered_program_root,
+            )
+            .map_err(commitment_error)?
+    {
+        return Err(VerificationError::AuthenticationFailed(
+            "KV append instruction",
+        ));
+    }
+    if !witness
+        .memory
+        .verify(witness.pre_state.residual_root)
+        .map_err(commitment_error)?
+    {
+        return Err(VerificationError::AuthenticationFailed(
+            "VM residual memory",
+        ));
+    }
+    let key_root: Digest = witness
+        .memory
+        .bytes_at(witness.instruction.source_a, 32)
+        .map_err(commitment_error)?
+        .try_into()
+        .map_err(|_| VerificationError::InvalidWitness("key root"))?;
+    let value_root: Digest = witness
+        .memory
+        .bytes_at(witness.instruction.source_b, 32)
+        .map_err(commitment_error)?
+        .try_into()
+        .map_err(|_| VerificationError::InvalidWitness("value root"))?;
+
+    let context_capacity = usize::try_from(witness.max_context_tokens)
+        .map_err(|_| VerificationError::Overflow)?
+        .checked_add(1)
+        .ok_or(VerificationError::Overflow)?
+        .checked_next_power_of_two()
+        .ok_or(VerificationError::Overflow)?;
+    let context_depth = context_capacity.trailing_zeros() as usize;
+    let layer_capacity = usize::from(witness.num_layers)
+        .checked_next_power_of_two()
+        .ok_or(VerificationError::Overflow)?;
+    let global_depth = layer_capacity.trailing_zeros() as usize;
+    if witness.layer_siblings.len() != context_depth
+        || witness.global_siblings.len() != global_depth
+    {
+        return Err(VerificationError::InvalidWitness("KV proof depth"));
+    }
+    let empty = qx_commit::hash_domain(
+        qx_commit::HashAlgorithm::Blake3V1,
+        qx_commit::D_MERKLE_EMPTY,
+        &[qx_commit::D_KV],
+    )
+    .map_err(commitment_error)?;
+    let token_index = witness.pre_state.token_index;
+    let old_layer_root =
+        domain_merkle_root(empty, token_index, &witness.layer_siblings, qx_commit::D_KV)?;
+    let layer_index = witness.instruction.source_c;
+    let old_global_root = domain_merkle_root(
+        old_layer_root,
+        layer_index,
+        &witness.global_siblings,
+        qx_commit::D_KV,
+    )?;
+    if old_global_root != witness.pre_state.global_kv_root {
+        return Err(VerificationError::AuthenticationFailed("old KV frontier"));
+    }
+    let kv_leaf = qx_commit::kv_leaf_hash_from_roots_v1(
+        u16::try_from(layer_index).map_err(|_| VerificationError::Overflow)?,
+        token_index,
+        key_root,
+        value_root,
+    )
+    .map_err(commitment_error)?;
+    let new_layer_root = domain_merkle_root(
+        kv_leaf,
+        token_index,
+        &witness.layer_siblings,
+        qx_commit::D_KV,
+    )?;
+    let new_global_root = domain_merkle_root(
+        new_layer_root,
+        layer_index,
+        &witness.global_siblings,
+        qx_commit::D_KV,
+    )?;
+    witness
+        .pre_state
+        .successor_with_roots(witness.pre_state.residual_root, new_global_root)
+        .map_err(commitment_error)
+}
+
+fn domain_merkle_root(
+    mut node: Digest,
+    mut index: u32,
+    siblings: &[Digest],
+    tree_domain: &'static [u8],
+) -> Result<Digest, VerificationError> {
+    for sibling in siblings {
+        node = if index & 1 == 0 {
+            qx_commit::hash_domain(
+                qx_commit::HashAlgorithm::Blake3V1,
+                qx_commit::D_MERKLE,
+                &[tree_domain, &node, sibling],
+            )
+        } else {
+            qx_commit::hash_domain(
+                qx_commit::HashAlgorithm::Blake3V1,
+                qx_commit::D_MERKLE,
+                &[tree_domain, sibling, &node],
+            )
+        }
+        .map_err(commitment_error)?;
+        index >>= 1;
+    }
+    Ok(node)
+}
+
+/// Pairwise greedy-output terminal. A challenger only needs one token that
+/// outranks the miner's claimed token; equal logits select the lower token ID.
+/// Each memory record is `[logit_bits, token_id]` and the selected raw token ID
+/// is written at `destination`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VmArgMaxWitnessV1 {
+    pub pre_state: qx_commit::VmStateV1,
+    pub instruction: qx_commit::VmInstructionV1,
+    pub instruction_proof: qx_commit::MerkleProof,
+    pub memory: qx_commit::VmMemoryOpeningV1,
+    pub vocab_size: u32,
+}
+
+pub fn verify_vm_argmax_transition_v1(
+    registered_program_root: Digest,
+    witness: &VmArgMaxWitnessV1,
+) -> Result<(qx_commit::VmStateV1, u32), VerificationError> {
+    let pc = witness.pre_state.program_counter;
+    if witness.instruction.opcode != QxOpV1::ArgMax as u8
+        || witness.instruction.source_c != 0
+        || witness.instruction_proof.leaf_index != pc
+        || !witness
+            .instruction_proof
+            .verify(
+                qx_commit::HashAlgorithm::Blake3V1,
+                qx_commit::D_PROGRAM_TREE,
+                witness.instruction.hash(pc).map_err(commitment_error)?,
+                registered_program_root,
+            )
+            .map_err(commitment_error)?
+    {
+        return Err(VerificationError::AuthenticationFailed(
+            "argmax instruction",
+        ));
+    }
+    if !witness
+        .memory
+        .verify(witness.pre_state.residual_root)
+        .map_err(commitment_error)?
+    {
+        return Err(VerificationError::AuthenticationFailed(
+            "VM residual memory",
+        ));
+    }
+    let left_logit = witness
+        .memory
+        .scalar_bits(witness.instruction.source_a)
+        .map_err(commitment_error)?;
+    let left_token = witness
+        .memory
+        .scalar_bits(
+            witness
+                .instruction
+                .source_a
+                .checked_add(4)
+                .ok_or(VerificationError::Overflow)?,
+        )
+        .map_err(commitment_error)?;
+    let right_logit = witness
+        .memory
+        .scalar_bits(witness.instruction.source_b)
+        .map_err(commitment_error)?;
+    let right_token = witness
+        .memory
+        .scalar_bits(
+            witness
+                .instruction
+                .source_b
+                .checked_add(4)
+                .ok_or(VerificationError::Overflow)?,
+        )
+        .map_err(commitment_error)?;
+    if left_token >= witness.vocab_size
+        || right_token >= witness.vocab_size
+        || left_token == right_token
+    {
+        return Err(VerificationError::InvalidWitness("argmax token IDs"));
+    }
+    let left_key = finite_order_key(left_logit)?;
+    let right_key = finite_order_key(right_logit)?;
+    let selected = if right_key > left_key || (right_key == left_key && right_token < left_token) {
+        right_token
+    } else {
+        left_token
+    };
+    let residual_root = witness
+        .memory
+        .root_after_scalar_write(witness.instruction.destination, selected)
+        .map_err(commitment_error)?;
+    let post = witness
+        .pre_state
+        .successor(residual_root)
+        .map_err(commitment_error)?;
+    Ok((post, selected))
+}
+
 fn commitment_error(error: qx_commit::CommitError) -> VerificationError {
     VerificationError::Commitment(error.to_string())
 }
@@ -715,6 +1052,186 @@ mod tests {
             verify_quantized_fma_v1(witness.weight.commitment.root, &witness),
             Err(VerificationError::ArithmeticClaimFailed)
         );
+    }
+
+    #[test]
+    fn chained_q4_authenticates_program_weight_and_memory() {
+        let mut memory = vec![0_u8; 512];
+        memory[4..8].copy_from_slice(&3.0_f32.to_le_bytes());
+        memory[12..16].copy_from_slice(&(-1.0_f32).to_le_bytes());
+        memory[136..140].copy_from_slice(&2.0_f32.to_le_bytes());
+        let memory_root = state_hash_v1(&memory).unwrap();
+        let memory_opening = prove_state_chunk_v1(StateTreeKindV1::Residual, &memory, 0).unwrap();
+
+        let mut packed = vec![0x77; 16];
+        packed[1] = 0x78;
+        let leaf = WeightLeafV1 {
+            tensor_id: 4,
+            row: 9,
+            group: 1,
+            quantization_type: Q4_QUANTIZATION_TYPE,
+            packed_values: packed,
+            scale_bits: f16::from_f32(0.5).to_bits(),
+        };
+        let weight_tree = MerkleTree::new(
+            HashAlgorithm::Sha256V1,
+            qx_commit::D_WEIGHT_TREE,
+            &[leaf.hash(ProtocolVersion::V1).unwrap()],
+        )
+        .unwrap();
+        let weight = WeightProofV1 {
+            commitment: WeightCommitmentV1 {
+                root: weight_tree.root(),
+                leaf_count: 1,
+                tensor_count: 1,
+            },
+            leaf,
+            proof: weight_tree.proof(0).unwrap(),
+        };
+        let instruction = VmInstructionV1 {
+            opcode: QxOpV1::QuantizedFma as u8,
+            source_a: 136,
+            source_b: 4,
+            source_c: qx_commit::q4_weight_selector_v1(0, 2).unwrap(),
+            destination: 12,
+        };
+        let program = MerkleTree::new(
+            HashAlgorithm::Blake3V1,
+            qx_commit::D_PROGRAM_TREE,
+            &[instruction.hash(0).unwrap()],
+        )
+        .unwrap();
+        let pre_state = VmStateV1 {
+            job_hash: [1; 32],
+            token_index: 2,
+            segment_index: 3,
+            program_counter: 0,
+            residual_root: memory_root,
+            global_kv_root: [2; 32],
+        };
+        let mut witness = VmQ4WitnessV1 {
+            pre_state,
+            instruction,
+            instruction_proof: program.proof(0).unwrap(),
+            memory: memory_opening,
+            weight,
+        };
+        let post =
+            verify_vm_q4_transition_v1(program.root(), weight_tree.root(), &witness).unwrap();
+        memory[12..16].copy_from_slice(&4.0_f32.to_le_bytes());
+        assert_eq!(post.residual_root, state_hash_v1(&memory).unwrap());
+
+        witness.instruction.source_c = 1;
+        assert!(verify_vm_q4_transition_v1(program.root(), weight_tree.root(), &witness).is_err());
+    }
+
+    #[test]
+    fn structured_kv_append_preserves_the_old_frontier() {
+        let key_root = [0x31; 32];
+        let value_root = [0x52; 32];
+        let mut memory = vec![0_u8; 256];
+        memory[..32].copy_from_slice(&key_root);
+        memory[32..64].copy_from_slice(&value_root);
+        let memory_root = state_hash_v1(&memory).unwrap();
+        let memory_opening = prove_state_chunk_v1(StateTreeKindV1::Residual, &memory, 0).unwrap();
+
+        let empty = qx_commit::hash_domain(
+            HashAlgorithm::Blake3V1,
+            qx_commit::D_MERKLE_EMPTY,
+            &[qx_commit::D_KV],
+        )
+        .unwrap();
+        let layer_tree =
+            MerkleTree::new(HashAlgorithm::Blake3V1, qx_commit::D_KV, &[empty; 4]).unwrap();
+        let global_tree = MerkleTree::new(
+            HashAlgorithm::Blake3V1,
+            qx_commit::D_KV,
+            &[layer_tree.root(); 3],
+        )
+        .unwrap();
+        let instruction = VmInstructionV1 {
+            opcode: QxOpV1::KvAppend as u8,
+            source_a: 0,
+            source_b: 32,
+            source_c: 1,
+            destination: 0,
+        };
+        let program = MerkleTree::new(
+            HashAlgorithm::Blake3V1,
+            qx_commit::D_PROGRAM_TREE,
+            &[instruction.hash(0).unwrap()],
+        )
+        .unwrap();
+        let pre_state = VmStateV1 {
+            job_hash: [1; 32],
+            token_index: 1,
+            segment_index: 2,
+            program_counter: 0,
+            residual_root: memory_root,
+            global_kv_root: global_tree.root(),
+        };
+        let layer_proof = layer_tree.proof(1).unwrap();
+        let global_proof = global_tree.proof(1).unwrap();
+        let mut witness = VmKvAppendWitnessV1 {
+            pre_state,
+            instruction,
+            instruction_proof: program.proof(0).unwrap(),
+            memory: memory_opening,
+            max_context_tokens: 3,
+            num_layers: 3,
+            layer_siblings: layer_proof.siblings,
+            global_siblings: global_proof.siblings,
+        };
+        let post = verify_vm_kv_append_transition_v1(program.root(), &witness).unwrap();
+        assert_ne!(post.global_kv_root, pre_state.global_kv_root);
+        assert_eq!(post.residual_root, pre_state.residual_root);
+        assert_eq!(post.program_counter, 1);
+
+        witness.layer_siblings[0][0] ^= 1;
+        assert!(verify_vm_kv_append_transition_v1(program.root(), &witness).is_err());
+    }
+
+    #[test]
+    fn pairwise_argmax_uses_lowest_token_id_for_ties() {
+        let mut memory = vec![0_u8; 256];
+        memory[..4].copy_from_slice(&7.0_f32.to_le_bytes());
+        memory[4..8].copy_from_slice(&42_u32.to_le_bytes());
+        memory[8..12].copy_from_slice(&7.0_f32.to_le_bytes());
+        memory[12..16].copy_from_slice(&9_u32.to_le_bytes());
+        memory[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let opening = prove_state_chunk_v1(StateTreeKindV1::Residual, &memory, 0).unwrap();
+        let instruction = VmInstructionV1 {
+            opcode: QxOpV1::ArgMax as u8,
+            source_a: 0,
+            source_b: 8,
+            source_c: 0,
+            destination: 16,
+        };
+        let program = MerkleTree::new(
+            HashAlgorithm::Blake3V1,
+            qx_commit::D_PROGRAM_TREE,
+            &[instruction.hash(0).unwrap()],
+        )
+        .unwrap();
+        let pre_state = VmStateV1 {
+            job_hash: [1; 32],
+            token_index: 2,
+            segment_index: 4,
+            program_counter: 0,
+            residual_root: state_hash_v1(&memory).unwrap(),
+            global_kv_root: [2; 32],
+        };
+        let witness = VmArgMaxWitnessV1 {
+            pre_state,
+            instruction,
+            instruction_proof: program.proof(0).unwrap(),
+            memory: opening,
+            vocab_size: 100,
+        };
+        let (post, selected) = verify_vm_argmax_transition_v1(program.root(), &witness).unwrap();
+        assert_eq!(selected, 9);
+        memory[16..20].copy_from_slice(&9_u32.to_le_bytes());
+        assert_eq!(post.residual_root, state_hash_v1(&memory).unwrap());
     }
 
     #[test]
