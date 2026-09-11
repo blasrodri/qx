@@ -164,6 +164,10 @@ pub fn process_instruction(
         v2::OP_RESOLVE_STAGED_VM_Q4_V2 => {
             v2::resolve_staged_vm_q4(program_id, accounts, &mut cursor)
         }
+        v2::OP_STAGE_VM_ARGMAX_V2 => v2::stage_vm_argmax(program_id, accounts, &mut cursor),
+        v2::OP_RESOLVE_STAGED_VM_ARGMAX_V2 => {
+            v2::resolve_staged_vm_argmax(program_id, accounts, &mut cursor)
+        }
         _ => Err(QxError::InvalidEncoding.into()),
     }
 }

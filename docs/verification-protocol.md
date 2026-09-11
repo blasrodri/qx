@@ -54,19 +54,20 @@ The current live-SBF measurements are:
 | Finalize epoch seed (once/epoch) | 1,786 |
 | Authenticate job/result and open challenge | 8,676 |
 | Both boundary openings + one midpoint round | 10,332 |
-| Authenticate segment program and bind both operator traces | 8,916 |
-| Chained runtime-chunk scalar terminal | 4,344 |
-| Cross-chunk scalar (two source chunks + destination) | 10,365 |
+| Authenticate segment program and bind both operator traces | 8,914 |
+| Chained runtime-chunk scalar terminal | 4,343 |
+| Cross-chunk scalar (two source chunks + destination) | 10,369 |
 | Chained authenticated Q4 terminal (two instructions) | 11,881 |
-| Cross-chunk Q4 (weight + two sources + destination) | 18,465 |
+| Cross-chunk Q4 (weight + two sources + destination) | 18,467 |
 | Chained structured KV append (two instructions) | 9,412 |
-| Intermediate pairwise argmax in a two-leaf registered program | 4,473 |
-| Authenticate head program and bind both final-head traces | 10,407 |
-| Final-head token-deciding argmax | 4,112 |
-| Compatibility staged Q4/FMA terminal | 9,533 |
+| Intermediate pairwise argmax in a two-leaf registered program | 4,472 |
+| Cross-chunk final-head argmax | 10,558 |
+| Authenticate head program and bind both final-head traces | 10,408 |
+| Final-head token-deciding argmax | 4,111 |
+| Compatibility staged Q4/FMA terminal | 9,534 |
 
 Each additional binary-search level costs one challenger and one miner
-midpoint instruction. The complete three-state synthetic dispute is 32,360 CU,
+midpoint instruction. The complete three-state synthetic dispute is 32,361 CU,
 including both terminal-state reveals. The full test also exercises both
 timeout directions, rejects an unselected result, rejects duplicate epoch
 submission, and convicts an incorrect accumulator without a miner co-signature.

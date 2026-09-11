@@ -19,6 +19,7 @@ const DISPUTE_BYTES: usize = 768;
 const STAGED_BYTES: usize = 64;
 const STAGED_KV_BYTES: usize = 144;
 const STAGED_SCALAR_BYTES: usize = 104;
+const STAGED_ARGMAX_BYTES: usize = 108;
 const MINER_BYTES: usize = 16;
 const MODEL_BYTES: usize = 156;
 const WEIGHT_LEAVES: u32 = 41_755_744;
@@ -952,6 +953,160 @@ fn chained_vm_argmax_enforces_lowest_token_tie_on_sbf() {
     println!(
         "v2_chained_vm_argmax_cu={}",
         resolved.compute_units_consumed
+    );
+}
+
+#[test]
+fn staged_vm_argmax_resolves_cross_chunk_final_output_on_sbf() {
+    let f = Fixture::new();
+    let vm = f.vm();
+    let mut memory = vec![0_u8; 512];
+    memory[..4].copy_from_slice(&7.0_f32.to_le_bytes());
+    memory[4..8].copy_from_slice(&42_u32.to_le_bytes());
+    memory[260..264].copy_from_slice(&7.0_f32.to_le_bytes());
+    memory[264..268].copy_from_slice(&9_u32.to_le_bytes());
+    memory[268..272].copy_from_slice(&f32::NEG_INFINITY.to_le_bytes());
+    memory[272..276].copy_from_slice(&u32::MAX.to_le_bytes());
+    let residual_root = state_hash_v1(&memory).unwrap();
+    let opening_0 = prove_state_chunk_v1(StateTreeKindV1::Residual, &memory, 0).unwrap();
+    let opening_1 = prove_state_chunk_v1(StateTreeKindV1::Residual, &memory, 1).unwrap();
+    let instruction = VmInstructionV1 {
+        opcode: 8,
+        source_a: 0,
+        source_b: 260,
+        source_c: 0,
+        destination: 268,
+    };
+    let program = vm_program_tree_v1(&[instruction]).unwrap();
+    let pre = VmStateV1 {
+        job_hash: [0x71; 32],
+        token_index: 9,
+        segment_index: 3,
+        program_counter: 0,
+        residual_root,
+        global_kv_root: [0x72; 32],
+    };
+    let mut honest_memory = memory.clone();
+    honest_memory[268..272].copy_from_slice(&7.0_f32.to_le_bytes());
+    honest_memory[272..276].copy_from_slice(&9_u32.to_le_bytes());
+    let honest_output = VmOutputStateV1 {
+        job_hash: pre.job_hash,
+        token_index: pre.token_index,
+        segment_index: pre.segment_index,
+        program_counter: 1,
+        residual_root: state_hash_v1(&honest_memory).unwrap(),
+        global_kv_root: pre.global_kv_root,
+        predicted_token: 9,
+    };
+    let mut miner_memory = memory.clone();
+    miner_memory[268..272].copy_from_slice(&7.0_f32.to_le_bytes());
+    miner_memory[272..276].copy_from_slice(&42_u32.to_le_bytes());
+    let miner_output = VmOutputStateV1 {
+        residual_root: state_hash_v1(&miner_memory).unwrap(),
+        predicted_token: 42,
+        ..honest_output
+    };
+    let mut model = owned(MODEL_BYTES, f.program);
+    model.data[..4].copy_from_slice(b"QXM1");
+    model.data[152..156].copy_from_slice(&49_155_u32.to_le_bytes());
+    let mut dispute = owned(DISPUTE_BYTES, f.program);
+    dispute.data[..4].copy_from_slice(b"QXD2");
+    dispute.data[4] = 5;
+    dispute.data[6] = 2;
+    dispute.data[7] = 4;
+    dispute.data[40..72].copy_from_slice(f.model.as_ref());
+    dispute.data[72..104].copy_from_slice(&pre.job_hash);
+    dispute.data[232..264].copy_from_slice(&pre.hash().unwrap());
+    dispute.data[264..296].copy_from_slice(&miner_output.hash().unwrap());
+    dispute.data[296..328].copy_from_slice(&honest_output.hash().unwrap());
+    dispute.data[360..368].copy_from_slice(&1_000_u64.to_le_bytes());
+    dispute.data[368..376].copy_from_slice(&1_200_u64.to_le_bytes());
+    dispute.data[376..380].copy_from_slice(&0_u32.to_le_bytes());
+    dispute.data[516..520].copy_from_slice(&pre.token_index.to_le_bytes());
+    bind_segment_program(&mut dispute, &program);
+    let proof = program.proof(0).unwrap();
+    let stage_body = |mask: u8, opening: &qx_commit::StateChunkProofV1| {
+        let mut body = vec![mask];
+        body.extend_from_slice(&pre.segment_index.to_le_bytes());
+        body.extend_from_slice(&pre.program_counter.to_le_bytes());
+        body.extend_from_slice(&pre.residual_root);
+        body.extend_from_slice(&pre.global_kv_root);
+        body.extend_from_slice(&instruction.canonical_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.push(proof.siblings.len() as u8);
+        append_siblings(&mut body, &proof);
+        body.extend_from_slice(&opening.byte_length.to_le_bytes());
+        body.extend_from_slice(&opening.chunk_index.to_le_bytes());
+        body.extend_from_slice(&(opening.chunk.len() as u16).to_le_bytes());
+        body.extend_from_slice(&opening.chunk);
+        body.push(opening.siblings.len() as u8);
+        for sibling in &opening.siblings {
+            body.extend_from_slice(sibling);
+        }
+        body
+    };
+    let staged_left = vm.process_instruction(
+        &f.ix(
+            41,
+            vec![
+                AccountMeta::new_readonly(f.dispute, false),
+                AccountMeta::new(f.staged, false),
+            ],
+            &stage_body(1, &opening_0),
+        ),
+        &[
+            (f.dispute, dispute.clone()),
+            (f.staged, owned(STAGED_ARGMAX_BYTES, f.program)),
+        ],
+    );
+    assert_ok(&staged_left.program_result);
+    let staged = account(&staged_left.resulting_accounts, f.staged);
+    let staged_right = vm.process_instruction(
+        &f.ix(
+            41,
+            vec![
+                AccountMeta::new_readonly(f.dispute, false),
+                AccountMeta::new(f.staged, false),
+            ],
+            &stage_body(2, &opening_1),
+        ),
+        &[(f.dispute, dispute.clone()), (f.staged, staged)],
+    );
+    assert_ok(&staged_right.program_result);
+    let staged = account(&staged_right.resulting_accounts, f.staged);
+    let mut resolve_body = Vec::new();
+    resolve_body.extend_from_slice(&pre.segment_index.to_le_bytes());
+    resolve_body.extend_from_slice(&pre.residual_root);
+    resolve_body.extend_from_slice(&pre.global_kv_root);
+    resolve_body.extend_from_slice(&opening_1.byte_length.to_le_bytes());
+    resolve_body.extend_from_slice(&opening_1.chunk_index.to_le_bytes());
+    resolve_body.extend_from_slice(&(opening_1.chunk.len() as u16).to_le_bytes());
+    resolve_body.extend_from_slice(&opening_1.chunk);
+    resolve_body.push(opening_1.siblings.len() as u8);
+    for sibling in &opening_1.siblings {
+        resolve_body.extend_from_slice(sibling);
+    }
+    let resolved = vm.process_instruction(
+        &f.ix(
+            42,
+            vec![
+                AccountMeta::new_readonly(f.model, false),
+                AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.staged, false),
+            ],
+            &resolve_body,
+        ),
+        &[(f.model, model), (f.dispute, dispute), (f.staged, staged)],
+    );
+    assert_ok(&resolved.program_result);
+    let dispute = account(&resolved.resulting_accounts, f.dispute);
+    assert_eq!((dispute.data[4], dispute.data[5]), (8, 2));
+    assert_eq!(u32_at(&dispute.data, 436), 9);
+    println!(
+        "v2_cross_chunk_argmax_cu={}",
+        staged_left.compute_units_consumed
+            + staged_right.compute_units_consumed
+            + resolved.compute_units_consumed
     );
 }
 
