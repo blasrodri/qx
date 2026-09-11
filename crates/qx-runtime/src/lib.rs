@@ -1348,7 +1348,6 @@ impl GraniteModel {
             committer
                 .begin_token(
                     u32::try_from(position).map_err(|_| "token position exceeds u32".to_owned())?,
-                    &hidden,
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -1803,7 +1802,9 @@ pub fn granite_moe_decode(
 mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
-    use qx_commit::{VmStateV1, granite_macro_plan_v1, granite_macro_trace_v1};
+    use qx_commit::{
+        VmStateV1, granite_macro_plan_v1, granite_macro_trace_v1, token_input_state_hash_v1,
+    };
 
     #[test]
     fn fixed_top_k_api_rejects_missing_experts() {
@@ -1893,19 +1894,22 @@ mod tests {
             assert!(outputs.iter().all(|output| output.output_root != [0; 32]));
         }
         let plan = granite_macro_plan_v1(2).unwrap();
-        let mut interval_outputs = trace.layers[0]
-            .macro_outputs_v1(u32::try_from(prompt.len() - 1).unwrap())
-            .unwrap();
+        let token_index = u32::try_from(prompt.len() - 1).unwrap();
+        let mut interval_outputs = vec![GraniteMacroOutputV1 {
+            opcode: GraniteMacroOpcodeV1::Embedding,
+            output_root: state_hash_v1(&canonical_f32_bytes(&trace.layers[0].input)).unwrap(),
+        }];
+        interval_outputs.extend(trace.layers[0].macro_outputs_v1(token_index).unwrap());
         interval_outputs.extend(
             trace.layers[1]
                 .macro_outputs_v1(u32::try_from(prompt.len() - 1).unwrap())
                 .unwrap(),
         );
-        let start_residual = state_hash_v1(&canonical_f32_bytes(&trace.layers[0].input)).unwrap();
+        let start_residual = token_input_state_hash_v1(&[7; 32], token_index).unwrap();
         let macro_trace = granite_macro_trace_v1(
             VmStateV1 {
                 job_hash: [7; 32],
-                token_index: u32::try_from(prompt.len() - 1).unwrap(),
+                token_index,
                 segment_index: 1,
                 program_counter: 0,
                 residual_root: start_residual,
@@ -1917,7 +1921,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(macro_trace.state_hashes.len(), 29);
+        assert_eq!(macro_trace.state_hashes.len(), 30);
         assert_eq!(
             macro_trace.final_residual_root,
             interval_outputs.last().unwrap().output_root

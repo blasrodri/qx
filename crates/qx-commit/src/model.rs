@@ -211,7 +211,7 @@ pub fn granite_execution_spec_with_math_profile(
     bytes.push(math_mode as u8);
     bytes.push(math_functions as u8);
     bytes.push(1); // canonical job-genesis leaf at job-tree index zero
-    bytes.push(2); // token genesis is a pre-layer checkpoint with residual + prior KV
+    bytes.push(3); // token genesis is a deterministic pre-embedding sentinel + prior KV
     bytes.push(1); // token result commits checkpoint-tree leaf count
     bytes.push(1); // result trace length selects the compact job-tree root
     bytes.extend_from_slice(b"GRANITE_ROPE_FIXED_V1");

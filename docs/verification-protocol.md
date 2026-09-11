@@ -12,7 +12,7 @@ to decide whether the selected inference is checked.
 
 This separates three costs:
 
-1. every inference pays 3.003–3.510% measured commitment cost inside the selected
+1. every inference pays 3.127–3.312% measured commitment cost inside the selected
    fixed-math two-layer checkpoint profile, including output-token binding; the
    earlier fast-uncommitted to precise-committed migration measurement was
    8.820%, so arithmetic mode remains a separate deployment cost;
@@ -254,7 +254,7 @@ RoPE trigonometry throughout the model kernels with protocol-defined
 fixed-operation implementations and a pinned inverse-frequency table. Rust,
 Metal, and the SBF terminal evaluator share identical constants and operation
 order. Live Metal bit-parity tests pass. The selected interval-2 execution-spec
-`f5ff8f542c09108d080e22b90f4d8d7e0335c6b2e4750b3627959aac13e0eec9`
+`b3843de16b7f41da86fcbc0be44a2ee1b18fe601b5e2febd2d7ddccc028dd6ce`
 binds the fixed-math and commitment-shape profile.
 
 The scalar terminal IR now objectively evaluates FMA/dot steps, add, multiply,

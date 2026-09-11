@@ -104,6 +104,7 @@ const D_TRACE_TREE: &[u8] = b"QX:JOB:V1";
 const D_TOKEN_TREE: &[u8] = b"QX:TOKEN:V1";
 const D_OPERATOR_TREE: &[u8] = b"QX:OPERATOR:V1";
 const D_TOKEN_RESULT: &[u8] = b"QX:TOKEN:RESULT:V1";
+const D_TOKEN_INPUT_STATE: &[u8] = b"QX:TOKEN:INPUT:STATE:V1";
 const D_CHECKPOINT: &[u8] = b"QX:CHECKPOINT:V1";
 const D_KV: &[u8] = b"QX:KV:V1";
 const D_FMA_STATE: &[u8] = b"QX:FMA:STATE:V1";
@@ -1097,12 +1098,22 @@ pub(super) fn submit_challenger_checkpoint(
             .checked_sub(checkpoint_interval)
             .ok_or(QxError::InvalidState)?
     };
+    let expected_input_state = blake3_domain(
+        D_TOKEN_INPUT_STATE,
+        &[
+            &array_at(&state, D_JOB_ID_OFFSET)?,
+            &u32_at(&state, D_TOKEN_INDEX_OFFSET)?.to_le_bytes(),
+        ],
+    );
     if !cursor.is_empty()
         || state[D_MODEL_OFFSET..D_MODEL_OFFSET + 32] != model.key.to_bytes()
         || expected_layer >= model_layers
         || common_checkpoint[..32] != state[D_JOB_ID_OFFSET..D_JOB_ID_OFFSET + 32]
         || u32_from(common_checkpoint, 32)? != u32_at(&state, D_TOKEN_INDEX_OFFSET)?
         || u32::from(u16_from(common_checkpoint, 36)?) != expected_common_layer
+        || (model_layers == 24
+            && expected_common_layer == u32::from(u16::MAX)
+            && common_checkpoint[38..70] != expected_input_state)
         || blake3_domain(D_CHECKPOINT, &[common_checkpoint])
             != array_at(&state, D_COMMON_ROOT_OFFSET)?
         || checkpoint[..32] != state[D_JOB_ID_OFFSET..D_JOB_ID_OFFSET + 32]

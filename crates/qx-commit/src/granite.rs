@@ -32,6 +32,7 @@ pub enum GraniteMacroOpcodeV1 {
     Moe = 72,
     FinalLogits = 73,
     ArgMax = 74,
+    Embedding = 75,
 }
 
 impl TryFrom<u8> for GraniteMacroOpcodeV1 {
@@ -50,6 +51,7 @@ impl TryFrom<u8> for GraniteMacroOpcodeV1 {
             72 => Ok(Self::Moe),
             73 => Ok(Self::FinalLogits),
             74 => Ok(Self::ArgMax),
+            75 => Ok(Self::Embedding),
             _ => Err(CommitError::InvalidExecution(
                 "unknown Granite macro opcode".to_owned(),
             )),
@@ -526,6 +528,16 @@ pub fn granite_final_head_macro_program_v1() -> Result<Vec<VmInstructionV1>, Com
     ])
 }
 
+pub fn granite_embedding_macro_program_v1() -> Vec<VmInstructionV1> {
+    vec![macro_instruction(
+        GraniteMacroOpcodeV1::Embedding,
+        granite_embedding_tensor_id_v1(),
+        qx_model::HIDDEN as u32,
+        qx_model::EMBEDDING_MULTIPLIER.to_bits(),
+        0,
+    )]
+}
+
 #[derive(Clone, Debug)]
 pub struct GraniteMacroPlanV1 {
     pub checkpoint_interval: u8,
@@ -555,6 +567,9 @@ pub fn granite_macro_plan_v1(checkpoint_interval: u8) -> Result<GraniteMacroPlan
     )]);
     for start in (0..layers).step_by(interval) {
         let mut program = Vec::with_capacity(14 * interval);
+        if start == 0 {
+            program.extend(granite_embedding_macro_program_v1());
+        }
         for layer in start..start + interval {
             program.extend(granite_layer_macro_program_v1(
                 u16::try_from(layer).map_err(|_| CommitError::ArithmeticOverflow)?,
@@ -631,6 +646,7 @@ fn macro_slot(instruction: VmInstructionV1) -> Result<GraniteWorkspaceSlotV1, Co
         value if value == GraniteMacroOpcodeV1::Moe as u8 => GraniteWorkspaceSlotV1::Moe,
         value if value == GraniteMacroOpcodeV1::FinalLogits as u8 => GraniteWorkspaceSlotV1::Logits,
         value if value == GraniteMacroOpcodeV1::ArgMax as u8 => GraniteWorkspaceSlotV1::Winner,
+        value if value == GraniteMacroOpcodeV1::Embedding as u8 => GraniteWorkspaceSlotV1::Residual,
         _ => {
             return Err(CommitError::InvalidExecution(
                 "unknown Granite macro opcode".to_owned(),
@@ -754,7 +770,7 @@ mod tests {
         let plan = granite_macro_plan_v1(2).unwrap();
         assert_eq!(plan.programs.len(), 14);
         assert_eq!(plan.programs[0].len(), 1);
-        assert_eq!(plan.programs[1].len(), 28);
+        assert_eq!(plan.programs[1].len(), 29);
         assert_eq!(plan.programs[12].len(), 28);
         assert_eq!(plan.programs[13].len(), 3);
         assert_eq!(plan.segments.len(), plan.programs.len());

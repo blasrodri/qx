@@ -2786,10 +2786,6 @@ impl GraniteV2Generator {
             .begin_token_hash(
                 u32::try_from(token_index)
                     .map_err(|_| "verification token index exceeds u32".to_owned())?,
-                bytes[..32]
-                    .try_into()
-                    .map_err(|_| "invalid token genesis digest width".to_owned())?,
-                HIDDEN * std::mem::size_of::<f32>(),
             )
             .map_err(|error| error.to_string())?;
         for layer in 0..LAYERS {

@@ -135,8 +135,10 @@ commits:
 
 The every-layer profile covers **196,608 canonical activation/KV bytes per
 executed token** (`24 × (1024 + 512 + 512) × 4`). The selected two-layer
-profile covers every K/V append, 12 post-layer residuals, and the pre-layer
-embedding residual, or **151,552 bytes/token**.
+profile covers every K/V append and 12 post-layer residuals, or **147,456
+bytes/token**. Its pre-layer state is a small deterministic sentinel derived
+from `(job_id, token_index)`; embedding is challenged as the first macro rather
+than assumed as a shared boundary.
 Only digests and Merkle frontiers remain after a token; no activation tensor is
 retained.
 Each completed token adds a 76-byte canonical token-result preimage binding the
@@ -158,8 +160,9 @@ checkpoint interval, and index 13 binds the final norm/LM-head/argmax program.
 Each 40-byte segment descriptor commits `(segment_index, instruction_root,
 instruction_count)`. This prevents a proof for one layer's otherwise
 well-formed arithmetic from substituting another layer's weights or schedule.
-The canonical macro compiler emits 28 instructions per two-layer interval
-(14 per layer) and three for the final head. It validates its tensor mapping
+The canonical macro compiler emits 29 instructions for the first two-layer
+interval (embedding plus 14 per layer), 28 for later intervals, and three for
+the final head. It validates its tensor mapping
 against the installed 1,706-entry artifact without reading the weight payload.
 The challenge-only runtime emits matching roots for normalized/Q/K/V,
 rotated-QK, K/V leaf, attention, router, selected routes, MoE, residual,
@@ -189,12 +192,12 @@ This closes the byte-level commitment gap. Consensus arithmetic now uses an
 explicit 32-lane shuffle-down reduction tree, protocol-defined fixed-operation
 `exp`, `rsqrt`, `sin`, and `cos`, a pinned 32-value RoPE inverse-frequency
 table, and safe Metal arithmetic; CPU, Metal, and SBF primitives reproduce the
-same operation order. Two fixed-RoPE 31-repeat runs measured 3.510% and 3.003%
+same operation order. Two fixed-RoPE 31-repeat runs measured 3.312% and 3.127%
 commitment overhead. Its
 512-position PTB PPL differed from native precise math by only
 `4.8735e-8` relatively, with complete sampled top-k agreement. The selected
 interval-2 execution-spec is
-`f5ff8f542c09108d080e22b90f4d8d7e0335c6b2e4750b3627959aac13e0eec9`.
+`b3843de16b7f41da86fcbc0be44a2ee1b18fe601b5e2febd2d7ddccc028dd6ce`.
 It binds the hash design, reduction tree, math mode, fixed functions,
 checkpoint interval, canonical genesis leaves, checkpoint-tree length, and
 compact job-root semantics. See `docs/verification-benchmarks.md` for exact

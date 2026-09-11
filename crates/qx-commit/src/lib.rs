@@ -29,15 +29,16 @@ pub use epoch::{
 };
 pub use execution::{
     CheckpointV1, CommitmentMetrics, ExecutionCommitterV1, ExecutionTraceV1,
-    TOKEN_GENESIS_LAYER_V1, TokenResultV1, job_genesis_hash_v1,
+    TOKEN_GENESIS_LAYER_V1, TokenResultV1, job_genesis_hash_v1, token_input_state_hash_v1,
 };
 pub use granite::{
     GRANITE_TENSORS_PER_LAYER_V1, GraniteDenseOutputV1, GraniteLayerTensorIdsV1,
     GraniteMacroOpcodeV1, GraniteMacroOutputV1, GraniteMacroPlanV1, GraniteMacroStateV1,
     GraniteMacroTraceV1, GraniteMacroWorkspaceV1, GraniteWorkspaceSlotV1,
-    granite_embedding_tensor_id_v1, granite_final_head_macro_program_v1,
-    granite_final_norm_tensor_id_v1, granite_layer_macro_program_v1, granite_layer_tensor_ids_v1,
-    granite_macro_plan_v1, granite_macro_trace_v1, validate_granite_macro_artifact_v1,
+    granite_embedding_macro_program_v1, granite_embedding_tensor_id_v1,
+    granite_final_head_macro_program_v1, granite_final_norm_tensor_id_v1,
+    granite_layer_macro_program_v1, granite_layer_tensor_ids_v1, granite_macro_plan_v1,
+    granite_macro_trace_v1, validate_granite_macro_artifact_v1,
 };
 pub use hash::{Digest, HashAlgorithm, ProtocolVersion, hash_domain, hash_domain_input_len};
 pub use job::{JobEnvelopeV1, JobPayloadV1, MIN_AUDIT_PROBABILITY_PPM_V1, ResultLeafV1};
@@ -79,6 +80,7 @@ pub const D_ACTIVATION_TREE: &[u8] = b"QX:ACTIVATION:TREE:V1";
 pub const D_CHECKPOINT: &[u8] = b"QX:CHECKPOINT:V1";
 pub const D_TOKEN: &[u8] = b"QX:TOKEN:V1";
 pub const D_TOKEN_RESULT: &[u8] = b"QX:TOKEN:RESULT:V1";
+pub const D_TOKEN_INPUT_STATE: &[u8] = b"QX:TOKEN:INPUT:STATE:V1";
 pub const D_JOB: &[u8] = b"QX:JOB:V1";
 pub const D_JOB_GENESIS: &[u8] = b"QX:JOB:GENESIS:V1";
 pub const D_JOB_PAYLOAD: &[u8] = b"QX:JOB:PAYLOAD:V1";

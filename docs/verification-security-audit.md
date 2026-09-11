@@ -16,8 +16,8 @@ The remaining boundary is the nested model trace rather than the bisection
 primitive. Chained authenticated Q4 and structured KV-frontier transitions now
 work, and an equal-checkpoint prediction disagreement descends into a
 token-bound final-head trace. A deterministic Granite macro lowering now binds
-all 1,706 semantic tensor IDs and reduces an interval-2 segment to 28 coarse
-steps, but its macro-state commitments and macro-to-scalar on-chain descent,
+all 1,706 semantic tensor IDs and reduces interval-2 segments to 28 coarse
+steps (29 for the first, including embedding), but its macro-to-scalar on-chain descent,
 logits production, and K/V root production are not yet wired.
 The tests therefore do not yet prove the entire model's `Execute(M, E, X)`
 claim.
@@ -50,7 +50,7 @@ claim.
 | Cross-chunk argmax | two source records are staged independently and the destination can occupy a third chunk; the last reduction binds the selected token into the output state | Implemented on SBF; 10,554 CU |
 | Final-head output binding | shared final checkpoint starts both registered traces; distinct output-state hashes bind each trace to its claimed prediction | Implemented end to end on SBF |
 | Objective arithmetic library | Q4 FMA plus fixed add/mul/div/exp/rsqrt/sin/cos/reduction primitives | Implemented; fixed sine is executed on SBF, but not every family is wired into the chained VM |
-| Granite macro schedule | 14 steps per layer, 28 per selected interval, three for the final head; exact tensor map validated against the 1,706-entry production artifact | Implemented off-chain; nested macro-state dispute is not yet on-chain |
+| Granite macro schedule | 14 steps per layer, 29 for the first selected interval including embedding, 28 thereafter, and three for the final head; exact tensor map validated against the 1,706-entry production artifact | Implemented off-chain; nested macro-state dispute is not yet on-chain |
 | Dispute-only macro trace | real runtime captures normalized/Q/K/V/rotated-QK/attention/router/routing/MoE/residual roots, the derived K/V leaf, and final hidden/logits/winner in compiler order; a 16-slot Merkle workspace retains every live root | Implemented and complete-model tested; macro-to-scalar on-chain descent is still required |
 | CPU verified generation | complete checkpoint+artifact execution emits a nonzero receipt root | Implemented and complete-model tested; a missing `begin_token` call was fixed by this audit |
 | Turn liveness | every unilateral move has a deadline and either non-responder loses | Implemented and tested |
@@ -69,13 +69,13 @@ registered spec.
 
 ## Cost at massive scale
 
-Two independent 31-repeat fixed-math and fixed-RoPE runs add **3.003–3.510%**
-to inference on the tested M5 Pro (mean **3.257%**). At the mandatory 1% sampling floor with one auditor, replay adds
+Two independent 31-repeat fixed-math and fixed-RoPE runs add **3.127–3.312%**
+to inference on the tested M5 Pro (mean **3.220%**). At the mandatory 1% sampling floor with one auditor, replay adds
 1% of baseline inference work. If auditors use the same committed path, total
 network compute is approximately:
 
 ```text
-(1 + 0.032565) * (1 + 0.01) - 1 = 4.2891%
+(1 + 0.03220) * (1 + 0.01) - 1 = 4.2522%
 ```
 
 This excludes the one-time migration from a fast, non-consensus math profile
@@ -124,8 +124,8 @@ artifact tensor IDs. A rolling 16-slot workspace now binds every simultaneously
 live macro value while retaining the existing checkpoint hashes as trace
 endpoints. Complete the second bisection from one disputed macro into the
 existing scalar terminals. The canonical
-pre-layer checkpoint now binds the embedding
-residual and prior-token global KV root, and the SBF hierarchy test exercises
+pre-layer checkpoint is an on-chain-derivable token-start sentinel; embedding
+is the first registered macro in segment one. The SBF hierarchy test exercises
 a disagreement in the first checkpoint interval.
 
 The final-head path and token-bound output state are now inside the chained

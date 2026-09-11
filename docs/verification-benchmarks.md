@@ -2,19 +2,20 @@
 
 ## Current hardened commitment format
 
-The canonical token genesis is now a real pre-layer checkpoint containing the
-embedding residual and prior-token KV root. Its snapshot is fused into the
-embedding lookup, so verified execution still adds only 23 dispatches. RoPE
+The canonical token genesis is now an on-chain-derivable pre-embedding
+sentinel plus the prior-token KV root; embedding is the first instruction in
+the first segment. Verified execution still adds only 23 dispatches. RoPE
 now uses a pinned inverse-frequency table and fixed-operation sine/cosine on
 both Rust and Metal; the previous native `pow`/`sin`/`cos` profile is not
 slashable under the new execution spec.
 
-Two independent 31-repeat runs of the fixed-RoPE interval-2 profile measured
-102.851/106.461 ms and 102.688/105.772 ms uncommitted/committed: **3.510% and
-3.003%** commitment overhead (mean **3.257%**). Both produced trace root
-`1b24445faf24d7760cb5414e3b327470699e4d73f5ca2c0093028de0dca00537`.
+Two independent 31-repeat runs of the fixed-RoPE, challengeable-embedding
+interval-2 profile measured 104.874/108.348 ms and 107.370/110.728 ms
+uncommitted/committed: **3.312% and 3.127%** commitment overhead (mean
+**3.220%**). Both produced trace root
+`6fbe894a85b94f0edbd7ac58600f2277181b5d12472e24a3aed85fbcf8afdab1`.
 The interval-2 execution spec is
-`f5ff8f542c09108d080e22b90f4d8d7e0335c6b2e4750b3627959aac13e0eec9`.
+`b3843de16b7f41da86fcbc0be44a2ee1b18fe601b5e2febd2d7ddccc028dd6ce`.
 
 On 2026-09-11, after adding canonical job/token genesis leaves, compact job
 roots, and committed checkpoint-tree lengths, two independent 31-repeat runs
