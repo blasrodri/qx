@@ -35,6 +35,8 @@ pub(super) const OP_RESOLVE_VM_KV_V2: u8 = 34;
 pub(super) const OP_RESOLVE_VM_ARGMAX_V2: u8 = 35;
 pub(super) const OP_CHALLENGER_FINAL_HEAD_V2: u8 = 36;
 pub(super) const OP_MINER_FINAL_HEAD_V2: u8 = 37;
+pub(super) const OP_STAGE_VM_SCALAR_V2: u8 = 38;
+pub(super) const OP_RESOLVE_STAGED_VM_SCALAR_V2: u8 = 39;
 
 pub const JOB_PAYLOAD_BYTES: usize = 310;
 pub const JOB_ACCOUNT_BYTES: usize = 314;
@@ -42,6 +44,7 @@ pub const RESULT_LEAF_BYTES: usize = 104;
 pub const EPOCH_V2_ACCOUNT_BYTES: usize = 152;
 pub const DISPUTE_V2_ACCOUNT_BYTES: usize = 768;
 pub const MINER_V2_ACCOUNT_BYTES: usize = 16;
+pub const STAGED_SCALAR_V2_ACCOUNT_BYTES: usize = 104;
 /// Roughly one day at a 400 ms slot. This is a consensus parameter, not a
 /// value the submitting miner may shorten.
 pub const CHALLENGE_WINDOW_SLOTS: u64 = 216_000;
@@ -111,6 +114,7 @@ const D_STATE_CHUNK: &[u8] = b"QX:STATE:CHUNK:V1";
 const D_MERKLE_EMPTY: &[u8] = b"QX:MERKLE:EMPTY:V1";
 const STATE_CHUNK_BYTES: usize = 256;
 const STAGED_KV_MAGIC: &[u8; 4] = b"QXK2";
+const STAGED_SCALAR_MAGIC: &[u8; 4] = b"QXS2";
 
 const PHASE_CHALLENGER_BOUNDS: u8 = 1;
 const PHASE_MINER_BOUNDS: u8 = 2;
@@ -1728,6 +1732,300 @@ pub(super) fn resolve_vm_scalar(
         &[&chunk_index.to_le_bytes(), &updated_chunk[..chunk_len]],
     );
     let post_residual_root = state_merkle_root(updated_leaf, chunk_index, memory_siblings);
+    let expected_end = vm_state_hash(
+        &array_at(&state, D_JOB_HASH_OFFSET)?,
+        u32_at(&state, D_TOKEN_INDEX_OFFSET)?,
+        segment_index,
+        program_counter
+            .checked_add(1)
+            .ok_or(QxError::InvalidEncoding)?,
+        &post_residual_root,
+        &global_kv_root,
+    );
+    let agrees_with_challenger = expected_end == array_at(&state, D_CHALLENGER_END_OFFSET)?;
+    let disagrees_with_miner = expected_end != array_at(&state, D_DEFENDER_END_OFFSET)?;
+    let winner = if agrees_with_challenger && disagrees_with_miner {
+        PARTY_CHALLENGER
+    } else {
+        PARTY_MINER
+    };
+    put(&mut state, D_ACC_START_OFFSET, &expected.to_le_bytes())?;
+    state[D_RESOLUTION_FLAGS_OFFSET] =
+        u8::from(agrees_with_challenger) | (u8::from(disagrees_with_miner) << 1);
+    state[D_PHASE_OFFSET] = PHASE_RESOLVED_V2;
+    state[D_WINNER_OFFSET] = winner;
+    state[D_EXPECTED_PARTY_OFFSET] = PARTY_NONE;
+    Ok(())
+}
+
+/// Authenticate any subset of a scalar instruction's three operands from one
+/// residual-memory chunk. Repeated calls may fill the same dispute-bound
+/// staging account, allowing operands to reside in different chunks.
+pub(super) fn stage_vm_scalar(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [dispute, staged] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    if dispute.owner != program_id
+        || dispute.data_len() != DISPUTE_V2_ACCOUNT_BYTES
+        || staged.owner != program_id
+        || !staged.is_writable
+        || staged.data_len() != STAGED_SCALAR_V2_ACCOUNT_BYTES
+    {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let state = dispute.try_borrow_data()?;
+    require_dispute(&state, PHASE_CHALLENGER_TERMINAL)?;
+    require_deadline(&state)?;
+    let role_mask = cursor.u8()?;
+    let segment_index = cursor.u32()?;
+    let program_counter = cursor.u32()?;
+    let residual_root = cursor.array_32()?;
+    let global_kv_root = cursor.array_32()?;
+    if role_mask == 0
+        || role_mask & !7 != 0
+        || program_counter != u32_at(&state, D_LOW_OFFSET)?
+        || vm_state_hash(
+            &array_at(&state, D_JOB_HASH_OFFSET)?,
+            u32_at(&state, D_TOKEN_INDEX_OFFSET)?,
+            segment_index,
+            program_counter,
+            &residual_root,
+            &global_kv_root,
+        ) != array_at(&state, D_COMMON_ROOT_OFFSET)?
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    let opcode = cursor.u8()?;
+    let source_a = cursor.u32()?;
+    let source_b = cursor.u32()?;
+    let source_c = cursor.u32()?;
+    let destination = cursor.u32()?;
+    let instruction_count = cursor.u32()?;
+    let instruction_depth = usize::from(cursor.u8()?);
+    let instruction_siblings = cursor.take(
+        instruction_depth
+            .checked_mul(32)
+            .ok_or(QxError::InvalidEncoding)?,
+    )?;
+    if !scalar_op_supported(opcode)
+        || opcode == 4
+        || instruction_count != u32_at(&state, D_SEGMENT_INSTRUCTION_COUNT_OFFSET)?
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    let instruction = vm_instruction_bytes(opcode, source_a, source_b, source_c, destination);
+    verify_merkle_blake3(
+        blake3_domain(
+            D_VM_INSTRUCTION,
+            &[&program_counter.to_le_bytes(), &instruction],
+        ),
+        program_counter,
+        instruction_count,
+        instruction_depth,
+        instruction_siblings,
+        array_at(&state, D_SEGMENT_PROGRAM_ROOT_OFFSET)?,
+        D_PROGRAM_TREE,
+    )?;
+
+    let byte_length = cursor.u32()?;
+    let chunk_index = cursor.u32()?;
+    let chunk_len = usize::from(cursor.u16()?);
+    let chunk = cursor.take(chunk_len)?;
+    let memory_depth = usize::from(cursor.u8()?);
+    let memory_siblings = cursor.take(
+        memory_depth
+            .checked_mul(32)
+            .ok_or(QxError::InvalidEncoding)?,
+    )?;
+    let memory_count = byte_length.div_ceil(STATE_CHUNK_BYTES as u32);
+    if memory_count == 0 || chunk_index >= memory_count {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let expected_len = if chunk_index.checked_add(1) == Some(memory_count) {
+        let chunk_start = chunk_index
+            .checked_mul(STATE_CHUNK_BYTES as u32)
+            .ok_or(QxError::InvalidEncoding)?;
+        usize::try_from(
+            byte_length
+                .checked_sub(chunk_start)
+                .ok_or(QxError::InvalidEncoding)?,
+        )
+        .map_err(|_| QxError::InvalidEncoding)?
+    } else {
+        STATE_CHUNK_BYTES
+    };
+    if !cursor.is_empty()
+        || byte_length == 0
+        || chunk_len != expected_len
+        || merkle_depth(memory_count)? != memory_depth
+        || state_merkle_root(
+            blake3_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]),
+            chunk_index,
+            memory_siblings,
+        ) != residual_root
+    {
+        return Err(QxError::InvalidReceiptProof.into());
+    }
+    let addresses = [source_a, source_b, source_c];
+    let mut opened = [0_u32; 3];
+    for role in 0..3 {
+        if role_mask & (1 << role) != 0 {
+            opened[role] = scalar_from_chunk(addresses[role], byte_length, chunk_index, chunk)?;
+        }
+    }
+    let common_state = array_at(&state, D_COMMON_ROOT_OFFSET)?;
+    drop(state);
+
+    let mut staged_data = staged.try_borrow_mut_data()?;
+    if staged_data.iter().all(|byte| *byte == 0) {
+        staged_data[..4].copy_from_slice(STAGED_SCALAR_MAGIC);
+        put(&mut staged_data, 4, dispute.key.as_ref())?;
+        put(&mut staged_data, 36, &common_state)?;
+        put(&mut staged_data, 68, &program_counter.to_le_bytes())?;
+        put(&mut staged_data, 72, &instruction)?;
+    } else if &staged_data[..4] != STAGED_SCALAR_MAGIC
+        || staged_data[4..36] != dispute.key.to_bytes()
+        || staged_data[36..68] != common_state
+        || u32_at(&staged_data, 68)? != program_counter
+        || staged_data[72..89] != instruction
+    {
+        return Err(QxError::Unauthorized.into());
+    }
+    for role in 0..3 {
+        if role_mask & (1 << role) == 0 {
+            continue;
+        }
+        let offset = 92 + role * 4;
+        if staged_data[89] & (1 << role) != 0 && u32_at(&staged_data, offset)? != opened[role] {
+            return Err(QxError::InvalidState.into());
+        }
+        put(&mut staged_data, offset, &opened[role].to_le_bytes())?;
+    }
+    staged_data[89] |= role_mask;
+    Ok(())
+}
+
+/// Resolve a scalar instruction after all three operands were staged. Only
+/// the destination chunk is transported here; its path derives the post-root.
+pub(super) fn resolve_staged_vm_scalar(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [dispute, staged] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    if dispute.owner != program_id
+        || !dispute.is_writable
+        || dispute.data_len() != DISPUTE_V2_ACCOUNT_BYTES
+        || staged.owner != program_id
+        || staged.data_len() != STAGED_SCALAR_V2_ACCOUNT_BYTES
+    {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let staged_data = staged.try_borrow_data()?;
+    if &staged_data[..4] != STAGED_SCALAR_MAGIC
+        || staged_data[4..36] != dispute.key.to_bytes()
+        || staged_data[89] != 7
+    {
+        return Err(QxError::Unauthorized.into());
+    }
+    let common_state: [u8; 32] = staged_data[36..68]
+        .try_into()
+        .map_err(|_| QxError::InvalidEncoding)?;
+    let program_counter = u32_at(&staged_data, 68)?;
+    let instruction: [u8; 17] = staged_data[72..89]
+        .try_into()
+        .map_err(|_| QxError::InvalidEncoding)?;
+    let operands = [
+        u32_at(&staged_data, 92)?,
+        u32_at(&staged_data, 96)?,
+        u32_at(&staged_data, 100)?,
+    ];
+    drop(staged_data);
+
+    let mut state = dispute.try_borrow_mut_data()?;
+    require_dispute(&state, PHASE_CHALLENGER_TERMINAL)?;
+    require_deadline(&state)?;
+    if program_counter != u32_at(&state, D_LOW_OFFSET)?
+        || common_state != array_at(&state, D_COMMON_ROOT_OFFSET)?
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    let segment_index = cursor.u32()?;
+    let residual_root = cursor.array_32()?;
+    let global_kv_root = cursor.array_32()?;
+    if vm_state_hash(
+        &array_at(&state, D_JOB_HASH_OFFSET)?,
+        u32_at(&state, D_TOKEN_INDEX_OFFSET)?,
+        segment_index,
+        program_counter,
+        &residual_root,
+        &global_kv_root,
+    ) != common_state
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    let byte_length = cursor.u32()?;
+    let chunk_index = cursor.u32()?;
+    let chunk_len = usize::from(cursor.u16()?);
+    let chunk = cursor.take(chunk_len)?;
+    let memory_depth = usize::from(cursor.u8()?);
+    let memory_siblings = cursor.take(
+        memory_depth
+            .checked_mul(32)
+            .ok_or(QxError::InvalidEncoding)?,
+    )?;
+    let memory_count = byte_length.div_ceil(STATE_CHUNK_BYTES as u32);
+    if memory_count == 0 || chunk_index >= memory_count {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let expected_len = if chunk_index.checked_add(1) == Some(memory_count) {
+        let chunk_start = chunk_index
+            .checked_mul(STATE_CHUNK_BYTES as u32)
+            .ok_or(QxError::InvalidEncoding)?;
+        usize::try_from(
+            byte_length
+                .checked_sub(chunk_start)
+                .ok_or(QxError::InvalidEncoding)?,
+        )
+        .map_err(|_| QxError::InvalidEncoding)?
+    } else {
+        STATE_CHUNK_BYTES
+    };
+    let destination = u32_from(&instruction, 13)?;
+    if !cursor.is_empty()
+        || byte_length == 0
+        || chunk_len != expected_len
+        || merkle_depth(memory_count)? != memory_depth
+        || state_merkle_root(
+            blake3_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]),
+            chunk_index,
+            memory_siblings,
+        ) != residual_root
+    {
+        return Err(QxError::InvalidReceiptProof.into());
+    }
+    scalar_from_chunk(destination, byte_length, chunk_index, chunk)?;
+    let expected = evaluate_scalar(instruction[0], operands[0], operands[1], operands[2])?;
+    let chunk_start = chunk_index as usize * STATE_CHUNK_BYTES;
+    let destination_offset = destination as usize - chunk_start;
+    let mut updated_chunk = [0_u8; STATE_CHUNK_BYTES];
+    updated_chunk[..chunk_len].copy_from_slice(chunk);
+    updated_chunk[destination_offset..destination_offset + 4]
+        .copy_from_slice(&expected.to_le_bytes());
+    let post_residual_root = state_merkle_root(
+        blake3_domain(
+            D_STATE_CHUNK,
+            &[&chunk_index.to_le_bytes(), &updated_chunk[..chunk_len]],
+        ),
+        chunk_index,
+        memory_siblings,
+    );
     let expected_end = vm_state_hash(
         &array_at(&state, D_JOB_HASH_OFFSET)?,
         u32_at(&state, D_TOKEN_INDEX_OFFSET)?,

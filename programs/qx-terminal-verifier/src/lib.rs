@@ -157,6 +157,10 @@ pub fn process_instruction(
         v2::OP_MINER_FINAL_HEAD_V2 => {
             v2::submit_miner_final_head(program_id, accounts, &mut cursor)
         }
+        v2::OP_STAGE_VM_SCALAR_V2 => v2::stage_vm_scalar(program_id, accounts, &mut cursor),
+        v2::OP_RESOLVE_STAGED_VM_SCALAR_V2 => {
+            v2::resolve_staged_vm_scalar(program_id, accounts, &mut cursor)
+        }
         _ => Err(QxError::InvalidEncoding.into()),
     }
 }
