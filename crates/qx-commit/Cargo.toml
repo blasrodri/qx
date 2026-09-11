@@ -8,6 +8,7 @@ license.workspace = true
 blake3.workspace = true
 ed25519-dalek.workspace = true
 qx-format.workspace = true
+qx-consensus-math.workspace = true
 qx-model.workspace = true
 qx-quant.workspace = true
 sha2.workspace = true

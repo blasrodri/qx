@@ -25,6 +25,8 @@ pub enum QxOpV1 {
     Div = 12,
     Select = 13,
     RawWeightFma = 14,
+    Sin = 15,
+    Cos = 16,
 }
 
 impl TryFrom<u8> for QxOpV1 {
@@ -46,6 +48,8 @@ impl TryFrom<u8> for QxOpV1 {
             12 => Ok(Self::Div),
             13 => Ok(Self::Select),
             14 => Ok(Self::RawWeightFma),
+            15 => Ok(Self::Sin),
+            16 => Ok(Self::Cos),
             _ => Err(VerificationError::InvalidWitness("unknown QX operation")),
         }
     }
@@ -106,6 +110,12 @@ pub fn evaluate_scalar_op_v1(op: QxOpV1, operands: [u32; 3]) -> Result<u32, Veri
             .ok_or(VerificationError::InvalidWitness("invalid rsqrt input"))?,
         QxOpV1::ExpApprox => qx_consensus_math::exp_f32(a)
             .ok_or(VerificationError::InvalidWitness("invalid exp input"))?,
+        QxOpV1::Sin => qx_consensus_math::sin_cos_f32(a)
+            .map(|value| value.0)
+            .ok_or(VerificationError::InvalidWitness("invalid sin input"))?,
+        QxOpV1::Cos => qx_consensus_math::sin_cos_f32(a)
+            .map(|value| value.1)
+            .ok_or(VerificationError::InvalidWitness("invalid cos input"))?,
         QxOpV1::Div => qx_consensus_math::div_f32(a, b)
             .ok_or(VerificationError::InvalidWitness("invalid division"))?,
         QxOpV1::Select => match a_bits {

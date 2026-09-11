@@ -12,7 +12,7 @@ to decide whether the selected inference is checked.
 
 This separates three costs:
 
-1. every inference pays 2.939–4.201% measured commitment cost inside the selected
+1. every inference pays 3.003–3.510% measured commitment cost inside the selected
    fixed-math two-layer checkpoint profile, including output-token binding; the
    earlier fast-uncommitted to precise-committed migration measurement was
    8.820%, so arithmetic mode remains a separate deployment cost;
@@ -84,8 +84,10 @@ Automatic slashing remains disabled. The generic hierarchy, canonical
 first-segment checkpoint, chained scalar/Q4/KV terminals, and token-bound
 final-head argmax path work. Equal-checkpoint prediction disagreements now
 descend through a registered operator trace and resolve objectively. The real
-Granite computation is not lowered into the registered dispute VM yet, and
-logit/K/V vector roots are not yet produced through that lowering. Collateral
+Granite tensor map and 14-macro-per-layer schedule are now lowered and checked
+against the production artifact, but macro boundary states and the nested
+macro-to-scalar dispute are not yet connected on chain. Logit/K/V vector roots
+are not yet produced through that lowering. Collateral
 transfer and durable input availability are also outside this proof milestone. See
 `docs/verification-security-audit.md` for the exact readiness gate.
 
@@ -247,18 +249,21 @@ the active dispute PDA, so a proof cannot be replayed into another dispute.
 `QX_EXEC_METAL_V1` now replaces native `simd_sum`/`simd_max` with an explicit
 32-lane shuffle-down tree in the Q4, dense, decode, and dynamic-MoE kernels.
 Metal fast math is disabled by default, and the host verifier contains the
-matching FP32 sum oracle. It also replaces native `exp` and `rsqrt` throughout
-the model kernels with protocol-defined fixed-operation implementations. Rust,
+matching FP32 sum oracle. It also replaces native `exp`, `rsqrt`, and Granite
+RoPE trigonometry throughout the model kernels with protocol-defined
+fixed-operation implementations and a pinned inverse-frequency table. Rust,
 Metal, and the SBF terminal evaluator share identical constants and operation
 order. Live Metal bit-parity tests pass. The selected interval-2 execution-spec
-`01e47ff99355d9eca97bde30253739fe38fdfb70049871d4307daa89ffb9cd1d`
+`f5ff8f542c09108d080e22b90f4d8d7e0335c6b2e4750b3627959aac13e0eec9`
 binds the fixed-math and commitment-shape profile.
 
 The scalar terminal IR now objectively evaluates FMA/dot steps, add, multiply,
-ordered sum/max, compare, select, division, fixed exp, and fixed rsqrt. An
+ordered sum/max, compare, select, division, fixed exp/rsqrt, and fixed
+sine/cosine. An
 actual SBF fixed-exp dispute, including verification-program authentication,
-consumes 10,803 CU across both terminal reveals and resolution. RoPE
-decomposes into multiply/add steps; softmax and RMSNorm use the
+consumes 10,807 CU across both terminal reveals and resolution. A fixed-sine
+resolution consumes 5,566 CU after boundary authentication. RoPE decomposes
+into fixed sine/cosine and multiply/add steps; softmax and RMSNorm use the
 fixed exp/rsqrt/div primitives. Argmax and Top-K decompose into compare/select.
 KV leaf hashing exists, but its append/frontier-update witness and the nested
 layer-to-operator trace bridge remain required before complete inference is

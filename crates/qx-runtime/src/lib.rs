@@ -10,7 +10,7 @@ use qx_compiler::QuantizedExpert;
 use qx_format::{MappedArtifact, TensorKind};
 use qx_model::{
     ATTENTION_HEADS, ATTENTION_MULTIPLIER, EMBEDDING_MULTIPLIER, EXPERTS, HEAD_DIM, HIDDEN,
-    KV_HEADS, LAYERS, LOGITS_SCALING, MAX_CONTEXT, ROPE_THETA, TOP_K, VOCAB,
+    KV_HEADS, LAYERS, LOGITS_SCALING, MAX_CONTEXT, TOP_K, VOCAB,
 };
 use qx_safetensors::Checkpoint;
 use qx_tokenizer::Tokenizer;
@@ -145,7 +145,14 @@ pub struct VerifiedGenerationV1 {
 pub struct LayerTrace {
     pub layer: u16,
     pub input: Vec<f32>,
+    pub normalized: Vec<f32>,
+    pub query: Vec<f32>,
+    pub key: Vec<f32>,
+    pub value: Vec<f32>,
+    pub rotated_query: Vec<f32>,
+    pub rotated_key: Vec<f32>,
     pub attention: Vec<f32>,
+    pub attention_projection: Vec<f32>,
     pub post_attention: Vec<f32>,
     pub moe_input: Vec<f32>,
     pub router_logits: Vec<f32>,
@@ -160,7 +167,14 @@ impl LayerTrace {
         Self {
             layer,
             input: Vec::new(),
+            normalized: Vec::new(),
+            query: Vec::new(),
+            key: Vec::new(),
+            value: Vec::new(),
+            rotated_query: Vec::new(),
+            rotated_key: Vec::new(),
             attention: Vec::new(),
+            attention_projection: Vec::new(),
             post_attention: Vec::new(),
             moe_input: Vec::new(),
             router_logits: Vec::new(),
@@ -571,6 +585,9 @@ impl GraniteLayerWeights {
         }
         let attention_start = Instant::now();
         let normalized = rms_norm(hidden, &self.input_norm);
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.normalized = normalized.to_vec();
+        }
         #[cfg(target_os = "macos")]
         let (query, key, value) = if let (Some(context), Some(q_proj), Some(k_proj), Some(v_proj)) = (
             self.metal.as_ref(),
@@ -598,6 +615,16 @@ impl GraniteLayerWeights {
             array_from_vec(self.k_proj.apply(&normalized), KV_HEADS * HEAD_DIM),
             array_from_vec(self.v_proj.apply(&normalized), KV_HEADS * HEAD_DIM),
         );
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.query = query.to_vec();
+            trace.key = key.to_vec();
+            trace.value = value.to_vec();
+            let mut rotated_query = query;
+            let mut rotated_key = key;
+            apply_granite_rope(&mut rotated_query, &mut rotated_key, position);
+            trace.rotated_query = rotated_query.to_vec();
+            trace.rotated_key = rotated_key.to_vec();
+        }
         let attention = granite_attention_decode(&query, &key, &value, position, cache)?;
         if let Some(trace) = trace.as_deref_mut() {
             trace.attention = attention.to_vec();
@@ -616,6 +643,9 @@ impl GraniteLayerWeights {
             }
         };
         let mut after_attention = [0.0; HIDDEN];
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.attention_projection = attention_projection.to_vec();
+        }
         for index in 0..HIDDEN {
             after_attention[index] =
                 hidden[index] + qx_model::RESIDUAL_MULTIPLIER * attention_projection[index];
@@ -1200,6 +1230,14 @@ impl GraniteModel {
         {
             *destination = *source * EMBEDDING_MULTIPLIER;
         }
+        if let Some(committer) = commitments.as_deref_mut() {
+            committer
+                .begin_token(
+                    u32::try_from(position).map_err(|_| "token position exceeds u32".to_owned())?,
+                    &hidden,
+                )
+                .map_err(|error| error.to_string())?;
+        }
         for index in 0..LAYERS {
             let trace = traces.as_deref_mut().map(|values| &mut values[index]);
             let timing = timings.as_deref_mut().map(|values| &mut values[index]);
@@ -1307,11 +1345,12 @@ fn array_from_vec<const N: usize>(values: Vec<f32>, expected: usize) -> [f32; N]
 }
 
 fn rotate_heads(values: &mut [f32], heads: usize, position: usize) {
+    let position = u32::try_from(position).expect("Granite position fits u32");
     for head in 0..heads {
         let head_start = head * HEAD_DIM;
         for pair in 0..HEAD_DIM / 2 {
-            let angle = position as f32 * ROPE_THETA.powf(-((2 * pair) as f32) / HEAD_DIM as f32);
-            let (sin, cos) = angle.sin_cos();
+            let (sin, cos) = qx_consensus_math::granite_rope_sin_cos(position, pair as u32)
+                .expect("registered Granite RoPE coordinate");
             let left = values[head_start + pair];
             let right = values[head_start + HEAD_DIM / 2 + pair];
             values[head_start + pair] = left * cos - right * sin;
@@ -1727,6 +1766,42 @@ mod tests {
         let mut model = GraniteModel::from_paths(model, artifact, 128).unwrap();
         let output = model.generate("Hello", 1).unwrap();
         assert!(output.starts_with("Hello"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "loads the complete Granite checkpoint and executes the verified path"]
+    fn complete_granite_model_emits_a_verification_receipt() {
+        let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../external/models/granite-3.0-1b-a400m-instruct");
+        let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../external/models/granite-m5-pro-q4.qx");
+        if !model_dir.exists() || !artifact.exists() {
+            return;
+        }
+        let mut model = GraniteModel::from_paths(&model_dir, artifact, 128).unwrap();
+        let prompt = model.encode_text("Hello").unwrap();
+        let verified = model
+            .generate_tokens_with_verification(
+                &prompt,
+                1,
+                false,
+                VerificationRequestV1 {
+                    job_id: [1; 32],
+                    model_id: [2; 32],
+                    miner_pubkey: [3; 32],
+                    sequence: 4,
+                },
+            )
+            .unwrap();
+        assert_eq!(verified.generation.token_ids.len(), 1);
+        assert_eq!(
+            verified.receipt.input_token_count,
+            u32::try_from(prompt.len()).unwrap()
+        );
+        assert_ne!(verified.receipt.trace_root, [0; 32]);
+        verified.receipt.hash().unwrap();
+        assert!(verified.commitment_metrics.executed_tokens > 0);
     }
 
     #[cfg(target_os = "macos")]

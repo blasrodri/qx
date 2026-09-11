@@ -151,13 +151,18 @@ and value tree domains. The CPU oracle and Metal implementation produce
 identical commitments and the structure permits independent chunk proofs
 during replay.
 
-The registered verifier schedule has `checkpoint_count + 1` leaves. For the
+The verifier schedule has `checkpoint_count + 1` leaves. For the
 selected two-layer profile this is 14 leaves: index 0 is reserved, indices
 1–12 bind the distinct instruction root and length for each two-layer
 checkpoint interval, and index 13 binds the final norm/LM-head/argmax program.
 Each 40-byte segment descriptor commits `(segment_index, instruction_root,
 instruction_count)`. This prevents a proof for one layer's otherwise
 well-formed arithmetic from substituting another layer's weights or schedule.
+The canonical macro compiler emits 28 instructions per two-layer interval
+(14 per layer) and three for the final head. It validates its tensor mapping
+against the installed 1,706-entry artifact without reading the weight payload.
+The remaining implementation gate is committing macro boundary states and
+descending the one disputed macro into scalar terminals on chain.
 Generation executes and commits `input_token_count + output_token_count - 1`
 tokens in the usual non-EOS case because the final output is the prediction of
 the preceding step.
@@ -177,13 +182,14 @@ only 1,536 digest bytes after the runtime's existing token synchronization.
 
 This closes the byte-level commitment gap. Consensus arithmetic now uses an
 explicit 32-lane shuffle-down reduction tree, protocol-defined fixed-operation
-`exp` and `rsqrt`, and safe Metal arithmetic; CPU and SBF primitives reproduce
-the same operation order. After trace-shape hardening, two independent
-31-repeat runs measured 2.939% and 4.201% commitment overhead. Its
+`exp`, `rsqrt`, `sin`, and `cos`, a pinned 32-value RoPE inverse-frequency
+table, and safe Metal arithmetic; CPU, Metal, and SBF primitives reproduce the
+same operation order. Two fixed-RoPE 31-repeat runs measured 3.510% and 3.003%
+commitment overhead. Its
 512-position PTB PPL differed from native precise math by only
 `4.8735e-8` relatively, with complete sampled top-k agreement. The selected
 interval-2 execution-spec is
-`01e47ff99355d9eca97bde30253739fe38fdfb70049871d4307daa89ffb9cd1d`.
+`f5ff8f542c09108d080e22b90f4d8d7e0335c6b2e4750b3627959aac13e0eec9`.
 It binds the hash design, reduction tree, math mode, fixed functions,
 checkpoint interval, canonical genesis leaves, checkpoint-tree length, and
 compact job-root semantics. See `docs/verification-benchmarks.md` for exact

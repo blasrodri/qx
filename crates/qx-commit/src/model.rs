@@ -214,6 +214,10 @@ pub fn granite_execution_spec_with_math_profile(
     bytes.push(2); // token genesis is a pre-layer checkpoint with residual + prior KV
     bytes.push(1); // token result commits checkpoint-tree leaf count
     bytes.push(1); // result trace length selects the compact job-tree root
+    bytes.extend_from_slice(b"GRANITE_ROPE_FIXED_V1");
+    for bits in qx_consensus_math::GRANITE_ROPE_INVERSE_FREQUENCY_BITS {
+        bytes.extend_from_slice(&bits.to_le_bytes());
+    }
     if checkpoint_interval != 1 {
         bytes.extend_from_slice(b"CHECKPOINT_INTERVAL");
         bytes.push(checkpoint_interval);

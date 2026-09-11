@@ -8,6 +8,7 @@ mod dispute;
 mod economics;
 mod epoch;
 mod execution;
+mod granite;
 mod hash;
 mod job;
 mod merkle;
@@ -30,6 +31,13 @@ pub use execution::{
     CheckpointV1, CommitmentMetrics, ExecutionCommitterV1, ExecutionTraceV1,
     TOKEN_GENESIS_LAYER_V1, TokenResultV1, job_genesis_hash_v1,
 };
+pub use granite::{
+    GRANITE_TENSORS_PER_LAYER_V1, GraniteDenseOutputV1, GraniteLayerTensorIdsV1,
+    GraniteMacroOpcodeV1, GraniteMacroPlanV1, granite_embedding_tensor_id_v1,
+    granite_final_head_macro_program_v1, granite_final_norm_tensor_id_v1,
+    granite_layer_macro_program_v1, granite_layer_tensor_ids_v1, granite_macro_plan_v1,
+    validate_granite_macro_artifact_v1,
+};
 pub use hash::{Digest, HashAlgorithm, ProtocolVersion, hash_domain, hash_domain_input_len};
 pub use job::{JobEnvelopeV1, JobPayloadV1, MIN_AUDIT_PROBABILITY_PPM_V1, ResultLeafV1};
 pub use merkle::{FixedMerkleAccumulator, MerkleProof, MerkleTree, MutableMerkleTree};
@@ -50,7 +58,8 @@ pub use vm::{
     vm_program_tree_v1, vm_segment_schedule_v1,
 };
 pub use weights::{
-    WeightCommitmentV1, WeightLeafV1, WeightProofV1, commit_q4_artifact, prove_q4_artifact_leaf,
+    SemanticTensorV1, WeightCommitmentV1, WeightLeafV1, WeightProofV1,
+    artifact_semantic_tensors_v1, commit_q4_artifact, prove_q4_artifact_leaf,
 };
 
 pub const D_MODEL: &[u8] = b"QX:MODEL:V1";

@@ -85,6 +85,44 @@ struct OrderedTensor {
     tensor_id: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SemanticTensorV1 {
+    pub tensor_id: u32,
+    pub layer: u16,
+    pub expert: u8,
+    pub kind: TensorKind,
+    pub rows: u32,
+    pub cols: u32,
+    pub group_size: u16,
+    pub quant_type: QuantType,
+}
+
+/// Return the exact semantic tensor order used by the weight commitment.
+/// This is intentionally metadata-only; validating a verifier program must
+/// not reread or retain the 750 MB logical weight payload.
+pub fn artifact_semantic_tensors_v1(
+    path: impl AsRef<Path>,
+) -> Result<Vec<SemanticTensorV1>, CommitError> {
+    let artifact = MappedArtifact::open(path)
+        .map_err(|error| CommitError::InvalidArtifact(error.to_string()))?;
+    ordered_tensors(&artifact)?
+        .into_iter()
+        .map(|ordered| {
+            let entry = &artifact.info().entries[ordered.artifact_index];
+            Ok(SemanticTensorV1 {
+                tensor_id: ordered.tensor_id,
+                layer: entry.layer,
+                expert: entry.expert,
+                kind: entry.kind,
+                rows: entry.rows,
+                cols: entry.cols,
+                group_size: entry.group_size,
+                quant_type: entry.quant_type,
+            })
+        })
+        .collect()
+}
+
 fn semantic_rank(entry: &TensorDirectoryEntry) -> (u8, u16, u8, u8) {
     let global = entry.layer == u16::MAX;
     let stage = match entry.kind {

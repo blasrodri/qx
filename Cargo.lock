@@ -2107,6 +2107,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek 2.1.1",
  "half",
+ "qx-consensus-math",
  "qx-format",
  "qx-model",
  "qx-quant",

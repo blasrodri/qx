@@ -249,6 +249,39 @@ fn fixed_exp_scalar_transition_convicts_wrong_miner_on_sbf() {
 }
 
 #[test]
+fn fixed_sine_terminal_matches_the_registered_rope_math_on_sbf() {
+    let f = Fixture::new();
+    let mut vm = f.vm();
+    vm.sysvars.clock.slot = 100;
+    let angle = 1234.5_f32;
+    let honest = qx_consensus_math::sin_cos_f32(angle).unwrap().0.to_bits();
+    let dishonest = honest ^ 1;
+    let mut dispute = owned(DISPUTE_BYTES, f.program);
+    dispute.data[..4].copy_from_slice(b"QXD2");
+    dispute.data[4] = 7;
+    dispute.data[7] = 15;
+    dispute.data[360..368].copy_from_slice(&1_000_u64.to_le_bytes());
+    dispute.data[424..428].copy_from_slice(&angle.to_bits().to_le_bytes());
+    dispute.data[428..432].copy_from_slice(&0.0_f32.to_bits().to_le_bytes());
+    dispute.data[432..436].copy_from_slice(&0.0_f32.to_bits().to_le_bytes());
+    dispute.data[440..444].copy_from_slice(&dishonest.to_le_bytes());
+    dispute.data[444..448].copy_from_slice(&honest.to_le_bytes());
+
+    let resolved = vm.process_instruction(
+        &f.ix(23, vec![AccountMeta::new(f.dispute, false)], &[]),
+        &[(f.dispute, dispute)],
+    );
+    assert_ok(&resolved.program_result);
+    let dispute = account(&resolved.resulting_accounts, f.dispute);
+    assert_eq!((dispute.data[4], dispute.data[5]), (8, 2));
+    assert_eq!(u32_at(&dispute.data, 436), honest);
+    println!(
+        "v2_fixed_sine_terminal_cu={}",
+        resolved.compute_units_consumed
+    );
+}
+
+#[test]
 fn chained_vm_scalar_transition_convicts_wrong_miner_on_sbf() {
     let f = Fixture::new();
     let mut vm = f.vm();

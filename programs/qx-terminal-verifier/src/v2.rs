@@ -3907,7 +3907,7 @@ fn scalar_state_hash(
 }
 
 fn scalar_op_supported(op: u8) -> bool {
-    matches!(op, 1..=7 | 9 | 10 | 12 | 13)
+    matches!(op, 1..=7 | 9 | 10 | 12 | 13 | 15 | 16)
 }
 
 fn evaluate_scalar(op: u8, a_bits: u32, b_bits: u32, c_bits: u32) -> Result<u32, ProgramError> {
@@ -3940,6 +3940,12 @@ fn evaluate_scalar(op: u8, a_bits: u32, b_bits: u32, c_bits: u32) -> Result<u32,
         }
         9 => qx_consensus_math::rsqrt_f32(a).ok_or(QxError::InvalidEncoding)?,
         10 => qx_consensus_math::exp_f32(a).ok_or(QxError::InvalidEncoding)?,
+        15 => qx_consensus_math::sin_cos_f32(a)
+            .map(|value| value.0)
+            .ok_or(QxError::InvalidEncoding)?,
+        16 => qx_consensus_math::sin_cos_f32(a)
+            .map(|value| value.1)
+            .ok_or(QxError::InvalidEncoding)?,
         12 => qx_consensus_math::div_f32(a, b).ok_or(QxError::InvalidEncoding)?,
         13 => match a_bits {
             0x0000_0000 => c,

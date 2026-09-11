@@ -9613,12 +9613,12 @@ pub mod platform {
             })
         }
 
-        /// Execute the protocol math conformance kernel and return raw exp and
-        /// reciprocal-square-root bits for cross-implementation tests.
+        /// Execute the protocol math conformance kernel and return raw exp,
+        /// reciprocal-square-root, Granite-RoPE sine, and cosine bits.
         pub fn run_consensus_math_conformance(
             &self,
             inputs: &[f32],
-        ) -> Result<Vec<[u32; 2]>, String> {
+        ) -> Result<Vec<[u32; 4]>, String> {
             if inputs.is_empty() {
                 return Ok(Vec::new());
             }
@@ -9646,7 +9646,7 @@ pub mod platform {
             let output = self
                 .device
                 .newBufferWithLength_options(
-                    inputs.len() * std::mem::size_of::<[u32; 2]>(),
+                    inputs.len() * std::mem::size_of::<[u32; 4]>(),
                     MTLResourceOptions::StorageModeShared,
                 )
                 .ok_or_else(|| "Metal consensus-math output allocation failed".to_owned())?;
@@ -9681,7 +9681,7 @@ pub mod platform {
             if command_buffer.status() == objc2_metal::MTLCommandBufferStatus::Error {
                 return Err("Metal consensus-math execution failed".to_owned());
             }
-            let pointer = output.contents().as_ptr() as *const [u32; 2];
+            let pointer = output.contents().as_ptr() as *const [u32; 4];
             Ok(unsafe { std::slice::from_raw_parts(pointer, inputs.len()).to_vec() })
         }
 
@@ -15483,14 +15483,23 @@ mod tests {
     #[test]
     fn consensus_math_is_bit_exact_between_rust_and_metal() {
         let context = platform::MetalContext::system_default().expect("Metal device");
-        let inputs = [1.0e-6_f32, 0.001, 0.25, 0.5, 1.0, 2.0, 10.0, 1024.0];
+        let inputs = [1.0e-6_f32, 1.0, 17.0, 128.0, 511.0, 1024.0, 2048.0, 4095.0];
         let observed = context
             .run_consensus_math_conformance(&inputs)
             .expect("consensus math dispatch");
-        let expected = inputs.map(|value| {
+        let expected: [[u32; 4]; 8] = std::array::from_fn(|index| {
+            let value = inputs[index];
             [
                 qx_consensus_math::exp_f32(value).unwrap().to_bits(),
                 qx_consensus_math::rsqrt_f32(value).unwrap().to_bits(),
+                qx_consensus_math::granite_rope_sin_cos(value as u32, index as u32)
+                    .unwrap()
+                    .0
+                    .to_bits(),
+                qx_consensus_math::granite_rope_sin_cos(value as u32, index as u32)
+                    .unwrap()
+                    .1
+                    .to_bits(),
             ]
         });
         assert_eq!(observed, expected);

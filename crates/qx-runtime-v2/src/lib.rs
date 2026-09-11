@@ -4645,12 +4645,12 @@ fn cpu_rms_norm(input: &[f32], weight: &[f32]) -> Vec<f32> {
 }
 
 fn cpu_rotate_heads(values: &mut [f32], heads: usize, position: usize) {
+    let position = u32::try_from(position).expect("Granite position fits u32");
     for head in 0..heads {
         let start = head * HEAD_DIM;
         for pair in 0..HEAD_DIM / 2 {
-            let angle =
-                position as f32 * qx_model::ROPE_THETA.powf(-((2 * pair) as f32) / HEAD_DIM as f32);
-            let (sin, cos) = angle.sin_cos();
+            let (sin, cos) = qx_consensus_math::granite_rope_sin_cos(position, pair as u32)
+                .expect("registered Granite RoPE coordinate");
             let left = values[start + pair];
             let right = values[start + HEAD_DIM / 2 + pair];
             values[start + pair] = left * cos - right * sin;
