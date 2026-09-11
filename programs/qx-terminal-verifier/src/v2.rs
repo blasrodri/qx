@@ -37,6 +37,7 @@ pub(super) const OP_CHALLENGER_FINAL_HEAD_V2: u8 = 36;
 pub(super) const OP_MINER_FINAL_HEAD_V2: u8 = 37;
 pub(super) const OP_STAGE_VM_SCALAR_V2: u8 = 38;
 pub(super) const OP_RESOLVE_STAGED_VM_SCALAR_V2: u8 = 39;
+pub(super) const OP_RESOLVE_STAGED_VM_Q4_V2: u8 = 40;
 
 pub const JOB_PAYLOAD_BYTES: usize = 310;
 pub const JOB_ACCOUNT_BYTES: usize = 314;
@@ -1812,7 +1813,7 @@ pub(super) fn stage_vm_scalar(
             .ok_or(QxError::InvalidEncoding)?,
     )?;
     if !scalar_op_supported(opcode)
-        || opcode == 4
+        || (opcode == 4 && role_mask & !3 != 0)
         || instruction_count != u32_at(&state, D_SEGMENT_INSTRUCTION_COUNT_OFFSET)?
     {
         return Err(QxError::InvalidState.into());
@@ -1931,6 +1932,7 @@ pub(super) fn resolve_staged_vm_scalar(
     if &staged_data[..4] != STAGED_SCALAR_MAGIC
         || staged_data[4..36] != dispute.key.to_bytes()
         || staged_data[89] != 7
+        || staged_data[72] == 4
     {
         return Err(QxError::Unauthorized.into());
     }
@@ -2298,6 +2300,176 @@ pub(super) fn resolve_vm_q4(
         PARTY_MINER
     };
     put(&mut state, D_ACC_START_OFFSET, &expected.to_le_bytes())?;
+    state[D_RESOLUTION_FLAGS_OFFSET] =
+        u8::from(agrees_with_challenger) | (u8::from(disagrees_with_miner) << 1);
+    state[D_PHASE_OFFSET] = PHASE_RESOLVED_V2;
+    state[D_WINNER_OFFSET] = winner;
+    state[D_EXPECTED_PARTY_OFFSET] = PARTY_NONE;
+    Ok(())
+}
+
+/// Resolve a Q4 FMA whose activation, accumulator, and destination need not
+/// share one residual chunk. The weight and scalar operands were independently
+/// authenticated and bound to this dispute and registered instruction.
+pub(super) fn resolve_staged_vm_q4(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [dispute, staged_weight, staged_operands] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    if dispute.owner != program_id
+        || !dispute.is_writable
+        || dispute.data_len() != DISPUTE_V2_ACCOUNT_BYTES
+        || staged_weight.owner != program_id
+        || staged_weight.data_len() != STAGED_WEIGHT_BYTES
+        || staged_operands.owner != program_id
+        || staged_operands.data_len() != STAGED_SCALAR_V2_ACCOUNT_BYTES
+    {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let weight_data = staged_weight.try_borrow_data()?;
+    if &weight_data[..4] != STAGED_WEIGHT_MAGIC || weight_data[4..36] != dispute.key.to_bytes() {
+        return Err(QxError::Unauthorized.into());
+    }
+    let program_counter = u32_at(&weight_data, 36)?;
+    let source_a = u32_at(&weight_data, 40)?;
+    let source_b = u32_at(&weight_data, 44)?;
+    let destination = u32_at(&weight_data, 48)?;
+    let weight = f32::from_bits(u32_at(&weight_data, 52)?);
+    drop(weight_data);
+
+    let operand_data = staged_operands.try_borrow_data()?;
+    if &operand_data[..4] != STAGED_SCALAR_MAGIC
+        || operand_data[4..36] != dispute.key.to_bytes()
+        || operand_data[89] != 3
+        || u32_at(&operand_data, 68)? != program_counter
+    {
+        return Err(QxError::Unauthorized.into());
+    }
+    let common_state: [u8; 32] = operand_data[36..68]
+        .try_into()
+        .map_err(|_| QxError::InvalidEncoding)?;
+    let instruction: [u8; 17] = operand_data[72..89]
+        .try_into()
+        .map_err(|_| QxError::InvalidEncoding)?;
+    if instruction[0] != 4
+        || u32_from(&instruction, 1)? != source_a
+        || u32_from(&instruction, 5)? != source_b
+        || u32_from(&instruction, 13)? != destination
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    let activation = f32::from_bits(u32_at(&operand_data, 92)?);
+    let accumulator = f32::from_bits(u32_at(&operand_data, 96)?);
+    drop(operand_data);
+    if !activation.is_finite() || !accumulator.is_finite() || !weight.is_finite() {
+        return Err(QxError::NonFinite.into());
+    }
+
+    let mut state = dispute.try_borrow_mut_data()?;
+    require_dispute(&state, PHASE_CHALLENGER_TERMINAL)?;
+    require_deadline(&state)?;
+    if program_counter != u32_at(&state, D_LOW_OFFSET)?
+        || common_state != array_at(&state, D_COMMON_ROOT_OFFSET)?
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    let segment_index = cursor.u32()?;
+    let residual_root = cursor.array_32()?;
+    let global_kv_root = cursor.array_32()?;
+    if vm_state_hash(
+        &array_at(&state, D_JOB_HASH_OFFSET)?,
+        u32_at(&state, D_TOKEN_INDEX_OFFSET)?,
+        segment_index,
+        program_counter,
+        &residual_root,
+        &global_kv_root,
+    ) != common_state
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    let byte_length = cursor.u32()?;
+    let chunk_index = cursor.u32()?;
+    let chunk_len = usize::from(cursor.u16()?);
+    let chunk = cursor.take(chunk_len)?;
+    let memory_depth = usize::from(cursor.u8()?);
+    let memory_siblings = cursor.take(
+        memory_depth
+            .checked_mul(32)
+            .ok_or(QxError::InvalidEncoding)?,
+    )?;
+    let memory_count = byte_length.div_ceil(STATE_CHUNK_BYTES as u32);
+    if memory_count == 0 || chunk_index >= memory_count {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let expected_len = if chunk_index.checked_add(1) == Some(memory_count) {
+        let chunk_start = chunk_index
+            .checked_mul(STATE_CHUNK_BYTES as u32)
+            .ok_or(QxError::InvalidEncoding)?;
+        usize::try_from(
+            byte_length
+                .checked_sub(chunk_start)
+                .ok_or(QxError::InvalidEncoding)?,
+        )
+        .map_err(|_| QxError::InvalidEncoding)?
+    } else {
+        STATE_CHUNK_BYTES
+    };
+    if !cursor.is_empty()
+        || byte_length == 0
+        || chunk_len != expected_len
+        || merkle_depth(memory_count)? != memory_depth
+        || state_merkle_root(
+            blake3_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]),
+            chunk_index,
+            memory_siblings,
+        ) != residual_root
+    {
+        return Err(QxError::InvalidReceiptProof.into());
+    }
+    scalar_from_chunk(destination, byte_length, chunk_index, chunk)?;
+    let expected = qx_consensus_math::fma_f32(weight, activation, accumulator);
+    if !expected.is_finite() {
+        return Err(QxError::NonFinite.into());
+    }
+    let chunk_start = chunk_index as usize * STATE_CHUNK_BYTES;
+    let destination_offset = destination as usize - chunk_start;
+    let mut updated_chunk = [0_u8; STATE_CHUNK_BYTES];
+    updated_chunk[..chunk_len].copy_from_slice(chunk);
+    updated_chunk[destination_offset..destination_offset + 4]
+        .copy_from_slice(&expected.to_le_bytes());
+    let post_residual_root = state_merkle_root(
+        blake3_domain(
+            D_STATE_CHUNK,
+            &[&chunk_index.to_le_bytes(), &updated_chunk[..chunk_len]],
+        ),
+        chunk_index,
+        memory_siblings,
+    );
+    let expected_end = vm_state_hash(
+        &array_at(&state, D_JOB_HASH_OFFSET)?,
+        u32_at(&state, D_TOKEN_INDEX_OFFSET)?,
+        segment_index,
+        program_counter
+            .checked_add(1)
+            .ok_or(QxError::InvalidEncoding)?,
+        &post_residual_root,
+        &global_kv_root,
+    );
+    let agrees_with_challenger = expected_end == array_at(&state, D_CHALLENGER_END_OFFSET)?;
+    let disagrees_with_miner = expected_end != array_at(&state, D_DEFENDER_END_OFFSET)?;
+    let winner = if agrees_with_challenger && disagrees_with_miner {
+        PARTY_CHALLENGER
+    } else {
+        PARTY_MINER
+    };
+    put(
+        &mut state,
+        D_ACC_START_OFFSET,
+        &expected.to_bits().to_le_bytes(),
+    )?;
     state[D_RESOLUTION_FLAGS_OFFSET] =
         u8::from(agrees_with_challenger) | (u8::from(disagrees_with_miner) << 1);
     state[D_PHASE_OFFSET] = PHASE_RESOLVED_V2;
