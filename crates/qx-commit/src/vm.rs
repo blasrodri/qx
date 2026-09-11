@@ -32,6 +32,37 @@ pub struct VmStateV1 {
     pub global_kv_root: Digest,
 }
 
+/// Final-head endpoint. Binding the selected token into the endpoint prevents
+/// a valid logits trace from being paired with an unrelated token result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmOutputStateV1 {
+    pub job_hash: Digest,
+    pub token_index: u32,
+    pub segment_index: u32,
+    pub program_counter: u32,
+    pub residual_root: Digest,
+    pub global_kv_root: Digest,
+    pub predicted_token: u32,
+}
+
+impl VmOutputStateV1 {
+    pub fn hash(&self) -> Result<Digest, CommitError> {
+        hash_domain(
+            HashAlgorithm::Blake3V1,
+            crate::D_VM_OUTPUT,
+            &[
+                &self.job_hash,
+                &self.token_index.to_le_bytes(),
+                &self.segment_index.to_le_bytes(),
+                &self.program_counter.to_le_bytes(),
+                &self.residual_root,
+                &self.global_kv_root,
+                &self.predicted_token.to_le_bytes(),
+            ],
+        )
+    }
+}
+
 impl VmStateV1 {
     pub fn hash(&self) -> Result<Digest, CommitError> {
         hash_domain(
@@ -152,5 +183,21 @@ mod tests {
         assert_eq!(decode_q4_weight_selector_v1(selector), (41_755_743, 31));
         assert!(q4_weight_selector_v1(u32::MAX, 0).is_err());
         assert!(q4_weight_selector_v1(0, 32).is_err());
+    }
+
+    #[test]
+    fn output_state_binds_selected_token() {
+        let output = VmOutputStateV1 {
+            job_hash: [1; 32],
+            token_index: 2,
+            segment_index: 3,
+            program_counter: 4,
+            residual_root: [5; 32],
+            global_kv_root: [6; 32],
+            predicted_token: 7,
+        };
+        let mut changed = output;
+        changed.predicted_token = 8;
+        assert_ne!(output.hash().unwrap(), changed.hash().unwrap());
     }
 }

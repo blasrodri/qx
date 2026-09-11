@@ -58,7 +58,8 @@ The current live-SBF measurements are:
 | Chained runtime-chunk scalar terminal | 4,341 |
 | Chained authenticated Q4 terminal (two instructions) | 11,881 |
 | Chained structured KV append (two instructions) | 9,410 |
-| Chained pairwise argmax terminal | 3,972 |
+| Chained pairwise argmax terminal | 4,043 |
+| Bind both final-head traces to shared checkpoint and claimed outputs | 9,156 |
 | Compatibility staged Q4/FMA terminal | 9,533 |
 
 Each additional binary-search level costs one challenger and one miner
@@ -74,12 +75,12 @@ convicts an incorrect update to the same 256-byte chunk tree used by normal
 execution. Compact roots and exact lengths prevent trace shortening.
 
 Automatic slashing remains disabled. The generic hierarchy, canonical
-first-segment checkpoint, chained scalar/Q4/KV terminals, and the pairwise
-lowest-token-ID argmax primitive work. The real Granite computation is not
-lowered into the registered dispute VM yet, K/V vector roots are not yet
-produced through that lowering, and prediction disagreements do not yet
-descend into a final-head trace. Collateral transfer and durable input
-availability are also outside this proof milestone. See
+first-segment checkpoint, chained scalar/Q4/KV terminals, and token-bound
+final-head argmax path work. Equal-checkpoint prediction disagreements now
+descend through a registered operator trace and resolve objectively. The real
+Granite computation is not lowered into the registered dispute VM yet, and
+logit/K/V vector roots are not yet produced through that lowering. Collateral
+transfer and durable input availability are also outside this proof milestone. See
 `docs/verification-security-audit.md` for the exact readiness gate.
 
 ## Epoch selection

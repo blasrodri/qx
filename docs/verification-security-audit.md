@@ -14,10 +14,10 @@ same 256-byte residual commitment emitted by normal execution.
 
 The remaining boundary is complete model lowering rather than the bisection
 primitive. Chained authenticated Q4 and structured KV-frontier transitions now
-work, but the real Granite operator schedule, its dispute-local working-memory
-commitments, K/V root production, and final-head descent are not wired. The
-pairwise argmax terminal itself is implemented and enforces the lowest-token-ID
-tie rule.
+work, and an equal-checkpoint prediction disagreement descends into a
+token-bound final-head trace. The real Granite operator schedule, its
+dispute-local working-memory commitments, logits production, and K/V root
+production are not yet wired.
 The tests therefore do not yet prove the entire model's `Execute(M, E, X)`
 claim.
 
@@ -42,7 +42,8 @@ claim.
 | Chained objective scalar update | instruction, runtime-format residual chunk, old/new root, token, segment, PC, and unchanged KV root are bound | Implemented end to end on SBF |
 | Chained authenticated Q4 update | registered instruction selects an exact model-weight leaf; its 26-level proof is staged and the VM memory/root update is objective | Implemented end to end on SBF; 11,881 CU |
 | Structured KV append | proves the exact token slot was empty, preserves the layer frontier, and updates the authenticated global layer root | Implemented on SBF; K/V root production still needs Granite lowering |
-| Pairwise greedy argmax | authenticated logits select the higher score and exact ties select the lower token ID | Implemented on SBF; not yet reachable from equal-checkpoint prediction disputes |
+| Pairwise greedy argmax | authenticated `[logit, token]` records select the higher score, exact ties select the lower token ID, and both fields are copied for tournament reduction | Implemented on SBF and reached from an equal-checkpoint prediction dispute |
+| Final-head output binding | shared final checkpoint starts both registered traces; distinct output-state hashes bind each trace to its claimed prediction | Implemented end to end on SBF |
 | Objective arithmetic library | Q4 FMA plus fixed add/mul/div/exp/rsqrt/reduction primitives | Implemented; not every family is wired into the chained VM |
 | Turn liveness | every unilateral move has a deadline and either non-responder loses | Implemented and tested |
 
@@ -79,7 +80,8 @@ entropy finalization consumes 1,785 CU once per epoch; opening the challenged
 job costs 8,396 CU. A two-party operator-boundary submission costs 7,656 CU,
 the runtime-state-chunk scalar terminal costs 4,341 CU, the chained Q4 terminal
 costs 11,881 CU, structured KV append costs 9,410 CU, and pairwise argmax costs
-3,972 CU. Larger traces add a
+4,043 CU. Submitting both sides of the final-head boundary costs 9,156 CU.
+Larger traces add a
 challenger/miner midpoint pair for every binary-search level (10,329 CU in the
 three-leaf test). These costs occur only after a sampled replay disagrees.
 
@@ -110,9 +112,10 @@ pre-layer checkpoint now binds the embedding
 residual and prior-token global KV root, and the SBF hierarchy test exercises
 a disagreement in the first checkpoint interval.
 
-The final-head argmax and its lowest-token-ID tie rule must be inside this same
-chained path, not merely stored as `predicted_token`. Equal checkpoint roots
-with different predicted tokens are therefore not yet settlement-safe.
+The final-head path and token-bound output state are now inside the chained
+dispute path. What remains is lowering the real LM head and full-vocabulary
+argmax tournament into that registered program, rather than the two-candidate
+SBF fixture.
 
 ### P0: bind K/V root production
 

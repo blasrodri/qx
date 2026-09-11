@@ -151,6 +151,12 @@ pub fn process_instruction(
         v2::OP_STAGE_VM_KV_V2 => v2::stage_vm_kv(program_id, accounts, &mut cursor),
         v2::OP_RESOLVE_VM_KV_V2 => v2::resolve_vm_kv(program_id, accounts, &mut cursor),
         v2::OP_RESOLVE_VM_ARGMAX_V2 => v2::resolve_vm_argmax(program_id, accounts, &mut cursor),
+        v2::OP_CHALLENGER_FINAL_HEAD_V2 => {
+            v2::submit_challenger_final_head(program_id, accounts, &mut cursor)
+        }
+        v2::OP_MINER_FINAL_HEAD_V2 => {
+            v2::submit_miner_final_head(program_id, accounts, &mut cursor)
+        }
         _ => Err(QxError::InvalidEncoding.into()),
     }
 }

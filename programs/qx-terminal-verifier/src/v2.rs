@@ -33,6 +33,8 @@ pub(super) const OP_RESOLVE_VM_Q4_V2: u8 = 32;
 pub(super) const OP_STAGE_VM_KV_V2: u8 = 33;
 pub(super) const OP_RESOLVE_VM_KV_V2: u8 = 34;
 pub(super) const OP_RESOLVE_VM_ARGMAX_V2: u8 = 35;
+pub(super) const OP_CHALLENGER_FINAL_HEAD_V2: u8 = 36;
+pub(super) const OP_MINER_FINAL_HEAD_V2: u8 = 37;
 
 pub const JOB_PAYLOAD_BYTES: usize = 310;
 pub const JOB_ACCOUNT_BYTES: usize = 314;
@@ -101,6 +103,7 @@ const D_SCALAR_STATE: &[u8] = b"QX:SCALAR:STATE:V1";
 const D_PROGRAM_TREE: &[u8] = b"QX:PROGRAM:TREE:V1";
 const D_PROGRAM_INSTRUCTION: &[u8] = b"QX:PROGRAM:INSTRUCTION:V1";
 const D_VM_STATE: &[u8] = b"QX:VM:STATE:V1";
+const D_VM_OUTPUT: &[u8] = b"QX:VM:OUTPUT:V1";
 const D_VM_INSTRUCTION: &[u8] = b"QX:VM:INSTRUCTION:V1";
 const D_STATE_CHUNK: &[u8] = b"QX:STATE:CHUNK:V1";
 const D_MERKLE_EMPTY: &[u8] = b"QX:MERKLE:EMPTY:V1";
@@ -121,9 +124,8 @@ const PHASE_CHALLENGER_CHECKPOINT: u8 = 11;
 const PHASE_MINER_CHECKPOINT: u8 = 12;
 const PHASE_CHALLENGER_OPERATOR_ROOT: u8 = 13;
 const PHASE_MINER_OPERATOR_ROOT: u8 = 14;
-/// A valid disagreement reached a transition family that this version cannot
-/// decide. No timeout or winner is possible from this fail-closed state.
-const PHASE_UNSUPPORTED: u8 = 15;
+const PHASE_CHALLENGER_FINAL_HEAD: u8 = 16;
+const PHASE_MINER_FINAL_HEAD: u8 = 17;
 const PARTY_NONE: u8 = 0;
 const PARTY_MINER: u8 = 1;
 const PARTY_CHALLENGER: u8 = 2;
@@ -173,6 +175,7 @@ const D_COMMON_KV_OFFSET: usize = 696;
 const TRACE_KIND_JOB: u8 = 1;
 const TRACE_KIND_TOKEN: u8 = 2;
 const TRACE_KIND_OPERATOR: u8 = 3;
+const TRACE_KIND_FINAL_HEAD: u8 = 4;
 
 pub(super) fn register_job(
     program_id: &Pubkey,
@@ -823,10 +826,18 @@ pub(super) fn submit_miner_token(
         .map_err(|_| QxError::InvalidEncoding)?;
     let challenger_root = array_at(&state, D_CHALLENGER_TOKEN_ROOT_OFFSET)?;
     if defender_root == challenger_root {
-        // The checkpoint execution agrees and only the final head/argmax is
-        // disputed. Freeze until that registered transition is implemented;
-        // allowing a timeout here would let one side win without proof.
-        return set_phase(&mut state, PHASE_UNSUPPORTED, PARTY_NONE);
+        if token[68..72]
+            == state[D_CHALLENGER_PREDICTION_OFFSET..D_CHALLENGER_PREDICTION_OFFSET + 4]
+        {
+            return Err(QxError::InvalidState.into());
+        }
+        put(&mut state, D_DEFENDER_ROOT_OFFSET, &defender_root)?;
+        put(&mut state, D_CHALLENGER_ROOT_OFFSET, &challenger_root)?;
+        put(&mut state, D_LOW_OFFSET, &0_u32.to_le_bytes())?;
+        put(&mut state, D_HIGH_OFFSET, &checkpoint_count.to_le_bytes())?;
+        state[D_RESOLUTION_FLAGS_OFFSET] = TRACE_KIND_FINAL_HEAD;
+        set_phase(&mut state, PHASE_CHALLENGER_FINAL_HEAD, PARTY_CHALLENGER)?;
+        return refresh_deadline(&mut state, Clock::get()?.slot);
     }
     put(&mut state, D_DEFENDER_ROOT_OFFSET, &defender_root)?;
     put(&mut state, D_CHALLENGER_ROOT_OFFSET, &challenger_root)?;
@@ -843,6 +854,190 @@ pub(super) fn submit_miner_token(
     )?;
     state[D_RESOLUTION_FLAGS_OFFSET] = TRACE_KIND_TOKEN;
     set_phase(&mut state, PHASE_CHALLENGER_BOUNDS, PARTY_CHALLENGER)?;
+    refresh_deadline(&mut state, Clock::get()?.slot)
+}
+
+/// When checkpoint roots agree but predicted tokens differ, authenticate the
+/// shared final checkpoint and bind the challenger's final-head trace to that
+/// checkpoint and its claimed output token.
+pub(super) fn submit_challenger_final_head(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [model, dispute, challenger] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    if model.owner != program_id || model.data_len() != MODEL_ACCOUNT_BYTES {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let mut state = checked_party_state(
+        program_id,
+        dispute,
+        challenger,
+        PHASE_CHALLENGER_FINAL_HEAD,
+        PARTY_CHALLENGER,
+    )?;
+    if state[D_MODEL_OFFSET..D_MODEL_OFFSET + 32] != model.key.to_bytes() {
+        return Err(QxError::Unauthorized.into());
+    }
+    let checkpoint = cursor.take(102)?;
+    let checkpoint_depth = usize::from(cursor.u8()?);
+    let checkpoint_siblings = cursor.take(
+        checkpoint_depth
+            .checked_mul(32)
+            .ok_or(QxError::InvalidEncoding)?,
+    )?;
+    let model_data = model.try_borrow_data()?;
+    if &model_data[..4] != MODEL_MAGIC {
+        return Err(QxError::InvalidState.into());
+    }
+    let checkpoint_count = u32_at(&state, D_TOKEN_COUNT_OFFSET)?;
+    let checkpoint_index = checkpoint_count
+        .checked_sub(1)
+        .ok_or(QxError::InvalidState)?;
+    let model_layers = u32::from(u16_from(&model_data, 144)?);
+    if checkpoint[..32] != state[D_JOB_ID_OFFSET..D_JOB_ID_OFFSET + 32]
+        || u32_from(checkpoint, 32)? != u32_at(&state, D_TOKEN_INDEX_OFFSET)?
+        || u32::from(u16_from(checkpoint, 36)?)
+            != model_layers.checked_sub(1).ok_or(QxError::InvalidState)?
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    verify_merkle_blake3(
+        blake3_domain(D_CHECKPOINT, &[checkpoint]),
+        checkpoint_index,
+        checkpoint_count,
+        checkpoint_depth,
+        checkpoint_siblings,
+        array_at(&state, D_CHALLENGER_ROOT_OFFSET)?,
+        D_TOKEN_TREE,
+    )?;
+    let instruction_count = u32_at(&model_data, 136)?;
+    let trace_length = instruction_count
+        .checked_add(1)
+        .ok_or(QxError::InvalidEncoding)?;
+    drop(model_data);
+    let end_residual = cursor.array_32()?;
+    let end_kv = cursor.array_32()?;
+    let trace_root = cursor.array_32()?;
+    let (start, end) = parse_and_verify_bounds(cursor, trace_length, trace_root, D_OPERATOR_TREE)?;
+    let segment_index = u32_at(&state, D_HIGH_OFFSET)?;
+    let checkpoint_residual: [u8; 32] = checkpoint[38..70]
+        .try_into()
+        .map_err(|_| QxError::InvalidEncoding)?;
+    let checkpoint_kv: [u8; 32] = checkpoint[70..102]
+        .try_into()
+        .map_err(|_| QxError::InvalidEncoding)?;
+    let expected_start = vm_state_hash(
+        &array_at(&state, D_JOB_HASH_OFFSET)?,
+        u32_at(&state, D_TOKEN_INDEX_OFFSET)?,
+        segment_index,
+        0,
+        &checkpoint_residual,
+        &checkpoint_kv,
+    );
+    let expected_end = vm_output_hash(
+        &array_at(&state, D_JOB_HASH_OFFSET)?,
+        u32_at(&state, D_TOKEN_INDEX_OFFSET)?,
+        segment_index,
+        instruction_count,
+        &end_residual,
+        &end_kv,
+        u32_at(&state, D_CHALLENGER_PREDICTION_OFFSET)?,
+    );
+    if start != expected_start || end != expected_end {
+        return Err(QxError::InvalidState.into());
+    }
+    put(&mut state, D_COMMON_RESIDUAL_OFFSET, &checkpoint[38..70])?;
+    put(&mut state, D_COMMON_KV_OFFSET, &checkpoint[70..102])?;
+    put(&mut state, D_CHALLENGER_RESIDUAL_OFFSET, &end_residual)?;
+    put(&mut state, D_CHALLENGER_KV_OFFSET, &end_kv)?;
+    put(&mut state, D_CHALLENGER_ROOT_OFFSET, &trace_root)?;
+    put(&mut state, D_COMMON_ROOT_OFFSET, &start)?;
+    put(&mut state, D_CHALLENGER_END_OFFSET, &end)?;
+    put(
+        &mut state,
+        D_TRACE_LENGTH_OFFSET,
+        &trace_length.to_le_bytes(),
+    )?;
+    set_phase(&mut state, PHASE_MINER_FINAL_HEAD, PARTY_MINER)?;
+    refresh_deadline(&mut state, Clock::get()?.slot)
+}
+
+/// Bind the miner's final-head trace to the same shared checkpoint and its
+/// different predicted token, then enter the common operator bisection game.
+pub(super) fn submit_miner_final_head(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [model, dispute, miner] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    if model.owner != program_id || model.data_len() != MODEL_ACCOUNT_BYTES {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let mut state = checked_party_state(
+        program_id,
+        dispute,
+        miner,
+        PHASE_MINER_FINAL_HEAD,
+        PARTY_MINER,
+    )?;
+    if state[D_MODEL_OFFSET..D_MODEL_OFFSET + 32] != model.key.to_bytes() {
+        return Err(QxError::Unauthorized.into());
+    }
+    let model_data = model.try_borrow_data()?;
+    if &model_data[..4] != MODEL_MAGIC {
+        return Err(QxError::InvalidState.into());
+    }
+    let instruction_count = u32_at(&model_data, 136)?;
+    let trace_length = instruction_count
+        .checked_add(1)
+        .ok_or(QxError::InvalidEncoding)?;
+    drop(model_data);
+    let end_residual = cursor.array_32()?;
+    let end_kv = cursor.array_32()?;
+    let trace_root = cursor.array_32()?;
+    let (start, end) = parse_and_verify_bounds(cursor, trace_length, trace_root, D_OPERATOR_TREE)?;
+    let segment_index = u32_at(&state, D_HIGH_OFFSET)?;
+    let expected_start = vm_state_hash(
+        &array_at(&state, D_JOB_HASH_OFFSET)?,
+        u32_at(&state, D_TOKEN_INDEX_OFFSET)?,
+        segment_index,
+        0,
+        &array_at(&state, D_COMMON_RESIDUAL_OFFSET)?,
+        &array_at(&state, D_COMMON_KV_OFFSET)?,
+    );
+    let expected_end = vm_output_hash(
+        &array_at(&state, D_JOB_HASH_OFFSET)?,
+        u32_at(&state, D_TOKEN_INDEX_OFFSET)?,
+        segment_index,
+        instruction_count,
+        &end_residual,
+        &end_kv,
+        u32_at(&state, D_DEFENDER_PREDICTION_OFFSET)?,
+    );
+    if start != expected_start
+        || start != array_at(&state, D_COMMON_ROOT_OFFSET)?
+        || end != expected_end
+        || end == array_at(&state, D_CHALLENGER_END_OFFSET)?
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    put(&mut state, D_DEFENDER_RESIDUAL_OFFSET, &end_residual)?;
+    put(&mut state, D_DEFENDER_KV_OFFSET, &end_kv)?;
+    put(&mut state, D_DEFENDER_ROOT_OFFSET, &trace_root)?;
+    put(&mut state, D_DEFENDER_END_OFFSET, &end)?;
+    put(&mut state, D_LOW_OFFSET, &0_u32.to_le_bytes())?;
+    put(&mut state, D_HIGH_OFFSET, &instruction_count.to_le_bytes())?;
+    state[D_RESOLUTION_FLAGS_OFFSET] = TRACE_KIND_FINAL_HEAD;
+    if trace_length == 2 {
+        set_terminal_phase(&mut state)?;
+    } else {
+        set_phase(&mut state, PHASE_CHALLENGER_MIDPOINT, PARTY_CHALLENGER)?;
+    }
     refresh_deadline(&mut state, Clock::get()?.slot)
 }
 
@@ -2043,9 +2238,10 @@ pub(super) fn resolve_vm_kv(
     Ok(())
 }
 
-/// Resolve a pairwise greedy-output claim. The two authenticated memory
-/// records are `[logit_bits, token_id]`; a higher finite logit wins and equal
-/// logits select the lower token ID.
+/// Resolve one pairwise greedy-output reduction. Source and destination
+/// records are `[logit_bits, token_id]`; copying both fields lets a registered
+/// program reduce the entire vocabulary as a deterministic tournament. A
+/// higher finite logit wins and equal logits select the lower token ID.
 pub(super) fn resolve_vm_argmax(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2167,6 +2363,12 @@ pub(super) fn resolve_vm_argmax(
         chunk,
     )?;
     scalar_from_chunk(destination, byte_length, chunk_index, chunk)?;
+    scalar_from_chunk(
+        destination.checked_add(4).ok_or(QxError::InvalidEncoding)?,
+        byte_length,
+        chunk_index,
+        chunk,
+    )?;
     if !f32::from_bits(left_logit).is_finite()
         || !f32::from_bits(right_logit).is_finite()
         || left_token >= vocab_size
@@ -2177,32 +2379,50 @@ pub(super) fn resolve_vm_argmax(
     }
     let left_key = finite_key(left_logit);
     let right_key = finite_key(right_logit);
-    let selected = if right_key > left_key || (right_key == left_key && right_token < left_token) {
-        right_token
-    } else {
-        left_token
-    };
+    let (selected_logit, selected) =
+        if right_key > left_key || (right_key == left_key && right_token < left_token) {
+            (right_logit, right_token)
+        } else {
+            (left_logit, left_token)
+        };
     let chunk_start = chunk_index as usize * STATE_CHUNK_BYTES;
     let destination_offset = destination as usize - chunk_start;
     let mut updated_chunk = [0_u8; STATE_CHUNK_BYTES];
     updated_chunk[..chunk_len].copy_from_slice(chunk);
     updated_chunk[destination_offset..destination_offset + 4]
+        .copy_from_slice(&selected_logit.to_le_bytes());
+    updated_chunk[destination_offset + 4..destination_offset + 8]
         .copy_from_slice(&selected.to_le_bytes());
     let updated_leaf = blake3_domain(
         D_STATE_CHUNK,
         &[&chunk_index.to_le_bytes(), &updated_chunk[..chunk_len]],
     );
     let post_residual_root = state_merkle_root(updated_leaf, chunk_index, memory_siblings);
-    let expected_end = vm_state_hash(
-        &array_at(&state, D_JOB_HASH_OFFSET)?,
-        u32_at(&state, D_TOKEN_INDEX_OFFSET)?,
-        segment_index,
-        program_counter
-            .checked_add(1)
-            .ok_or(QxError::InvalidEncoding)?,
-        &post_residual_root,
-        &global_kv_root,
-    );
+    let next_program_counter = program_counter
+        .checked_add(1)
+        .ok_or(QxError::InvalidEncoding)?;
+    let expected_end = if state[D_RESOLUTION_FLAGS_OFFSET] == TRACE_KIND_FINAL_HEAD
+        && next_program_counter == instruction_count
+    {
+        vm_output_hash(
+            &array_at(&state, D_JOB_HASH_OFFSET)?,
+            u32_at(&state, D_TOKEN_INDEX_OFFSET)?,
+            segment_index,
+            next_program_counter,
+            &post_residual_root,
+            &global_kv_root,
+            selected,
+        )
+    } else {
+        vm_state_hash(
+            &array_at(&state, D_JOB_HASH_OFFSET)?,
+            u32_at(&state, D_TOKEN_INDEX_OFFSET)?,
+            segment_index,
+            next_program_counter,
+            &post_residual_root,
+            &global_kv_root,
+        )
+    };
     let agrees_with_challenger = expected_end == array_at(&state, D_CHALLENGER_END_OFFSET)?;
     let disagrees_with_miner = expected_end != array_at(&state, D_DEFENDER_END_OFFSET)?;
     let winner = if agrees_with_challenger && disagrees_with_miner {
@@ -2285,6 +2505,29 @@ fn vm_state_hash(
             &program_counter.to_le_bytes(),
             residual_root,
             global_kv_root,
+        ],
+    )
+}
+
+fn vm_output_hash(
+    job_hash: &[u8; 32],
+    token_index: u32,
+    segment_index: u32,
+    program_counter: u32,
+    residual_root: &[u8; 32],
+    global_kv_root: &[u8; 32],
+    predicted_token: u32,
+) -> [u8; 32] {
+    blake3_domain(
+        D_VM_OUTPUT,
+        &[
+            job_hash,
+            &token_index.to_le_bytes(),
+            &segment_index.to_le_bytes(),
+            &program_counter.to_le_bytes(),
+            residual_root,
+            global_kv_root,
+            &predicted_token.to_le_bytes(),
         ],
     )
 }
@@ -2400,7 +2643,7 @@ fn trace_domain(state: &[u8]) -> Result<&'static [u8], ProgramError> {
     match state[D_RESOLUTION_FLAGS_OFFSET] {
         TRACE_KIND_JOB => Ok(D_TRACE_TREE),
         TRACE_KIND_TOKEN => Ok(D_TOKEN_TREE),
-        TRACE_KIND_OPERATOR => Ok(D_OPERATOR_TREE),
+        TRACE_KIND_OPERATOR | TRACE_KIND_FINAL_HEAD => Ok(D_OPERATOR_TREE),
         _ => Err(QxError::InvalidState.into()),
     }
 }
@@ -2409,7 +2652,7 @@ fn set_terminal_phase(state: &mut [u8]) -> ProgramResult {
     let phase = match state[D_RESOLUTION_FLAGS_OFFSET] {
         TRACE_KIND_JOB => PHASE_CHALLENGER_TOKEN,
         TRACE_KIND_TOKEN => PHASE_CHALLENGER_CHECKPOINT,
-        TRACE_KIND_OPERATOR => PHASE_CHALLENGER_TERMINAL,
+        TRACE_KIND_OPERATOR | TRACE_KIND_FINAL_HEAD => PHASE_CHALLENGER_TERMINAL,
         _ => return Err(QxError::InvalidState.into()),
     };
     set_phase(state, phase, PARTY_CHALLENGER)

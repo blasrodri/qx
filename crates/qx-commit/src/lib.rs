@@ -45,7 +45,7 @@ pub use state::{
     state_hash_v1,
 };
 pub use vm::{
-    Q4_SELECTOR_LOCAL_BITS, VmInstructionV1, VmMemoryOpeningV1, VmStateV1,
+    Q4_SELECTOR_LOCAL_BITS, VmInstructionV1, VmMemoryOpeningV1, VmOutputStateV1, VmStateV1,
     decode_q4_weight_selector_v1, q4_weight_selector_v1,
 };
 pub use weights::{
@@ -85,6 +85,7 @@ pub const D_AUDIT_DRAW: &[u8] = b"QX:AUDIT:DRAW:V1";
 pub const D_DISPUTE_TRACE: &[u8] = b"QX:DISPUTE:TRACE:V1";
 pub const D_FMA_STATE: &[u8] = b"QX:FMA:STATE:V1";
 pub const D_VM_STATE: &[u8] = b"QX:VM:STATE:V1";
+pub const D_VM_OUTPUT: &[u8] = b"QX:VM:OUTPUT:V1";
 pub const D_VM_INSTRUCTION: &[u8] = b"QX:VM:INSTRUCTION:V1";
 pub const D_PROGRAM_TREE: &[u8] = b"QX:PROGRAM:TREE:V1";
 pub const D_OPERATOR_TREE: &[u8] = b"QX:OPERATOR:V1";

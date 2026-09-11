@@ -5,8 +5,8 @@ use qx_commit::{
     activation_hash_v1, hash_domain, job_genesis_hash_v1, prove_state_chunk_v1, state_hash_v1,
     CheckpointV1, EpochBlockSeedV2, FmaStateV1, HashAlgorithm, JobPayloadV1, MerkleProof,
     MerkleTree, ProtocolVersion, ResultLeafV1, StateTreeKindV1, TokenResultV1, VmInstructionV1,
-    VmStateV1, WeightLeafV1, D_BATCH, D_JOB, D_MERKLE, D_OPERATOR_TREE, D_PROGRAM_TREE, D_TOKEN,
-    D_WEIGHT_TREE,
+    VmOutputStateV1, VmStateV1, WeightLeafV1, D_BATCH, D_JOB, D_MERKLE, D_OPERATOR_TREE,
+    D_PROGRAM_TREE, D_TOKEN, D_WEIGHT_TREE,
 };
 use solana_account::Account;
 use solana_hash::Hash;
@@ -555,8 +555,14 @@ fn chained_vm_argmax_enforces_lowest_token_tie_on_sbf() {
         residual_root: memory_root,
         global_kv_root: [0x91; 32],
     };
-    let honest_root = opening.root_after_scalar_write(16, 9).unwrap();
-    let miner_root = opening.root_after_scalar_write(16, 42).unwrap();
+    let mut honest_memory = memory.clone();
+    honest_memory[16..20].copy_from_slice(&7.0_f32.to_bits().to_le_bytes());
+    honest_memory[20..24].copy_from_slice(&9_u32.to_le_bytes());
+    let honest_root = state_hash_v1(&honest_memory).unwrap();
+    let mut miner_memory = memory.clone();
+    miner_memory[16..20].copy_from_slice(&7.0_f32.to_bits().to_le_bytes());
+    miner_memory[20..24].copy_from_slice(&42_u32.to_le_bytes());
+    let miner_root = state_hash_v1(&miner_memory).unwrap();
     let honest_post = pre.successor(honest_root).unwrap();
     let miner_post = pre.successor(miner_root).unwrap();
     let mut model = owned(MODEL_BYTES, f.program);
@@ -1162,6 +1168,301 @@ fn sbf_bisects_the_actual_runtime_job_leaf_format() {
     println!(
         "v2_operator_boundary_cu={}",
         challenger_operator_cu + miner_operator_cu
+    );
+}
+
+#[test]
+fn equal_checkpoints_descend_into_final_head_and_convict_wrong_token_on_sbf() {
+    let mut f = Fixture::new();
+    let instruction = VmInstructionV1 {
+        opcode: 8,
+        source_a: 0,
+        source_b: 8,
+        source_c: 0,
+        destination: 16,
+    };
+    f.verification_instruction = instruction;
+
+    let mut memory = vec![0_u8; 256];
+    memory[..4].copy_from_slice(&7.0_f32.to_le_bytes());
+    memory[4..8].copy_from_slice(&42_u32.to_le_bytes());
+    memory[8..12].copy_from_slice(&7.0_f32.to_le_bytes());
+    memory[12..16].copy_from_slice(&9_u32.to_le_bytes());
+    memory[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+    let memory_root = state_hash_v1(&memory).unwrap();
+    let opening = prove_state_chunk_v1(StateTreeKindV1::Residual, &memory, 0).unwrap();
+    let common_kv = [0x72; 32];
+
+    let genesis_checkpoint = CheckpointV1 {
+        job_id: f.job.job_id,
+        token_index: 1,
+        layer_index: u16::MAX,
+        residual_hash: [0x30; 32],
+        global_kv_root: [0x31; 32],
+    };
+    let middle_checkpoint = CheckpointV1 {
+        layer_index: 1,
+        residual_hash: [0x32; 32],
+        global_kv_root: [0x33; 32],
+        ..genesis_checkpoint
+    };
+    let final_checkpoint = CheckpointV1 {
+        layer_index: 3,
+        residual_hash: memory_root,
+        global_kv_root: common_kv,
+        ..genesis_checkpoint
+    };
+    let checkpoint_tree = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        D_TOKEN,
+        &[
+            genesis_checkpoint.hash().unwrap(),
+            middle_checkpoint.hash().unwrap(),
+            final_checkpoint.hash().unwrap(),
+        ],
+    )
+    .unwrap();
+
+    let common_token = TokenResultV1 {
+        job_id: f.job.job_id,
+        token_index: 0,
+        checkpoint_root: [8; 32],
+        predicted_token: 41,
+        checkpoint_count: 2,
+    };
+    let challenger_token = TokenResultV1 {
+        job_id: f.job.job_id,
+        token_index: 1,
+        checkpoint_root: checkpoint_tree.root(),
+        predicted_token: 9,
+        checkpoint_count: 3,
+    };
+    let miner_token = TokenResultV1 {
+        predicted_token: 42,
+        ..challenger_token
+    };
+    let job_genesis = job_genesis_hash_v1(&f.job.job_id).unwrap();
+    let common_token_hash = common_token.hash().unwrap();
+    let challenger_token_hash = challenger_token.hash().unwrap();
+    let miner_token_hash = miner_token.hash().unwrap();
+    f.honest_tree = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        D_JOB,
+        &[job_genesis, common_token_hash, challenger_token_hash],
+    )
+    .unwrap();
+    f.miner_tree = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        D_JOB,
+        &[job_genesis, common_token_hash, miner_token_hash],
+    )
+    .unwrap();
+    f.result.trace_root = f.miner_tree.root();
+    f.results = MerkleTree::new(
+        HashAlgorithm::Sha256V1,
+        D_BATCH,
+        &[f.result.hash().unwrap(), [99; 32]],
+    )
+    .unwrap();
+
+    let mut vm = f.vm();
+    let (model, epoch, _) = f.seeded_epoch(&mut vm);
+    let (dispute, _) = f.open(&vm, epoch, model.clone());
+    let (dispute, _) = f.bounds_hashes(&vm, dispute, true, job_genesis, challenger_token_hash);
+    let (dispute, _) = f.bounds_hashes(&vm, dispute, false, job_genesis, miner_token_hash);
+    let (dispute, _) = f.midpoint_hash(&vm, dispute, true, common_token_hash);
+    let (dispute, _) = f.midpoint_hash(&vm, dispute, false, common_token_hash);
+
+    let challenger_reveal = vm.process_instruction(
+        &f.ix(
+            25,
+            vec![
+                AccountMeta::new_readonly(f.model, false),
+                AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.challenger, true),
+            ],
+            &challenger_token.canonical_bytes(),
+        ),
+        &[
+            (f.model, model.clone()),
+            (f.dispute, dispute),
+            (f.challenger, Account::default()),
+        ],
+    );
+    assert_ok(&challenger_reveal.program_result);
+    let dispute = account(&challenger_reveal.resulting_accounts, f.dispute);
+    let miner_reveal = vm.process_instruction(
+        &f.ix(
+            26,
+            vec![
+                AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.miner, true),
+            ],
+            &miner_token.canonical_bytes(),
+        ),
+        &[(f.dispute, dispute), (f.miner, Account::default())],
+    );
+    assert_ok(&miner_reveal.program_result);
+    let dispute = account(&miner_reveal.resulting_accounts, f.dispute);
+    assert_eq!(dispute.data[4], 16);
+
+    let pre = VmStateV1 {
+        job_hash: f.job.hash().unwrap(),
+        token_index: 1,
+        segment_index: 3,
+        program_counter: 0,
+        residual_root: memory_root,
+        global_kv_root: common_kv,
+    };
+    let mut challenger_memory = memory.clone();
+    challenger_memory[16..20].copy_from_slice(&7.0_f32.to_bits().to_le_bytes());
+    challenger_memory[20..24].copy_from_slice(&9_u32.to_le_bytes());
+    let challenger_residual = state_hash_v1(&challenger_memory).unwrap();
+    let mut miner_memory = memory.clone();
+    miner_memory[16..20].copy_from_slice(&7.0_f32.to_bits().to_le_bytes());
+    miner_memory[20..24].copy_from_slice(&42_u32.to_le_bytes());
+    let miner_residual = state_hash_v1(&miner_memory).unwrap();
+    let challenger_output = VmOutputStateV1 {
+        job_hash: pre.job_hash,
+        token_index: pre.token_index,
+        segment_index: pre.segment_index,
+        program_counter: 1,
+        residual_root: challenger_residual,
+        global_kv_root: common_kv,
+        predicted_token: 9,
+    };
+    let miner_output = VmOutputStateV1 {
+        residual_root: miner_residual,
+        predicted_token: 42,
+        ..challenger_output
+    };
+    let challenger_operator = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        D_OPERATOR_TREE,
+        &[pre.hash().unwrap(), challenger_output.hash().unwrap()],
+    )
+    .unwrap();
+    let miner_operator = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        D_OPERATOR_TREE,
+        &[pre.hash().unwrap(), miner_output.hash().unwrap()],
+    )
+    .unwrap();
+    let operator_bounds = |tree: &MerkleTree, end: [u8; 32]| {
+        let start_proof = tree.proof(0).unwrap();
+        let end_proof = tree.proof(1).unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(&tree.root());
+        body.extend_from_slice(&pre.hash().unwrap());
+        body.extend_from_slice(&end);
+        body.push(start_proof.siblings.len() as u8);
+        append_siblings(&mut body, &start_proof);
+        append_siblings(&mut body, &end_proof);
+        body
+    };
+
+    let checkpoint_proof = checkpoint_tree.proof(2).unwrap();
+    let mut challenger_head_body = final_checkpoint.canonical_bytes().to_vec();
+    challenger_head_body.push(checkpoint_proof.siblings.len() as u8);
+    append_siblings(&mut challenger_head_body, &checkpoint_proof);
+    challenger_head_body.extend_from_slice(&challenger_residual);
+    challenger_head_body.extend_from_slice(&common_kv);
+    challenger_head_body.extend_from_slice(&operator_bounds(
+        &challenger_operator,
+        challenger_output.hash().unwrap(),
+    ));
+    let challenger_head = vm.process_instruction(
+        &f.ix(
+            36,
+            vec![
+                AccountMeta::new_readonly(f.model, false),
+                AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.challenger, true),
+            ],
+            &challenger_head_body,
+        ),
+        &[
+            (f.model, model.clone()),
+            (f.dispute, dispute),
+            (f.challenger, Account::default()),
+        ],
+    );
+    assert_ok(&challenger_head.program_result);
+    let dispute = account(&challenger_head.resulting_accounts, f.dispute);
+
+    let mut miner_head_body = Vec::new();
+    miner_head_body.extend_from_slice(&miner_residual);
+    miner_head_body.extend_from_slice(&common_kv);
+    miner_head_body.extend_from_slice(&operator_bounds(
+        &miner_operator,
+        miner_output.hash().unwrap(),
+    ));
+    let miner_head = vm.process_instruction(
+        &f.ix(
+            37,
+            vec![
+                AccountMeta::new_readonly(f.model, false),
+                AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.miner, true),
+            ],
+            &miner_head_body,
+        ),
+        &[
+            (f.model, model.clone()),
+            (f.dispute, dispute),
+            (f.miner, Account::default()),
+        ],
+    );
+    assert_ok(&miner_head.program_result);
+    let dispute = account(&miner_head.resulting_accounts, f.dispute);
+    assert_eq!(dispute.data[4], 5);
+
+    let instruction_tree = MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        D_PROGRAM_TREE,
+        &[instruction.hash(0).unwrap()],
+    )
+    .unwrap();
+    let instruction_proof = instruction_tree.proof(0).unwrap();
+    let mut terminal_body = Vec::new();
+    terminal_body.extend_from_slice(&pre.segment_index.to_le_bytes());
+    terminal_body.extend_from_slice(&pre.program_counter.to_le_bytes());
+    terminal_body.extend_from_slice(&pre.residual_root);
+    terminal_body.extend_from_slice(&pre.global_kv_root);
+    terminal_body.extend_from_slice(&instruction.canonical_bytes());
+    terminal_body.extend_from_slice(&1_u32.to_le_bytes());
+    terminal_body.push(instruction_proof.siblings.len() as u8);
+    append_siblings(&mut terminal_body, &instruction_proof);
+    terminal_body.extend_from_slice(&opening.byte_length.to_le_bytes());
+    terminal_body.extend_from_slice(&opening.chunk_index.to_le_bytes());
+    terminal_body.extend_from_slice(&(opening.chunk.len() as u16).to_le_bytes());
+    terminal_body.extend_from_slice(&opening.chunk);
+    terminal_body.push(opening.siblings.len() as u8);
+    for sibling in &opening.siblings {
+        terminal_body.extend_from_slice(sibling);
+    }
+    let resolved = vm.process_instruction(
+        &f.ix(
+            35,
+            vec![
+                AccountMeta::new_readonly(f.model, false),
+                AccountMeta::new(f.dispute, false),
+            ],
+            &terminal_body,
+        ),
+        &[(f.model, model), (f.dispute, dispute)],
+    );
+    assert_ok(&resolved.program_result);
+    let dispute = account(&resolved.resulting_accounts, f.dispute);
+    assert_eq!((dispute.data[4], dispute.data[5]), (8, 2));
+    assert_eq!(u32_at(&dispute.data, 436), 9);
+    println!(
+        "v2_final_head_boundary_cu={}",
+        challenger_head.compute_units_consumed + miner_head.compute_units_consumed
+    );
+    println!(
+        "v2_final_head_argmax_cu={}",
+        resolved.compute_units_consumed
     );
 }
 
