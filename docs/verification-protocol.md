@@ -51,27 +51,28 @@ The current live-SBF measurements are:
 
 | Operation | Compute units |
 |---|---:|
-| Finalize epoch seed (once/epoch) | 1,785 |
-| Authenticate job/result and open challenge | 8,396 |
+| Finalize epoch seed (once/epoch) | 1,784 |
+| Authenticate job/result and open challenge | 8,677 |
 | Both boundary openings + one midpoint round | 10,329 |
-| Bind both operator traces to checkpoints | 7,656 |
-| Chained runtime-chunk scalar terminal | 4,341 |
-| Chained authenticated Q4 terminal (two instructions) | 11,881 |
-| Chained structured KV append (two instructions) | 9,410 |
-| Intermediate pairwise argmax in a two-leaf registered program | 4,469 |
-| Bind both final-head traces to shared checkpoint and claimed outputs | 9,156 |
+| Authenticate segment program and bind both operator traces | 8,914 |
+| Chained runtime-chunk scalar terminal | 4,344 |
+| Chained authenticated Q4 terminal (two instructions) | 11,883 |
+| Chained structured KV append (two instructions) | 9,412 |
+| Intermediate pairwise argmax in a two-leaf registered program | 4,471 |
+| Authenticate head program and bind both final-head traces | 10,409 |
 | Final-head token-deciding argmax | 4,110 |
-| Compatibility staged Q4/FMA terminal | 9,533 |
+| Compatibility staged Q4/FMA terminal | 9,534 |
 
 Each additional binary-search level costs one challenger and one miner
-midpoint instruction. The complete three-state synthetic dispute is 32,079 CU,
+midpoint instruction. The complete three-state synthetic dispute is 32,359 CU,
 including both terminal-state reveals. The full test also exercises both
 timeout directions, rejects an unselected result, rejects duplicate epoch
 submission, and convicts an incorrect accumulator without a miner co-signature.
 
 The SBF production-format test now traverses a `QX:JOB:V1` root, reveals the
-differing `TokenResultV1`, traverses its `QX:TOKEN:V1` checkpoint root, binds
-both `QX:OPERATOR:V1` traces to the agreed runtime checkpoint roots, and
+differing `TokenResultV1`, traverses its `QX:TOKEN:V1` checkpoint root,
+authenticates that interval's program descriptor from the model schedule,
+binds both `QX:OPERATOR:V1` traces to the agreed runtime checkpoint roots, and
 convicts an incorrect update to the same 256-byte chunk tree used by normal
 execution. Compact roots and exact lengths prevent trace shortening.
 

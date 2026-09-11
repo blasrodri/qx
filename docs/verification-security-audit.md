@@ -28,7 +28,7 @@ claim.
 | Exact input is available to both executors | `JobEnvelopeV1` carries raw token IDs and validates their signed header hash | Implemented transport format; no durable data-availability layer |
 | No miner signature per result | unsigned result leaf is attributed through one miner-signed epoch root | Implemented |
 | Job authorization | requester Ed25519 signature over the immutable job hash is checked only when challenged | Implemented on SBF |
-| Model and execution semantics | job binds the exact model registry; registry stores model ID, weights root, execution-spec hash, and verification-program root | Implemented on SBF |
+| Model and execution semantics | job binds the exact model registry; registry stores model ID, weights root, execution-spec hash, and a tree of checkpoint-segment program descriptors | Implemented on SBF |
 | Sampling cannot be disabled | host and SBF reject probabilities below 10,000 ppm or above 1,000,000 ppm | Implemented; 1% is a provisional policy |
 | Epoch/root grinding | one monotonically increasing epoch per miner identity; job binds its assigned epoch | Implemented for duplicate submissions |
 | Entropy choice | seed uses the first produced Solana block strictly after epoch close | Implemented; timely finalization is still an operational assumption |
@@ -38,7 +38,7 @@ claim.
 | Token tree shape is committed | `TokenResultV1` commits its checkpoint leaf count | Implemented in the runtime commitment |
 | Token/checkpoint descent | exact token and checkpoint preimages are authenticated; model-fixed counts/layers prevent challenger-chosen geometry | Implemented and tested on SBF, including the genesis segment |
 | Checkpoint-to-operator binding | both operator traces must open the agreed start checkpoint and their respective end checkpoint under `QX:OPERATOR:V1` | Implemented and tested on SBF |
-| Verification opcode is registered | scalar terminal opcode is opened against the model's verification-program root | Implemented on SBF |
+| Verification opcode is registered | the disputed segment descriptor authenticates its own instruction root and length; the terminal opcode opens against that root | Implemented on SBF |
 | Chained objective scalar update | instruction, runtime-format residual chunk, old/new root, token, segment, PC, and unchanged KV root are bound | Implemented end to end on SBF |
 | Chained authenticated Q4 update | registered instruction selects an exact model-weight leaf; its 26-level proof is staged and the VM memory/root update is objective | Implemented end to end on SBF; 11,881 CU |
 | Structured KV append | proves the exact token slot was empty, preserves the layer frontier, and updates the authenticated global layer root | Implemented on SBF; K/V root production still needs Granite lowering |
@@ -75,13 +75,13 @@ to the fixed consensus profile. The previous same-machine measurement for
 that arithmetic migration plus commitments was 8.820%. It also excludes
 duplicate auditors, data distribution, failed jobs, and dispute replay.
 
-The current live three-leaf synthetic SBF dispute consumes 32,079 CU. Epoch
-entropy finalization consumes 1,785 CU once per epoch; opening the challenged
-job costs 8,396 CU. A two-party operator-boundary submission costs 7,656 CU,
-the runtime-state-chunk scalar terminal costs 4,341 CU, the chained Q4 terminal
-costs 11,881 CU, structured KV append costs 9,410 CU, and an intermediate
-pairwise argmax with a two-leaf registered program costs 4,469 CU. Submitting
-both sides of the final-head boundary costs 9,156 CU; its final argmax costs
+The current live three-leaf synthetic SBF dispute consumes 32,359 CU. Epoch
+entropy finalization consumes 1,784 CU once per epoch; opening the challenged
+job costs 8,677 CU. A two-party segment-program/operator-boundary submission
+costs 8,914 CU, the runtime-state-chunk scalar terminal costs 4,344 CU, the
+chained Q4 terminal costs 11,883 CU, structured KV append costs 9,412 CU, and
+an intermediate pairwise argmax with a two-leaf registered program costs 4,471
+CU. Submitting both sides of the final-head boundary costs 10,409 CU; its final argmax costs
 4,110 CU.
 Larger traces add a
 challenger/miner midpoint pair for every binary-search level (10,329 CU in the
@@ -106,8 +106,10 @@ high-value job.
 
 ### P0: complete registered VM lowering
 
-The job→token→checkpoint→operator chain plus scalar, authenticated-Q4, and KV
-append terminals is implemented. Complete the registered Granite program,
+The job→token→checkpoint→segment-program→operator chain plus scalar,
+authenticated-Q4, and KV append terminals is implemented. Each checkpoint
+interval now authenticates its own program root, so layer-specific Granite
+weights cannot be swapped through one generic program. Complete the registered Granite program,
 cross-chunk working-memory operations, attention/RoPE/RMSNorm/router/MoE state
 updates, K/V vector-root production, and the final head. The canonical
 pre-layer checkpoint now binds the embedding

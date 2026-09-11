@@ -1,4 +1,4 @@
-use crate::{CommitError, Digest, HashAlgorithm, StateChunkProofV1, hash_domain};
+use crate::{CommitError, Digest, HashAlgorithm, MerkleTree, StateChunkProofV1, hash_domain};
 
 pub const Q4_SELECTOR_LOCAL_BITS: u32 = 5;
 
@@ -43,6 +43,41 @@ pub struct VmOutputStateV1 {
     pub residual_root: Digest,
     pub global_kv_root: Digest,
     pub predicted_token: u32,
+}
+
+/// One checkpoint interval's independently committed verification program.
+/// Segment zero is reserved; checkpoint transitions use their high checkpoint
+/// index and the final head uses `checkpoint_count`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmSegmentProgramV1 {
+    pub segment_index: u32,
+    pub instruction_root: Digest,
+    pub instruction_count: u32,
+}
+
+impl VmSegmentProgramV1 {
+    pub const CANONICAL_SIZE: usize = 40;
+
+    pub fn canonical_bytes(&self) -> [u8; Self::CANONICAL_SIZE] {
+        let mut bytes = [0; Self::CANONICAL_SIZE];
+        bytes[..4].copy_from_slice(&self.segment_index.to_le_bytes());
+        bytes[4..36].copy_from_slice(&self.instruction_root);
+        bytes[36..40].copy_from_slice(&self.instruction_count.to_le_bytes());
+        bytes
+    }
+
+    pub fn hash(&self) -> Result<Digest, CommitError> {
+        if self.instruction_root == [0; 32] || self.instruction_count == 0 {
+            return Err(CommitError::InvalidShape(
+                "segment program must contain instructions".to_owned(),
+            ));
+        }
+        hash_domain(
+            HashAlgorithm::Blake3V1,
+            crate::D_VM_SEGMENT_PROGRAM,
+            &[&self.canonical_bytes()],
+        )
+    }
 }
 
 impl VmOutputStateV1 {
@@ -134,6 +169,39 @@ impl VmInstructionV1 {
     }
 }
 
+pub fn vm_program_tree_v1(instructions: &[VmInstructionV1]) -> Result<MerkleTree, CommitError> {
+    let leaves = instructions
+        .iter()
+        .enumerate()
+        .map(|(index, instruction)| {
+            instruction.hash(u32::try_from(index).map_err(|_| CommitError::ArithmeticOverflow)?)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    MerkleTree::new(HashAlgorithm::Blake3V1, crate::D_PROGRAM_TREE, &leaves)
+}
+
+pub fn vm_segment_schedule_v1(segments: &[VmSegmentProgramV1]) -> Result<MerkleTree, CommitError> {
+    let leaves = segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            if segment.segment_index
+                != u32::try_from(index).map_err(|_| CommitError::ArithmeticOverflow)?
+            {
+                return Err(CommitError::InvalidShape(
+                    "segment programs must be dense and ordered".to_owned(),
+                ));
+            }
+            segment.hash()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    MerkleTree::new(
+        HashAlgorithm::Blake3V1,
+        crate::D_SEGMENT_PROGRAM_TREE,
+        &leaves,
+    )
+}
+
 /// A scalar VM transition opens one canonical residual chunk. The verifier
 /// requires all operands and the destination to be in this chunk, avoiding
 /// four redundant Merkle paths and keeping the witness transportable.
@@ -199,5 +267,48 @@ mod tests {
         let mut changed = output;
         changed.predicted_token = 8;
         assert_ne!(output.hash().unwrap(), changed.hash().unwrap());
+    }
+
+    #[test]
+    fn segment_program_binds_index_root_and_length() {
+        let segment = VmSegmentProgramV1 {
+            segment_index: 3,
+            instruction_root: [4; 32],
+            instruction_count: 5,
+        };
+        let mut changed = segment;
+        changed.segment_index = 2;
+        assert_ne!(segment.hash().unwrap(), changed.hash().unwrap());
+        changed = segment;
+        changed.instruction_count = 6;
+        assert_ne!(segment.hash().unwrap(), changed.hash().unwrap());
+        changed.instruction_count = 0;
+        assert!(changed.hash().is_err());
+
+        let program = vm_program_tree_v1(&[VmInstructionV1 {
+            opcode: 2,
+            source_a: 0,
+            source_b: 4,
+            source_c: 8,
+            destination: 12,
+        }])
+        .unwrap();
+        let schedule = vm_segment_schedule_v1(&[
+            VmSegmentProgramV1 {
+                segment_index: 0,
+                instruction_root: program.root(),
+                instruction_count: 1,
+            },
+            VmSegmentProgramV1 {
+                segment_index: 1,
+                instruction_root: program.root(),
+                instruction_count: 1,
+            },
+        ])
+        .unwrap();
+        assert!(schedule.proof(1).is_ok());
+        let mut unordered = segment;
+        unordered.segment_index = 1;
+        assert!(vm_segment_schedule_v1(&[unordered]).is_err());
     }
 }

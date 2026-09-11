@@ -148,6 +148,14 @@ leaves, binds each leaf's index, and reduces it under separate residual, key,
 and value tree domains. The CPU oracle and Metal implementation produce
 identical commitments and the structure permits independent chunk proofs
 during replay.
+
+The registered verifier schedule has `checkpoint_count + 1` leaves. For the
+selected two-layer profile this is 14 leaves: index 0 is reserved, indices
+1–12 bind the distinct instruction root and length for each two-layer
+checkpoint interval, and index 13 binds the final norm/LM-head/argmax program.
+Each 40-byte segment descriptor commits `(segment_index, instruction_root,
+instruction_count)`. This prevents a proof for one layer's otherwise
+well-formed arithmetic from substituting another layer's weights or schedule.
 Generation executes and commits `input_token_count + output_token_count - 1`
 tokens in the usual non-EOS case because the final output is the prediction of
 the preceding step.

@@ -40,7 +40,7 @@ pub const JOB_PAYLOAD_BYTES: usize = 310;
 pub const JOB_ACCOUNT_BYTES: usize = 314;
 pub const RESULT_LEAF_BYTES: usize = 104;
 pub const EPOCH_V2_ACCOUNT_BYTES: usize = 152;
-pub const DISPUTE_V2_ACCOUNT_BYTES: usize = 728;
+pub const DISPUTE_V2_ACCOUNT_BYTES: usize = 768;
 pub const MINER_V2_ACCOUNT_BYTES: usize = 16;
 /// Roughly one day at a 400 ms slot. This is a consensus parameter, not a
 /// value the submitting miner may shorten.
@@ -105,6 +105,8 @@ const D_PROGRAM_INSTRUCTION: &[u8] = b"QX:PROGRAM:INSTRUCTION:V1";
 const D_VM_STATE: &[u8] = b"QX:VM:STATE:V1";
 const D_VM_OUTPUT: &[u8] = b"QX:VM:OUTPUT:V1";
 const D_VM_INSTRUCTION: &[u8] = b"QX:VM:INSTRUCTION:V1";
+const D_VM_SEGMENT_PROGRAM: &[u8] = b"QX:VM:SEGMENT:V1";
+const D_SEGMENT_PROGRAM_TREE: &[u8] = b"QX:SEGMENT:PROGRAM:TREE:V1";
 const D_STATE_CHUNK: &[u8] = b"QX:STATE:CHUNK:V1";
 const D_MERKLE_EMPTY: &[u8] = b"QX:MERKLE:EMPTY:V1";
 const STATE_CHUNK_BYTES: usize = 256;
@@ -171,6 +173,8 @@ const D_DEFENDER_RESIDUAL_OFFSET: usize = 600;
 const D_DEFENDER_KV_OFFSET: usize = 632;
 const D_COMMON_RESIDUAL_OFFSET: usize = 664;
 const D_COMMON_KV_OFFSET: usize = 696;
+const D_SEGMENT_PROGRAM_ROOT_OFFSET: usize = 728;
+const D_SEGMENT_INSTRUCTION_COUNT_OFFSET: usize = 760;
 
 const TRACE_KIND_JOB: u8 = 1;
 const TRACE_KIND_TOKEN: u8 = 2;
@@ -913,7 +917,9 @@ pub(super) fn submit_challenger_final_head(
         array_at(&state, D_CHALLENGER_ROOT_OFFSET)?,
         D_TOKEN_TREE,
     )?;
-    let instruction_count = u32_at(&model_data, 136)?;
+    let segment_index = u32_at(&state, D_HIGH_OFFSET)?;
+    let (instruction_root, instruction_count) =
+        parse_segment_program(cursor, &model_data, segment_index)?;
     let trace_length = instruction_count
         .checked_add(1)
         .ok_or(QxError::InvalidEncoding)?;
@@ -922,7 +928,6 @@ pub(super) fn submit_challenger_final_head(
     let end_kv = cursor.array_32()?;
     let trace_root = cursor.array_32()?;
     let (start, end) = parse_and_verify_bounds(cursor, trace_length, trace_root, D_OPERATOR_TREE)?;
-    let segment_index = u32_at(&state, D_HIGH_OFFSET)?;
     let checkpoint_residual: [u8; 32] = checkpoint[38..70]
         .try_into()
         .map_err(|_| QxError::InvalidEncoding)?;
@@ -956,6 +961,12 @@ pub(super) fn submit_challenger_final_head(
     put(&mut state, D_CHALLENGER_ROOT_OFFSET, &trace_root)?;
     put(&mut state, D_COMMON_ROOT_OFFSET, &start)?;
     put(&mut state, D_CHALLENGER_END_OFFSET, &end)?;
+    put(&mut state, D_SEGMENT_PROGRAM_ROOT_OFFSET, &instruction_root)?;
+    put(
+        &mut state,
+        D_SEGMENT_INSTRUCTION_COUNT_OFFSET,
+        &instruction_count.to_le_bytes(),
+    )?;
     put(
         &mut state,
         D_TRACE_LENGTH_OFFSET,
@@ -992,7 +1003,7 @@ pub(super) fn submit_miner_final_head(
     if &model_data[..4] != MODEL_MAGIC {
         return Err(QxError::InvalidState.into());
     }
-    let instruction_count = u32_at(&model_data, 136)?;
+    let instruction_count = u32_at(&state, D_SEGMENT_INSTRUCTION_COUNT_OFFSET)?;
     let trace_length = instruction_count
         .checked_add(1)
         .ok_or(QxError::InvalidEncoding)?;
@@ -1168,14 +1179,15 @@ pub(super) fn submit_challenger_operator(
     if &model_data[..4] != MODEL_MAGIC {
         return Err(QxError::InvalidState.into());
     }
-    let instruction_count = u32_at(&model_data, 136)?;
+    let segment_index = u32_at(&state, D_HIGH_OFFSET)?;
+    let (instruction_root, instruction_count) =
+        parse_segment_program(cursor, &model_data, segment_index)?;
     let trace_length = instruction_count
         .checked_add(1)
         .ok_or(QxError::InvalidEncoding)?;
     drop(model_data);
     let trace_root = cursor.array_32()?;
     let (start, end) = parse_and_verify_bounds(cursor, trace_length, trace_root, D_OPERATOR_TREE)?;
-    let segment_index = u32_at(&state, D_HIGH_OFFSET)?;
     let expected_start = vm_state_hash(
         &array_at(&state, D_JOB_HASH_OFFSET)?,
         u32_at(&state, D_TOKEN_INDEX_OFFSET)?,
@@ -1198,6 +1210,12 @@ pub(super) fn submit_challenger_operator(
     put(&mut state, D_CHALLENGER_ROOT_OFFSET, &trace_root)?;
     put(&mut state, D_COMMON_ROOT_OFFSET, &start)?;
     put(&mut state, D_CHALLENGER_END_OFFSET, &end)?;
+    put(&mut state, D_SEGMENT_PROGRAM_ROOT_OFFSET, &instruction_root)?;
+    put(
+        &mut state,
+        D_SEGMENT_INSTRUCTION_COUNT_OFFSET,
+        &instruction_count.to_le_bytes(),
+    )?;
     put(
         &mut state,
         D_TRACE_LENGTH_OFFSET,
@@ -1234,7 +1252,7 @@ pub(super) fn submit_miner_operator(
     if &model_data[..4] != MODEL_MAGIC {
         return Err(QxError::InvalidState.into());
     }
-    let instruction_count = u32_at(&model_data, 136)?;
+    let instruction_count = u32_at(&state, D_SEGMENT_INSTRUCTION_COUNT_OFFSET)?;
     let trace_length = instruction_count
         .checked_add(1)
         .ok_or(QxError::InvalidEncoding)?;
@@ -1640,7 +1658,9 @@ pub(super) fn resolve_vm_scalar(
     }
 
     let model_data = model.try_borrow_data()?;
-    if &model_data[..4] != MODEL_MAGIC || instruction_count != u32_at(&model_data, 136)? {
+    if &model_data[..4] != MODEL_MAGIC
+        || instruction_count != u32_at(&state, D_SEGMENT_INSTRUCTION_COUNT_OFFSET)?
+    {
         return Err(QxError::InvalidState.into());
     }
     let instruction_bytes = vm_instruction_bytes(opcode, source_a, source_b, source_c, destination);
@@ -1654,7 +1674,7 @@ pub(super) fn resolve_vm_scalar(
         instruction_count,
         instruction_depth,
         instruction_siblings,
-        array_at(&model_data, 104)?,
+        array_at(&state, D_SEGMENT_PROGRAM_ROOT_OFFSET)?,
         D_PROGRAM_TREE,
     )?;
     drop(model_data);
@@ -1780,7 +1800,9 @@ pub(super) fn stage_vm_q4(
         return Err(QxError::InvalidState.into());
     }
     let model_data = model.try_borrow_data()?;
-    if &model_data[..4] != MODEL_MAGIC || instruction_count != u32_at(&model_data, 136)? {
+    if &model_data[..4] != MODEL_MAGIC
+        || instruction_count != u32_at(&state, D_SEGMENT_INSTRUCTION_COUNT_OFFSET)?
+    {
         return Err(QxError::InvalidState.into());
     }
     let instruction_bytes = vm_instruction_bytes(opcode, source_a, source_b, source_c, destination);
@@ -1794,7 +1816,7 @@ pub(super) fn stage_vm_q4(
         instruction_count,
         instruction_depth,
         instruction_siblings,
-        array_at(&model_data, 104)?,
+        array_at(&state, D_SEGMENT_PROGRAM_ROOT_OFFSET)?,
         D_PROGRAM_TREE,
     )?;
 
@@ -2163,7 +2185,9 @@ pub(super) fn resolve_vm_kv(
         return Err(QxError::InvalidState.into());
     }
     let model_data = model.try_borrow_data()?;
-    if &model_data[..4] != MODEL_MAGIC || instruction_count != u32_at(&model_data, 136)? {
+    if &model_data[..4] != MODEL_MAGIC
+        || instruction_count != u32_at(&state, D_SEGMENT_INSTRUCTION_COUNT_OFFSET)?
+    {
         return Err(QxError::InvalidState.into());
     }
     let instruction = vm_instruction_bytes(opcode, source_a, source_b, source_c, destination);
@@ -2175,7 +2199,7 @@ pub(super) fn resolve_vm_kv(
         instruction_count,
         instruction_depth,
         instruction_siblings,
-        array_at(&model_data, 104)?,
+        array_at(&state, D_SEGMENT_PROGRAM_ROOT_OFFSET)?,
         D_PROGRAM_TREE,
     )?;
     drop(model_data);
@@ -2296,7 +2320,9 @@ pub(super) fn resolve_vm_argmax(
         return Err(QxError::InvalidState.into());
     }
     let model_data = model.try_borrow_data()?;
-    if &model_data[..4] != MODEL_MAGIC || instruction_count != u32_at(&model_data, 136)? {
+    if &model_data[..4] != MODEL_MAGIC
+        || instruction_count != u32_at(&state, D_SEGMENT_INSTRUCTION_COUNT_OFFSET)?
+    {
         return Err(QxError::InvalidState.into());
     }
     let instruction = vm_instruction_bytes(opcode, source_a, source_b, source_c, destination);
@@ -2310,7 +2336,7 @@ pub(super) fn resolve_vm_argmax(
         instruction_count,
         instruction_depth,
         instruction_siblings,
-        array_at(&model_data, 104)?,
+        array_at(&state, D_SEGMENT_PROGRAM_ROOT_OFFSET)?,
         D_PROGRAM_TREE,
     )?;
     let vocab_size = u32_at(&model_data, 152)?;
@@ -2656,6 +2682,36 @@ fn set_terminal_phase(state: &mut [u8]) -> ProgramResult {
         _ => return Err(QxError::InvalidState.into()),
     };
     set_phase(state, phase, PARTY_CHALLENGER)
+}
+
+fn parse_segment_program(
+    cursor: &mut Cursor<'_>,
+    model_data: &[u8],
+    expected_segment: u32,
+) -> Result<([u8; 32], u32), ProgramError> {
+    let descriptor = cursor.take(40)?;
+    let segment_index = u32_from(descriptor, 0)?;
+    let instruction_root: [u8; 32] = descriptor[4..36]
+        .try_into()
+        .map_err(|_| QxError::InvalidEncoding)?;
+    let instruction_count = u32_from(descriptor, 36)?;
+    let schedule_count = u32_at(model_data, 136)?;
+    let depth = usize::from(cursor.u8()?);
+    let siblings = cursor.take(depth.checked_mul(32).ok_or(QxError::InvalidEncoding)?)?;
+    if segment_index != expected_segment || instruction_root == [0; 32] || instruction_count == 0 {
+        return Err(QxError::InvalidState.into());
+    }
+    let descriptor_hash = blake3_domain(D_VM_SEGMENT_PROGRAM, &[descriptor]);
+    verify_merkle_blake3(
+        descriptor_hash,
+        segment_index,
+        schedule_count,
+        depth,
+        siblings,
+        array_at(model_data, 104)?,
+        D_SEGMENT_PROGRAM_TREE,
+    )?;
+    Ok((instruction_root, instruction_count))
 }
 
 fn parse_and_verify_bounds(

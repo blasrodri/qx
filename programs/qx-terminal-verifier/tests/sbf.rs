@@ -332,7 +332,7 @@ impl Fixture {
         model_data.extend_from_slice(&PRODUCTION_WEIGHT_LEAVES.to_le_bytes());
         model_data.extend_from_slice(&[7; 32]);
         model_data.extend_from_slice(&[8; 32]);
-        model_data.extend_from_slice(&1_u32.to_le_bytes());
+        model_data.extend_from_slice(&4_u32.to_le_bytes());
         model_data.extend_from_slice(&3_u32.to_le_bytes());
         model_data.extend_from_slice(&4_u16.to_le_bytes());
         model_data.extend_from_slice(&2_u16.to_le_bytes());

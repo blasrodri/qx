@@ -180,8 +180,8 @@ fn register_model(
     let weights_root = cursor.array_32()?;
     let weight_leaves = cursor.u32()?;
     let execution_spec = cursor.array_32()?;
-    let verification_program_root = cursor.array_32()?;
-    let verification_program_leaves = cursor.u32()?;
+    let verification_schedule_root = cursor.array_32()?;
+    let verification_schedule_leaves = cursor.u32()?;
     let checkpoint_count = cursor.u32()?;
     let model_layers = cursor.u16()?;
     let checkpoint_interval = cursor.u16()?;
@@ -190,14 +190,18 @@ fn register_model(
     if !cursor.is_empty()
         || weight_leaves == 0
         || execution_spec == [0; 32]
-        || verification_program_root == [0; 32]
-        || verification_program_leaves == 0
+        || verification_schedule_root == [0; 32]
+        || verification_schedule_leaves == 0
         || model_layers == 0
         || max_context_tokens == 0
         || vocab_size == 0
         || checkpoint_interval == 0
         || !model_layers.is_multiple_of(checkpoint_interval)
         || checkpoint_count != u32::from(model_layers / checkpoint_interval) + 1
+        || verification_schedule_leaves
+            != checkpoint_count
+                .checked_add(1)
+                .ok_or(QxError::InvalidEncoding)?
     {
         return Err(QxError::InvalidEncoding.into());
     }
@@ -210,8 +214,8 @@ fn register_model(
     put(&mut state, 36, &weights_root)?;
     put(&mut state, 68, &weight_leaves.to_le_bytes())?;
     put(&mut state, 72, &execution_spec)?;
-    put(&mut state, 104, &verification_program_root)?;
-    put(&mut state, 136, &verification_program_leaves.to_le_bytes())?;
+    put(&mut state, 104, &verification_schedule_root)?;
+    put(&mut state, 136, &verification_schedule_leaves.to_le_bytes())?;
     put(&mut state, 140, &checkpoint_count.to_le_bytes())?;
     put(&mut state, 144, &model_layers.to_le_bytes())?;
     put(&mut state, 146, &checkpoint_interval.to_le_bytes())?;

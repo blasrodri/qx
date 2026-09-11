@@ -3,10 +3,11 @@ use half::f16;
 use mollusk_svm::Mollusk;
 use qx_commit::{
     activation_hash_v1, hash_domain, job_genesis_hash_v1, prove_state_chunk_v1, state_hash_v1,
-    CheckpointV1, EpochBlockSeedV2, FmaStateV1, HashAlgorithm, JobPayloadV1, MerkleProof,
-    MerkleTree, ProtocolVersion, ResultLeafV1, StateTreeKindV1, TokenResultV1, VmInstructionV1,
-    VmOutputStateV1, VmStateV1, WeightLeafV1, D_BATCH, D_JOB, D_MERKLE, D_OPERATOR_TREE,
-    D_PROGRAM_TREE, D_TOKEN, D_WEIGHT_TREE,
+    vm_program_tree_v1, vm_segment_schedule_v1, CheckpointV1, EpochBlockSeedV2, FmaStateV1,
+    HashAlgorithm, JobPayloadV1, MerkleProof, MerkleTree, ProtocolVersion, ResultLeafV1,
+    StateTreeKindV1, TokenResultV1, VmInstructionV1, VmOutputStateV1, VmSegmentProgramV1,
+    VmStateV1, WeightLeafV1, D_BATCH, D_JOB, D_MERKLE, D_OPERATOR_TREE, D_PROGRAM_TREE, D_TOKEN,
+    D_WEIGHT_TREE,
 };
 use solana_account::Account;
 use solana_hash::Hash;
@@ -14,7 +15,7 @@ use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 
 const EPOCH_BYTES: usize = 152;
-const DISPUTE_BYTES: usize = 728;
+const DISPUTE_BYTES: usize = 768;
 const STAGED_BYTES: usize = 64;
 const STAGED_KV_BYTES: usize = 144;
 const MINER_BYTES: usize = 16;
@@ -306,6 +307,7 @@ fn chained_vm_scalar_transition_convicts_wrong_miner_on_sbf() {
     dispute.data[376..380].copy_from_slice(&0_u32.to_le_bytes());
     dispute.data[380..384].copy_from_slice(&1_u32.to_le_bytes());
     dispute.data[516..520].copy_from_slice(&pre.token_index.to_le_bytes());
+    bind_segment_program(&mut dispute, &program);
 
     let mut body = Vec::new();
     body.extend_from_slice(&pre.segment_index.to_le_bytes());
@@ -445,6 +447,7 @@ fn chained_vm_kv_append_convicts_wrong_frontier_on_sbf() {
     dispute.data[368..376].copy_from_slice(&1_200_u64.to_le_bytes());
     dispute.data[376..380].copy_from_slice(&0_u32.to_le_bytes());
     dispute.data[516..520].copy_from_slice(&pre.token_index.to_le_bytes());
+    bind_segment_program(&mut dispute, &program);
 
     let layer_proof = layer_tree.proof(1).unwrap();
     let global_proof = global_tree.proof(1).unwrap();
@@ -584,6 +587,7 @@ fn chained_vm_argmax_enforces_lowest_token_tie_on_sbf() {
     dispute.data[368..376].copy_from_slice(&1_200_u64.to_le_bytes());
     dispute.data[376..380].copy_from_slice(&0_u32.to_le_bytes());
     dispute.data[516..520].copy_from_slice(&pre.token_index.to_le_bytes());
+    bind_segment_program(&mut dispute, &program);
 
     let instruction_proof = program.proof(0).unwrap();
     let mut body = Vec::new();
@@ -1042,6 +1046,37 @@ fn sbf_bisects_the_actual_runtime_job_leaf_format() {
         &[forged_pre_hash, honest_post_hash],
     )
     .unwrap();
+    let mut wrong_segment_body = Vec::new();
+    f.append_segment_program(&mut wrong_segment_body, 3);
+    wrong_segment_body.extend_from_slice(&operator_bounds(
+        &honest_operator,
+        pre_hash,
+        honest_post_hash,
+    ));
+    let wrong_segment = vm.process_instruction(
+        &f.ix(
+            29,
+            vec![
+                AccountMeta::new_readonly(f.model, false),
+                AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.challenger, true),
+            ],
+            &wrong_segment_body,
+        ),
+        &[
+            (f.model, model.clone()),
+            (f.dispute, dispute.clone()),
+            (f.challenger, Account::default()),
+        ],
+    );
+    assert!(wrong_segment.program_result.is_err());
+    let mut forged_operator_body = Vec::new();
+    f.append_segment_program(&mut forged_operator_body, 1);
+    forged_operator_body.extend_from_slice(&operator_bounds(
+        &forged_operator,
+        forged_pre_hash,
+        honest_post_hash,
+    ));
     let forged_boundary = vm.process_instruction(
         &f.ix(
             29,
@@ -1050,7 +1085,7 @@ fn sbf_bisects_the_actual_runtime_job_leaf_format() {
                 AccountMeta::new(f.dispute, false),
                 AccountMeta::new_readonly(f.challenger, true),
             ],
-            &operator_bounds(&forged_operator, forged_pre_hash, honest_post_hash),
+            &forged_operator_body,
         ),
         &[
             (f.model, model.clone()),
@@ -1059,6 +1094,13 @@ fn sbf_bisects_the_actual_runtime_job_leaf_format() {
         ],
     );
     assert!(forged_boundary.program_result.is_err());
+    let mut challenger_operator_body = Vec::new();
+    f.append_segment_program(&mut challenger_operator_body, 1);
+    challenger_operator_body.extend_from_slice(&operator_bounds(
+        &honest_operator,
+        pre_hash,
+        honest_post_hash,
+    ));
     let challenger_operator = vm.process_instruction(
         &f.ix(
             29,
@@ -1067,7 +1109,7 @@ fn sbf_bisects_the_actual_runtime_job_leaf_format() {
                 AccountMeta::new(f.dispute, false),
                 AccountMeta::new_readonly(f.challenger, true),
             ],
-            &operator_bounds(&honest_operator, pre_hash, honest_post_hash),
+            &challenger_operator_body,
         ),
         &[
             (f.model, model.clone()),
@@ -1366,6 +1408,7 @@ fn equal_checkpoints_descend_into_final_head_and_convict_wrong_token_on_sbf() {
     let mut challenger_head_body = final_checkpoint.canonical_bytes().to_vec();
     challenger_head_body.push(checkpoint_proof.siblings.len() as u8);
     append_siblings(&mut challenger_head_body, &checkpoint_proof);
+    f.append_segment_program(&mut challenger_head_body, 3);
     challenger_head_body.extend_from_slice(&challenger_residual);
     challenger_head_body.extend_from_slice(&common_kv);
     challenger_head_body.extend_from_slice(&operator_bounds(
@@ -1695,20 +1738,40 @@ impl Fixture {
         Instruction::new_with_bytes(self.program, &data, accounts)
     }
 
+    fn verification_program(&self) -> MerkleTree {
+        vm_program_tree_v1(&[self.verification_instruction]).unwrap()
+    }
+
+    fn verification_schedule(&self) -> (MerkleTree, Vec<VmSegmentProgramV1>) {
+        let program = self.verification_program();
+        let segments = (0..4)
+            .map(|segment_index| VmSegmentProgramV1 {
+                segment_index,
+                instruction_root: program.root(),
+                instruction_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let schedule = vm_segment_schedule_v1(&segments).unwrap();
+        (schedule, segments)
+    }
+
+    fn append_segment_program(&self, body: &mut Vec<u8>, segment_index: usize) {
+        let (schedule, segments) = self.verification_schedule();
+        let proof = schedule.proof(segment_index).unwrap();
+        body.extend_from_slice(&segments[segment_index].canonical_bytes());
+        body.push(proof.siblings.len() as u8);
+        append_siblings(body, &proof);
+    }
+
     fn register(&self, vm: &Mollusk) -> (Account, Account, Account) {
-        let verification_program = MerkleTree::new(
-            HashAlgorithm::Blake3V1,
-            D_PROGRAM_TREE,
-            &[self.verification_instruction.hash(0).unwrap()],
-        )
-        .unwrap();
+        let (verification_schedule, segments) = self.verification_schedule();
         let mut model_body = Vec::new();
         model_body.extend_from_slice(&self.job.model_id);
         model_body.extend_from_slice(&self.weight_root);
         model_body.extend_from_slice(&WEIGHT_LEAVES.to_le_bytes());
         model_body.extend_from_slice(&self.job.execution_spec);
-        model_body.extend_from_slice(&verification_program.root());
-        model_body.extend_from_slice(&1_u32.to_le_bytes());
+        model_body.extend_from_slice(&verification_schedule.root());
+        model_body.extend_from_slice(&(segments.len() as u32).to_le_bytes());
         model_body.extend_from_slice(&3_u32.to_le_bytes());
         model_body.extend_from_slice(&4_u16.to_le_bytes());
         model_body.extend_from_slice(&2_u16.to_le_bytes());
@@ -2027,6 +2090,11 @@ fn append_siblings(body: &mut Vec<u8>, proof: &MerkleProof) {
     for sibling in &proof.siblings {
         body.extend_from_slice(sibling);
     }
+}
+
+fn bind_segment_program(dispute: &mut Account, program: &MerkleTree) {
+    dispute.data[728..760].copy_from_slice(&program.root());
+    dispute.data[760..764].copy_from_slice(&program.proof(0).unwrap().leaf_count.to_le_bytes());
 }
 
 fn owned(size: usize, owner: Pubkey) -> Account {
