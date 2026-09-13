@@ -45,6 +45,7 @@ pub(super) const OP_CHALLENGER_MACRO_V2: u8 = 44;
 pub(super) const OP_MINER_MACRO_V2: u8 = 45;
 pub(super) const OP_STAGE_MACRO_RESIDUAL_V2: u8 = 46;
 pub(super) const OP_RESOLVE_MACRO_RESIDUAL_V2: u8 = 47;
+pub(super) const OP_TESTNET_LOAD_PROBE_V2: u8 = 48;
 
 pub const JOB_PAYLOAD_BYTES: usize = 310;
 pub const JOB_ACCOUNT_BYTES: usize = 314;
@@ -130,6 +131,7 @@ const D_INPUT_TREE: &[u8] = b"QX:INPUT:TREE:V1";
 const D_MACRO_STATE: &[u8] = b"QX:MACRO:STATE:V1";
 const D_MACRO_WORKSPACE: &[u8] = b"QX:MACRO:WORKSPACE:V1";
 const D_MACRO_WORKSPACE_SLOT: &[u8] = b"QX:MACRO:WORKSPACE:SLOT:V1";
+const D_TESTNET_LOAD: &[u8] = b"QX:TESTNET:LOAD:V1";
 const STATE_CHUNK_BYTES: usize = 256;
 const STAGED_KV_MAGIC: &[u8; 4] = b"QXK2";
 const STAGED_SCALAR_MAGIC: &[u8; 4] = b"QXS2";
@@ -206,6 +208,34 @@ const TRACE_KIND_JOB: u8 = 1;
 const TRACE_KIND_TOKEN: u8 = 2;
 const TRACE_KIND_OPERATOR: u8 = 3;
 const TRACE_KIND_FINAL_HEAD: u8 = 4;
+
+/// Stateless testnet probe used to measure RPC/leader throughput and actual
+/// SBF compute without creating fake protocol jobs. It has no production
+/// state transition and cannot affect a dispute.
+pub(super) fn testnet_load_probe(
+    _program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    if !accounts.is_empty() {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let rounds = cursor.u16()?;
+    let payload_len = usize::from(cursor.u16()?);
+    let payload = cursor.take(payload_len)?;
+    let expected = cursor.array_32()?;
+    if !cursor.is_empty() || !(1..=64).contains(&rounds) || payload_len > 512 {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let mut digest = blake3_domain(D_TESTNET_LOAD, &[payload]);
+    for round in 1..rounds {
+        digest = blake3_domain(D_TESTNET_LOAD, &[&round.to_le_bytes(), &digest]);
+    }
+    if digest != expected {
+        return Err(QxError::InvalidArithmetic.into());
+    }
+    Ok(())
+}
 
 pub(super) fn register_job(
     program_id: &Pubkey,

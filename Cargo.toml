@@ -30,6 +30,7 @@ members = [
     "tools/qx-task-eval",
     "tools/qx-route-cache",
     "tools/qx-verify",
+    "tools/qx-testnet-load",
 ]
 resolver = "2"
 

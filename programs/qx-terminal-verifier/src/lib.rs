@@ -179,6 +179,7 @@ pub fn process_instruction(
         v2::OP_RESOLVE_MACRO_RESIDUAL_V2 => {
             v2::resolve_macro_residual(program_id, accounts, &mut cursor)
         }
+        v2::OP_TESTNET_LOAD_PROBE_V2 => v2::testnet_load_probe(program_id, accounts, &mut cursor),
         _ => Err(QxError::InvalidEncoding.into()),
     }
 }

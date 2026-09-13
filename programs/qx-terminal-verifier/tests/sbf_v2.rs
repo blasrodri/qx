@@ -25,6 +25,36 @@ const MODEL_BYTES: usize = 156;
 const WEIGHT_LEAVES: u32 = 41_755_744;
 
 #[test]
+fn testnet_load_probe_executes_real_sbf_hash_work() {
+    let f = Fixture::new();
+    let vm = f.vm();
+    let rounds = 32_u16;
+    let payload = vec![0x5a; 256];
+    let mut digest =
+        hash_domain(HashAlgorithm::Blake3V1, b"QX:TESTNET:LOAD:V1", &[&payload]).unwrap();
+    for round in 1..rounds {
+        digest = hash_domain(
+            HashAlgorithm::Blake3V1,
+            b"QX:TESTNET:LOAD:V1",
+            &[&round.to_le_bytes(), &digest],
+        )
+        .unwrap();
+    }
+    let mut body = Vec::new();
+    body.extend_from_slice(&rounds.to_le_bytes());
+    body.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    body.extend_from_slice(&payload);
+    body.extend_from_slice(&digest);
+    let valid = vm.process_instruction(&f.ix(48, vec![], &body), &[]);
+    assert_ok(&valid.program_result);
+    let mut corrupt = body;
+    *corrupt.last_mut().unwrap() ^= 1;
+    let invalid = vm.process_instruction(&f.ix(48, vec![], &corrupt), &[]);
+    assert!(invalid.program_result.is_err());
+    println!("v2_testnet_load_probe_cu={}", valid.compute_units_consumed);
+}
+
+#[test]
 fn granite_macro_boundary_authenticates_the_single_workspace_update_on_sbf() {
     let f = Fixture::new();
     let vm = f.vm();
