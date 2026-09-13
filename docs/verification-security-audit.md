@@ -1,6 +1,6 @@
 # QX verification security audit
 
-Date: 2026-09-11
+Date: 2026-09-13
 
 ## Verdict
 
@@ -12,13 +12,14 @@ binds both dispute-local operator traces to the agreed checkpoint and each
 party's endpoint, and lets SBF convict the incorrect state update using the
 same 256-byte residual commitment emitted by normal execution.
 
-The remaining boundary is the nested model trace rather than the bisection
-primitive. Chained authenticated Q4 and structured KV-frontier transitions now
-work, and an equal-checkpoint prediction disagreement descends into a
-token-bound final-head trace. A deterministic Granite macro lowering now binds
-all 1,706 semantic tensor IDs and reduces interval-2 segments to 28 coarse
-steps (29 for the first, including embedding), but its macro-to-scalar on-chain descent,
-logits production, and K/V root production are not yet wired.
+The remaining boundary is macro-specific arithmetic rather than the bisection
+primitive. Chained authenticated Q4 and structured KV-frontier transitions
+work, an equal-checkpoint prediction disagreement descends into a token-bound
+final-head trace, and the on-chain bridge now authenticates the isolated
+Granite macro, its registered instruction, both rolling 16-slot workspace
+roots, and its K/V boundary. The residual macro then descends to an objective
+fixed FMA terminal. The other macro families, logits production, and derived
+K/V root production are not yet terminally resolved.
 The tests therefore do not yet prove the entire model's `Execute(M, E, X)`
 claim.
 
@@ -26,7 +27,7 @@ claim.
 
 | Property | Evidence | Status |
 |---|---|---|
-| Exact input is available to both executors | `JobEnvelopeV1` carries raw token IDs and validates their signed header hash | Implemented transport format; no durable data-availability layer |
+| Exact input is bound | the input hash is a position-bound token Merkle root; prompt tokens open against it and generated inputs must equal the preceding authenticated prediction | Implemented on SBF; durable availability is outside this milestone |
 | No miner signature per result | unsigned result leaf is attributed through one miner-signed epoch root | Implemented |
 | Job authorization | requester Ed25519 signature over the immutable job hash is checked only when challenged | Implemented on SBF |
 | Model and execution semantics | job binds the exact model registry; registry stores model ID, weights root, execution-spec hash, and a tree of checkpoint-segment program descriptors | Implemented on SBF |
@@ -50,8 +51,12 @@ claim.
 | Cross-chunk argmax | two source records are staged independently and the destination can occupy a third chunk; the last reduction binds the selected token into the output state | Implemented on SBF; 10,554 CU |
 | Final-head output binding | shared final checkpoint starts both registered traces; distinct output-state hashes bind each trace to its claimed prediction | Implemented end to end on SBF |
 | Objective arithmetic library | Q4 FMA plus fixed add/mul/div/exp/rsqrt/sin/cos/reduction primitives | Implemented; fixed sine is executed on SBF, but not every family is wired into the chained VM |
-| Granite macro schedule | 14 steps per layer, 29 for the first selected interval including embedding, 28 thereafter, and three for the final head; exact tensor map validated against the 1,706-entry production artifact | Implemented off-chain; nested macro-state dispute is not yet on-chain |
-| Dispute-only macro trace | real runtime captures normalized/Q/K/V/rotated-QK/attention/router/routing/MoE/residual roots, the derived K/V leaf, and final hidden/logits/winner in compiler order; a 16-slot Merkle workspace retains every live root | Implemented and complete-model tested; macro-to-scalar on-chain descent is still required |
+| Granite macro schedule | 14 steps per layer, 29 for the first selected interval including embedding, 28 thereafter, and three for the final head; exact tensor map validated against the 1,706-entry production artifact | Implemented and registered |
+| Dispute-only macro trace | real runtime captures normalized/Q/K/V/rotated-QK/attention/router/routing/MoE/residual roots, the derived K/V leaf, and final hidden/logits/winner in compiler order; a 16-slot Merkle workspace retains every live root | Implemented and complete-model tested |
+| Macro boundary bridge | isolated instruction, pre/post workspace roots, changed slot, and K/V transition are authenticated for both parties | Implemented on SBF; 193,264 CU with software BLAKE3 |
+| Residual macro terminal | two authenticated inputs and both claimed outputs resolve with the fixed FMA rule | Implemented on SBF; 175,672 CU with software BLAKE3 |
+| Cross-token continuity | generated input is the prior agreed prediction and each token's genesis K/V root is the prior authenticated final K/V root | Implemented on SBF |
+| Testnet deployability | v0 SBF artifact uses platform tools v1.54 and only testnet-enabled syscalls | Deployed to a local validator cloned from the live testnet feature set |
 | CPU verified generation | complete checkpoint+artifact execution emits a nonzero receipt root | Implemented and complete-model tested; a missing `begin_token` call was fixed by this audit |
 | Turn liveness | every unilateral move has a deadline and either non-responder loses | Implemented and tested |
 
@@ -69,13 +74,13 @@ registered spec.
 
 ## Cost at massive scale
 
-Two independent 31-repeat fixed-math and fixed-RoPE runs add **3.127–3.312%**
-to inference on the tested M5 Pro (mean **3.220%**). At the mandatory 1% sampling floor with one auditor, replay adds
+Two fresh 31-repeat fixed-math and fixed-RoPE runs add **2.469–4.449%**
+to inference on the tested M5 Pro (mean **3.459%**). At the mandatory 1% sampling floor with one auditor, replay adds
 1% of baseline inference work. If auditors use the same committed path, total
 network compute is approximately:
 
 ```text
-(1 + 0.03220) * (1 + 0.01) - 1 = 4.2522%
+(1 + 0.03459) * (1 + 0.01) - 1 = 4.49359%
 ```
 
 This excludes the one-time migration from a fast, non-consensus math profile
@@ -83,14 +88,15 @@ to the fixed consensus profile. The previous same-machine measurement for
 that arithmetic migration plus commitments was 8.820%. It also excludes
 duplicate auditors, data distribution, failed jobs, and dispute replay.
 
-The current live three-leaf synthetic SBF dispute consumes 32,363 CU. Epoch
-entropy finalization consumes 1,786 CU once per epoch; opening the challenged
-job costs 8,676 CU. A two-party segment-program/operator-boundary submission
-costs 8,915 CU, the runtime-state-chunk scalar terminal costs 4,343 CU, the
-chained Q4 terminal costs 11,885 CU, structured KV append costs 9,412 CU, and
-an intermediate pairwise argmax with a two-leaf registered program costs 4,471
-CU. Submitting both sides of the final-head boundary costs 10,409 CU; its final argmax costs
-4,110 CU.
+The current live three-leaf synthetic SBF dispute consumes 159,352 CU. Epoch
+entropy finalization consumes 14,285 CU once per epoch; opening the challenged
+job costs 8,894 CU. A two-party segment-program/operator-boundary submission
+costs 87,209 CU, the runtime-state-chunk scalar terminal costs 61,033 CU, the
+chained Q4 terminal costs 68,631 CU, structured KV append costs 114,436 CU,
+and an intermediate pairwise argmax costs 61,436 CU. Submitting both sides of
+the final-head boundary costs 107,227 CU; its final argmax costs 55,075 CU.
+These are rare-dispute costs. Software BLAKE3 avoids a testnet-inactive syscall
+while preserving the low normal-inference commitment path.
 Larger traces add a
 challenger/miner midpoint pair for every binary-search level (10,332 CU in the
 three-leaf test). These costs occur only after a sampled replay disagrees.
@@ -112,7 +118,7 @@ high-value job.
 
 ## What remains before confidence
 
-### P0: complete registered VM lowering
+### P0: complete macro terminals
 
 The job→token→checkpoint→segment-program→operator chain plus scalar,
 authenticated-Q4, cross-chunk scalar, and KV append terminals is implemented. Each checkpoint
@@ -120,18 +126,18 @@ interval now authenticates its own program root, so layer-specific Granite
 weights cannot be swapped through one generic program. The deterministic
 macro compiler now emits RMSNorm, Q/K/V/O/router projection, RoPE, KV append,
 attention, Top-K, MoE, residual, final-logit, and argmax steps with exact
-artifact tensor IDs. A rolling 16-slot workspace now binds every simultaneously
+artifact tensor IDs. A rolling 16-slot workspace binds every simultaneously
 live macro value while retaining the existing checkpoint hashes as trace
-endpoints. Complete the second bisection from one disputed macro into the
-existing scalar terminals. The canonical
+endpoints. The on-chain macro bridge and residual terminal are complete. Add
+objective terminal traces for embedding, RMSNorm, dense projections, RoPE,
+attention, Top-K, dynamic MoE, final logits, and full-vocabulary argmax. The canonical
 pre-layer checkpoint is an on-chain-derivable token-start sentinel; embedding
 is the first registered macro in segment one. The SBF hierarchy test exercises
 a disagreement in the first checkpoint interval.
 
-The final-head path and token-bound output state are now inside the chained
-dispute path. What remains is lowering the real LM head and full-vocabulary
-argmax tournament into that registered program, rather than the two-candidate
-SBF fixture.
+The final-head path and token-bound output state are inside the chained dispute
+path. The real LM head and full-vocabulary argmax tournament still need their
+registered scalar traces rather than the two-candidate SBF fixture.
 
 ### P0: bind K/V root production
 

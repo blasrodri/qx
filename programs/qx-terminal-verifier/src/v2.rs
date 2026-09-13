@@ -227,9 +227,9 @@ pub(super) fn testnet_load_probe(
     if !cursor.is_empty() || !(1..=64).contains(&rounds) || payload_len > 512 {
         return Err(QxError::InvalidEncoding.into());
     }
-    let mut digest = blake3_domain(D_TESTNET_LOAD, &[payload]);
+    let mut digest = stable_hash_domain(D_TESTNET_LOAD, &[payload]);
     for round in 1..rounds {
-        digest = blake3_domain(D_TESTNET_LOAD, &[&round.to_le_bytes(), &digest]);
+        digest = stable_hash_domain(D_TESTNET_LOAD, &[&round.to_le_bytes(), &digest]);
     }
     if digest != expected {
         return Err(QxError::InvalidArithmetic.into());
@@ -850,7 +850,8 @@ pub(super) fn submit_challenger_token(
         || checkpoint_count != u32_at(&model_data, 140)?
         || token_index != expected_token
         || token[..32] != state[D_JOB_ID_OFFSET..D_JOB_ID_OFFSET + 32]
-        || blake3_domain(D_TOKEN_RESULT, &[token]) != array_at(&state, D_CHALLENGER_END_OFFSET)?
+        || stable_hash_domain(D_TOKEN_RESULT, &[token])
+            != array_at(&state, D_CHALLENGER_END_OFFSET)?
     {
         return Err(QxError::InvalidState.into());
     }
@@ -881,7 +882,7 @@ pub(super) fn submit_challenger_token(
 
     let expected_genesis_kv = if token_index == 0 {
         if array_at(&state, D_COMMON_ROOT_OFFSET)?
-            != blake3_domain(D_JOB_GENESIS, &[&array_at(&state, D_JOB_ID_OFFSET)?])
+            != stable_hash_domain(D_JOB_GENESIS, &[&array_at(&state, D_JOB_ID_OFFSET)?])
         {
             return Err(QxError::InvalidState.into());
         }
@@ -892,7 +893,8 @@ pub(super) fn submit_challenger_token(
         if prior[..32] != state[D_JOB_ID_OFFSET..D_JOB_ID_OFFSET + 32]
             || u32_from(prior, 32)? != prior_index
             || u32_from(prior, 72)? != checkpoint_count
-            || blake3_domain(D_TOKEN_RESULT, &[prior]) != array_at(&state, D_COMMON_ROOT_OFFSET)?
+            || stable_hash_domain(D_TOKEN_RESULT, &[prior])
+                != array_at(&state, D_COMMON_ROOT_OFFSET)?
             || (token_index >= input_count && u32_from(prior, 68)? != consumed_token)
         {
             return Err(QxError::InvalidState.into());
@@ -910,7 +912,7 @@ pub(super) fn submit_challenger_token(
             return Err(QxError::InvalidState.into());
         }
         verify_merkle_blake3(
-            blake3_domain(D_CHECKPOINT, &[final_checkpoint]),
+            stable_hash_domain(D_CHECKPOINT, &[final_checkpoint]),
             checkpoint_count - 1,
             checkpoint_count,
             depth,
@@ -959,7 +961,7 @@ pub(super) fn submit_miner_token(
         || checkpoint_count != u32_at(&state, D_TOKEN_COUNT_OFFSET)?
         || token_index != u32_at(&state, D_TOKEN_INDEX_OFFSET)?
         || token[..32] != state[D_JOB_ID_OFFSET..D_JOB_ID_OFFSET + 32]
-        || blake3_domain(D_TOKEN_RESULT, &[token]) != array_at(&state, D_DEFENDER_END_OFFSET)?
+        || stable_hash_domain(D_TOKEN_RESULT, &[token]) != array_at(&state, D_DEFENDER_END_OFFSET)?
     {
         return Err(QxError::InvalidState.into());
     }
@@ -1048,7 +1050,7 @@ pub(super) fn submit_challenger_final_head(
         return Err(QxError::InvalidState.into());
     }
     verify_merkle_blake3(
-        blake3_domain(D_CHECKPOINT, &[checkpoint]),
+        stable_hash_domain(D_CHECKPOINT, &[checkpoint]),
         checkpoint_index,
         checkpoint_count,
         checkpoint_depth,
@@ -1226,7 +1228,7 @@ pub(super) fn submit_challenger_checkpoint(
             .checked_sub(checkpoint_interval)
             .ok_or(QxError::InvalidState)?
     };
-    let expected_input_state = blake3_domain(
+    let expected_input_state = stable_hash_domain(
         D_TOKEN_INPUT_STATE,
         &[
             &array_at(&state, D_JOB_ID_OFFSET)?,
@@ -1244,12 +1246,13 @@ pub(super) fn submit_challenger_checkpoint(
             && common_checkpoint[38..70] != expected_input_state)
         || (expected_common_layer == u32::from(u16::MAX)
             && common_checkpoint[70..102] != state[D_ACTIVATION_OFFSET..D_ACTIVATION_OFFSET + 32])
-        || blake3_domain(D_CHECKPOINT, &[common_checkpoint])
+        || stable_hash_domain(D_CHECKPOINT, &[common_checkpoint])
             != array_at(&state, D_COMMON_ROOT_OFFSET)?
         || checkpoint[..32] != state[D_JOB_ID_OFFSET..D_JOB_ID_OFFSET + 32]
         || u32_from(checkpoint, 32)? != u32_at(&state, D_TOKEN_INDEX_OFFSET)?
         || u32::from(u16_from(checkpoint, 36)?) != expected_layer
-        || blake3_domain(D_CHECKPOINT, &[checkpoint]) != array_at(&state, D_CHALLENGER_END_OFFSET)?
+        || stable_hash_domain(D_CHECKPOINT, &[checkpoint])
+            != array_at(&state, D_CHALLENGER_END_OFFSET)?
     {
         return Err(QxError::InvalidState.into());
     }
@@ -1291,7 +1294,8 @@ pub(super) fn submit_miner_checkpoint(
         || checkpoint[..32] != state[D_JOB_ID_OFFSET..D_JOB_ID_OFFSET + 32]
         || u32_from(checkpoint, 32)? != u32_at(&state, D_TOKEN_INDEX_OFFSET)?
         || u16_from(checkpoint, 36)? != u16_from(&state, D_CHECKPOINT_LAYER_OFFSET)?
-        || blake3_domain(D_CHECKPOINT, &[checkpoint]) != array_at(&state, D_DEFENDER_END_OFFSET)?
+        || stable_hash_domain(D_CHECKPOINT, &[checkpoint])
+            != array_at(&state, D_DEFENDER_END_OFFSET)?
     {
         return Err(QxError::InvalidState.into());
     }
@@ -1489,7 +1493,7 @@ pub(super) fn submit_challenger_macro(
         return Err(QxError::InvalidState.into());
     }
     verify_merkle_blake3(
-        blake3_domain(
+        stable_hash_domain(
             D_VM_INSTRUCTION,
             &[&program_counter.to_le_bytes(), instruction],
         ),
@@ -1955,7 +1959,7 @@ pub(super) fn submit_challenger_scalar(
     if &model_data[..4] != MODEL_MAGIC || instruction_count != u32_at(&model_data, 136)? {
         return Err(QxError::InvalidState.into());
     }
-    let instruction_hash = blake3_domain(
+    let instruction_hash = stable_hash_domain(
         D_PROGRAM_INSTRUCTION,
         &[&instruction_index.to_le_bytes(), &[op]],
     );
@@ -2136,7 +2140,7 @@ pub(super) fn resolve_vm_scalar(
         return Err(QxError::InvalidState.into());
     }
     let instruction_bytes = vm_instruction_bytes(opcode, source_a, source_b, source_c, destination);
-    let instruction_hash = blake3_domain(
+    let instruction_hash = stable_hash_domain(
         D_VM_INSTRUCTION,
         &[&program_counter.to_le_bytes(), &instruction_bytes],
     );
@@ -2176,7 +2180,7 @@ pub(super) fn resolve_vm_scalar(
     {
         return Err(QxError::InvalidEncoding.into());
     }
-    let memory_leaf = blake3_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]);
+    let memory_leaf = stable_hash_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]);
     let opened_root = state_merkle_root(memory_leaf, chunk_index, memory_siblings);
     if opened_root != residual_root {
         return Err(QxError::InvalidReceiptProof.into());
@@ -2195,7 +2199,7 @@ pub(super) fn resolve_vm_scalar(
     updated_chunk[..chunk_len].copy_from_slice(chunk);
     updated_chunk[destination_offset..destination_offset + 4]
         .copy_from_slice(&expected.to_le_bytes());
-    let updated_leaf = blake3_domain(
+    let updated_leaf = stable_hash_domain(
         D_STATE_CHUNK,
         &[&chunk_index.to_le_bytes(), &updated_chunk[..chunk_len]],
     );
@@ -2287,7 +2291,7 @@ pub(super) fn stage_vm_scalar(
     }
     let instruction = vm_instruction_bytes(opcode, source_a, source_b, source_c, destination);
     verify_merkle_blake3(
-        blake3_domain(
+        stable_hash_domain(
             D_VM_INSTRUCTION,
             &[&program_counter.to_le_bytes(), &instruction],
         ),
@@ -2331,7 +2335,7 @@ pub(super) fn stage_vm_scalar(
         || chunk_len != expected_len
         || merkle_depth(memory_count)? != memory_depth
         || state_merkle_root(
-            blake3_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]),
+            stable_hash_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]),
             chunk_index,
             memory_siblings,
         ) != residual_root
@@ -2472,7 +2476,7 @@ pub(super) fn resolve_staged_vm_scalar(
         || chunk_len != expected_len
         || merkle_depth(memory_count)? != memory_depth
         || state_merkle_root(
-            blake3_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]),
+            stable_hash_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]),
             chunk_index,
             memory_siblings,
         ) != residual_root
@@ -2488,7 +2492,7 @@ pub(super) fn resolve_staged_vm_scalar(
     updated_chunk[destination_offset..destination_offset + 4]
         .copy_from_slice(&expected.to_le_bytes());
     let post_residual_root = state_merkle_root(
-        blake3_domain(
+        stable_hash_domain(
             D_STATE_CHUNK,
             &[&chunk_index.to_le_bytes(), &updated_chunk[..chunk_len]],
         ),
@@ -2573,7 +2577,7 @@ pub(super) fn stage_vm_q4(
         return Err(QxError::InvalidState.into());
     }
     let instruction_bytes = vm_instruction_bytes(opcode, source_a, source_b, source_c, destination);
-    let instruction_hash = blake3_domain(
+    let instruction_hash = stable_hash_domain(
         D_VM_INSTRUCTION,
         &[&program_counter.to_le_bytes(), &instruction_bytes],
     );
@@ -2691,7 +2695,7 @@ pub(super) fn stage_vm_raw_weight(
     }
     let instruction = vm_instruction_bytes(opcode, source_a, source_b, source_c, destination);
     verify_merkle_blake3(
-        blake3_domain(
+        stable_hash_domain(
             D_VM_INSTRUCTION,
             &[&program_counter.to_le_bytes(), &instruction],
         ),
@@ -2835,7 +2839,7 @@ pub(super) fn resolve_vm_q4(
     {
         return Err(QxError::InvalidEncoding.into());
     }
-    let memory_leaf = blake3_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]);
+    let memory_leaf = stable_hash_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]);
     if state_merkle_root(memory_leaf, chunk_index, memory_siblings) != residual_root {
         return Err(QxError::InvalidReceiptProof.into());
     }
@@ -2865,7 +2869,7 @@ pub(super) fn resolve_vm_q4(
     updated_chunk[..chunk_len].copy_from_slice(chunk);
     updated_chunk[destination_offset..destination_offset + 4]
         .copy_from_slice(&expected.to_le_bytes());
-    let updated_leaf = blake3_domain(
+    let updated_leaf = stable_hash_domain(
         D_STATE_CHUNK,
         &[&chunk_index.to_le_bytes(), &updated_chunk[..chunk_len]],
     );
@@ -3010,7 +3014,7 @@ pub(super) fn resolve_staged_vm_q4(
         || chunk_len != expected_len
         || merkle_depth(memory_count)? != memory_depth
         || state_merkle_root(
-            blake3_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]),
+            stable_hash_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]),
             chunk_index,
             memory_siblings,
         ) != residual_root
@@ -3029,7 +3033,7 @@ pub(super) fn resolve_staged_vm_q4(
     updated_chunk[destination_offset..destination_offset + 4]
         .copy_from_slice(&expected.to_le_bytes());
     let post_residual_root = state_merkle_root(
-        blake3_domain(
+        stable_hash_domain(
             D_STATE_CHUNK,
             &[&chunk_index.to_le_bytes(), &updated_chunk[..chunk_len]],
         ),
@@ -3141,13 +3145,13 @@ pub(super) fn stage_vm_kv(
     {
         return Err(QxError::InvalidEncoding.into());
     }
-    let empty = blake3_domain(D_MERKLE_EMPTY, &[D_KV]);
+    let empty = stable_hash_domain(D_MERKLE_EMPTY, &[D_KV]);
     let old_layer_root = domain_merkle_root(empty, token_index, layer_siblings, D_KV);
     let opened_global = domain_merkle_root(old_layer_root, u32::from(layer), global_siblings, D_KV);
     if opened_global != global_kv_root {
         return Err(QxError::InvalidReceiptProof.into());
     }
-    let kv_leaf = blake3_domain(
+    let kv_leaf = stable_hash_domain(
         D_KV,
         &[
             &layer.to_le_bytes(),
@@ -3250,7 +3254,7 @@ pub(super) fn resolve_vm_kv(
     }
     let instruction = vm_instruction_bytes(opcode, source_a, source_b, source_c, destination);
     let instruction_hash =
-        blake3_domain(D_VM_INSTRUCTION, &[&staged_pc.to_le_bytes(), &instruction]);
+        stable_hash_domain(D_VM_INSTRUCTION, &[&staged_pc.to_le_bytes(), &instruction]);
     verify_merkle_blake3(
         instruction_hash,
         staged_pc,
@@ -3290,7 +3294,7 @@ pub(super) fn resolve_vm_kv(
     if chunk_len != expected_len {
         return Err(QxError::InvalidEncoding.into());
     }
-    let memory_leaf = blake3_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]);
+    let memory_leaf = stable_hash_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]);
     if state_merkle_root(memory_leaf, chunk_index, memory_siblings) != residual_root
         || bytes32_from_chunk(source_a, byte_length, chunk_index, chunk)? != staged_key
         || bytes32_from_chunk(source_b, byte_length, chunk_index, chunk)? != staged_value
@@ -3381,7 +3385,7 @@ pub(super) fn stage_vm_argmax(
     }
     let instruction = vm_instruction_bytes(opcode, source_a, source_b, source_c, destination);
     verify_merkle_blake3(
-        blake3_domain(
+        stable_hash_domain(
             D_VM_INSTRUCTION,
             &[&program_counter.to_le_bytes(), &instruction],
         ),
@@ -3428,7 +3432,7 @@ pub(super) fn stage_vm_argmax(
     };
     if chunk_len != expected_len
         || state_merkle_root(
-            blake3_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]),
+            stable_hash_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]),
             chunk_index,
             memory_siblings,
         ) != residual_root
@@ -3611,7 +3615,7 @@ pub(super) fn resolve_staged_vm_argmax(
     };
     if chunk_len != expected_len
         || state_merkle_root(
-            blake3_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]),
+            stable_hash_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]),
             chunk_index,
             memory_siblings,
         ) != residual_root
@@ -3634,7 +3638,7 @@ pub(super) fn resolve_staged_vm_argmax(
     updated_chunk[destination_offset + 4..destination_offset + 8]
         .copy_from_slice(&selected.to_le_bytes());
     let post_residual_root = state_merkle_root(
-        blake3_domain(
+        stable_hash_domain(
             D_STATE_CHUNK,
             &[&chunk_index.to_le_bytes(), &updated_chunk[..chunk_len]],
         ),
@@ -3746,7 +3750,7 @@ pub(super) fn resolve_vm_argmax(
         return Err(QxError::InvalidState.into());
     }
     let instruction = vm_instruction_bytes(opcode, source_a, source_b, source_c, destination);
-    let instruction_hash = blake3_domain(
+    let instruction_hash = stable_hash_domain(
         D_VM_INSTRUCTION,
         &[&program_counter.to_le_bytes(), &instruction],
     );
@@ -3790,7 +3794,7 @@ pub(super) fn resolve_vm_argmax(
     if chunk_len != expected_len {
         return Err(QxError::InvalidEncoding.into());
     }
-    let memory_leaf = blake3_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]);
+    let memory_leaf = stable_hash_domain(D_STATE_CHUNK, &[&chunk_index.to_le_bytes(), chunk]);
     if state_merkle_root(memory_leaf, chunk_index, memory_siblings) != residual_root {
         return Err(QxError::InvalidReceiptProof.into());
     }
@@ -3839,7 +3843,7 @@ pub(super) fn resolve_vm_argmax(
         .copy_from_slice(&selected_logit.to_le_bytes());
     updated_chunk[destination_offset + 4..destination_offset + 8]
         .copy_from_slice(&selected.to_le_bytes());
-    let updated_leaf = blake3_domain(
+    let updated_leaf = stable_hash_domain(
         D_STATE_CHUNK,
         &[&chunk_index.to_le_bytes(), &updated_chunk[..chunk_len]],
     );
@@ -3942,7 +3946,7 @@ fn vm_state_hash(
     residual_root: &[u8; 32],
     global_kv_root: &[u8; 32],
 ) -> [u8; 32] {
-    blake3_domain(
+    stable_hash_domain(
         D_VM_STATE,
         &[
             job_hash,
@@ -3964,7 +3968,7 @@ fn vm_output_hash(
     global_kv_root: &[u8; 32],
     predicted_token: u32,
 ) -> [u8; 32] {
-    blake3_domain(
+    stable_hash_domain(
         D_VM_OUTPUT,
         &[
             job_hash,
@@ -4019,7 +4023,7 @@ fn granite_macro_slot(instruction: &[u8]) -> Result<u8, ProgramError> {
 }
 
 fn macro_workspace_leaf(slot: u8, value_root: &[u8; 32]) -> [u8; 32] {
-    blake3_domain(
+    stable_hash_domain(
         D_MACRO_WORKSPACE_SLOT,
         &[&u32::from(slot).to_le_bytes(), value_root],
     )
@@ -4027,7 +4031,7 @@ fn macro_workspace_leaf(slot: u8, value_root: &[u8; 32]) -> [u8; 32] {
 
 fn empty_global_kv_root(layer_count: u32) -> Result<[u8; 32], ProgramError> {
     let depth = merkle_depth(layer_count)?;
-    let mut root = blake3_domain(D_MERKLE_EMPTY, &[D_KV]);
+    let mut root = stable_hash_domain(D_MERKLE_EMPTY, &[D_KV]);
     for _ in 0..depth {
         root = blake3_merkle_parent(D_KV, &root, &root);
     }
@@ -4108,7 +4112,7 @@ fn parse_vector_scalar(
     } else {
         D_ACTIVATION_CHUNK
     };
-    let leaf = blake3_domain(leaf_domain, &[&chunk_index.to_le_bytes(), chunk]);
+    let leaf = stable_hash_domain(leaf_domain, &[&chunk_index.to_le_bytes(), chunk]);
     if state_merkle_root(leaf, chunk_index, siblings) != expected_root {
         return Err(QxError::InvalidActivationProof.into());
     }
@@ -4144,7 +4148,7 @@ fn macro_state_hash(
     workspace_root: &[u8; 32],
     global_kv_root: &[u8; 32],
 ) -> [u8; 32] {
-    blake3_domain(
+    stable_hash_domain(
         D_MACRO_STATE,
         &[
             job_hash,
@@ -4296,9 +4300,9 @@ fn state_merkle_root(mut node: [u8; 32], mut index: u32, siblings: &[u8]) -> [u8
     for sibling in siblings.chunks_exact(32) {
         let sibling: &[u8; 32] = sibling.try_into().expect("exact chunks");
         node = if index & 1 == 0 {
-            solana_blake3_hasher::hashv(&[&node, sibling]).to_bytes()
+            crate::stable_hashv(&[&node, sibling])
         } else {
-            solana_blake3_hasher::hashv(&[sibling, &node]).to_bytes()
+            crate::stable_hashv(&[sibling, &node])
         };
         index >>= 1;
     }
@@ -4411,7 +4415,7 @@ fn parse_segment_program(
     if segment_index != expected_segment || instruction_root == [0; 32] || instruction_count == 0 {
         return Err(QxError::InvalidState.into());
     }
-    let descriptor_hash = blake3_domain(D_VM_SEGMENT_PROGRAM, &[descriptor]);
+    let descriptor_hash = stable_hash_domain(D_VM_SEGMENT_PROGRAM, &[descriptor]);
     verify_merkle_blake3(
         descriptor_hash,
         segment_index,
@@ -4547,7 +4551,7 @@ fn verify_merkle_blake3(
 }
 
 fn blake3_merkle_parent(tree_domain: &[u8], left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    blake3_domain(D_MERKLE, &[tree_domain, left, right])
+    stable_hash_domain(D_MERKLE, &[tree_domain, left, right])
 }
 
 fn parse_activation(
@@ -4619,7 +4623,7 @@ fn fma_state_hash(
     activation_root: &[u8; 32],
     accumulator_bits: u32,
 ) -> [u8; 32] {
-    blake3_domain(
+    stable_hash_domain(
         D_FMA_STATE,
         &[
             job_hash,
@@ -4643,7 +4647,7 @@ fn scalar_state_hash(
 ) -> [u8; 32] {
     let phase = u8::from(result.is_some());
     let result = result.unwrap_or(0);
-    blake3_domain(
+    stable_hash_domain(
         D_SCALAR_STATE,
         &[
             job_hash,
@@ -4734,7 +4738,7 @@ fn audit_seed(
     entropy_slot: u64,
     block_hash: &[u8; 32],
 ) -> [u8; 32] {
-    blake3_domain(
+    stable_hash_domain(
         D_AUDIT_SEED,
         &[
             program_id.as_ref(),
@@ -4764,7 +4768,7 @@ fn audit_selected(
     if probability_ppm == 1_000_000 {
         return Ok(true);
     }
-    let digest = blake3_domain(
+    let digest = stable_hash_domain(
         D_AUDIT_DRAW,
         &[
             seed,
@@ -4796,7 +4800,7 @@ fn sha_domain(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
     solana_sha256_hasher::hashv(&parts).to_bytes()
 }
 
-fn blake3_domain(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
+fn stable_hash_domain(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
     let mut parts = Vec::with_capacity(1 + fields.len() * 2);
     parts.push(domain);
     let lengths = fields
@@ -4807,7 +4811,7 @@ fn blake3_domain(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
         parts.push(length);
         parts.push(field);
     }
-    solana_blake3_hasher::hashv(&parts).to_bytes()
+    crate::stable_hashv(&parts)
 }
 
 fn require_epoch(data: &[u8], phase: u8) -> ProgramResult {

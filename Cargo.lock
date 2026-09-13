@@ -3655,6 +3655,7 @@ dependencies = [
 name = "qx-terminal-verifier"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "ed25519-dalek 2.1.1",
  "half",
  "mollusk-svm",
@@ -3662,7 +3663,6 @@ dependencies = [
  "qx-consensus-math",
  "qx-verifier-core",
  "solana-account",
- "solana-blake3-hasher",
  "solana-ed25519-program",
  "solana-hash 4.2.0",
  "solana-instruction",
@@ -3681,6 +3681,7 @@ dependencies = [
  "blake3",
  "clap",
  "solana-client",
+ "solana-commitment-config",
  "solana-sdk",
 ]
 

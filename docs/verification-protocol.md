@@ -12,7 +12,7 @@ to decide whether the selected inference is checked.
 
 This separates three costs:
 
-1. every inference pays 3.127–3.312% measured commitment cost inside the selected
+1. every inference pays 2.469–4.449% measured commitment cost (3.459% mean) inside the selected
    fixed-math two-layer checkpoint profile, including output-token binding; the
    earlier fast-uncommitted to precise-committed migration measurement was
    8.820%, so arithmetic mode remains a separate deployment cost;
@@ -21,7 +21,7 @@ This separates three costs:
 3. Solana pays only when a selected replay disagrees and a bonded dispute is
    opened.
 
-## Adversarial V2 implementation status (2026-09-10)
+## Adversarial V2 implementation status (2026-09-13)
 
 The implemented live SBF path is:
 
@@ -51,24 +51,26 @@ The current live-SBF measurements are:
 
 | Operation | Compute units |
 |---|---:|
-| Finalize epoch seed (once/epoch) | 1,786 |
-| Authenticate job/result and open challenge | 8,676 |
-| Both boundary openings + one midpoint round | 10,332 |
-| Authenticate segment program and bind both operator traces | 8,915 |
-| Chained runtime-chunk scalar terminal | 4,343 |
-| Cross-chunk scalar (two source chunks + destination) | 10,365 |
-| Chained authenticated Q4 terminal (two instructions) | 11,885 |
-| Cross-chunk Q4 (weight + two sources + destination) | 18,473 |
-| Authenticated raw FP32 weight FMA | 15,014 |
-| Chained structured KV append (two instructions) | 9,412 |
-| Intermediate pairwise argmax in a two-leaf registered program | 4,471 |
-| Cross-chunk final-head argmax | 10,554 |
-| Authenticate head program and bind both final-head traces | 10,409 |
-| Final-head token-deciding argmax | 4,110 |
+| Finalize epoch seed (once/epoch) | 14,285 |
+| Authenticate job/result and open challenge | 8,894 |
+| Both boundary openings + one midpoint round | 84,805 |
+| Authenticate segment program and bind both operator traces | 87,209 |
+| Chained runtime-chunk scalar terminal | 61,033 |
+| Cross-chunk scalar (two source chunks + destination) | 123,822 |
+| Chained authenticated Q4 terminal (two instructions) | 68,631 |
+| Cross-chunk Q4 (weight + two sources + destination) | 135,229 |
+| Authenticated raw FP32 weight FMA | 92,933 |
+| Chained structured KV append (two instructions) | 114,436 |
+| Intermediate pairwise argmax in a two-leaf registered program | 61,436 |
+| Cross-chunk final-head argmax | 124,175 |
+| Authenticate head program and bind both final-head traces | 107,227 |
+| Final-head token-deciding argmax | 55,075 |
+| Granite macro boundary bridge | 193,264 |
+| Granite residual macro terminal | 175,672 |
 | Compatibility staged Q4/FMA terminal | 9,536 |
 
 Each additional binary-search level costs one challenger and one miner
-midpoint instruction. The complete three-state synthetic dispute is 32,363 CU,
+midpoint instruction. The complete three-state synthetic dispute is 159,352 CU,
 including both terminal-state reveals. The full test also exercises both
 timeout directions, rejects an unselected result, rejects duplicate epoch
 submission, and convicts an incorrect accumulator without a miner co-signature.
@@ -80,14 +82,24 @@ binds both `QX:OPERATOR:V1` traces to the agreed runtime checkpoint roots, and
 convicts an incorrect update to the same 256-byte chunk tree used by normal
 execution. Compact roots and exact lengths prevent trace shortening.
 
+The deployable v0 artifact was also installed on Agave 4.2.2 with the feature
+set cloned from public testnet. A 100-transaction, concurrency-4 load run
+confirmed 100/100 probes in 13.121 seconds: 7.622 confirmed tx/s and 524.724 ms
+mean confirmed latency. Each representative 32-round/256-byte probe simulated
+at 210,621 CU, requested a 400,000 CU limit, and paid the base 5,000-lamport
+fee with no priority fee. This is a validator/RPC load probe, not a claim that
+every Granite macro terminal is complete. Public testnet deployment still
+requires funding the dedicated authority with program rent and fees.
+
 Automatic slashing remains disabled. The generic hierarchy, canonical
 first-segment checkpoint, chained scalar/Q4/KV terminals, and token-bound
 final-head argmax path work. Equal-checkpoint prediction disagreements now
 descend through a registered operator trace and resolve objectively. The real
-Granite tensor map and 14-macro-per-layer schedule are now lowered and checked
-against the production artifact, but macro boundary states and the nested
-macro-to-scalar dispute are not yet connected on chain. Logit/K/V vector roots
-are not yet produced through that lowering. Collateral
+Granite tensor map and 14-macro-per-layer schedule are lowered and checked
+against the production artifact. Macro boundary states are connected on chain
+and the residual macro resolves objectively; the remaining macro families do
+not yet have terminal traces. Logit/K/V vector roots are not yet produced
+through that lowering. Collateral
 transfer and durable input availability are also outside this proof milestone. See
 `docs/verification-security-audit.md` for the exact readiness gate.
 

@@ -8,8 +8,8 @@ license = "MIT"
 crate-type = ["cdylib"]
 
 [dependencies]
+blake3.workspace = true
 half = { version = "2", default-features = false }
-solana-blake3-hasher = "3.1.0"
 solana-program = "4.0.0"
 solana-sha256-hasher = "3.1.0"
 qx-consensus-math = { path = "../../crates/qx-consensus-math" }

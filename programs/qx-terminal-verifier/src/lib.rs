@@ -813,12 +813,21 @@ fn activation_leaf_hash(index: u32, chunk: &[u8]) -> [u8; 32] {
     let index = index.to_le_bytes();
     let index_len = 4_u64.to_le_bytes();
     let chunk_len = (chunk.len() as u64).to_le_bytes();
-    solana_blake3_hasher::hashv(&[D_ACTIVATION_CHUNK, &index_len, &index, &chunk_len, chunk])
-        .to_bytes()
+    stable_hashv(&[D_ACTIVATION_CHUNK, &index_len, &index, &chunk_len, chunk])
 }
 
 fn raw_blake3_parent(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    solana_blake3_hasher::hashv(&[left, right]).to_bytes()
+    stable_hashv(&[left, right])
+}
+
+/// Evaluate BLAKE3 in SBF until its syscall is active on every target cluster.
+/// Disputes pay this cost; normal inference retains fast GPU commitments.
+fn stable_hashv(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    *hasher.finalize().as_bytes()
 }
 
 fn merkle_depth(leaf_count: u32) -> Result<usize, ProgramError> {

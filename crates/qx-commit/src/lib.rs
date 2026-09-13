@@ -114,7 +114,8 @@ pub const D_MACRO_WORKSPACE_SLOT: &[u8] = b"QX:MACRO:WORKSPACE:SLOT:V1";
 pub const D_MACRO_STATE: &[u8] = b"QX:MACRO:STATE:V1";
 
 pub const MAX_MERKLE_DEPTH: usize = 32;
-/// Hot per-token commitment trees use the Solana-supported BLAKE3 syscall;
+/// Hot per-token commitment trees use BLAKE3. On clusters where the native
+/// syscall is unavailable, the rare on-chain dispute path evaluates it in SBF;
 /// cold model, weight, and receipt objects retain their existing algorithms.
 pub const TRACE_HASH_ALGORITHM: HashAlgorithm = HashAlgorithm::Blake3V1;
 

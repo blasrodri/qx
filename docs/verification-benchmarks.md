@@ -1,5 +1,13 @@
 # QX verification benchmark report
 
+On 2026-09-13, after replacing the testnet-inactive BLAKE3 syscall with
+dispute-only software BLAKE3, two fresh 31-repeat production runs measured
+139.546/145.755 ms and 136.682/140.057 ms uncommitted/committed: **4.449%**
+and **2.469%** overhead (mean **3.459%**). Both emitted trace root
+`6fbe894a85b94f0edbd7ac58600f2277181b5d12472e24a3aed85fbcf8afdab1`.
+The software fallback changes only rare on-chain dispute cost; the GPU path
+and commitment bytes remain BLAKE3.
+
 ## Current hardened commitment format
 
 The canonical token genesis is now an on-chain-derivable pre-embedding
