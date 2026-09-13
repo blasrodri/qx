@@ -869,7 +869,7 @@ impl QuantizedTensor {
                 for offset in 0..len {
                     let code = unpack_code(packed, offset, self.quant_type);
                     let value = decode_scaled(code, scale, self.quant_type);
-                    accumulator += value * input[column + offset];
+                    accumulator = value.mul_add(input[column + offset], accumulator);
                 }
                 remaining -= len;
                 group += 1;

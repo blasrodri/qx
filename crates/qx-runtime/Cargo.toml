@@ -12,6 +12,10 @@ qx-consensus-math.workspace = true
 qx-format.workspace = true
 qx-metal.workspace = true
 qx-model.workspace = true
+qx-quant.workspace = true
 qx-safetensors.workspace = true
 qx-tokenizer.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+qx-runtime-v2.workspace = true

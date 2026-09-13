@@ -199,15 +199,14 @@ pub fn granite_execution_spec_with_math_profile(
     bytes.push(1); // top-k ties: lowest expert id
     bytes.push(1); // greedy decoding
     bytes.push(1); // argmax ties: lowest token id
-    bytes.push(1); // total_cmp ordering for exceptional values
+    bytes.push(1); // finite bit ordering with signed-zero canonicalization
     bytes.push(HashAlgorithm::Blake3V1 as u8); // residual and new-K/V leaf hash
     bytes.extend_from_slice(&256_u16.to_le_bytes()); // state hash chunk bytes
     bytes.push(1); // raw BLAKE3(left || right) state-tree parent
     bytes.push(HashAlgorithm::Blake3V1 as u8); // hot KV/checkpoint/token/job trees
     bytes.push(1); // token trace leaf binds the deterministic predicted token
-    bytes.push(32); // SIMD width
-    bytes.extend_from_slice(&[16, 8, 4, 2, 1]); // fixed shuffle-down reduction tree
-    bytes.push(1); // Q4 dot and MoE accumulation use explicit ordered FMA
+    bytes.push(1); // slashable reductions use one serial control lane
+    bytes.push(1); // dot/MoE accumulation uses explicit ordered FP32 FMA
     bytes.push(math_mode as u8);
     bytes.push(math_functions as u8);
     bytes.push(1); // canonical job-genesis leaf at job-tree index zero
@@ -217,6 +216,9 @@ pub fn granite_execution_spec_with_math_profile(
     bytes.push(1); // signed input hash is a position-bound token Merkle root
     bytes.push(1); // token genesis KV equals the authenticated predecessor frontier
     bytes.push(1); // isolated Granite macros open one rolling workspace-slot update
+    bytes.push(1); // challenge vectors use canonical 256-byte state chunks
+    bytes.push(1); // RoPE commits independently openable rotated Q/K roots
+    bytes.push(1); // hierarchical Granite micro traces and fixed trace lengths
     bytes.extend_from_slice(b"GRANITE_ROPE_FIXED_V1");
     for bits in qx_consensus_math::GRANITE_ROPE_INVERSE_FREQUENCY_BITS {
         bytes.extend_from_slice(&bits.to_le_bytes());

@@ -1,27 +1,29 @@
 # QX verification security audit
 
-Date: 2026-09-13
+Date: 2026-09-14
 
 ## Verdict
 
-The generic fraud-proof mechanism is now demonstrated end to end for an
-in-place scalar transition, but the complete Granite inference program is
-**not ready for automatic settlement or permissionless production inference**.
+The complete Granite inference program now has an exact hierarchical verifier,
+but the protocol is **not ready for automatic settlement or high-throughput
+permissionless production inference**.
 A real runtime-format job root descends through the token and checkpoint trees,
 binds both dispute-local operator traces to the agreed checkpoint and each
 party's endpoint, and lets SBF convict the incorrect state update using the
 same 256-byte residual commitment emitted by normal execution.
 
-The remaining boundary is macro-specific arithmetic rather than the bisection
-primitive. Chained authenticated Q4 and structured KV-frontier transitions
-work, an equal-checkpoint prediction disagreement descends into a token-bound
-final-head trace, and the on-chain bridge now authenticates the isolated
-Granite macro, its registered instruction, both rolling 16-slot workspace
-roots, and its K/V boundary. The residual macro then descends to an objective
-fixed FMA terminal. The other macro families, logits production, and derived
-K/V root production are not yet terminally resolved.
-The tests therefore do not yet prove the entire model's `Execute(M, E, X)`
-claim.
+The job, token, checkpoint, macro, micro, and terminal layers are connected.
+The on-chain bridge authenticates the isolated Granite macro, its registered
+instruction, both rolling 16-slot workspace roots, its K/V boundary, and the
+fixed-length micro program. Objective terminals cover embedding, RMSNorm,
+dense projections, RoPE, attention, Top-K, dynamic MoE, residual, logits, K/V
+append, and argmax. An artifact-native CPU verifier independently reproduces
+the slashable Metal path bit-for-bit through the final receipt root.
+
+The remaining production blockers are economic settlement/data availability,
+adversarial SBF coverage, independent platform validation, and performance.
+The exact serial execution profile currently has 410.614% overhead, not the
+sub-5% target.
 
 ## What is implemented and checked
 
@@ -46,15 +48,15 @@ claim.
 | Chained authenticated Q4 update | registered instruction selects an exact model-weight leaf; its 26-level proof is staged and the VM memory/root update is objective | Implemented end to end on SBF; 11,885 CU |
 | Cross-chunk Q4 update | weight, activation, and accumulator are independently authenticated; a separate destination opening derives the post-root | Implemented on SBF; 18,473 CU across four bounded instructions |
 | Raw FP32 weight update | one finite value is selected from an authenticated canonical raw-weight leaf and combined with staged operands | Implemented on SBF for Granite norm tensors; 15,014 CU |
-| Structured KV append | proves the exact token slot was empty, preserves the layer frontier, and updates the authenticated global layer root | Implemented on SBF; K/V root production still needs Granite lowering |
+| Structured KV append | proves the exact token slot was empty, preserves the layer frontier, and updates the authenticated global layer root | Implemented on SBF and bound to the Granite RoPE/K/V macro output |
 | Pairwise greedy argmax | authenticated `[logit, token]` records select the higher score, exact ties select the lower token ID, and both fields are copied for tournament reduction | Implemented on SBF and reached from an equal-checkpoint prediction dispute |
 | Cross-chunk argmax | two source records are staged independently and the destination can occupy a third chunk; the last reduction binds the selected token into the output state | Implemented on SBF; 10,554 CU |
 | Final-head output binding | shared final checkpoint starts both registered traces; distinct output-state hashes bind each trace to its claimed prediction | Implemented end to end on SBF |
-| Objective arithmetic library | Q4 FMA plus fixed add/mul/div/exp/rsqrt/sin/cos/reduction primitives | Implemented; fixed sine is executed on SBF, but not every family is wired into the chained VM |
+| Objective arithmetic library | Q4 FMA plus fixed add/mul/div/exp/rsqrt/sin/cos/reduction primitives | Implemented and wired through fixed-length Granite micro traces |
 | Granite macro schedule | 14 steps per layer, 29 for the first selected interval including embedding, 28 thereafter, and three for the final head; exact tensor map validated against the 1,706-entry production artifact | Implemented and registered |
 | Dispute-only macro trace | real runtime captures normalized/Q/K/V/rotated-QK/attention/router/routing/MoE/residual roots, the derived K/V leaf, and final hidden/logits/winner in compiler order; a 16-slot Merkle workspace retains every live root | Implemented and complete-model tested |
 | Macro boundary bridge | isolated instruction, pre/post workspace roots, changed slot, and K/V transition are authenticated for both parties | Implemented on SBF; 193,264 CU with software BLAKE3 |
-| Residual macro terminal | two authenticated inputs and both claimed outputs resolve with the fixed FMA rule | Implemented on SBF; 175,672 CU with software BLAKE3 |
+| Granite micro terminals | embedding, RMSNorm, dense, RoPE, attention, Top-K, MoE, residual, logits, K/V, and argmax have objective terminal rules | Implemented on SBF; full branch-by-branch adversarial transaction coverage remains a production gate |
 | Cross-token continuity | generated input is the prior agreed prediction and each token's genesis K/V root is the prior authenticated final K/V root | Implemented on SBF |
 | Testnet deployability | v0 SBF artifact uses platform tools v1.54 and only testnet-enabled syscalls | Deployed to a local validator cloned from the live testnet feature set |
 | CPU verified generation | complete checkpoint+artifact execution emits a nonzero receipt root | Implemented and complete-model tested; a missing `begin_token` call was fixed by this audit |
@@ -74,19 +76,20 @@ registered spec.
 
 ## Cost at massive scale
 
-Two fresh 31-repeat fixed-math and fixed-RoPE runs add **2.469–4.449%**
-to inference on the tested M5 Pro (mean **3.459%**). At the mandatory 1% sampling floor with one auditor, replay adds
-1% of baseline inference work. If auditors use the same committed path, total
-network compute is approximately:
+The old fixed-math/fixed-RoPE runs added **2.469–4.449%** for commitment
+hashing on the optimized path. They did not include the arithmetic migration
+needed for objective replay. The completed exact profile measures **410.614%**
+overhead on the tested M5 Pro. At the mandatory 1% sampling floor with one
+auditor, replay itself adds 1% of the exact execution work, but every receipt
+currently also pays the exact-profile execution cost. Relative to optimized
+inference, the approximate network cost is therefore:
 
 ```text
-(1 + 0.03459) * (1 + 0.01) - 1 = 4.49359%
+(1 + 4.10614) * (1 + 0.01) - 1 = 415.72014%
 ```
 
-This excludes the one-time migration from a fast, non-consensus math profile
-to the fixed consensus profile. The previous same-machine measurement for
-that arithmetic migration plus commitments was 8.820%. It also excludes
-duplicate auditors, data distribution, failed jobs, and dispute replay.
+This excludes duplicate auditors, data distribution, failed jobs, and actual
+dispute transactions. The gap is an implementation cost, not a sampling cost.
 
 The current live three-leaf synthetic SBF dispute consumes 159,352 CU. Epoch
 entropy finalization consumes 14,285 CU once per epoch; opening the challenged
@@ -118,9 +121,9 @@ high-value job.
 
 ## What remains before confidence
 
-### P0: complete macro terminals
+### Completed: full Granite trace hierarchy
 
-The job→token→checkpoint→segment-program→operator chain plus scalar,
+The job→token→checkpoint→segment-program→operator→micro chain plus scalar,
 authenticated-Q4, cross-chunk scalar, and KV append terminals is implemented. Each checkpoint
 interval now authenticates its own program root, so layer-specific Granite
 weights cannot be swapped through one generic program. The deterministic
@@ -128,24 +131,22 @@ macro compiler now emits RMSNorm, Q/K/V/O/router projection, RoPE, KV append,
 attention, Top-K, MoE, residual, final-logit, and argmax steps with exact
 artifact tensor IDs. A rolling 16-slot workspace binds every simultaneously
 live macro value while retaining the existing checkpoint hashes as trace
-endpoints. The on-chain macro bridge and residual terminal are complete. Add
-objective terminal traces for embedding, RMSNorm, dense projections, RoPE,
-attention, Top-K, dynamic MoE, final logits, and full-vocabulary argmax. The canonical
+endpoints. The on-chain macro bridge and objective terminal traces for
+embedding, RMSNorm, dense projections, RoPE, attention, Top-K, dynamic MoE,
+residual, final logits, and full-vocabulary argmax are complete. The canonical
 pre-layer checkpoint is an on-chain-derivable token-start sentinel; embedding
 is the first registered macro in segment one. The SBF hierarchy test exercises
 a disagreement in the first checkpoint interval.
 
 The final-head path and token-bound output state are inside the chained dispute
-path. The real LM head and full-vocabulary argmax tournament still need their
-registered scalar traces rather than the two-candidate SBF fixture.
+path, including the real LM head and full-vocabulary argmax tournament.
 
-### P0: bind K/V root production
+### Completed: bind K/V root production
 
 The structured witness now proves that a new key/value leaf is appended at
 exactly `(layer, token)`, preserves the old frontier, and derives the committed
-global root. The registered Granite trace must still derive the authenticated
-K/V vector roots from Q/K/V projection and RoPE outputs; accepting unattached
-roots would not prove inference.
+global root. The registered Granite macro and micro traces derive the
+authenticated K/V vector roots from Q/K/V projection and RoPE outputs.
 
 ### P0: collateral and settlement
 

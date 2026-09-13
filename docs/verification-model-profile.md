@@ -66,9 +66,11 @@ tensor_count = 1,706
 ## Existing runtime map
 
 - Model loading: V1 `GraniteModel::from_paths` reads the Hugging Face
-  checkpoint for dense tensors and a mapped QX artifact for experts. V2
-  `GraniteV2Generator::load` loads the complete mapped artifact and activates
-  its sealed execution plan.
+  checkpoint for dense tensors and a mapped QX artifact for experts.
+  `GraniteModel::from_artifact_verifier` is the challenge-only CPU oracle: it
+  reads every dense, norm, embedding, and expert tensor directly from the same
+  complete Q4 artifact used by V2. V2 `GraniteV2Generator::load` activates the
+  artifact's sealed execution plan.
 - Quantization: `qx-quant::QuantizedTensor`; artifact mapping and physical
   layout decoding are in `qx-format::MappedArtifact`.
 - Metal entrypoint: V2 `GraniteV2Generator::step` and
@@ -169,8 +171,12 @@ rotated-QK, K/V leaf, attention, router, selected routes, MoE, residual,
 final-hidden, logits, and the winning `[logit, token]` record. A 16-slot Merkle
 workspace rolls those roots forward and collapses back to the existing
 checkpoint state at the end of a layer segment; this is complete-model tested.
-The remaining implementation gate is descent of the one disputed macro into
-scalar terminals on chain.
+Every macro family now descends into a fixed-length micro trace. The SBF
+program authenticates the micro endpoints, bisects the disputed micro trace,
+and resolves embedding, RMSNorm, dense/Q4 projections, RoPE, attention,
+Top-K, dynamic MoE, residual, final logits, and greedy argmax terminals. K/V
+append and Top-K also retain direct structured resolutions where a binary
+micro trace would add no useful localization.
 Generation executes and commits `input_token_count + output_token_count - 1`
 tokens in the usual non-EOS case because the final output is the prediction of
 the preceding step.
@@ -188,22 +194,28 @@ snapshots are overwritten each token and are never receipt or permanent trace
 storage. A single token-end hash dispatch processes all 24 layers and returns
 only 1,536 digest bytes after the runtime's existing token synchronization.
 
-This closes the byte-level commitment gap. Consensus arithmetic now uses an
-explicit 32-lane shuffle-down reduction tree, protocol-defined fixed-operation
-`exp`, `rsqrt`, `sin`, and `cos`, a pinned 32-value RoPE inverse-frequency
-table, and safe Metal arithmetic; CPU, Metal, and SBF primitives reproduce the
-same operation order. Two fixed-RoPE 31-repeat runs measured 3.312% and 3.127%
-commitment overhead. Its
-512-position PTB PPL differed from native precise math by only
-`4.8735e-8` relatively, with complete sampled top-k agreement. The selected
-interval-2 execution-spec is
-`b3843de16b7f41da86fcbc0be44a2ee1b18fe601b5e2febd2d7ddccc028dd6ce`.
-It binds the hash design, reduction tree, math mode, fixed functions,
-checkpoint interval, canonical genesis leaves, checkpoint-tree length, and
-compact job-root semantics. See `docs/verification-benchmarks.md` for exact
-measurements.
+This closes the byte-level commitment gap for the registered full-Q4 artifact.
+The slashable profile uses a serial control lane, explicit ordered FP32 FMA,
+protocol-defined fixed-operation `exp`, `rsqrt`, `sin`, and `cos`, and a pinned
+32-value RoPE inverse-frequency table. The challenge-only CPU oracle and the
+Metal slashable path match bit-for-bit for every layer's K/V, retained
+residual, predicted token, and final receipt root in the full-model parity
+test. The selected interval-2 execution-spec is
+`73af09e26312313a6050e1e371fe6b6e2b7ade395ef6610ace25850d9ee16b36`.
+It binds the hash design, serial arithmetic order, fixed functions, checkpoint
+interval, canonical genesis leaves, checkpoint-tree length, compact job-root
+semantics, and hierarchical micro traces.
 
-A distinct relaxed-arithmetic/precise-functions candidate now measures 3.734%
+This correctness profile is not yet throughput-production-ready. A fresh
+4-token measurement on the M5 Pro ran the optimized path at 179.563 tok/s and
+the slashable path at 35.166 tok/s, or **410.614% total overhead**. The two
+paths also selected different later tokens, which confirms that the optimized
+SIMD reductions cannot be covered by a serial terminal proof merely by adding
+hashes. The earlier 3.127–3.312% measurements remain valid as
+**commitment-only** cost on the optimized graph, but not as the cost of the
+fully replayable execution profile. See `docs/verification-benchmarks.md`.
+
+A distinct relaxed-arithmetic/precise-functions candidate measured 3.734%
 total overhead using the means of two independent 31-repeat candidate runs and
 two bracketing fast controls. It is repeatable on this M5 Pro but remains
 non-slashable until cross-device parity and compiler/metallib pinning are

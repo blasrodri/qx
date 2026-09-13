@@ -3479,7 +3479,7 @@ kernel void qx_dynamic_q4_moe(
             uint code = (byte >> ((local % 2) * 4)) & 0xf;
             uint scale = gate_scale_base + qx_dynamic_scale_offset(row, group, groups_up, layout);
             float weight = float(int(code) - int(qmax)) * float(gate_up_scales[scale]);
-            gate_up_sum += weight * input[column];
+            gate_up_sum = fma(weight, input[column], gate_up_sum);
         }
         gate_up[row] = gate_up_sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3500,9 +3500,9 @@ kernel void qx_dynamic_q4_moe(
             uint code = (byte >> ((local % 2) * 4)) & 0xf;
             uint scale = down_scale_base + qx_dynamic_scale_offset(row, group, groups_down, layout);
             float weight = float(int(code) - int(qmax)) * float(down_scales[scale]);
-            down_sum += weight * activated[column];
+            down_sum = fma(weight, activated[column], down_sum);
         }
-        accumulated += expert_weights[slot] * down_sum;
+        accumulated = fma(expert_weights[slot], down_sum, accumulated);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     output[row] = accumulated;

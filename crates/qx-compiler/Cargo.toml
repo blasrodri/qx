@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 qx-format.workspace = true
+qx-consensus-math = { path = "../qx-consensus-math" }
 qx-model.workspace = true
 qx-quant.workspace = true
 rayon.workspace = true

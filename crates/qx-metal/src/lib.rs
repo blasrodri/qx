@@ -3888,7 +3888,11 @@ pub mod platform {
             }
             self.encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
-                    width: 256,
+                    // The scalar kernel owns the complete batch-1 token in
+                    // one 1,024-thread group. `row` is the thread's position
+                    // inside that group; launching 256 groups only repeated
+                    // the same writes and made slashable replay ~256x dearer.
+                    width: 1,
                     height: 1,
                     depth: 1,
                 },
@@ -7750,7 +7754,7 @@ pub mod platform {
             }
             let params = Params {
                 n: 1024,
-                epsilon: 1e-5,
+                epsilon: 1e-6,
             };
             self.encode_decode_kernel(
                 context,
@@ -7784,7 +7788,7 @@ pub mod platform {
             }
             let params = Params {
                 n: 1024,
-                epsilon: 1e-5,
+                epsilon: 1e-6,
             };
             self.encode_decode_kernel(
                 context,
@@ -7817,7 +7821,7 @@ pub mod platform {
             if tokens == 0 {
                 return Err("batched RMSNorm requires at least one token".to_owned());
             }
-            let params = [1024u32.to_ne_bytes(), 1e-5f32.to_ne_bytes()].concat();
+            let params = [1024u32.to_ne_bytes(), 1e-6f32.to_ne_bytes()].concat();
             self.encode_decode_kernel(
                 context,
                 DecodeKernel::RmsNormBatch,
@@ -7853,7 +7857,7 @@ pub mod platform {
                     "scalar-semantics batched RMSNorm requires at least one token".to_owned(),
                 );
             }
-            let params = [1024u32.to_ne_bytes(), 1e-5f32.to_ne_bytes()].concat();
+            let params = [1024u32.to_ne_bytes(), 1e-6f32.to_ne_bytes()].concat();
             let kernel = if rms_parallel_writeback_enabled() {
                 DecodeKernel::RmsNormBatchParallelWriteback
             } else {
@@ -16839,7 +16843,7 @@ mod tests {
         };
         let norm_params = NormParams {
             n: 1024,
-            epsilon: 1e-5,
+            epsilon: 1e-6,
         };
         let vector_params = VectorParams { n: 1024 };
         let residual_params = ResidualParams {

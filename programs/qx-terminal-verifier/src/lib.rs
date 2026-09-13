@@ -180,6 +180,29 @@ pub fn process_instruction(
             v2::resolve_macro_residual(program_id, accounts, &mut cursor)
         }
         v2::OP_TESTNET_LOAD_PROBE_V2 => v2::testnet_load_probe(program_id, accounts, &mut cursor),
+        v2::OP_CHALLENGER_GRANITE_MICRO_V2 => {
+            v2::submit_challenger_granite_micro(program_id, accounts, &mut cursor)
+        }
+        v2::OP_MINER_GRANITE_MICRO_V2 => {
+            v2::submit_miner_granite_micro(program_id, accounts, &mut cursor)
+        }
+        v2::OP_RESOLVE_GRANITE_MICRO_V2 => {
+            v2::resolve_granite_micro(program_id, accounts, &mut cursor)
+        }
+        v2::OP_STAGE_GRANITE_WEIGHT_V2 => {
+            v2::stage_granite_weight(program_id, accounts, &mut cursor)
+        }
+        v2::OP_RESOLVE_MACRO_KV_V2 => v2::resolve_macro_kv(program_id, accounts, &mut cursor),
+        v2::OP_RESOLVE_MACRO_TOPK_V2 => v2::resolve_macro_topk(program_id, accounts, &mut cursor),
+        v2::OP_STAGE_GRANITE_KV_SCALAR_V2 => {
+            v2::stage_granite_kv_scalar(program_id, accounts, &mut cursor)
+        }
+        v2::OP_CHALLENGER_NESTED_MICRO_V2 => {
+            v2::submit_challenger_nested_micro(program_id, accounts, &mut cursor)
+        }
+        v2::OP_MINER_NESTED_MICRO_V2 => {
+            v2::submit_miner_nested_micro(program_id, accounts, &mut cursor)
+        }
         _ => Err(QxError::InvalidEncoding.into()),
     }
 }

@@ -319,6 +319,7 @@ fn metal_benchmark(
 
     let mut baseline = Vec::with_capacity(repeats);
     let mut verified = Vec::with_capacity(repeats);
+    let mut optimized_output_agreement = true;
     for repeat in 0..repeats {
         let baseline_sample = run_sample(
             &mut generator,
@@ -337,7 +338,7 @@ fn metal_benchmark(
             checkpoint_interval,
         )?;
         if baseline_sample.generated != verified_sample.generated {
-            bail!("verified execution changed generated tokens at repeat {repeat}");
+            optimized_output_agreement = false;
         }
         if verified
             .first()
@@ -397,6 +398,7 @@ fn metal_benchmark(
     print_mode("baseline", &baseline);
     print_mode("verified", &verified);
     println!("verification_overhead_percent={overhead:.3}");
+    println!("optimized_output_agreement={optimized_output_agreement}");
     if let Some(trace_root) = verified[0].trace_root {
         println!("trace_root={}", hex(&trace_root));
     } else {
@@ -405,7 +407,11 @@ fn metal_benchmark(
     println!("output_tokens={:?}", baseline[0].generated);
     println!(
         "performance_gate={}",
-        if overhead < 5.0 { "pass" } else { "fail" }
+        if overhead < 5.0 && optimized_output_agreement {
+            "pass"
+        } else {
+            "fail"
+        }
     );
     Ok(())
 }

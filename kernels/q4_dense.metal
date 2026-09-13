@@ -139,7 +139,7 @@ kernel void qx_q4_dense_gemv(
         uchar byte = packed[row * groups * bytes_per_group + group * bytes_per_group + local / 2];
         uint code = (byte >> ((local % 2) * 4)) & 0xf;
         float weight = float(int(code) - qmax) * float(scales[row * groups + group]);
-        sum += weight * input[column];
+        sum = fma(weight, input[column], sum);
     }
     output[row] = sum * multiplier;
 }

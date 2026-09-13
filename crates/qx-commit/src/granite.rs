@@ -4,10 +4,10 @@ use qx_format::TensorKind;
 use qx_quant::QuantType;
 
 use crate::{
-    CommitError, D_GRANITE_MICRO_STATE, D_GRANITE_MICRO_TREE, D_MACRO_STATE, D_MACRO_WORKSPACE,
-    D_MACRO_WORKSPACE_SLOT, D_OPERATOR_TREE, Digest, HashAlgorithm, MerkleTree, SemanticTensorV1,
-    VmInstructionV1, VmOutputStateV1, VmSegmentProgramV1, VmStateV1, artifact_semantic_tensors_v1,
-    hash_domain, vm_program_tree_v1, vm_segment_schedule_v1,
+    CommitError, D_GRANITE_MICRO_STATE, D_GRANITE_MICRO_TREE, D_GRANITE_ROPE_OUTPUT, D_MACRO_STATE,
+    D_MACRO_WORKSPACE, D_MACRO_WORKSPACE_SLOT, D_OPERATOR_TREE, Digest, HashAlgorithm, MerkleTree,
+    SemanticTensorV1, VmInstructionV1, VmOutputStateV1, VmSegmentProgramV1, VmStateV1,
+    artifact_semantic_tensors_v1, hash_domain, vm_program_tree_v1, vm_segment_schedule_v1,
 };
 
 /// Each Granite layer has seven shared tensors followed by 32 gate/up and 32
@@ -73,6 +73,24 @@ pub enum GraniteDenseOutputV1 {
 pub struct GraniteMacroOutputV1 {
     pub opcode: GraniteMacroOpcodeV1,
     pub output_root: Digest,
+}
+
+/// RoPE keeps rotated Q and K independently openable so the following KV
+/// append can derive the exact key root without revealing either full vector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraniteRopeOutputV1 {
+    pub query_root: Digest,
+    pub key_root: Digest,
+}
+
+impl GraniteRopeOutputV1 {
+    pub fn hash(&self) -> Result<Digest, CommitError> {
+        hash_domain(
+            HashAlgorithm::Blake3V1,
+            D_GRANITE_ROPE_OUTPUT,
+            &[&self.query_root, &self.key_root],
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -234,6 +252,8 @@ pub enum GraniteMicroLevelV1 {
     MoeUpDot = 11,
     FinalLogitDot = 12,
     ArgMaxTournament = 13,
+    TopKWeight = 14,
+    MoeActivation = 15,
 }
 
 impl TryFrom<u8> for GraniteMicroLevelV1 {
@@ -254,6 +274,8 @@ impl TryFrom<u8> for GraniteMicroLevelV1 {
             11 => Ok(Self::MoeUpDot),
             12 => Ok(Self::FinalLogitDot),
             13 => Ok(Self::ArgMaxTournament),
+            14 => Ok(Self::TopKWeight),
+            15 => Ok(Self::MoeActivation),
             _ => Err(CommitError::InvalidExecution(
                 "unknown Granite micro-trace level".to_owned(),
             )),
@@ -374,33 +396,46 @@ pub fn granite_micro_transition_count_v1(
         | (GraniteMacroOpcodeV1::Rope, GraniteMicroLevelV1::MacroOutput)
         | (GraniteMacroOpcodeV1::KvAppend, GraniteMicroLevelV1::MacroOutput)
         | (GraniteMacroOpcodeV1::Residual, GraniteMicroLevelV1::MacroOutput) => 1,
-        (GraniteMacroOpcodeV1::RmsNorm, GraniteMicroLevelV1::MacroOutput) => 4,
-        (GraniteMacroOpcodeV1::RmsNorm, GraniteMicroLevelV1::RmsSquares) => hidden,
+        // Load the child square-sum, divide, add epsilon, rsqrt, then apply
+        // the input and norm weight in the runtime's exact operation order.
+        (GraniteMacroOpcodeV1::RmsNorm, GraniteMicroLevelV1::MacroOutput) => 6,
+        (GraniteMacroOpcodeV1::RmsNorm, GraniteMicroLevelV1::RmsSquares) => {
+            hidden
+                .checked_add(5)
+                .ok_or(CommitError::ArithmeticOverflow)?
+        }
         (GraniteMacroOpcodeV1::Dense, GraniteMicroLevelV1::DenseDot)
         | (GraniteMacroOpcodeV1::FinalLogits, GraniteMicroLevelV1::FinalLogitDot) => hidden,
         (GraniteMacroOpcodeV1::Attention, GraniteMicroLevelV1::MacroOutput) => context,
         (GraniteMacroOpcodeV1::Attention, GraniteMicroLevelV1::AttentionScores) => {
             u32::try_from(shape.head_dim).map_err(|_| CommitError::ArithmeticOverflow)?
         }
+        // Three exact passes. Each context position recomputes its 64-wide
+        // score and performs one bounded finish transition for max, exp/sum,
+        // or divide/weighted accumulation respectively.
         (GraniteMacroOpcodeV1::Attention, GraniteMicroLevelV1::AttentionSoftmax) => context
-            .checked_mul(4)
-            .and_then(|value| value.checked_sub(1))
+            .checked_mul(195)
             .ok_or(CommitError::ArithmeticOverflow)?,
         (GraniteMacroOpcodeV1::Attention, GraniteMicroLevelV1::AttentionValue) => context,
-        (GraniteMacroOpcodeV1::TopK, GraniteMicroLevelV1::TopKSelection) => experts
-            .checked_mul(top_k)
-            .and_then(|value| value.checked_add(top_k.checked_mul(4)?))
+        // A disputed rank scans all router logits while excluding the shared
+        // lower ranks. Weight disputes separately recompute eight exponentials
+        // and the selected division.
+        (GraniteMacroOpcodeV1::TopK, GraniteMicroLevelV1::TopKSelection) => experts,
+        (GraniteMacroOpcodeV1::TopK, GraniteMicroLevelV1::TopKWeight) => top_k
+            .checked_add(1)
             .ok_or(CommitError::ArithmeticOverflow)?,
         (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MacroOutput)
-        | (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeExpertSum) => top_k,
-        (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeDownDot) => intermediate,
+        | (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeExpertSum) => top_k
+            .checked_mul(2)
+            .ok_or(CommitError::ArithmeticOverflow)?,
+        (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeDownDot) => intermediate
+            .checked_mul(2)
+            .ok_or(CommitError::ArithmeticOverflow)?,
         (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeGateDot)
         | (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeUpDot) => hidden,
+        (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeActivation) => 3,
         (GraniteMacroOpcodeV1::ArgMax, GraniteMicroLevelV1::ArgMaxTournament) => {
-            u32::try_from(shape.vocabulary)
-                .map_err(|_| CommitError::ArithmeticOverflow)?
-                .checked_sub(1)
-                .ok_or(CommitError::ArithmeticOverflow)?
+            u32::try_from(shape.vocabulary).map_err(|_| CommitError::ArithmeticOverflow)?
         }
         _ => {
             return Err(CommitError::InvalidExecution(
@@ -1042,7 +1077,7 @@ mod tests {
     fn every_granite_macro_has_a_bounded_hierarchical_micro_trace() {
         let layer = granite_layer_macro_program_v1(0).unwrap();
         let expected = [
-            (GraniteMicroLevelV1::RmsSquares, 1024),
+            (GraniteMicroLevelV1::RmsSquares, 1029),
             (GraniteMicroLevelV1::DenseDot, 1024),
             (GraniteMicroLevelV1::DenseDot, 1024),
             (GraniteMicroLevelV1::DenseDot, 1024),
@@ -1051,10 +1086,10 @@ mod tests {
             (GraniteMicroLevelV1::AttentionScores, 64),
             (GraniteMicroLevelV1::DenseDot, 1024),
             (GraniteMicroLevelV1::MacroOutput, 1),
-            (GraniteMicroLevelV1::RmsSquares, 1024),
+            (GraniteMicroLevelV1::RmsSquares, 1029),
             (GraniteMicroLevelV1::DenseDot, 1024),
-            (GraniteMicroLevelV1::TopKSelection, 288),
-            (GraniteMicroLevelV1::MoeExpertSum, 8),
+            (GraniteMicroLevelV1::TopKSelection, 32),
+            (GraniteMicroLevelV1::MoeExpertSum, 16),
             (GraniteMicroLevelV1::MacroOutput, 1),
         ];
         for (instruction, (level, count)) in layer.into_iter().zip(expected) {
@@ -1072,7 +1107,7 @@ mod tests {
         assert_eq!(
             granite_micro_transition_count_v1(head[2], 0, GraniteMicroLevelV1::ArgMaxTournament)
                 .unwrap(),
-            49_154
+            49_155
         );
     }
 

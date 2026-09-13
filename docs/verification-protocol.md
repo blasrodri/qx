@@ -96,12 +96,13 @@ first-segment checkpoint, chained scalar/Q4/KV terminals, and token-bound
 final-head argmax path work. Equal-checkpoint prediction disagreements now
 descend through a registered operator trace and resolve objectively. The real
 Granite tensor map and 14-macro-per-layer schedule are lowered and checked
-against the production artifact. Macro boundary states are connected on chain
-and the residual macro resolves objectively; the remaining macro families do
-not yet have terminal traces. Logit/K/V vector roots are not yet produced
-through that lowering. Collateral
-transfer and durable input availability are also outside this proof milestone. See
-`docs/verification-security-audit.md` for the exact readiness gate.
+against the production artifact. Macro boundary states are connected on chain,
+and every macro family descends into an objective fixed-length micro trace or
+direct structured terminal. Logit and K/V vector roots are produced and bound
+through that lowering. Collateral transfer, durable input availability,
+exhaustive adversarial SBF coverage, and production throughput are outside
+this proof milestone. See `docs/verification-security-audit.md` for the exact
+readiness gate.
 
 ## Epoch selection
 
@@ -258,15 +259,15 @@ the active dispute PDA, so a proof cannot be replayed into another dispute.
 
 ## Consensus arithmetic status
 
-`QX_EXEC_METAL_V1` now replaces native `simd_sum`/`simd_max` with an explicit
-32-lane shuffle-down tree in the Q4, dense, decode, and dynamic-MoE kernels.
-Metal fast math is disabled by default, and the host verifier contains the
-matching FP32 sum oracle. It also replaces native `exp`, `rsqrt`, and Granite
-RoPE trigonometry throughout the model kernels with protocol-defined
-fixed-operation implementations and a pinned inverse-frequency table. Rust,
-Metal, and the SBF terminal evaluator share identical constants and operation
-order. Live Metal bit-parity tests pass. The selected interval-2 execution-spec
-`b3843de16b7f41da86fcbc0be44a2ee1b18fe601b5e2febd2d7ddccc028dd6ce`
+`QX_EXEC_METAL_V1` uses a serial control lane and explicit ordered FP32 FMA in
+the slashable Q4, dense, decode, and dynamic-MoE kernels. Metal fast math is
+disabled, and the artifact-native CPU verifier uses the same operation order.
+The profile also replaces native `exp`, `rsqrt`, and Granite RoPE trigonometry
+with protocol-defined fixed-operation implementations and a pinned
+inverse-frequency table. Rust, Metal, and the SBF terminal evaluator share
+identical constants and operation order. Full-model Metal/CPU bit-parity tests
+pass. The selected interval-2 execution-spec
+`73af09e26312313a6050e1e371fe6b6e2b7ade395ef6610ace25850d9ee16b36`
 binds the fixed-math and commitment-shape profile.
 
 The scalar terminal IR now objectively evaluates FMA/dot steps, add, multiply,
@@ -277,9 +278,10 @@ consumes 10,807 CU across both terminal reveals and resolution. A fixed-sine
 resolution consumes 5,566 CU after boundary authentication. RoPE decomposes
 into fixed sine/cosine and multiply/add steps; softmax and RMSNorm use the
 fixed exp/rsqrt/div primitives. Argmax and Top-K decompose into compare/select.
-KV leaf hashing exists, but its append/frontier-update witness and the nested
-layer-to-operator trace bridge remain required before complete inference is
-slashable end to end.
+KV leaf hashing, its append/frontier-update witness, and the nested
+layer-to-operator-to-micro bridge are implemented. Every Granite macro family
+has an objective terminal rule. The artifact-native CPU oracle matches the
+slashable Metal execution through the final receipt root.
 
 An experimental Metal profile now combines relaxed arithmetic optimization
 with precise math functions. It reduced the mean fast-uncommitted to
@@ -308,9 +310,11 @@ unsigned result through the miner's epoch, and binds the model, parties,
 activation root, arithmetic claims, and staged weight to one dispute account.
 It no longer needs mutual agreement or a miner signature per result.
 Hierarchical bisection now reaches a chained scalar terminal from a
-production-format runtime root. Automatic slashing remains disabled until the
-registered VM covers genesis, every Granite operation family, KV append, and
-final argmax, and collateral/bond settlement is implemented.
+production-format runtime root. Automatic slashing remains disabled until
+collateral/bond settlement, durable input availability, independent platform
+validation, and full adversarial SBF coverage are implemented. The exact path
+is also not throughput-ready: the current serial implementation measures
+410.614% overhead versus optimized inference.
 
 ## Platform references
 

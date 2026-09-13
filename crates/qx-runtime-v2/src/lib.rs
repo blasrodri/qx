@@ -2159,6 +2159,19 @@ impl PreparedAttentionStack {
             usize,
         )>,
     ) -> Result<(), String> {
+        if let Some((residuals, digests, checkpoint_interval)) = commitment_buffers {
+            return self.encode_scalar_verification_token(
+                graph,
+                buffers,
+                moe,
+                token_input,
+                token_output,
+                position,
+                residuals,
+                digests,
+                checkpoint_interval,
+            );
+        }
         let context = buffers.context().as_ref();
         let genesis_snapshot = commitment_buffers
             .map(|(residuals, _, _)| residuals.subregion(0, HIDDEN * std::mem::size_of::<f32>()))
@@ -2279,6 +2292,206 @@ impl PreparedAttentionStack {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// Encode the slashable Granite profile. Every reduction uses the serial
+    /// row/position order implemented by the CPU Q4 oracle and the SBF micro
+    /// terminals. The optimized SIMD graph remains available to ordinary
+    /// inference, but its different reduction tree is deliberately not
+    /// allowed to produce a slashable receipt.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_scalar_verification_token(
+        &self,
+        graph: &mut qx_metal::platform::DecodeGraph,
+        buffers: &GpuRuntimeBuffers,
+        moe: &PreparedMoeStack,
+        token_input: &qx_metal::platform::RuntimeBuffer,
+        token_output: &qx_metal::platform::RuntimeBuffer,
+        position: usize,
+        residuals: &qx_metal::platform::RuntimeBuffer,
+        digests: &qx_metal::platform::RuntimeBuffer,
+        checkpoint_interval: usize,
+    ) -> Result<(), String> {
+        if buffers.plan.kv_precision != qx_format::KvPrecision::Fp32 {
+            return Err("slashable Granite verification requires FP32 K/V".to_owned());
+        }
+        let context = buffers.context().as_ref();
+        let genesis = residuals.subregion(0, HIDDEN * std::mem::size_of::<f32>())?;
+        graph.encode_q4_embedding_lookup(
+            &self.embedding_lookup,
+            token_input,
+            buffers.buffer(BufferId::HiddenA),
+            Some(&genesis),
+            qx_model::EMBEDDING_MULTIPLIER,
+        )?;
+
+        for (layer, weights) in self.layers.iter().enumerate() {
+            let input = if layer.is_multiple_of(2) {
+                BufferId::HiddenA
+            } else {
+                BufferId::HiddenB
+            };
+            let output = if layer.is_multiple_of(2) {
+                BufferId::HiddenB
+            } else {
+                BufferId::HiddenA
+            };
+            graph.encode_rmsnorm(
+                context,
+                buffers.buffer(input),
+                &weights.input_norm,
+                buffers.buffer(BufferId::MoeInput),
+            )?;
+            graph.encode_prepared_q4_dense(
+                &weights.q_proj,
+                buffers.buffer(BufferId::MoeInput),
+                buffers.buffer(BufferId::Query),
+            )?;
+            graph.encode_prepared_q4_dense(
+                &weights.k_proj,
+                buffers.buffer(BufferId::MoeInput),
+                buffers.buffer(BufferId::Key),
+            )?;
+            graph.encode_prepared_q4_dense(
+                &weights.v_proj,
+                buffers.buffer(BufferId::MoeInput),
+                buffers.buffer(BufferId::Value),
+            )?;
+            let key_cache = buffers.kv_key_buffer(layer)?;
+            let value_cache = buffers.kv_value_buffer(layer)?;
+            graph.encode_rope_kv_for_layer(
+                context,
+                buffers.buffer(BufferId::Query),
+                buffers.buffer(BufferId::Key),
+                buffers.buffer(BufferId::Value),
+                buffers.buffer(BufferId::Query),
+                &key_cache,
+                &value_cache,
+                layer,
+                position,
+            )?;
+            graph.encode_attention(
+                context,
+                buffers.buffer(BufferId::Query),
+                &key_cache,
+                &value_cache,
+                buffers.buffer(BufferId::Attention),
+                position + 1,
+            )?;
+            graph.encode_prepared_q4_dense(
+                &weights.o_proj,
+                buffers.buffer(BufferId::Attention),
+                buffers.buffer(BufferId::MoeOutput),
+            )?;
+            graph.encode_residual(
+                context,
+                buffers.buffer(input),
+                buffers.buffer(BufferId::MoeOutput),
+                buffers.buffer(output),
+                qx_model::RESIDUAL_MULTIPLIER,
+            )?;
+            graph.encode_rmsnorm(
+                context,
+                buffers.buffer(output),
+                &weights.post_attention_norm,
+                buffers.buffer(BufferId::MoeInput),
+            )?;
+            graph.encode_prepared_q4_dense(
+                &weights.router,
+                buffers.buffer(BufferId::MoeInput),
+                buffers.buffer(BufferId::RouterScores),
+            )?;
+            graph.encode_topk(
+                context,
+                buffers.buffer(BufferId::RouterScores),
+                buffers.buffer(BufferId::TopKIds),
+                buffers.buffer(BufferId::TopKWeights),
+            )?;
+            graph.encode_dynamic_q4_moe(
+                &moe.layers[layer],
+                buffers.buffer(BufferId::MoeInput),
+                buffers.buffer(BufferId::TopKIds),
+                buffers.buffer(BufferId::TopKWeights),
+                buffers.buffer(BufferId::MoeOutput),
+            )?;
+            graph.encode_residual(
+                context,
+                buffers.buffer(output),
+                buffers.buffer(BufferId::MoeOutput),
+                buffers.buffer(output),
+                qx_model::RESIDUAL_MULTIPLIER,
+            )?;
+            if (layer + 1).is_multiple_of(checkpoint_interval) || layer + 1 == LAYERS {
+                let snapshot = residuals.subregion(
+                    (layer + 1) * HIDDEN * std::mem::size_of::<f32>(),
+                    HIDDEN * std::mem::size_of::<f32>(),
+                )?;
+                graph.encode_copy_f32(context, buffers.buffer(output), &snapshot, HIDDEN)?;
+            }
+        }
+
+        let mut key_offsets = [0_u32; LAYERS];
+        let mut value_offsets = [0_u32; LAYERS];
+        let mut key_bytes = [0_u32; LAYERS];
+        let mut value_bytes = [0_u32; LAYERS];
+        for layer in 0..LAYERS {
+            let key_width = KV_HEADS * HEAD_DIM * buffers.plan.kv_key_element_bytes[layer];
+            let value_width = KV_HEADS * HEAD_DIM * buffers.plan.kv_value_element_bytes[layer];
+            key_offsets[layer] =
+                u32::try_from(buffers.kv_layer_offset(layer) + position * key_width)
+                    .map_err(|_| "verification key offset exceeds u32".to_owned())?;
+            value_offsets[layer] = u32::try_from(
+                buffers.kv_layer_offset(layer)
+                    + GpuRuntimeBuffers::key_layer_bytes(&buffers.plan, layer)
+                    + position * value_width,
+            )
+            .map_err(|_| "verification value offset exceeds u32".to_owned())?;
+            key_bytes[layer] = u32::try_from(key_width)
+                .map_err(|_| "verification key width exceeds u32".to_owned())?;
+            value_bytes[layer] = u32::try_from(value_width)
+                .map_err(|_| "verification value width exceeds u32".to_owned())?;
+        }
+        graph.encode_verification_hashes(
+            context,
+            residuals,
+            buffers.kv_buffer(),
+            digests,
+            u32::try_from(position)
+                .map_err(|_| "verification token index exceeds u32".to_owned())?,
+            LAYERS,
+            HIDDEN * std::mem::size_of::<f32>(),
+            checkpoint_interval,
+            key_offsets,
+            value_offsets,
+            key_bytes,
+            value_bytes,
+        )?;
+
+        let final_hidden = if LAYERS.is_multiple_of(2) {
+            BufferId::HiddenA
+        } else {
+            BufferId::HiddenB
+        };
+        graph.encode_rmsnorm(
+            context,
+            buffers.buffer(final_hidden),
+            &self.final_norm,
+            buffers.buffer(BufferId::MoeInput),
+        )?;
+        graph.encode_prepared_q4_dense_scaled(
+            &self.embedding,
+            buffers.buffer(BufferId::MoeInput),
+            buffers.buffer(BufferId::Logits),
+            1.0 / qx_model::LOGITS_SCALING,
+        )?;
+        graph.encode_argmax(
+            context,
+            buffers.buffer(BufferId::Logits),
+            buffers.buffer(BufferId::MoeScratch),
+            token_output,
+            VOCAB,
+        )?;
         Ok(())
     }
 
@@ -2831,6 +3044,68 @@ impl GraniteV2Generator {
         self.verifier_buffers
             .as_ref()
             .map_or(0, |_| granite_verifier_buffer_bytes(4))
+    }
+
+    /// Read the compact hashes produced by the most recent verified step.
+    /// This is test/diagnostic data and does not expose activation buffers.
+    pub fn last_verification_digests(&self) -> Result<Vec<([u8; 32], [u8; 32])>, String> {
+        let buffer = self
+            .verification_digests
+            .as_ref()
+            .ok_or_else(|| "verification digest buffer is unavailable".to_owned())?;
+        let bytes = self.context.read_runtime_bytes(buffer);
+        if bytes.len() != (LAYERS + 1) * 64 {
+            return Err("verification digest buffer has an invalid length".to_owned());
+        }
+        (0..=LAYERS)
+            .map(|index| {
+                let offset = index * 64;
+                Ok((
+                    bytes[offset..offset + 32]
+                        .try_into()
+                        .map_err(|_| "invalid residual digest width".to_owned())?,
+                    bytes[offset + 32..offset + 64]
+                        .try_into()
+                        .map_err(|_| "invalid KV digest width".to_owned())?,
+                ))
+            })
+            .collect()
+    }
+
+    pub fn last_verification_residuals(&self) -> Result<Vec<Vec<f32>>, String> {
+        let buffer = self
+            .verification_residuals
+            .as_ref()
+            .ok_or_else(|| "verification residual buffer is unavailable".to_owned())?;
+        let values = self
+            .context
+            .read_runtime_f32(buffer, (LAYERS + 1) * HIDDEN)?;
+        Ok(values.chunks_exact(HIDDEN).map(<[f32]>::to_vec).collect())
+    }
+
+    pub fn verification_kv_slot(
+        &self,
+        layer: usize,
+        position: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        if layer >= LAYERS || position >= self.position {
+            return Err("verification KV coordinate is unavailable".to_owned());
+        }
+        let width = KV_HEADS * HEAD_DIM;
+        let start = position * width * std::mem::size_of::<f32>();
+        let bytes = width * std::mem::size_of::<f32>();
+        let key = self.context.read_runtime_f32(
+            &self.buffers.kv_key_buffer(layer)?.subregion(start, bytes)?,
+            width,
+        )?;
+        let value = self.context.read_runtime_f32(
+            &self
+                .buffers
+                .kv_value_buffer(layer)?
+                .subregion(start, bytes)?,
+            width,
+        )?;
+        Ok((key, value))
     }
 
     fn ensure_verifier_buffers(&mut self) -> Result<&mut KWideVerifierBuffers, String> {
@@ -4438,7 +4713,9 @@ impl CpuQ4Reference {
             let after_attention = hidden
                 .iter()
                 .zip(projection)
-                .map(|(left, right)| left + qx_model::RESIDUAL_MULTIPLIER * right)
+                .map(|(left, right)| {
+                    qx_consensus_math::fma_f32(qx_model::RESIDUAL_MULTIPLIER, right, *left)
+                })
                 .collect::<Vec<_>>();
             let moe_input = cpu_rms_norm(&after_attention, &weights.post_attention_norm);
             let router_logits = weights.router.mat_vec(&moe_input);
@@ -4467,13 +4744,15 @@ impl CpuQ4Reference {
                     .collect::<Vec<_>>();
                 let expert_output = down.mat_vec(&activated);
                 for (destination, value) in moe_output.iter_mut().zip(expert_output) {
-                    *destination += route_weight * value;
+                    *destination = qx_consensus_math::fma_f32(route_weight, value, *destination);
                 }
             }
             hidden = after_attention
                 .into_iter()
                 .zip(moe_output)
-                .map(|(left, right)| left + qx_model::RESIDUAL_MULTIPLIER * right)
+                .map(|(left, right)| {
+                    qx_consensus_math::fma_f32(qx_model::RESIDUAL_MULTIPLIER, right, left)
+                })
                 .collect();
         }
         let hidden = cpu_rms_norm(&hidden, &self.final_norm);
@@ -4547,12 +4826,14 @@ impl CpuQ4Cache {
             let scores = (0..self.length)
                 .map(|cached| {
                     let key_start = (cached * KV_HEADS + kv_head) * HEAD_DIM;
-                    query[query_start..query_start + HEAD_DIM]
+                    let mut score = 0.0_f32;
+                    for (&left, &right) in query[query_start..query_start + HEAD_DIM]
                         .iter()
                         .zip(&self.keys[key_start..key_start + HEAD_DIM])
-                        .map(|(left, right)| left * right)
-                        .sum::<f32>()
-                        * qx_model::ATTENTION_MULTIPLIER
+                    {
+                        score = qx_consensus_math::fma_f32(left, right, score);
+                    }
+                    score * qx_model::ATTENTION_MULTIPLIER
                 })
                 .collect::<Vec<_>>();
             let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -4565,7 +4846,11 @@ impl CpuQ4Cache {
                 let weight = consensus_exp(score - maximum) / denominator;
                 let value_start = key_start;
                 for index in 0..HEAD_DIM {
-                    output[query_start + index] += weight * self.values[value_start + index];
+                    output[query_start + index] = qx_consensus_math::fma_f32(
+                        weight,
+                        self.values[value_start + index],
+                        output[query_start + index],
+                    );
                 }
             }
         }
@@ -4631,7 +4916,11 @@ fn artifact_raw_norm(
 }
 
 fn cpu_rms_norm(input: &[f32], weight: &[f32]) -> Vec<f32> {
-    let mean_square = input.iter().map(|value| value * value).sum::<f32>() / HIDDEN as f32;
+    let mut sum = 0.0_f32;
+    for value in input {
+        sum = qx_consensus_math::fma_f32(*value, *value, sum);
+    }
+    let mean_square = sum / HIDDEN as f32;
     let scale = consensus_rsqrt(mean_square + qx_model::RMS_EPSILON);
     input
         .iter()

@@ -91,9 +91,9 @@ impl ExpertWeights {
             let activated = (start..end)
                 .map(|index| silu(gate_up[index]) * gate_up[intermediate + index])
                 .collect::<Vec<_>>();
-            for row in 0..self.down_rows {
+            for (row, value) in output.iter_mut().enumerate() {
                 let down_row = &self.down[row * intermediate..(row + 1) * intermediate];
-                output[row] += down_row[start..end]
+                *value += down_row[start..end]
                     .iter()
                     .zip(&activated)
                     .map(|(weight, value)| weight * value)
@@ -159,7 +159,8 @@ fn mat_vec(matrix: &[f32], rows: usize, cols: usize, input: &[f32]) -> Vec<f32> 
 }
 
 fn silu(value: f32) -> f32 {
-    value / (1.0 + (-value).exp())
+    let exponential = qx_consensus_math::exp_f32(-value).expect("finite expert activation");
+    qx_consensus_math::div_f32(value, 1.0 + exponential).expect("positive SiLU denominator")
 }
 
 #[derive(Clone, Debug)]

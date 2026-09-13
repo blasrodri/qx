@@ -1,5 +1,33 @@
 # QX verification benchmark report
 
+## Current full-verifier measurement
+
+The earlier results below isolate commitment hashing or compare arithmetic
+candidates. They must not be interpreted as the total cost of the completed
+slashable execution path.
+
+On 2026-09-13, the complete interval-2 verifier was run against
+`granite-m5-pro-q4-dense.qx` with a 512-token context, four returned tokens,
+two warmups, and five alternating repeats. The ordinary optimized SIMD path
+measured 61.260 ms total and 179.563 tok/s. The exact slashable path measured
+312.802 ms and 35.166 tok/s: **410.614% total overhead**. Its trace root was
+`d679a8e8f3e961ff0771c43ef0946766ba17b612b41195f018afc1367b442d43`
+under execution spec
+`73af09e26312313a6050e1e371fe6b6e2b7ade395ef6610ace25850d9ee16b36`.
+
+The optimized and slashable paths did not retain token agreement over this
+rollout (`optimized_output_agreement=false`), so the performance gate correctly
+reports `fail`. Separately, the artifact-native CPU verifier matches the
+slashable Metal path bit-for-bit for all layer K/V values, retained residual
+hashes, predicted tokens, and the final two-token receipt root. This separates
+the two conclusions cleanly: the proof semantics are reproducible, while the
+current serial implementation is too expensive for mass deployment.
+
+Reducing this overhead without weakening verification requires committing and
+tracing the optimized SIMD reduction tree (including its precise compiler and
+device semantics), rather than comparing that tree to a serial execution
+after the fact.
+
 On 2026-09-13, after replacing the testnet-inactive BLAKE3 syscall with
 dispute-only software BLAKE3, two fresh 31-repeat production runs measured
 139.546/145.755 ms and 136.682/140.057 ms uncommitted/committed: **4.449%**
@@ -8,7 +36,7 @@ and **2.469%** overhead (mean **3.459%**). Both emitted trace root
 The software fallback changes only rare on-chain dispute cost; the GPU path
 and commitment bytes remain BLAKE3.
 
-## Current hardened commitment format
+## Historical commitment-only measurements
 
 The canonical token genesis is now an on-chain-derivable pre-embedding
 sentinel plus the prior-token KV root; embedding is the first instruction in
@@ -205,11 +233,11 @@ of magnitude. The frequency sweep is almost flat at intervals 2 and 4, showing
 that incremental K/V SHA-256 is now the limiting work rather than checkpoint
 frequency, CPU work, synchronization, or residual copies.
 
-The commitment-only `<5%` gate is achieved and its `<=3%` desired target is
-achieved in safe-precise mode. The safe-precise comparison against the old fast
-execution path remains 8.820%. The relaxed-precise candidate reduces the
-measured total to 3.734%, below 5%, but the complete production gate remains
-open until its cross-device consensus requirements pass.
+These historical experiments achieved the commitment-only `<5%` gate; they do
+not establish the full-verifier performance gate. The completed serial
+slashable profile measured above is bit-reproducible but costs 410.614% over
+the optimized path. The relaxed-precise candidate remains useful evidence for
+a future SIMD-trace design, not a registered slashable profile.
 See the protocol document for the receipt-bound Solana measurements.
 
 Reproduction command:

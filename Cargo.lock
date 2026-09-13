@@ -3417,6 +3417,7 @@ name = "qx-compiler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "qx-consensus-math",
  "qx-format",
  "qx-model",
  "qx-quant",
@@ -3599,6 +3600,8 @@ dependencies = [
  "qx-format",
  "qx-metal",
  "qx-model",
+ "qx-quant",
+ "qx-runtime-v2",
  "qx-safetensors",
  "qx-tokenizer",
  "serde_json",

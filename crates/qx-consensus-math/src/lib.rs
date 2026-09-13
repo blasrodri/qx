@@ -10,6 +10,18 @@
 pub const EXP_MIN_INPUT: f32 = -87.0;
 pub const EXP_MAX_INPUT: f32 = 88.0;
 
+/// Total-order key for finite model values. Signed zero is canonicalized so
+/// protocol ties always fall through to the lower expert/token identifier.
+#[inline(always)]
+pub const fn finite_order_key(bits: u32) -> u32 {
+    let bits = if bits & 0x7fff_ffff == 0 { 0 } else { bits };
+    if bits & 0x8000_0000 != 0 {
+        !bits
+    } else {
+        bits ^ 0x8000_0000
+    }
+}
+
 /// Pinned Granite inverse frequencies for `theta=10000`, head dimension 64.
 /// Storing the binary32 values avoids implementation-defined `pow` in every
 /// CPU/GPU RoPE invocation.
@@ -180,6 +192,18 @@ pub fn sin_cos_f32(angle: f32) -> Option<(f32, f32)> {
 pub fn granite_rope_sin_cos(position: u32, pair: u32) -> Option<(f32, f32)> {
     let inverse = f32::from_bits(*GRANITE_ROPE_INVERSE_FREQUENCY_BITS.get(pair as usize)?);
     sin_cos_f32(position as f32 * inverse)
+}
+
+/// Rotate one Granite half-split pair with an explicitly pinned FMA order.
+#[inline(always)]
+pub fn granite_rope_pair(position: u32, pair: u32, left: f32, right: f32) -> Option<(f32, f32)> {
+    if !left.is_finite() || !right.is_finite() {
+        return None;
+    }
+    let (sine, cosine) = granite_rope_sin_cos(position, pair)?;
+    let first = libm::fmaf(-right, sine, left * cosine);
+    let second = libm::fmaf(right, cosine, left * sine);
+    (first.is_finite() && second.is_finite()).then_some((first, second))
 }
 
 #[cfg(test)]

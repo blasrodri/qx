@@ -64,7 +64,7 @@ kernel void qx_v2_rmsnorm(
     uint tid [[thread_position_in_grid]]) {
     if (tid != 0) return;
     float sum = 0.0f;
-    for (uint i = 0; i < params.n; ++i) sum += input[i] * input[i];
+    for (uint i = 0; i < params.n; ++i) sum = fma(input[i], input[i], sum);
     float inverse = qx_consensus_rsqrt(sum / float(params.n) + params.epsilon);
     for (uint i = 0; i < params.n; ++i) output[i] = input[i] * inverse * weights[i];
 }
@@ -226,7 +226,7 @@ kernel void qx_v2_residual(
     device float* output [[buffer(2)]],
     constant ResidualParams& params [[buffer(3)]],
     uint tid [[thread_position_in_grid]]) {
-    if (tid < params.n) output[tid] = left[tid] + params.scale * right[tid];
+    if (tid < params.n) output[tid] = fma(params.scale, right[tid], left[tid]);
 }
 
 kernel void qx_v2_residual_batch(
@@ -264,8 +264,8 @@ kernel void qx_v2_rope_kv(
             float c = rotation.y;
             float x = query_input[offset];
             float y = query_input[paired_offset];
-            query_output[offset] = x * c - y * s;
-            query_output[paired_offset] = x * s + y * c;
+            query_output[offset] = fma(-y, s, x * c);
+            query_output[paired_offset] = fma(y, c, x * s);
         }
     }
     uint cache_offset = params.position * kv_heads * head_dim;
@@ -278,8 +278,8 @@ kernel void qx_v2_rope_kv(
             float c = rotation.y;
             float x = key_input[offset];
             float y = key_input[paired_offset];
-            key_cache[cache_offset + offset] = x * c - y * s;
-            key_cache[cache_offset + paired_offset] = x * s + y * c;
+            key_cache[cache_offset + offset] = fma(-y, s, x * c);
+            key_cache[cache_offset + paired_offset] = fma(y, c, x * s);
             value_cache[cache_offset + offset] = value_input[offset];
             value_cache[cache_offset + paired_offset] = value_input[paired_offset];
         }
@@ -308,8 +308,8 @@ kernel void qx_v2_rope_query_simd(
     float c = rotation.y;
     float x = query_input[offset];
     float y = query_input[paired_offset];
-    query_output[offset] = x * c - y * s;
-    query_output[paired_offset] = x * s + y * c;
+    query_output[offset] = fma(-y, s, x * c);
+    query_output[paired_offset] = fma(y, c, x * s);
 }
 
 // Fixed Granite K/V path. K is rotated directly into its final cache slot;
@@ -337,8 +337,8 @@ kernel void qx_v2_rope_kv_simd(
     float c = rotation.y;
     float x = key_input[offset];
     float y = key_input[paired_offset];
-    key_cache[cache_offset + offset] = x * c - y * s;
-    key_cache[cache_offset + paired_offset] = x * s + y * c;
+    key_cache[cache_offset + offset] = fma(-y, s, x * c);
+    key_cache[cache_offset + paired_offset] = fma(y, c, x * s);
     value_cache[cache_offset + offset] = value_input[offset];
     value_cache[cache_offset + paired_offset] = value_input[paired_offset];
 }
@@ -368,8 +368,8 @@ kernel void qx_v2_rope_kv_simd_kf32_vf16(
     float c = rotation.y;
     float x = key_input[offset];
     float y = key_input[paired_offset];
-    key_cache[cache_offset + offset] = x * c - y * s;
-    key_cache[cache_offset + paired_offset] = x * s + y * c;
+    key_cache[cache_offset + offset] = fma(-y, s, x * c);
+    key_cache[cache_offset + paired_offset] = fma(y, c, x * s);
     value_cache[cache_offset + offset] = half(value_input[offset]);
     value_cache[cache_offset + paired_offset] = half(value_input[paired_offset]);
 }
@@ -406,8 +406,8 @@ kernel void qx_v2_rope_query_batch_simd(
     float x = query_input[input_base + offset];
     float y = query_input[input_base + paired_offset];
     uint output_base = input_base;
-    query_output[output_base + offset] = x * c - y * s;
-    query_output[output_base + paired_offset] = x * s + y * c;
+    query_output[output_base + offset] = fma(-y, s, x * c);
+    query_output[output_base + paired_offset] = fma(y, c, x * s);
 }
 
 kernel void qx_v2_rope_kv_batch_simd(
@@ -436,8 +436,8 @@ kernel void qx_v2_rope_kv_batch_simd(
     float c = rotation.y;
     float x = key_input[input_base + offset];
     float y = key_input[input_base + paired_offset];
-    key_cache[cache_base + offset] = x * c - y * s;
-    key_cache[cache_base + paired_offset] = x * s + y * c;
+    key_cache[cache_base + offset] = fma(-y, s, x * c);
+    key_cache[cache_base + paired_offset] = fma(y, c, x * s);
     value_cache[cache_base + offset] = value_input[input_base + offset];
     value_cache[cache_base + paired_offset] = value_input[input_base + paired_offset];
 }
@@ -465,8 +465,8 @@ kernel void qx_v2_rope_kv_f16(
             float c = rotation.y;
             float x = query_input[offset];
             float y = query_input[paired_offset];
-            query_output[offset] = x * c - y * s;
-            query_output[paired_offset] = x * s + y * c;
+            query_output[offset] = fma(-y, s, x * c);
+            query_output[paired_offset] = fma(y, c, x * s);
         }
     }
     uint cache_offset = params.position * kv_heads * head_dim;
@@ -479,8 +479,8 @@ kernel void qx_v2_rope_kv_f16(
             float c = rotation.y;
             float x = key_input[offset];
             float y = key_input[paired_offset];
-            key_cache[cache_offset + offset] = half(x * c - y * s);
-            key_cache[cache_offset + paired_offset] = half(x * s + y * c);
+            key_cache[cache_offset + offset] = half(fma(-y, s, x * c));
+            key_cache[cache_offset + paired_offset] = half(fma(y, c, x * s));
             value_cache[cache_offset + offset] = half(value_input[offset]);
             value_cache[cache_offset + paired_offset] = half(value_input[paired_offset]);
         }
@@ -510,8 +510,8 @@ kernel void qx_v2_rope_kv_kf32_vf16(
             float c = rotation.y;
             float x = query_input[offset];
             float y = query_input[paired_offset];
-            query_output[offset] = x * c - y * s;
-            query_output[paired_offset] = x * s + y * c;
+            query_output[offset] = fma(-y, s, x * c);
+            query_output[paired_offset] = fma(y, c, x * s);
         }
     }
     uint cache_offset = params.position * kv_heads * head_dim;
@@ -524,8 +524,8 @@ kernel void qx_v2_rope_kv_kf32_vf16(
             float c = rotation.y;
             float x = key_input[offset];
             float y = key_input[paired_offset];
-            key_cache[cache_offset + offset] = x * c - y * s;
-            key_cache[cache_offset + paired_offset] = x * s + y * c;
+            key_cache[cache_offset + offset] = fma(-y, s, x * c);
+            key_cache[cache_offset + paired_offset] = fma(y, c, x * s);
             value_cache[cache_offset + offset] = half(value_input[offset]);
             value_cache[cache_offset + paired_offset] = half(value_input[paired_offset]);
         }
@@ -555,8 +555,8 @@ kernel void qx_v2_rope_kv_kf16_vf32(
             float c = rotation.y;
             float x = query_input[offset];
             float y = query_input[paired_offset];
-            query_output[offset] = x * c - y * s;
-            query_output[paired_offset] = x * s + y * c;
+            query_output[offset] = fma(-y, s, x * c);
+            query_output[paired_offset] = fma(y, c, x * s);
         }
     }
     uint cache_offset = params.position * kv_heads * head_dim;
@@ -569,8 +569,8 @@ kernel void qx_v2_rope_kv_kf16_vf32(
             float c = rotation.y;
             float x = key_input[offset];
             float y = key_input[paired_offset];
-            key_cache[cache_offset + offset] = half(x * c - y * s);
-            key_cache[cache_offset + paired_offset] = half(x * s + y * c);
+            key_cache[cache_offset + offset] = half(fma(-y, s, x * c));
+            key_cache[cache_offset + paired_offset] = half(fma(y, c, x * s));
             value_cache[cache_offset + offset] = value_input[offset];
             value_cache[cache_offset + paired_offset] = value_input[paired_offset];
         }
@@ -597,7 +597,7 @@ kernel void qx_v2_attention(
         uint cache_offset = (position * kv_heads + kv_head) * head_dim;
         uint query_offset = q_head * head_dim;
         for (uint d = 0; d < head_dim; ++d) {
-            score += query[query_offset + d] * key_cache[cache_offset + d];
+            score = fma(query[query_offset + d], key_cache[cache_offset + d], score);
         }
         maximum = max(maximum, score * scale);
     }
@@ -607,7 +607,7 @@ kernel void qx_v2_attention(
         uint cache_offset = (position * kv_heads + kv_head) * head_dim;
         uint query_offset = q_head * head_dim;
         for (uint d = 0; d < head_dim; ++d) {
-            score += query[query_offset + d] * key_cache[cache_offset + d];
+            score = fma(query[query_offset + d], key_cache[cache_offset + d], score);
         }
         denominator += qx_consensus_exp(score * scale - maximum);
     }
@@ -617,10 +617,11 @@ kernel void qx_v2_attention(
         uint cache_offset = (position * kv_heads + kv_head) * head_dim;
         uint query_offset = q_head * head_dim;
         for (uint d = 0; d < head_dim; ++d) {
-            score += query[query_offset + d] * key_cache[cache_offset + d];
+            score = fma(query[query_offset + d], key_cache[cache_offset + d], score);
         }
-        value += qx_consensus_exp(score * scale - maximum) / denominator
-            * value_cache[cache_offset + dimension];
+        value = fma(
+            qx_consensus_exp(score * scale - maximum) / denominator,
+            value_cache[cache_offset + dimension], value);
     }
     output[tid] = value;
 }
