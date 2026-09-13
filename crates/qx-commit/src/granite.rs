@@ -4,10 +4,10 @@ use qx_format::TensorKind;
 use qx_quant::QuantType;
 
 use crate::{
-    CommitError, D_MACRO_STATE, D_MACRO_WORKSPACE, D_MACRO_WORKSPACE_SLOT, D_OPERATOR_TREE, Digest,
-    HashAlgorithm, MerkleTree, SemanticTensorV1, VmInstructionV1, VmOutputStateV1,
-    VmSegmentProgramV1, VmStateV1, artifact_semantic_tensors_v1, hash_domain, vm_program_tree_v1,
-    vm_segment_schedule_v1,
+    CommitError, D_GRANITE_MICRO_STATE, D_GRANITE_MICRO_TREE, D_MACRO_STATE, D_MACRO_WORKSPACE,
+    D_MACRO_WORKSPACE_SLOT, D_OPERATOR_TREE, Digest, HashAlgorithm, MerkleTree, SemanticTensorV1,
+    VmInstructionV1, VmOutputStateV1, VmSegmentProgramV1, VmStateV1, artifact_semantic_tensors_v1,
+    hash_domain, vm_program_tree_v1, vm_segment_schedule_v1,
 };
 
 /// Each Granite layer has seven shared tensors followed by 32 gate/up and 32
@@ -213,6 +213,202 @@ pub struct GraniteMacroTraceV1 {
     pub tree: MerkleTree,
     pub final_residual_root: Digest,
     pub final_global_kv_root: Digest,
+}
+
+/// Hierarchical dispute levels below one isolated Granite macro. Keeping MoE
+/// and attention nested is essential: a flat scalar trace for one MoE output
+/// would contain tens of millions of leaves and make challenges impractical.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum GraniteMicroLevelV1 {
+    MacroOutput = 1,
+    RmsSquares = 2,
+    DenseDot = 3,
+    AttentionScores = 4,
+    AttentionSoftmax = 5,
+    AttentionValue = 6,
+    TopKSelection = 7,
+    MoeExpertSum = 8,
+    MoeDownDot = 9,
+    MoeGateDot = 10,
+    MoeUpDot = 11,
+    FinalLogitDot = 12,
+    ArgMaxTournament = 13,
+}
+
+impl TryFrom<u8> for GraniteMicroLevelV1 {
+    type Error = CommitError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::MacroOutput),
+            2 => Ok(Self::RmsSquares),
+            3 => Ok(Self::DenseDot),
+            4 => Ok(Self::AttentionScores),
+            5 => Ok(Self::AttentionSoftmax),
+            6 => Ok(Self::AttentionValue),
+            7 => Ok(Self::TopKSelection),
+            8 => Ok(Self::MoeExpertSum),
+            9 => Ok(Self::MoeDownDot),
+            10 => Ok(Self::MoeGateDot),
+            11 => Ok(Self::MoeUpDot),
+            12 => Ok(Self::FinalLogitDot),
+            13 => Ok(Self::ArgMaxTournament),
+            _ => Err(CommitError::InvalidExecution(
+                "unknown Granite micro-trace level".to_owned(),
+            )),
+        }
+    }
+}
+
+/// One state in a challenge-only scalar subtrace. Coordinates are interpreted
+/// by the registered level (for example output row, attention head/position,
+/// or expert/intermediate neuron). Four raw registers are enough for the
+/// accumulator plus fixed-math scratch without committing host struct layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GraniteMicroStateV1 {
+    pub job_hash: Digest,
+    pub token_index: u32,
+    pub segment_index: u32,
+    pub macro_pc: u32,
+    pub level: GraniteMicroLevelV1,
+    pub coordinates: [u32; 3],
+    pub step: u32,
+    pub registers: [u32; 4],
+}
+
+impl GraniteMicroStateV1 {
+    pub fn hash(&self) -> Result<Digest, CommitError> {
+        hash_domain(
+            HashAlgorithm::Blake3V1,
+            D_GRANITE_MICRO_STATE,
+            &[
+                &self.job_hash,
+                &self.token_index.to_le_bytes(),
+                &self.segment_index.to_le_bytes(),
+                &self.macro_pc.to_le_bytes(),
+                &[self.level as u8],
+                &self.coordinates[0].to_le_bytes(),
+                &self.coordinates[1].to_le_bytes(),
+                &self.coordinates[2].to_le_bytes(),
+                &self.step.to_le_bytes(),
+                &self.registers[0].to_le_bytes(),
+                &self.registers[1].to_le_bytes(),
+                &self.registers[2].to_le_bytes(),
+                &self.registers[3].to_le_bytes(),
+            ],
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GraniteMicroTraceV1 {
+    pub level: GraniteMicroLevelV1,
+    pub transition_count: u32,
+    pub states: Vec<GraniteMicroStateV1>,
+    pub tree: MerkleTree,
+}
+
+impl GraniteMicroTraceV1 {
+    /// Commit a dense sequence of caller-evaluated registers. The evaluator is
+    /// the runtime oracle; Solana later checks the single isolated transition.
+    pub fn from_registers(
+        context: GraniteMicroStateV1,
+        transition_count: u32,
+        registers: &[[u32; 4]],
+    ) -> Result<Self, CommitError> {
+        let state_count = usize::try_from(transition_count)
+            .map_err(|_| CommitError::ArithmeticOverflow)?
+            .checked_add(1)
+            .ok_or(CommitError::ArithmeticOverflow)?;
+        if context.step != 0 || registers.len() != state_count || registers.is_empty() {
+            return Err(CommitError::InvalidShape(
+                "Granite micro trace must contain every dense state".to_owned(),
+            ));
+        }
+        let states = registers
+            .iter()
+            .enumerate()
+            .map(|(step, registers)| {
+                Ok(GraniteMicroStateV1 {
+                    step: u32::try_from(step).map_err(|_| CommitError::ArithmeticOverflow)?,
+                    registers: *registers,
+                    ..context
+                })
+            })
+            .collect::<Result<Vec<_>, CommitError>>()?;
+        let leaves = states
+            .iter()
+            .map(GraniteMicroStateV1::hash)
+            .collect::<Result<Vec<_>, _>>()?;
+        let tree = MerkleTree::new(HashAlgorithm::Blake3V1, D_GRANITE_MICRO_TREE, &leaves)?;
+        Ok(Self {
+            level: context.level,
+            transition_count,
+            states,
+            tree,
+        })
+    }
+}
+
+/// Derive a subtrace length only from registered macro fields and the token
+/// position. Parties cannot shorten a trace to skip arithmetic. Nested levels
+/// are deliberately small even when the full MoE calculation is large.
+pub fn granite_micro_transition_count_v1(
+    instruction: VmInstructionV1,
+    token_index: u32,
+    level: GraniteMicroLevelV1,
+) -> Result<u32, CommitError> {
+    let opcode = GraniteMacroOpcodeV1::try_from(instruction.opcode)?;
+    let shape = qx_model::ModelShape::granite_v0();
+    let hidden = u32::try_from(shape.hidden_size).map_err(|_| CommitError::ArithmeticOverflow)?;
+    let intermediate =
+        u32::try_from(shape.expert_intermediate).map_err(|_| CommitError::ArithmeticOverflow)?;
+    let experts = u32::try_from(shape.experts).map_err(|_| CommitError::ArithmeticOverflow)?;
+    let top_k = u32::try_from(shape.active_experts).map_err(|_| CommitError::ArithmeticOverflow)?;
+    let context = token_index
+        .checked_add(1)
+        .ok_or(CommitError::ArithmeticOverflow)?;
+    let count = match (opcode, level) {
+        (GraniteMacroOpcodeV1::Embedding, GraniteMicroLevelV1::MacroOutput)
+        | (GraniteMacroOpcodeV1::Rope, GraniteMicroLevelV1::MacroOutput)
+        | (GraniteMacroOpcodeV1::KvAppend, GraniteMicroLevelV1::MacroOutput)
+        | (GraniteMacroOpcodeV1::Residual, GraniteMicroLevelV1::MacroOutput) => 1,
+        (GraniteMacroOpcodeV1::RmsNorm, GraniteMicroLevelV1::MacroOutput) => 4,
+        (GraniteMacroOpcodeV1::RmsNorm, GraniteMicroLevelV1::RmsSquares) => hidden,
+        (GraniteMacroOpcodeV1::Dense, GraniteMicroLevelV1::DenseDot)
+        | (GraniteMacroOpcodeV1::FinalLogits, GraniteMicroLevelV1::FinalLogitDot) => hidden,
+        (GraniteMacroOpcodeV1::Attention, GraniteMicroLevelV1::MacroOutput) => context,
+        (GraniteMacroOpcodeV1::Attention, GraniteMicroLevelV1::AttentionScores) => {
+            u32::try_from(shape.head_dim).map_err(|_| CommitError::ArithmeticOverflow)?
+        }
+        (GraniteMacroOpcodeV1::Attention, GraniteMicroLevelV1::AttentionSoftmax) => context
+            .checked_mul(4)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or(CommitError::ArithmeticOverflow)?,
+        (GraniteMacroOpcodeV1::Attention, GraniteMicroLevelV1::AttentionValue) => context,
+        (GraniteMacroOpcodeV1::TopK, GraniteMicroLevelV1::TopKSelection) => experts
+            .checked_mul(top_k)
+            .and_then(|value| value.checked_add(top_k.checked_mul(4)?))
+            .ok_or(CommitError::ArithmeticOverflow)?,
+        (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MacroOutput)
+        | (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeExpertSum) => top_k,
+        (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeDownDot) => intermediate,
+        (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeGateDot)
+        | (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeUpDot) => hidden,
+        (GraniteMacroOpcodeV1::ArgMax, GraniteMicroLevelV1::ArgMaxTournament) => {
+            u32::try_from(shape.vocabulary)
+                .map_err(|_| CommitError::ArithmeticOverflow)?
+                .checked_sub(1)
+                .ok_or(CommitError::ArithmeticOverflow)?
+        }
+        _ => {
+            return Err(CommitError::InvalidExecution(
+                "micro-trace level is not valid for the isolated macro".to_owned(),
+            ));
+        }
+    };
+    Ok(count)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -840,6 +1036,78 @@ mod tests {
             }
         }
         assert!(granite_macro_plan_v1(3).is_err());
+    }
+
+    #[test]
+    fn every_granite_macro_has_a_bounded_hierarchical_micro_trace() {
+        let layer = granite_layer_macro_program_v1(0).unwrap();
+        let expected = [
+            (GraniteMicroLevelV1::RmsSquares, 1024),
+            (GraniteMicroLevelV1::DenseDot, 1024),
+            (GraniteMicroLevelV1::DenseDot, 1024),
+            (GraniteMicroLevelV1::DenseDot, 1024),
+            (GraniteMicroLevelV1::MacroOutput, 1),
+            (GraniteMicroLevelV1::MacroOutput, 1),
+            (GraniteMicroLevelV1::AttentionScores, 64),
+            (GraniteMicroLevelV1::DenseDot, 1024),
+            (GraniteMicroLevelV1::MacroOutput, 1),
+            (GraniteMicroLevelV1::RmsSquares, 1024),
+            (GraniteMicroLevelV1::DenseDot, 1024),
+            (GraniteMicroLevelV1::TopKSelection, 288),
+            (GraniteMicroLevelV1::MoeExpertSum, 8),
+            (GraniteMicroLevelV1::MacroOutput, 1),
+        ];
+        for (instruction, (level, count)) in layer.into_iter().zip(expected) {
+            assert_eq!(
+                granite_micro_transition_count_v1(instruction, 0, level).unwrap(),
+                count
+            );
+        }
+        let head = granite_final_head_macro_program_v1().unwrap();
+        assert_eq!(
+            granite_micro_transition_count_v1(head[1], 0, GraniteMicroLevelV1::FinalLogitDot)
+                .unwrap(),
+            1024
+        );
+        assert_eq!(
+            granite_micro_transition_count_v1(head[2], 0, GraniteMicroLevelV1::ArgMaxTournament)
+                .unwrap(),
+            49_154
+        );
+    }
+
+    #[test]
+    fn micro_trace_binds_context_coordinates_steps_and_registers() {
+        let context = GraniteMicroStateV1 {
+            job_hash: [7; 32],
+            token_index: 3,
+            segment_index: 2,
+            macro_pc: 5,
+            level: GraniteMicroLevelV1::DenseDot,
+            coordinates: [11, 0, 0],
+            step: 0,
+            registers: [0; 4],
+        };
+        let trace =
+            GraniteMicroTraceV1::from_registers(context, 2, &[[0; 4], [1, 0, 0, 0], [2, 0, 0, 0]])
+                .unwrap();
+        assert_eq!(trace.states.len(), 3);
+        assert!(
+            trace
+                .tree
+                .proof(1)
+                .unwrap()
+                .verify(
+                    HashAlgorithm::Blake3V1,
+                    D_GRANITE_MICRO_TREE,
+                    trace.states[1].hash().unwrap(),
+                    trace.tree.root()
+                )
+                .unwrap()
+        );
+        let mut changed = trace.states[1];
+        changed.coordinates[0] += 1;
+        assert_ne!(changed.hash().unwrap(), trace.states[1].hash().unwrap());
     }
 
     #[test]

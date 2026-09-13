@@ -34,11 +34,12 @@ pub use execution::{
 pub use granite::{
     GRANITE_TENSORS_PER_LAYER_V1, GraniteDenseOutputV1, GraniteLayerTensorIdsV1,
     GraniteMacroOpcodeV1, GraniteMacroOutputV1, GraniteMacroPlanV1, GraniteMacroStateV1,
-    GraniteMacroTraceV1, GraniteMacroWorkspaceV1, GraniteWorkspaceSlotV1,
-    granite_embedding_macro_program_v1, granite_embedding_tensor_id_v1,
-    granite_final_head_macro_program_v1, granite_final_norm_tensor_id_v1,
-    granite_layer_macro_program_v1, granite_layer_tensor_ids_v1, granite_macro_plan_v1,
-    granite_macro_trace_v1, validate_granite_macro_artifact_v1,
+    GraniteMacroTraceV1, GraniteMacroWorkspaceV1, GraniteMicroLevelV1, GraniteMicroStateV1,
+    GraniteMicroTraceV1, GraniteWorkspaceSlotV1, granite_embedding_macro_program_v1,
+    granite_embedding_tensor_id_v1, granite_final_head_macro_program_v1,
+    granite_final_norm_tensor_id_v1, granite_layer_macro_program_v1, granite_layer_tensor_ids_v1,
+    granite_macro_plan_v1, granite_macro_trace_v1, granite_micro_transition_count_v1,
+    validate_granite_macro_artifact_v1,
 };
 pub use hash::{Digest, HashAlgorithm, ProtocolVersion, hash_domain, hash_domain_input_len};
 pub use job::{JobEnvelopeV1, JobPayloadV1, MIN_AUDIT_PROBABILITY_PPM_V1, ResultLeafV1};
@@ -112,6 +113,8 @@ pub const D_OPERATOR_TREE: &[u8] = b"QX:OPERATOR:V1";
 pub const D_MACRO_WORKSPACE: &[u8] = b"QX:MACRO:WORKSPACE:V1";
 pub const D_MACRO_WORKSPACE_SLOT: &[u8] = b"QX:MACRO:WORKSPACE:SLOT:V1";
 pub const D_MACRO_STATE: &[u8] = b"QX:MACRO:STATE:V1";
+pub const D_GRANITE_MICRO_STATE: &[u8] = b"QX:GRANITE:MICRO:STATE:V1";
+pub const D_GRANITE_MICRO_TREE: &[u8] = b"QX:GRANITE:MICRO:TREE:V1";
 
 pub const MAX_MERKLE_DEPTH: usize = 32;
 /// Hot per-token commitment trees use BLAKE3. On clusters where the native
