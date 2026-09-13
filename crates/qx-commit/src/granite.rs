@@ -116,25 +116,67 @@ impl GraniteMacroWorkspaceV1 {
         self.slots[slot as usize]
     }
 
-    pub fn root(&self) -> Result<Digest, CommitError> {
+    pub fn slot_leaf_hash(
+        slot: GraniteWorkspaceSlotV1,
+        value_root: &Digest,
+    ) -> Result<Digest, CommitError> {
+        hash_domain(
+            HashAlgorithm::Blake3V1,
+            D_MACRO_WORKSPACE_SLOT,
+            &[&(slot as u32).to_le_bytes(), value_root],
+        )
+    }
+
+    /// Opening used only after a dispute has isolated one macro. Normal
+    /// inference retains neither these proofs nor the underlying activations.
+    pub fn proof(&self, slot: GraniteWorkspaceSlotV1) -> Result<crate::MerkleProof, CommitError> {
+        self.tree()?.proof(slot as usize)
+    }
+
+    fn tree(&self) -> Result<MerkleTree, CommitError> {
         let leaves = self
             .slots
             .iter()
             .enumerate()
             .map(|(index, root)| {
-                hash_domain(
-                    HashAlgorithm::Blake3V1,
-                    D_MACRO_WORKSPACE_SLOT,
-                    &[
-                        &u32::try_from(index)
-                            .map_err(|_| CommitError::ArithmeticOverflow)?
-                            .to_le_bytes(),
-                        root,
-                    ],
-                )
+                let slot = GraniteWorkspaceSlotV1::try_from(index as u8)?;
+                Self::slot_leaf_hash(slot, root)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(MerkleTree::new(HashAlgorithm::Blake3V1, D_MACRO_WORKSPACE, &leaves)?.root())
+        MerkleTree::new(HashAlgorithm::Blake3V1, D_MACRO_WORKSPACE, &leaves)
+    }
+
+    pub fn root(&self) -> Result<Digest, CommitError> {
+        Ok(self.tree()?.root())
+    }
+}
+
+impl TryFrom<u8> for GraniteWorkspaceSlotV1 {
+    type Error = CommitError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Residual),
+            1 => Ok(Self::Normalized),
+            2 => Ok(Self::Query),
+            3 => Ok(Self::Key),
+            4 => Ok(Self::Value),
+            5 => Ok(Self::RotatedQueryKey),
+            6 => Ok(Self::KvLeaf),
+            7 => Ok(Self::Attention),
+            8 => Ok(Self::AttentionProjection),
+            9 => Ok(Self::PostAttention),
+            10 => Ok(Self::MoeInput),
+            11 => Ok(Self::RouterLogits),
+            12 => Ok(Self::Routes),
+            13 => Ok(Self::Moe),
+            14 => Ok(Self::Logits),
+            15 => Ok(Self::Winner),
+            _ => Err(CommitError::InvalidIndex {
+                index: usize::from(value),
+                length: 16,
+            }),
+        }
     }
 }
 

@@ -48,7 +48,10 @@ pub use model::{
     granite_execution_spec, granite_execution_spec_with_checkpoint_interval,
     granite_execution_spec_with_math_functions, granite_execution_spec_with_math_profile,
 };
-pub use receipt::{InferenceReceiptV1, SignedInferenceReceiptV1, input_hash_v1, output_hash_v1};
+pub use receipt::{
+    InferenceReceiptV1, SignedInferenceReceiptV1, input_hash_v1, input_token_tree_v1,
+    output_hash_v1,
+};
 pub use state::{
     ACTIVATION_CHUNK_BYTES, STATE_CHUNK_BYTES, StateChunkProofV1, StateTreeKindV1,
     activation_hash_v1, kv_leaf_hash_from_roots_v1, kv_leaf_hash_v1, prove_state_chunk_v1,
@@ -88,6 +91,8 @@ pub const D_RESULT: &[u8] = b"QX:RESULT:V1";
 pub const D_RECEIPT: &[u8] = b"QX:RECEIPT:V1";
 pub const D_BATCH: &[u8] = b"QX:BATCH:V1";
 pub const D_INPUT: &[u8] = b"QX:INPUT:V1";
+pub const D_INPUT_TOKEN: &[u8] = b"QX:INPUT:TOKEN:V1";
+pub const D_INPUT_TREE: &[u8] = b"QX:INPUT:TREE:V1";
 pub const D_OUTPUT: &[u8] = b"QX:OUTPUT:V1";
 pub const D_ARCHITECTURE: &[u8] = b"QX:ARCHITECTURE:V1";
 pub const D_EXECUTION_SPEC: &[u8] = b"QX:EXECUTION:V1";

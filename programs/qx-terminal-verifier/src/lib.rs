@@ -169,6 +169,16 @@ pub fn process_instruction(
             v2::resolve_staged_vm_argmax(program_id, accounts, &mut cursor)
         }
         v2::OP_STAGE_VM_RAW_WEIGHT_V2 => v2::stage_vm_raw_weight(program_id, accounts, &mut cursor),
+        v2::OP_CHALLENGER_MACRO_V2 => {
+            v2::submit_challenger_macro(program_id, accounts, &mut cursor)
+        }
+        v2::OP_MINER_MACRO_V2 => v2::submit_miner_macro(program_id, accounts, &mut cursor),
+        v2::OP_STAGE_MACRO_RESIDUAL_V2 => {
+            v2::stage_macro_residual(program_id, accounts, &mut cursor)
+        }
+        v2::OP_RESOLVE_MACRO_RESIDUAL_V2 => {
+            v2::resolve_macro_residual(program_id, accounts, &mut cursor)
+        }
         _ => Err(QxError::InvalidEncoding.into()),
     }
 }

@@ -214,6 +214,9 @@ pub fn granite_execution_spec_with_math_profile(
     bytes.push(3); // token genesis is a deterministic pre-embedding sentinel + prior KV
     bytes.push(1); // token result commits checkpoint-tree leaf count
     bytes.push(1); // result trace length selects the compact job-tree root
+    bytes.push(1); // signed input hash is a position-bound token Merkle root
+    bytes.push(1); // token genesis KV equals the authenticated predecessor frontier
+    bytes.push(1); // isolated Granite macros open one rolling workspace-slot update
     bytes.extend_from_slice(b"GRANITE_ROPE_FIXED_V1");
     for bits in qx_consensus_math::GRANITE_ROPE_INVERSE_FREQUENCY_BITS {
         bytes.extend_from_slice(&bits.to_le_bytes());

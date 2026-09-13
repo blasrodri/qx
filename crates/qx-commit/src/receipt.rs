@@ -1,6 +1,6 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
-use crate::{CommitError, D_INPUT, D_OUTPUT, D_RECEIPT, Digest, ProtocolVersion, hash_domain};
+use crate::{CommitError, D_OUTPUT, D_RECEIPT, Digest, ProtocolVersion, hash_domain};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InferenceReceiptV1 {
@@ -93,12 +93,46 @@ fn token_bytes(tokens: &[u32]) -> Result<Vec<u8>, CommitError> {
     Ok(bytes)
 }
 
-pub fn input_hash_v1(model_id: &Digest, tokens: &[u32]) -> Result<Digest, CommitError> {
-    hash_domain(
+pub fn input_token_tree_v1(
+    model_id: &Digest,
+    tokens: &[u32],
+) -> Result<crate::MerkleTree, CommitError> {
+    if tokens.is_empty() {
+        return Err(CommitError::InvalidShape(
+            "input must contain at least one token".to_owned(),
+        ));
+    }
+    let count = u32::try_from(tokens.len()).map_err(|_| CommitError::ArithmeticOverflow)?;
+    let leaves = tokens
+        .iter()
+        .enumerate()
+        .map(|(index, token)| {
+            hash_domain(
+                ProtocolVersion::V1.hash_algorithm(),
+                crate::D_INPUT_TOKEN,
+                &[
+                    model_id,
+                    &count.to_le_bytes(),
+                    &u32::try_from(index)
+                        .map_err(|_| CommitError::ArithmeticOverflow)?
+                        .to_le_bytes(),
+                    &token.to_le_bytes(),
+                ],
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::MerkleTree::new(
         ProtocolVersion::V1.hash_algorithm(),
-        D_INPUT,
-        &[model_id, &token_bytes(tokens)?],
+        crate::D_INPUT_TREE,
+        &leaves,
     )
+}
+
+/// Root of individually provable input tokens. The model, input length,
+/// position, and token value are bound into every leaf, so a challenged
+/// embedding never needs the full prompt in one Solana transaction.
+pub fn input_hash_v1(model_id: &Digest, tokens: &[u32]) -> Result<Digest, CommitError> {
+    Ok(input_token_tree_v1(model_id, tokens)?.root())
 }
 
 pub fn output_hash_v1(tokens: &[u32]) -> Result<Digest, CommitError> {
@@ -131,5 +165,30 @@ mod tests {
         let signed = SignedInferenceReceiptV1::sign(receipt, &key).unwrap();
         signed.verify().unwrap();
         assert_eq!(signed.canonical_bytes().unwrap().len(), 274);
+    }
+
+    #[test]
+    fn every_input_token_has_a_bounded_inclusion_proof() {
+        let model = [0x42; 32];
+        let tokens = [1, 7, 49_154, 9, 3];
+        let tree = input_token_tree_v1(&model, &tokens).unwrap();
+        assert_eq!(input_hash_v1(&model, &tokens).unwrap(), tree.root());
+        for (index, token) in tokens.iter().enumerate() {
+            let leaf = hash_domain(
+                ProtocolVersion::V1.hash_algorithm(),
+                crate::D_INPUT_TOKEN,
+                &[
+                    &model,
+                    &(tokens.len() as u32).to_le_bytes(),
+                    &(index as u32).to_le_bytes(),
+                    &token.to_le_bytes(),
+                ],
+            )
+            .unwrap();
+            let proof = tree.proof(index).unwrap();
+            assert!(tree.verify(leaf, &proof).unwrap());
+            assert!(proof.siblings.len() <= crate::MAX_MERKLE_DEPTH);
+        }
+        assert!(input_hash_v1(&model, &[]).is_err());
     }
 }
