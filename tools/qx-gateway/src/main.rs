@@ -134,7 +134,7 @@ enum Command {
         program: String,
         #[arg(long, default_value = "https://api.devnet.solana.com")]
         rpc_url: String,
-        /// File containing the bearer token used by the miner/operator write API.
+        /// File containing the transport token used by the miner/operator write API.
         /// If omitted, QX_MINER_TOKEN is read from the environment.
         #[arg(long)]
         miner_token_file: Option<PathBuf>,

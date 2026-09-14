@@ -238,8 +238,8 @@ The gateway accepts these JSON resources:
 Use `qx-gateway create-job` and `create-result` to produce canonical request
 bodies; `--help` lists their exact arguments. Submit the resulting files with
 `curl --data-binary @file.json`. The job endpoint is requester-authenticated by
-its Ed25519 signature. Result and epoch writes use the bearer token because V2
-deliberately has no miner signature per result.
+its Ed25519 signature. Result and epoch writes use the transport token because
+V2 deliberately has no miner signature per result.
 
 On this Mac, the DODIL miner token is stored in Keychain. Use it without
 placing it in shell history:
