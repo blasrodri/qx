@@ -13,6 +13,8 @@ __pycache__/
 *.key
 *keypair*.json
 .local/
+gateway-data/
+*.token
 
 # Local benchmark/autotuning output. Existing curated evidence remains tracked.
 benchmarks/results/

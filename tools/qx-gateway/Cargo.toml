@@ -1,0 +1,21 @@
+[package]
+name = "qx-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ed25519-dalek.workspace = true
+qx-commit = { path = "../../crates/qx-commit" }
+serde.workspace = true
+serde_json.workspace = true
+solana-client = "=3.0.10"
+solana-commitment-config = "=3.1.1"
+solana-sdk = "=3.0.0"
+solana-system-interface = { version = "2.0.0", features = ["bincode"] }
+tiny_http = "0.12"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+qx-runtime-v2.workspace = true

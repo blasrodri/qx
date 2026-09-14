@@ -58,7 +58,7 @@ below the 5% gate, with exact CPU/Metal receipt parity.
 | Macro boundary bridge | isolated instruction, pre/post workspace roots, changed slot, and K/V transition are authenticated for both parties | Implemented on SBF; 193,264 CU with software BLAKE3 |
 | Granite micro terminals | embedding, RMSNorm, dense, RoPE, attention, Top-K, MoE, residual, logits, K/V, and argmax have objective terminal rules | Implemented on SBF; full branch-by-branch adversarial transaction coverage remains a production gate |
 | Cross-token continuity | generated input is the prior agreed prediction and each token's genesis K/V root is the prior authenticated final K/V root | Implemented on SBF |
-| Testnet deployability | v0 SBF artifact uses platform tools v1.54 and only testnet-enabled syscalls | Deployed to a local validator cloned from the live testnet feature set |
+| Devnet deployability | SBF artifact uses supported syscalls and packet-safe instructions | Program and canonical model registry deployed; 10/10 public-devnet probes and one block-seeded gateway epoch completed |
 | CPU verified generation | complete checkpoint+artifact execution emits a nonzero receipt root | Implemented and complete-model tested; a missing `begin_token` call was fixed by this audit |
 | Turn liveness | every unilateral move has a deadline and either non-responder loses | Implemented and tested |
 

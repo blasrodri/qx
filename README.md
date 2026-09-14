@@ -1,6 +1,6 @@
 # QX PoC
 
-> Experimental software for testnet evaluation. Do not use it to settle value.
+> Experimental software for devnet evaluation. Do not use it to settle value.
 
 ## Optimistic Granite verification
 
@@ -11,8 +11,12 @@ by epoch using successor-block Solana entropy; a detected disagreement is
 bisected from job to token, checkpoint, macro, micro trace, and finally an
 objective SBF arithmetic transition.
 
-To deploy the verifier and exercise it with a second testnet payer, follow the
-[two-person Solana testnet quickstart](docs/testnet-two-person-quickstart.md).
+The verifier is deployed on Solana devnet at
+`QJPMJrcmJEeLcVZdqaofF9ioCpvXYJXLVZhFhea2EiB`. To run the gateway and
+exercise it with a second devnet participant, follow the
+[two-person Solana devnet quickstart](docs/devnet-two-person-quickstart.md).
+The canonical interval-2 Granite model registry is
+`CsUgpxaXfofqfEVS1DbTR8pcGqC4mCWXhR15kgiDoCZe`.
 The [protocol description](docs/verification-protocol.md),
 [model profile](docs/verification-model-profile.md), and
 [security/readiness audit](docs/verification-security-audit.md) describe the

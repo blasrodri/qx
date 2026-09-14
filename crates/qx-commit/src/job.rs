@@ -64,6 +64,36 @@ pub struct JobPayloadV1 {
 impl JobPayloadV1 {
     pub const CANONICAL_SIZE: usize = 310;
 
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CommitError> {
+        if bytes.len() != Self::CANONICAL_SIZE {
+            return Err(CommitError::InvalidShape(format!(
+                "job payload must be {} bytes",
+                Self::CANONICAL_SIZE
+            )));
+        }
+        let payload = Self {
+            protocol_version: read_u16(bytes, 0)?,
+            protocol_instance: read_32(bytes, 2)?,
+            job_id: read_32(bytes, 34)?,
+            requester: read_32(bytes, 66)?,
+            assigned_miner: read_32(bytes, 98)?,
+            model_id: read_32(bytes, 130)?,
+            execution_spec: read_32(bytes, 162)?,
+            input_hash: read_32(bytes, 194)?,
+            input_token_count: read_u32(bytes, 226)?,
+            max_output_tokens: read_u32(bytes, 230)?,
+            payment: read_u64(bytes, 234)?,
+            slashable_exposure: read_u64(bytes, 242)?,
+            deadline_slot: read_u64(bytes, 250)?,
+            nonce: read_u64(bytes, 258)?,
+            audit_probability_ppm: read_u32(bytes, 266)?,
+            assigned_epoch: read_u64(bytes, 270)?,
+            model_registry: read_32(bytes, 278)?,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
     pub fn validate(&self) -> Result<(), CommitError> {
         ProtocolVersion::parse(self.protocol_version)?;
         if self.input_token_count == 0
@@ -127,6 +157,24 @@ pub struct ResultLeafV1 {
 impl ResultLeafV1 {
     pub const CANONICAL_SIZE: usize = 104;
 
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CommitError> {
+        if bytes.len() != Self::CANONICAL_SIZE {
+            return Err(CommitError::InvalidShape(format!(
+                "result leaf must be {} bytes",
+                Self::CANONICAL_SIZE
+            )));
+        }
+        let result = Self {
+            job_hash: read_32(bytes, 0)?,
+            output_hash: read_32(bytes, 32)?,
+            trace_root: read_32(bytes, 64)?,
+            output_token_count: read_u32(bytes, 96)?,
+            trace_length: read_u32(bytes, 100)?,
+        };
+        result.hash()?;
+        Ok(result)
+    }
+
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(Self::CANONICAL_SIZE);
         bytes.extend_from_slice(&self.job_hash);
@@ -151,6 +199,37 @@ impl ResultLeafV1 {
             &[&self.canonical_bytes()],
         )
     }
+}
+
+fn read_32(bytes: &[u8], offset: usize) -> Result<[u8; 32], CommitError> {
+    bytes
+        .get(offset..offset + 32)
+        .and_then(|value| value.try_into().ok())
+        .ok_or_else(|| CommitError::InvalidShape("truncated canonical encoding".to_owned()))
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, CommitError> {
+    bytes
+        .get(offset..offset + 2)
+        .and_then(|value| value.try_into().ok())
+        .map(u16::from_le_bytes)
+        .ok_or_else(|| CommitError::InvalidShape("truncated canonical encoding".to_owned()))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, CommitError> {
+    bytes
+        .get(offset..offset + 4)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| CommitError::InvalidShape("truncated canonical encoding".to_owned()))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, CommitError> {
+    bytes
+        .get(offset..offset + 8)
+        .and_then(|value| value.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(|| CommitError::InvalidShape("truncated canonical encoding".to_owned()))
 }
 
 #[cfg(test)]
@@ -232,5 +311,27 @@ mod tests {
         let original = result.hash().unwrap();
         result.trace_length = 9;
         assert_ne!(original, result.hash().unwrap());
+    }
+
+    #[test]
+    fn canonical_job_and_result_round_trip() {
+        let job = job();
+        assert_eq!(
+            JobPayloadV1::from_canonical_bytes(&job.canonical_bytes().unwrap()).unwrap(),
+            job
+        );
+        let result = ResultLeafV1 {
+            job_hash: job.hash().unwrap(),
+            output_hash: [2; 32],
+            trace_root: [3; 32],
+            output_token_count: 4,
+            trace_length: 9,
+        };
+        assert_eq!(
+            ResultLeafV1::from_canonical_bytes(&result.canonical_bytes()).unwrap(),
+            result
+        );
+        assert!(JobPayloadV1::from_canonical_bytes(&[0; 309]).is_err());
+        assert!(ResultLeafV1::from_canonical_bytes(&[0; 103]).is_err());
     }
 }

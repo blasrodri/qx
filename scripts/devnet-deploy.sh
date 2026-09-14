@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   echo "usage: $0 <payer-keypair.json> [program-keypair.json]" >&2
-  echo "set QX_RPC_URL to override https://api.testnet.solana.com" >&2
+  echo "set QX_RPC_URL to override https://api.devnet.solana.com" >&2
 }
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
@@ -13,7 +13,7 @@ fi
 
 QX_PAYER_KEYPAIR=$1
 QX_PROGRAM_KEYPAIR=${2:-target/deploy/qx_terminal_verifier-keypair.json}
-QX_RPC_ENDPOINT=${QX_RPC_URL:-https://api.testnet.solana.com}
+QX_RPC_ENDPOINT=${QX_RPC_URL:-https://api.devnet.solana.com}
 QX_PROGRAM_SO=target/deploy/qx_terminal_verifier.so
 
 for QX_COMMAND in cargo solana solana-keygen; do

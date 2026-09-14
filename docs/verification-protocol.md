@@ -82,14 +82,26 @@ binds both `QX:OPERATOR:V1` traces to the agreed runtime checkpoint roots, and
 convicts an incorrect update to the same 256-byte chunk tree used by normal
 execution. Compact roots and exact lengths prevent trace shortening.
 
-The deployable v0 artifact was also installed on Agave 4.2.2 with the feature
-set cloned from public testnet. A 100-transaction, concurrency-4 load run
+The deployable verifier is installed on Solana devnet as
+`QJPMJrcmJEeLcVZdqaofF9ioCpvXYJXLVZhFhea2EiB`. A 100-transaction,
+concurrency-4 load run on the test validator
 confirmed 100/100 probes in 13.121 seconds: 7.622 confirmed tx/s and 524.724 ms
 mean confirmed latency. Each representative 32-round/256-byte probe simulated
 at 210,621 CU, requested a 400,000 CU limit, and paid the base 5,000-lamport
-fee with no priority fee. This is a validator/RPC load probe, not a claim that
-every Granite macro terminal is complete. Public testnet deployment still
-requires funding the dedicated authority with program rent and fees.
+fee with no priority fee. A subsequent public-devnet run confirmed 10/10 at
+210,573 simulated CU; public RPC confirmation latency averaged 7.0 seconds.
+This is a validator/RPC load probe, not a claim that every remote dispute turn
+was exercised.
+
+The shipped `qx-gateway` now validates and stores requester-signed jobs and
+their exact input tokens, accepts unsigned miner results through an
+authenticated transport, builds deterministic epoch roots, submits and
+finalizes verifier-owned epoch accounts, verifies their seeded state from
+devnet, recomputes Bernoulli selection, and serves challenge packages with
+result inclusion proofs. The first live epoch used consecutive close/entropy
+slots `498207688/498207689` and returned its selected real Metal execution.
+Automating every interactive challenge turn between remote miner and
+challenger processes remains outside this gateway milestone.
 
 Automatic slashing remains disabled. The generic hierarchy, canonical
 first-segment checkpoint, chained scalar/Q4/KV terminals, and token-bound
