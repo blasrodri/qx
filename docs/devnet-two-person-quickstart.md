@@ -185,8 +185,8 @@ the committed Granite execution path uses Metal. Gateway records are stored as
 private DataK3 objects, not on Ignite's stateless container filesystem.
 
 The checked-in deployment uses the small tier, scale-to-zero, at most two
-replicas, and no GitHub runner. It builds an amd64 image locally, pushes the
-immutable commit tag to DODIL Registry, then deploys that image:
+replicas, and no GitHub runner. It archives the exact Git commit and sends that
+small archive to DODIL's native Docker builder, then deploys the built image:
 
 ```bash
 ./scripts/dodil-deploy-gateway.sh
