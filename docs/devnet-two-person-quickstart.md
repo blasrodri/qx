@@ -178,6 +178,40 @@ Confirm it from the same machine:
 curl http://127.0.0.1:8787/health
 ```
 
+### Host the gateway on DODIL
+
+DODIL Ignite can host the Linux gateway/API. The miner remains on macOS because
+the committed Granite execution path uses Metal. Gateway records are stored as
+private DataK3 objects, not on Ignite's stateless container filesystem.
+
+The checked-in deployment uses the small tier, scale-to-zero, at most two
+replicas, and no GitHub runner. It builds an amd64 image locally, pushes the
+immutable commit tag to DODIL Registry, then deploys that image:
+
+```bash
+./scripts/dodil-deploy-gateway.sh
+```
+
+One-time DODIL resources are:
+
+- private bucket `qx-gateway-devnet`;
+- env secret `qx-gateway-datak3-token`, containing a bucket-scoped `k3.editor`
+  API key;
+- env secret `qx-gateway-miner-token`, containing a random 32-byte-or-longer
+  bearer token.
+
+Ignite receives only `secret://...` references. Do not put either value in Git,
+the container image, command-line flags, or job payloads. `DODIL_TOKEN` is used
+only for the private DataK3 object API; `QX_MINER_TOKEN` protects gateway write
+routes. Public read routes are intentional so independently operated
+challengers can obtain selected packages.
+
+The remote storage layout is one JSON object per job, result, and epoch. A
+small per-epoch/per-miner result index keeps epoch close proportional to the
+jobs in that miner's epoch rather than all historical jobs. Normal inference
+does two durable writes (job and result); inference and trace computation stay
+on the miner and do not consume Ignite compute.
+
 Bind to `0.0.0.0:8787` only behind a firewall, VPN, or TLS reverse proxy. The
 read endpoints intentionally let challengers fetch selected packages. Miner
 writes require `Authorization: Bearer <token>`. This transport credential is

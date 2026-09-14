@@ -1,0 +1,13 @@
+.git
+.codex
+target
+external
+gateway-data
+benchmarks/results
+*.token
+*.key
+*.pem
+*keypair*.json
+.env
+.env.*
+Dockerfile

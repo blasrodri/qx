@@ -124,15 +124,20 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         listen: String,
+        /// Local record directory. Mutually exclusive with --dodil-bucket.
         #[arg(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
+        /// DODIL DataK3 bucket used as durable record storage.
+        #[arg(long)]
+        dodil_bucket: Option<String>,
         #[arg(long)]
         program: String,
         #[arg(long, default_value = "https://api.devnet.solana.com")]
         rpc_url: String,
         /// File containing the bearer token used by the miner/operator write API.
+        /// If omitted, QX_MINER_TOKEN is read from the environment.
         #[arg(long)]
-        miner_token_file: PathBuf,
+        miner_token_file: Option<PathBuf>,
     },
     /// Create verifier-owned accounts and commit a locally closed epoch on Solana.
     SubmitEpoch {
@@ -168,11 +173,45 @@ enum Command {
 
 #[derive(Clone)]
 struct App {
-    data_dir: PathBuf,
+    store: GatewayStore,
     program: Pubkey,
     rpc_url: String,
     miner_token: String,
 }
+
+#[derive(Clone)]
+enum GatewayStore {
+    Files(PathBuf),
+    Dodil(DodilStore),
+}
+
+#[derive(Clone)]
+struct DodilStore {
+    client: reqwest::blocking::Client,
+    bucket_url: reqwest::Url,
+    token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "ListBucketResult")]
+struct ObjectList {
+    #[serde(rename = "Contents", default)]
+    contents: Vec<ObjectListEntry>,
+    #[serde(rename = "IsTruncated", default)]
+    is_truncated: bool,
+    #[serde(rename = "NextContinuationToken")]
+    next_continuation_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ObjectListEntry {
+    #[serde(rename = "Key")]
+    key: String,
+}
+
+const JOBS: &str = "jobs";
+const RESULTS: &str = "results";
+const EPOCHS: &str = "epochs";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct JobSubmission {
@@ -331,21 +370,34 @@ fn main() -> Result<()> {
         Command::Serve {
             listen,
             data_dir,
+            dodil_bucket,
             program,
             rpc_url,
             miner_token_file,
         } => {
             let program =
                 Pubkey::from_str(&program).context("invalid verifier program public key")?;
-            let miner_token = fs::read_to_string(&miner_token_file)
-                .with_context(|| format!("read {}", miner_token_file.display()))?
-                .trim()
-                .to_owned();
+            let miner_token = match miner_token_file {
+                Some(path) => fs::read_to_string(&path)
+                    .with_context(|| format!("read {}", path.display()))?
+                    .trim()
+                    .to_owned(),
+                None => std::env::var("QX_MINER_TOKEN")
+                    .context("set QX_MINER_TOKEN or pass --miner-token-file")?,
+            };
             if miner_token.len() < 32 {
                 bail!("miner token must contain at least 32 characters");
             }
+            let store = match (data_dir, dodil_bucket) {
+                (Some(data_dir), None) => GatewayStore::Files(data_dir),
+                (None, Some(bucket)) => GatewayStore::Dodil(DodilStore::from_env(&bucket)?),
+                (None, None) => bail!("pass exactly one of --data-dir or --dodil-bucket"),
+                (Some(_), Some(_)) => {
+                    bail!("--data-dir and --dodil-bucket are mutually exclusive")
+                }
+            };
             let app = App {
-                data_dir,
+                store,
                 program,
                 rpc_url,
                 miner_token,
@@ -355,7 +407,7 @@ fn main() -> Result<()> {
             println!("listen=http://{listen}");
             println!("rpc_url={}", app.rpc_url);
             println!("program={}", app.program);
-            println!("data_dir={}", app.data_dir.display());
+            println!("storage={}", app.store.label());
             for request in server.incoming_requests() {
                 let method = request.method().clone();
                 let path = request
@@ -498,6 +550,7 @@ fn create_result(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn verified_job(path: &Path) -> Result<(JobSubmission, JobPayloadV1)> {
     let job: JobSubmission = read_json_file(path)?;
     let payload_bytes = decode_hex_exact(
@@ -882,24 +935,26 @@ impl HttpError {
     fn bad(error: impl std::fmt::Display) -> Self {
         Self::new(400, error.to_string())
     }
+
+    fn internal(error: impl std::fmt::Display) -> Self {
+        Self::new(500, error.to_string())
+    }
 }
 
 type HttpResult = std::result::Result<serde_json::Value, HttpError>;
 
 impl App {
     fn prepare(&self) -> Result<()> {
-        for name in ["jobs", "results", "epochs"] {
-            fs::create_dir_all(self.data_dir.join(name))?;
-        }
-        Ok(())
+        self.store.prepare()
     }
 
     fn health(&self) -> HttpResult {
-        let jobs = entry_count(&self.data_dir.join("jobs")).map_err(HttpError::bad)?;
-        let results = entry_count(&self.data_dir.join("results")).map_err(HttpError::bad)?;
-        let epochs = entry_count(&self.data_dir.join("epochs")).map_err(HttpError::bad)?;
+        let jobs = self.store.count(JOBS).map_err(HttpError::internal)?;
+        let results = self.store.count(RESULTS).map_err(HttpError::internal)?;
+        let epochs = self.store.count(EPOCHS).map_err(HttpError::internal)?;
         Ok(serde_json::json!({
             "status": "ok",
+            "storage": self.store.label(),
             "cluster_rpc": self.rpc_url,
             "program": self.program.to_string(),
             "jobs": jobs,
@@ -949,9 +1004,11 @@ impl App {
             assigned_miner_hex: encode_hex(&payload.assigned_miner),
             received_unix_seconds: unix_seconds().map_err(HttpError::bad)?,
         };
-        let path = self.job_path(&job_hash_hex);
-        if path.exists() {
-            let existing: JobRecord = read_json_file(&path).map_err(HttpError::bad)?;
+        if let Some(existing) = self
+            .store
+            .get::<JobRecord>(JOBS, &job_hash_hex)
+            .map_err(HttpError::internal)?
+        {
             if existing.payload_hex != record.payload_hex
                 || existing.input_tokens != record.input_tokens
                 || existing.requester_signature_hex != record.requester_signature_hex
@@ -959,14 +1016,16 @@ impl App {
                 return Err(HttpError::new(409, "conflicting job already exists"));
             }
         } else {
-            write_record(&path, &record).map_err(HttpError::bad)?;
+            self.store
+                .put_if_absent(JOBS, &job_hash_hex, &record)
+                .map_err(HttpError::internal)?;
         }
         Ok(serde_json::json!({ "job_hash_hex": job_hash_hex, "status": "accepted" }))
     }
 
     fn get_job(&self, job_hash: &str) -> HttpResult {
         validate_hash_name(job_hash)?;
-        let record: JobRecord = read_record(&self.job_path(job_hash))?;
+        let record: JobRecord = self.record(JOBS, job_hash)?;
         serde_json::to_value(record).map_err(HttpError::bad)
     }
 
@@ -979,7 +1038,7 @@ impl App {
         .map_err(HttpError::bad)?;
         let result = ResultLeafV1::from_canonical_bytes(&result_bytes).map_err(HttpError::bad)?;
         let job_hash_hex = encode_hex(&result.job_hash);
-        let job: JobRecord = read_record(&self.job_path(&job_hash_hex))?;
+        let job: JobRecord = self.record(JOBS, &job_hash_hex)?;
         let payload_bytes = decode_hex_exact(
             &job.payload_hex,
             JobPayloadV1::CANONICAL_SIZE,
@@ -1009,27 +1068,38 @@ impl App {
             output_tokens: submission.output_tokens,
             received_unix_seconds: unix_seconds().map_err(HttpError::bad)?,
         };
-        let path = self.result_path(&job_hash_hex);
-        if path.exists() {
-            let existing: ResultRecord = read_json_file(&path).map_err(HttpError::bad)?;
+        if let Some(existing) = self
+            .store
+            .get::<ResultRecord>(RESULTS, &job_hash_hex)
+            .map_err(HttpError::internal)?
+        {
             if existing.result_hex != record.result_hex
                 || existing.output_tokens != record.output_tokens
             {
                 return Err(HttpError::new(409, "conflicting result already exists"));
             }
         } else {
-            write_record(&path, &record).map_err(HttpError::bad)?;
+            self.store
+                .put_if_absent(RESULTS, &job_hash_hex, &record)
+                .map_err(HttpError::internal)?;
         }
+        let index_kind = result_index_kind(job.assigned_epoch, &job.assigned_miner_hex);
+        self.store
+            .put_if_absent(&index_kind, &job_hash_hex, &record)
+            .map_err(HttpError::internal)?;
         Ok(serde_json::json!({ "job_hash_hex": job_hash_hex, "status": "accepted" }))
     }
 
     fn close_epoch(&self, epoch: u64, request: CloseEpochRequest) -> HttpResult {
         let miner = Pubkey::from_str(&request.miner_pubkey).map_err(HttpError::bad)?;
         let mut selected = Vec::<(String, ResultRecord, ResultLeafV1)>::new();
-        for path in json_entries(&self.data_dir.join("results")).map_err(HttpError::bad)? {
-            let result_record: ResultRecord = read_json_file(&path).map_err(HttpError::bad)?;
-            let job: JobRecord = read_json_file(&self.job_path(&result_record.job_hash_hex))
-                .map_err(HttpError::bad)?;
+        let index_kind = result_index_kind(epoch, &encode_hex(miner.as_ref()));
+        for result_record in self
+            .store
+            .list::<ResultRecord>(&index_kind)
+            .map_err(HttpError::internal)?
+        {
+            let job: JobRecord = self.record(JOBS, &result_record.job_hash_hex)?;
             if job.assigned_epoch != epoch || job.assigned_miner_hex != encode_hex(miner.as_ref()) {
                 continue;
             }
@@ -1060,9 +1130,12 @@ impl App {
             result_job_hashes: selected.into_iter().map(|entry| entry.0).collect(),
             onchain: None,
         };
-        let path = self.epoch_path(epoch);
-        if path.exists() {
-            let existing: EpochRecord = read_json_file(&path).map_err(HttpError::bad)?;
+        let epoch_key = epoch.to_string();
+        if let Some(existing) = self
+            .store
+            .get::<EpochRecord>(EPOCHS, &epoch_key)
+            .map_err(HttpError::internal)?
+        {
             if existing.miner_pubkey_hex != record.miner_pubkey_hex
                 || existing.result_root_hex != record.result_root_hex
                 || existing.result_count != record.result_count
@@ -1072,12 +1145,15 @@ impl App {
             }
             return serde_json::to_value(existing).map_err(HttpError::bad);
         }
-        write_record(&path, &record).map_err(HttpError::bad)?;
+        self.store
+            .put_if_absent(EPOCHS, &epoch_key, &record)
+            .map_err(HttpError::internal)?;
         serde_json::to_value(record).map_err(HttpError::bad)
     }
 
     fn sync_epoch(&self, epoch: u64, request: SyncEpochRequest) -> HttpResult {
-        let mut record: EpochRecord = read_record(&self.epoch_path(epoch))?;
+        let epoch_key = epoch.to_string();
+        let mut record: EpochRecord = self.record(EPOCHS, &epoch_key)?;
         let epoch_account = Pubkey::from_str(&request.epoch_account).map_err(HttpError::bad)?;
         let rpc =
             RpcClient::new_with_commitment(self.rpc_url.clone(), CommitmentConfig::confirmed());
@@ -1111,17 +1187,19 @@ impl App {
             challenge_deadline_slot: read_u64(data, 136).map_err(HttpError::bad)?,
             response_window_slots: read_u64(data, 144).map_err(HttpError::bad)?,
         });
-        write_record(&self.epoch_path(epoch), &record).map_err(HttpError::bad)?;
+        self.store
+            .set(EPOCHS, &epoch_key, &record)
+            .map_err(HttpError::internal)?;
         serde_json::to_value(record).map_err(HttpError::bad)
     }
 
     fn get_epoch(&self, epoch: u64) -> HttpResult {
-        let record: EpochRecord = read_record(&self.epoch_path(epoch))?;
+        let record: EpochRecord = self.record(EPOCHS, &epoch.to_string())?;
         serde_json::to_value(record).map_err(HttpError::bad)
     }
 
     fn audit_packages(&self, epoch: u64) -> HttpResult {
-        let record: EpochRecord = read_record(&self.epoch_path(epoch))?;
+        let record: EpochRecord = self.record(EPOCHS, &epoch.to_string())?;
         let mut packages = Vec::new();
         for job_hash in &record.result_job_hashes {
             if let Some(package) = self.package_if_selected(&record, job_hash)? {
@@ -1133,8 +1211,8 @@ impl App {
 
     fn challenge_package(&self, job_hash: &str) -> HttpResult {
         validate_hash_name(job_hash)?;
-        let job: JobRecord = read_record(&self.job_path(job_hash))?;
-        let epoch: EpochRecord = read_record(&self.epoch_path(job.assigned_epoch))?;
+        let job: JobRecord = self.record(JOBS, job_hash)?;
+        let epoch: EpochRecord = self.record(EPOCHS, &job.assigned_epoch.to_string())?;
         self.package_if_selected(&epoch, job_hash)?
             .ok_or_else(|| HttpError::new(403, "job was not selected for mandatory audit"))
             .and_then(|package| serde_json::to_value(package).map_err(HttpError::bad))
@@ -1154,8 +1232,8 @@ impl App {
             .iter()
             .position(|candidate| candidate == job_hash)
             .ok_or_else(|| HttpError::new(404, "result is not in the epoch"))?;
-        let job: JobRecord = read_record(&self.job_path(job_hash))?;
-        let result: ResultRecord = read_record(&self.result_path(job_hash))?;
+        let job: JobRecord = self.record(JOBS, job_hash)?;
+        let result: ResultRecord = self.record(RESULTS, job_hash)?;
         let payload_bytes = decode_hex_exact(
             &job.payload_hex,
             JobPayloadV1::CANONICAL_SIZE,
@@ -1199,7 +1277,7 @@ impl App {
             .result_job_hashes
             .iter()
             .map(|job_hash| {
-                let record: ResultRecord = read_record(&self.result_path(job_hash))?;
+                let record: ResultRecord = self.record(RESULTS, job_hash)?;
                 let bytes = decode_hex_exact(
                     &record.result_hex,
                     ResultLeafV1::CANONICAL_SIZE,
@@ -1214,19 +1292,277 @@ impl App {
         MerkleTree::new(HashAlgorithm::Sha256V1, D_BATCH, &leaves).map_err(HttpError::bad)
     }
 
-    fn job_path(&self, job_hash: &str) -> PathBuf {
-        self.data_dir.join("jobs").join(format!("{job_hash}.json"))
+    fn record<T: DeserializeOwned>(&self, kind: &str, key: &str) -> Result<T, HttpError> {
+        self.store
+            .get(kind, key)
+            .map_err(HttpError::internal)?
+            .ok_or_else(|| HttpError::new(404, "record not found"))
+    }
+}
+
+impl GatewayStore {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Files(_) => "local-files",
+            Self::Dodil(_) => "dodil-datak3",
+        }
     }
 
-    fn result_path(&self, job_hash: &str) -> PathBuf {
-        self.data_dir
-            .join("results")
-            .join(format!("{job_hash}.json"))
+    fn prepare(&self) -> Result<()> {
+        match self {
+            Self::Files(root) => {
+                for name in [JOBS, RESULTS, EPOCHS] {
+                    fs::create_dir_all(root.join(name))?;
+                }
+                Ok(())
+            }
+            Self::Dodil(store) => store.prepare(),
+        }
     }
 
-    fn epoch_path(&self, epoch: u64) -> PathBuf {
-        self.data_dir.join("epochs").join(format!("{epoch}.json"))
+    fn count(&self, kind: &str) -> Result<usize> {
+        match self {
+            Self::Files(root) => entry_count(&root.join(kind)),
+            Self::Dodil(store) => store.count(kind),
+        }
     }
+
+    fn get<T: DeserializeOwned>(&self, kind: &str, key: &str) -> Result<Option<T>> {
+        let bytes = match self {
+            Self::Files(root) => {
+                let path = record_path(root, kind, key);
+                if !path.exists() {
+                    return Ok(None);
+                }
+                fs::read(&path).with_context(|| format!("read {}", path.display()))?
+            }
+            Self::Dodil(store) => match store.get_bytes(kind, key)? {
+                Some(value) => value,
+                None => return Ok(None),
+            },
+        };
+        serde_json::from_slice(&bytes)
+            .context("decode stored record")
+            .map(Some)
+    }
+
+    fn list<T: DeserializeOwned>(&self, kind: &str) -> Result<Vec<T>> {
+        match self {
+            Self::Files(root) => json_entries(&root.join(kind))?
+                .iter()
+                .map(|path| read_json_file(path))
+                .collect(),
+            Self::Dodil(store) => store
+                .list_bytes(kind)?
+                .iter()
+                .map(|bytes| serde_json::from_slice(bytes).context("decode stored record"))
+                .collect(),
+        }
+    }
+
+    fn put_if_absent(&self, kind: &str, key: &str, value: &impl Serialize) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(value)?;
+        match self {
+            Self::Files(root) => {
+                let path = record_path(root, kind, key);
+                if path.exists() {
+                    let existing = fs::read(&path)?;
+                    if existing != bytes {
+                        bail!("conflicting record already exists");
+                    }
+                    return Ok(());
+                }
+                write_record_bytes(&path, &bytes)
+            }
+            Self::Dodil(store) => store.put_if_absent(kind, key, &bytes),
+        }
+    }
+
+    fn set(&self, kind: &str, key: &str, value: &impl Serialize) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(value)?;
+        match self {
+            Self::Files(root) => write_record_bytes(&record_path(root, kind, key), &bytes),
+            Self::Dodil(store) => store.set(kind, key, &bytes),
+        }
+    }
+}
+
+impl DodilStore {
+    fn from_env(bucket: &str) -> Result<Self> {
+        if bucket.is_empty()
+            || !bucket
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            bail!("DODIL bucket must contain only lowercase letters, digits, and hyphens");
+        }
+        let token =
+            std::env::var("DODIL_TOKEN").context("DODIL_TOKEN is required with --dodil-bucket")?;
+        if !token.starts_with("dk_") || token.len() < 32 {
+            bail!("DODIL_TOKEN must be a DODIL API key");
+        }
+        let endpoint = std::env::var("DODIL_OBJECT_ENDPOINT")
+            .unwrap_or_else(|_| "https://object.uk-lon-1.dodil.io".to_owned());
+        let bucket_url =
+            reqwest::Url::parse(&format!("{}/{bucket}", endpoint.trim_end_matches('/')))?;
+        Ok(Self {
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?,
+            bucket_url,
+            token,
+        })
+    }
+
+    fn prepare(&self) -> Result<()> {
+        self.list_keys(JOBS)?;
+        Ok(())
+    }
+
+    fn count(&self, kind: &str) -> Result<usize> {
+        Ok(self.list_keys(kind)?.len())
+    }
+
+    fn get_bytes(&self, kind: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        let response = self
+            .client
+            .get(self.object_url(kind, key)?)
+            .bearer_auth(&self.token)
+            .send()
+            .context("read DODIL DataK3 object")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = checked_dodil_response(response)?;
+        Ok(Some(response.bytes()?.to_vec()))
+    }
+
+    fn list_bytes(&self, kind: &str) -> Result<Vec<Vec<u8>>> {
+        self.list_keys(kind)?
+            .iter()
+            .map(|key| {
+                self.get_key(key)?
+                    .ok_or_else(|| anyhow!("DODIL object disappeared while listing"))
+            })
+            .collect()
+    }
+
+    fn put_if_absent(&self, kind: &str, key: &str, bytes: &[u8]) -> Result<()> {
+        if let Some(stored) = self.get_bytes(kind, key)? {
+            if stored != bytes {
+                bail!("conflicting record already exists");
+            }
+            return Ok(());
+        }
+        self.put(kind, key, bytes, true)?;
+        let stored = self
+            .get_bytes(kind, key)?
+            .ok_or_else(|| anyhow!("DODIL object was not stored"))?;
+        if stored != bytes {
+            bail!("conflicting record already exists");
+        }
+        Ok(())
+    }
+
+    fn set(&self, kind: &str, key: &str, bytes: &[u8]) -> Result<()> {
+        self.put(kind, key, bytes, false)
+    }
+
+    fn put(&self, kind: &str, key: &str, bytes: &[u8], only_if_absent: bool) -> Result<()> {
+        let mut request = self
+            .client
+            .put(self.object_url(kind, key)?)
+            .bearer_auth(&self.token)
+            .header("Content-Type", "application/json");
+        if only_if_absent {
+            request = request.header("If-None-Match", "*");
+        }
+        let response = request
+            .body(bytes.to_vec())
+            .send()
+            .context("write DODIL DataK3 object")?;
+        if only_if_absent && response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
+            return Ok(());
+        }
+        checked_dodil_response(response)?;
+        Ok(())
+    }
+
+    fn list_keys(&self, kind: &str) -> Result<Vec<String>> {
+        let prefix = format!("{kind}/");
+        let mut continuation: Option<String> = None;
+        let mut keys = Vec::new();
+        loop {
+            let mut request = self
+                .client
+                .get(self.bucket_url.clone())
+                .bearer_auth(&self.token);
+            request = request.query(&[("list-type", "2"), ("prefix", prefix.as_str())]);
+            if let Some(token) = continuation.as_deref() {
+                request = request.query(&[("continuation-token", token)]);
+            }
+            let body = checked_dodil_response(request.send().context("list DODIL objects")?)?
+                .text()
+                .context("read DODIL object list")?;
+            let page: ObjectList =
+                quick_xml::de::from_str(&body).context("decode DODIL object list")?;
+            keys.extend(page.contents.into_iter().map(|entry| entry.key));
+            if !page.is_truncated {
+                break;
+            }
+            continuation = Some(
+                page.next_continuation_token
+                    .ok_or_else(|| anyhow!("truncated DODIL list has no continuation token"))?,
+            );
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
+    fn get_key(&self, object_key: &str) -> Result<Option<Vec<u8>>> {
+        let mut url = self.bucket_url.clone();
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("DODIL object endpoint cannot be a base URL"))?
+            .extend(object_key.split('/'));
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.token)
+            .send()
+            .context("read DODIL DataK3 object")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(checked_dodil_response(response)?.bytes()?.to_vec()))
+    }
+
+    fn object_url(&self, kind: &str, key: &str) -> Result<reqwest::Url> {
+        let mut url = self.bucket_url.clone();
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("DODIL object endpoint cannot be a base URL"))?
+            .push(kind)
+            .push(&format!("{key}.json"));
+        Ok(url)
+    }
+}
+
+fn checked_dodil_response(
+    response: reqwest::blocking::Response,
+) -> Result<reqwest::blocking::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().unwrap_or_default();
+    bail!("DODIL DataK3 returned {status}: {body}")
+}
+
+fn record_path(root: &Path, kind: &str, key: &str) -> PathBuf {
+    root.join(kind).join(format!("{key}.json"))
+}
+
+fn result_index_kind(epoch: u64, miner_hex: &str) -> String {
+    format!("result-index/{epoch}/{miner_hex}")
 }
 
 fn require_miner(app: &App, request: &Request) -> Result<(), HttpError> {
@@ -1362,20 +1698,16 @@ fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))
 }
 
-fn read_record<T: DeserializeOwned>(path: &Path) -> std::result::Result<T, HttpError> {
-    if !path.exists() {
-        return Err(HttpError::new(404, "record not found"));
-    }
-    read_json_file(path).map_err(HttpError::bad)
+fn write_record(path: &Path, value: &impl Serialize) -> Result<()> {
+    write_record_bytes(path, &serde_json::to_vec_pretty(value)?)
 }
 
-fn write_record(path: &Path, value: &impl Serialize) -> Result<()> {
+fn write_record_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("record has no parent"))?;
     fs::create_dir_all(parent)?;
     let temporary = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(value)?;
     fs::write(&temporary, bytes)?;
     fs::rename(&temporary, path)?;
     Ok(())
@@ -1433,7 +1765,7 @@ mod tests {
         let job_hash = payload.hash().unwrap();
         let job_hash_hex = encode_hex(&job_hash);
         let app = App {
-            data_dir: directory.clone(),
+            store: GatewayStore::Files(directory.clone()),
             program,
             rpc_url: "http://invalid.test".to_owned(),
             miner_token: "x".repeat(32),
@@ -1465,7 +1797,7 @@ mod tests {
             },
         )
         .unwrap();
-        let mut epoch: EpochRecord = read_json_file(&app.epoch_path(9)).unwrap();
+        let mut epoch: EpochRecord = app.store.get(EPOCHS, "9").unwrap().unwrap();
         epoch.onchain = Some(OnchainEpoch {
             epoch_account: Pubkey::new_unique().to_string(),
             close_slot: 10,
@@ -1474,7 +1806,7 @@ mod tests {
             challenge_deadline_slot: 100,
             response_window_slots: 10,
         });
-        write_record(&app.epoch_path(9), &epoch).unwrap();
+        app.store.set(EPOCHS, "9", &epoch).unwrap();
         let package = app
             .package_if_selected(&epoch, &job_hash_hex)
             .unwrap()
