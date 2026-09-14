@@ -1733,7 +1733,12 @@ fn unix_seconds() -> Result<u64> {
 }
 
 fn json_entries(directory: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = fs::read_dir(directory)?
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut paths = entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
             path.extension()
@@ -1768,6 +1773,20 @@ fn write_record_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer as _, SigningKey};
+
+    #[test]
+    fn missing_local_index_is_an_empty_listing() {
+        let directory = std::env::temp_dir().join(format!(
+            "qx-gateway-missing-index-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!directory.exists());
+        assert!(json_entries(&directory).unwrap().is_empty());
+    }
 
     #[test]
     fn hex_codec_is_canonical() {
