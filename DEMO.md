@@ -50,9 +50,9 @@ solana program show QJPMJrcmJEeLcVZdqaofF9ioCpvXYJXLVZhFhea2EiB \
 ## Requirements
 
 The miner needs a macOS Apple Silicon machine, Xcode/Metal, stable Rust,
-`curl`, `jq`, and the exact `.qx` artifact. Both people should use the same QX
-Git commit. The requester also needs `openssl`; the Solana CLI is needed for
-the on-chain checks and verifier tests.
+`curl`, `jq`, and a `.qx` artifact built from the current QX source. Both
+people should use the same QX Git commit. The requester also needs `openssl`;
+the Solana CLI is needed for the on-chain checks and verifier tests.
 
 Both people run:
 
@@ -64,31 +64,17 @@ cargo build --release -p qx-gateway
 
 Never create or store private keys or gateway tokens inside the repository.
 
-## 1. Prepare the artifact
+## 1. Build the artifact
 
-The quickest option is to transfer this file to the miner over a trusted
-channel:
-
-```text
-external/models/granite-m5-pro-q4-factorial-rowinline.qx
-```
-
-The miner verifies it before running:
+From the repository root, run:
 
 ```bash
-shasum -a 256 \
-  external/models/granite-m5-pro-q4-factorial-rowinline.qx
+./scripts/build-artifact.sh
 ```
 
-The required SHA-256 is:
-
-```text
-b9c17197dc3014ae446188abf79a2b3e73af3e7ff78b68f80c89e5a546b54c84
-```
-
-The artifact is deliberately excluded from Git. See
-[Reproduce the artifact](#reproduce-the-artifact) to build it from the pinned
-IBM Granite checkpoint instead of transferring it.
+The command downloads and verifies the Granite checkpoint, compiles it using
+the current checkout, and prints the new artifact's path and SHA-256. The
+output is intentionally excluded from Git.
 
 ## 2. Give the miner its transport credential
 
@@ -116,7 +102,7 @@ On the friend's Apple Silicon machine:
 ```bash
 ./scripts/devnet-miner-worker.sh \
   4vikCFiyndM6KfpK6EezrpLPUjgUs9eZKCDxUhpuXCRa \
-  external/models/granite-m5-pro-q4-factorial-rowinline.qx \
+  external/models/granite-m5-pro-q4-main.qx \
   ../qx-devnet-keys/gateway.token
 ```
 
@@ -203,66 +189,6 @@ solana airdrop 1 "$REQUESTER" --url https://api.devnet.solana.com
 
 The probe measures transaction compute units, fees, throughput, failures, and
 confirmation latency. It is a load probe, not a model inference or challenge.
-
-## Reproduce the artifact
-
-Run this once from a clean QX clone. It downloads the pinned IBM Granite
-checkpoint and uses the historical compiler revision recorded in the released
-artifact. The harmless marker is required because compiler provenance,
-including its `+dirty` state, is embedded in the artifact.
-
-```bash
-git lfs install
-
-QX_REPO_ROOT="$(pwd)"
-QX_COMPILER_TREE="${QX_REPO_ROOT}-artifact-compiler"
-QX_MODEL_DIR="$QX_REPO_ROOT/external/models/granite-3.0-1b-a400m-instruct"
-QX_OUTPUT="$QX_REPO_ROOT/external/models/granite-m5-pro-q4-factorial-rowinline.qx"
-
-mkdir -p "$QX_REPO_ROOT/external/models"
-
-git clone --no-checkout \
-  https://huggingface.co/ibm-granite/granite-3.0-1b-a400m-instruct \
-  "$QX_MODEL_DIR"
-git -C "$QX_MODEL_DIR" checkout \
-  ffec3c35bdfd97a06f0b4cd5fcc92cd9b1584445
-
-test "$(shasum -a 256 "$QX_MODEL_DIR/model.safetensors" | awk '{print $1}')" = \
-  "f7ae1cee56a9ea6c5360437b1c0407f8d84816b2cc75470f4e7e5236fa2a07dc" ||
-  { echo "Model checksum mismatch"; exit 1; }
-
-git fetch origin 464424e7428ac048c9cba88de13db79aeca5c7c6
-git worktree add --detach \
-  "$QX_COMPILER_TREE" \
-  464424e7428ac048c9cba88de13db79aeca5c7c6
-touch "$QX_COMPILER_TREE/.qx-reproduction-marker"
-
-cd "$QX_COMPILER_TREE"
-cargo run --release -p qx-compile -- \
-  "$QX_MODEL_DIR" \
-  --target m5-pro \
-  --memory-budget 2gb \
-  --context 512 \
-  --disable-q3 \
-  --uniform-expert-bits q4 \
-  --expert-layout row-inline \
-  --moe-mapping qx \
-  --weight-storage mmap-no-copy \
-  --command-buffers-per-token 1 \
-  --plan-id factorial-rowinline-qx \
-  --output "$QX_OUTPUT"
-
-test "$(shasum -a 256 "$QX_OUTPUT" | awk '{print $1}')" = \
-  "b9c17197dc3014ae446188abf79a2b3e73af3e7ff78b68f80c89e5a546b54c84" ||
-  { echo "Artifact checksum mismatch"; exit 1; }
-
-echo "Artifact reproduced and verified: $QX_OUTPUT"
-cd "$QX_REPO_ROOT"
-git worktree remove --force "$QX_COMPILER_TREE"
-```
-
-Do not compile this artifact from current `main`: the planner has changed, so
-the result is valid but not byte-identical to the registered demo artifact.
 
 For gateway hosting, epoch operation, API details, and manual package
 inspection, continue with
