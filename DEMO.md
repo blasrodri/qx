@@ -47,6 +47,38 @@ solana program show QJPMJrcmJEeLcVZdqaofF9ioCpvXYJXLVZhFhea2EiB \
   --url https://api.devnet.solana.com
 ```
 
+## Run the 30-minute demo
+
+From a clean clone on an Apple Silicon Mac, run:
+
+```bash
+./scripts/run-demo.sh
+```
+
+It builds the artifact when needed, creates temporary demo identities, uses
+the configured Solana payer (or funds a temporary one from the devnet faucet),
+and then runs jobs continuously for 30 minutes. Every job prints its input and
+output token IDs, job hash, result leaf, and trace root. At the end it closes
+the epoch, commits and seeds it on Solana devnet, prints every job selected by
+the 5% audit rule and its Merkle proof size, and replays every selected job. If
+`cargo-build-sbf` is available, it also runs the adversarial
+bisection-to-conviction test.
+
+For a funded existing payer, avoiding the devnet faucet:
+
+```bash
+QX_PAYER_KEYPAIR=../qx-devnet-keys/payer.json ./scripts/run-demo.sh
+```
+
+For a short smoke run, override the duration:
+
+```bash
+QX_DEMO_DURATION_SECONDS=30 ./scripts/run-demo.sh
+```
+
+The final `event=demo_complete` line reports submitted jobs, completed jobs,
+failures, selected audits, matching replays, and adversarial-test status.
+
 ## Requirements
 
 The miner needs a macOS Apple Silicon machine, Xcode/Metal, stable Rust,

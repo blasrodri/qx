@@ -22,6 +22,7 @@ QX_PROGRAM_ID=${QX_PROGRAM_ID:-QJPMJrcmJEeLcVZdqaofF9ioCpvXYJXLVZhFhea2EiB}
 QX_MODEL_ID=${QX_MODEL_ID:-bc205dbf40be32428fa653aff4c690b2c8a379a2d3fedbf617bb831a6264a17d}
 QX_EXECUTION_SPEC=${QX_EXECUTION_SPEC:-2485240f3be98d158f5fca212e98e6776254f7279e772c8b12daa6ee9bec6f5f}
 QX_MODEL_REGISTRY=${QX_MODEL_REGISTRY:-CsUgpxaXfofqfEVS1DbTR8pcGqC4mCWXhR15kgiDoCZe}
+QX_AUDIT_PROBABILITY_PPM=${QX_AUDIT_PROBABILITY_PPM:-50000}
 
 for QX_REQUIRED_COMMAND in cargo curl jq openssl; do
   if ! command -v "$QX_REQUIRED_COMMAND" >/dev/null 2>&1; then
@@ -41,6 +42,11 @@ if [[ ! "$QX_MAX_OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ || ! "$QX_WAIT_SECONDS" =~ ^[0-
   echo "max-output-tokens must be positive and wait-seconds must be nonnegative" >&2
   exit 1
 fi
+if [[ ! "$QX_AUDIT_PROBABILITY_PPM" =~ ^[0-9]+$ ]] \
+  || (( QX_AUDIT_PROBABILITY_PPM < 10000 || QX_AUDIT_PROBABILITY_PPM > 1000000 )); then
+  echo "QX_AUDIT_PROBABILITY_PPM must be between 10000 and 1000000" >&2
+  exit 1
+fi
 
 QX_WORK_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/qx-client-test.XXXXXX")
 cleanup() {
@@ -54,7 +60,11 @@ QX_JOB_FILE="$QX_WORK_DIRECTORY/job.json"
 QX_RESULT_FILE="$QX_WORK_DIRECTORY/result.json"
 QX_JOB_ID=$(openssl rand -hex 32)
 QX_NOW=$(date +%s)
-QX_EPOCH=$((QX_NOW / 3600))
+QX_EPOCH=${QX_ASSIGNED_EPOCH:-$((QX_NOW / 3600))}
+if [[ ! "$QX_EPOCH" =~ ^[0-9]+$ ]]; then
+  echo "QX_ASSIGNED_EPOCH must be an unsigned integer" >&2
+  exit 1
+fi
 QX_NONCE=$QX_NOW
 QX_CURRENT_SLOT=$(curl --fail --silent --show-error \
   -H 'Content-Type: application/json' \
@@ -76,7 +86,7 @@ QX_CREATE_OUTPUT=$(target/release/qx-gateway create-job \
   --slashable-exposure 1 \
   --deadline-slot "$QX_DEADLINE_SLOT" \
   --nonce "$QX_NONCE" \
-  --audit-probability-ppm 50000 \
+  --audit-probability-ppm "$QX_AUDIT_PROBABILITY_PPM" \
   --assigned-epoch "$QX_EPOCH" \
   --output "$QX_JOB_FILE")
 QX_JOB_HASH=$(sed -n 's/^job_hash_hex=//p' <<< "$QX_CREATE_OUTPUT")
