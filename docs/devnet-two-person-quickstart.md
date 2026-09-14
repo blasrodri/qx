@@ -208,9 +208,14 @@ challengers can obtain selected packages.
 
 The remote storage layout is one JSON object per job, result, and epoch. A
 small per-epoch/per-miner result index keeps epoch close proportional to the
-jobs in that miner's epoch rather than all historical jobs. Normal inference
-does two durable writes (job and result); inference and trace computation stay
-on the miner and do not consume Ignite compute.
+jobs in that miner's epoch rather than all historical jobs. A complete job
+lifecycle uses three object PUTs: one job PUT from the requester, followed by
+one result PUT and one small index-pointer PUT from the miner. The health probe
+does not list the bucket. Inference and trace computation stay on the miner and
+do not consume Ignite compute.
+
+The current devnet deployment is available at
+<https://qx-gateway-devnet-sitoula-8080.ignite.dodil.cloud>.
 
 Bind to `0.0.0.0:8787` only behind a firewall, VPN, or TLS reverse proxy. The
 read endpoints intentionally let challengers fetch selected packages. Miner

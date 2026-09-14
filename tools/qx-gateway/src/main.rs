@@ -246,6 +246,11 @@ struct ResultRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct ResultIndexRecord {
+    job_hash_hex: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct CloseEpochRequest {
     miner_pubkey: String,
 }
@@ -949,17 +954,11 @@ impl App {
     }
 
     fn health(&self) -> HttpResult {
-        let jobs = self.store.count(JOBS).map_err(HttpError::internal)?;
-        let results = self.store.count(RESULTS).map_err(HttpError::internal)?;
-        let epochs = self.store.count(EPOCHS).map_err(HttpError::internal)?;
         Ok(serde_json::json!({
             "status": "ok",
             "storage": self.store.label(),
             "cluster_rpc": self.rpc_url,
             "program": self.program.to_string(),
-            "jobs": jobs,
-            "results": results,
-            "epochs": epochs,
         }))
     }
 
@@ -1084,8 +1083,11 @@ impl App {
                 .map_err(HttpError::internal)?;
         }
         let index_kind = result_index_kind(job.assigned_epoch, &job.assigned_miner_hex);
+        let index_record = ResultIndexRecord {
+            job_hash_hex: job_hash_hex.clone(),
+        };
         self.store
-            .put_if_absent(&index_kind, &job_hash_hex, &record)
+            .put_if_absent(&index_kind, &job_hash_hex, &index_record)
             .map_err(HttpError::internal)?;
         Ok(serde_json::json!({ "job_hash_hex": job_hash_hex, "status": "accepted" }))
     }
@@ -1094,15 +1096,16 @@ impl App {
         let miner = Pubkey::from_str(&request.miner_pubkey).map_err(HttpError::bad)?;
         let mut selected = Vec::<(String, ResultRecord, ResultLeafV1)>::new();
         let index_kind = result_index_kind(epoch, &encode_hex(miner.as_ref()));
-        for result_record in self
+        for index_record in self
             .store
-            .list::<ResultRecord>(&index_kind)
+            .list::<ResultIndexRecord>(&index_kind)
             .map_err(HttpError::internal)?
         {
-            let job: JobRecord = self.record(JOBS, &result_record.job_hash_hex)?;
+            let job: JobRecord = self.record(JOBS, &index_record.job_hash_hex)?;
             if job.assigned_epoch != epoch || job.assigned_miner_hex != encode_hex(miner.as_ref()) {
                 continue;
             }
+            let result_record: ResultRecord = self.record(RESULTS, &index_record.job_hash_hex)?;
             let bytes = decode_hex_exact(
                 &result_record.result_hex,
                 ResultLeafV1::CANONICAL_SIZE,
@@ -1320,13 +1323,6 @@ impl GatewayStore {
         }
     }
 
-    fn count(&self, kind: &str) -> Result<usize> {
-        match self {
-            Self::Files(root) => entry_count(&root.join(kind)),
-            Self::Dodil(store) => store.count(kind),
-        }
-    }
-
     fn get<T: DeserializeOwned>(&self, kind: &str, key: &str) -> Result<Option<T>> {
         let bytes = match self {
             Self::Files(root) => {
@@ -1419,10 +1415,6 @@ impl DodilStore {
         Ok(())
     }
 
-    fn count(&self, kind: &str) -> Result<usize> {
-        Ok(self.list_keys(kind)?.len())
-    }
-
     fn get_bytes(&self, kind: &str, key: &str) -> Result<Option<Vec<u8>>> {
         let response = self
             .client
@@ -1448,42 +1440,41 @@ impl DodilStore {
     }
 
     fn put_if_absent(&self, kind: &str, key: &str, bytes: &[u8]) -> Result<()> {
-        if let Some(stored) = self.get_bytes(kind, key)? {
+        let response = self
+            .client
+            .put(self.object_url(kind, key)?)
+            .bearer_auth(&self.token)
+            .header("Content-Type", "application/json")
+            .header("If-None-Match", "*")
+            .body(bytes.to_vec())
+            .send()
+            .context("write DODIL DataK3 object")?;
+        if response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
+            let stored = self
+                .get_bytes(kind, key)?
+                .ok_or_else(|| anyhow!("DODIL object disappeared after write conflict"))?;
             if stored != bytes {
                 bail!("conflicting record already exists");
             }
             return Ok(());
         }
-        self.put(kind, key, bytes, true)?;
-        let stored = self
-            .get_bytes(kind, key)?
-            .ok_or_else(|| anyhow!("DODIL object was not stored"))?;
-        if stored != bytes {
-            bail!("conflicting record already exists");
-        }
+        checked_dodil_response(response)?;
         Ok(())
     }
 
     fn set(&self, kind: &str, key: &str, bytes: &[u8]) -> Result<()> {
-        self.put(kind, key, bytes, false)
+        self.put(kind, key, bytes)
     }
 
-    fn put(&self, kind: &str, key: &str, bytes: &[u8], only_if_absent: bool) -> Result<()> {
-        let mut request = self
+    fn put(&self, kind: &str, key: &str, bytes: &[u8]) -> Result<()> {
+        let response = self
             .client
             .put(self.object_url(kind, key)?)
             .bearer_auth(&self.token)
-            .header("Content-Type", "application/json");
-        if only_if_absent {
-            request = request.header("If-None-Match", "*");
-        }
-        let response = request
+            .header("Content-Type", "application/json")
             .body(bytes.to_vec())
             .send()
             .context("write DODIL DataK3 object")?;
-        if only_if_absent && response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
-            return Ok(());
-        }
         checked_dodil_response(response)?;
         Ok(())
     }
@@ -1687,10 +1678,6 @@ fn json_entries(directory: &Path) -> Result<Vec<PathBuf>> {
         .collect::<Vec<_>>();
     paths.sort();
     Ok(paths)
-}
-
-fn entry_count(directory: &Path) -> Result<usize> {
-    Ok(json_entries(directory)?.len())
 }
 
 fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {

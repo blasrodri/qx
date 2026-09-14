@@ -25,6 +25,8 @@ implemented guarantees and remaining production gates.
 The devnet gateway can also run as a stateless DODIL Ignite container backed by
 private DataK3 object storage; see the
 [DODIL section of the quickstart](docs/devnet-two-person-quickstart.md#host-the-gateway-on-dodil).
+The current instance is
+<https://qx-gateway-devnet-sitoula-8080.ignite.dodil.cloud>.
 
 The repository does not contain model artifacts or private keys. External
 fixtures belong under `external/`, which is ignored by Git.
