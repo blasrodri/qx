@@ -26,7 +26,8 @@ dodil ignite app deploy "$QX_DODIL_APP" \
   --port 8080 \
   --health-path /health \
   --max-replicas 2 \
-  --auto-min-instances 0 \
+  --reserved 1 \
+  --auto-min-instances 1 \
   --allow-unauthenticated \
   --env "QX_DODIL_BUCKET=$QX_DODIL_BUCKET" \
   --env "QX_PROGRAM_ID=$QX_VERIFIER_PROGRAM" \

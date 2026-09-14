@@ -251,6 +251,11 @@ struct ResultIndexRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct JobIndexRecord {
+    job_hash_hex: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct CloseEpochRequest {
     miner_pubkey: String,
 }
@@ -885,11 +890,16 @@ fn handle(app: &App, mut request: Request) -> Result<()> {
             app.put_job(body)
         }
         (Method::Get, ["v1", "jobs", job_hash]) => app.get_job(job_hash),
+        (Method::Get, ["v1", "miners", miner, "jobs"]) => {
+            require_miner(app, &request)?;
+            app.pending_jobs(miner)
+        }
         (Method::Post, ["v1", "results"]) => {
             require_miner(app, &request)?;
             let body = read_json::<ResultSubmission>(&mut request).map_err(HttpError::bad)?;
             app.put_result(body)
         }
+        (Method::Get, ["v1", "results", job_hash]) => app.get_result(job_hash),
         (Method::Post, ["v1", "epochs", epoch, "close"]) => {
             require_miner(app, &request)?;
             let epoch = epoch.parse::<u64>().map_err(HttpError::bad)?;
@@ -1019,12 +1029,57 @@ impl App {
                 .put_if_absent(JOBS, &job_hash_hex, &record)
                 .map_err(HttpError::internal)?;
         }
+        let index_kind = job_index_kind(&record.assigned_miner_hex);
+        self.store
+            .put_if_absent(
+                &index_kind,
+                &job_hash_hex,
+                &JobIndexRecord {
+                    job_hash_hex: job_hash_hex.clone(),
+                },
+            )
+            .map_err(HttpError::internal)?;
         Ok(serde_json::json!({ "job_hash_hex": job_hash_hex, "status": "accepted" }))
     }
 
     fn get_job(&self, job_hash: &str) -> HttpResult {
         validate_hash_name(job_hash)?;
         let record: JobRecord = self.record(JOBS, job_hash)?;
+        serde_json::to_value(record).map_err(HttpError::bad)
+    }
+
+    fn pending_jobs(&self, miner: &str) -> HttpResult {
+        let miner = Pubkey::from_str(miner).map_err(HttpError::bad)?;
+        let index_kind = job_index_kind(&encode_hex(miner.as_ref()));
+        let mut jobs = Vec::new();
+        for index_record in self
+            .store
+            .list::<JobIndexRecord>(&index_kind)
+            .map_err(HttpError::internal)?
+        {
+            if self
+                .store
+                .get::<ResultRecord>(RESULTS, &index_record.job_hash_hex)
+                .map_err(HttpError::internal)?
+                .is_none()
+            {
+                let job: JobRecord = self.record(JOBS, &index_record.job_hash_hex)?;
+                jobs.push(job);
+            }
+        }
+        jobs.sort_by_key(|job| {
+            (
+                job.assigned_epoch,
+                job.received_unix_seconds,
+                job.job_hash_hex.clone(),
+            )
+        });
+        Ok(serde_json::json!({ "jobs": jobs }))
+    }
+
+    fn get_result(&self, job_hash: &str) -> HttpResult {
+        validate_hash_name(job_hash)?;
+        let record: ResultRecord = self.record(RESULTS, job_hash)?;
         serde_json::to_value(record).map_err(HttpError::bad)
     }
 
@@ -1559,6 +1614,10 @@ fn result_index_kind(epoch: u64, miner_hex: &str) -> String {
     format!("result-index/{epoch}/{miner_hex}")
 }
 
+fn job_index_kind(miner_hex: &str) -> String {
+    format!("job-index/{miner_hex}")
+}
+
 fn require_miner(app: &App, request: &Request) -> Result<(), HttpError> {
     let provided = request
         .headers()
@@ -1769,6 +1828,8 @@ mod tests {
             requester_signature_hex: encode_hex(&signing.sign(&job_hash).to_bytes()),
         })
         .unwrap();
+        let pending = app.pending_jobs(&miner.to_string()).unwrap();
+        assert_eq!(pending["jobs"].as_array().unwrap().len(), 1);
         let output_tokens = vec![4, 5];
         let result = ResultLeafV1 {
             job_hash,
@@ -1779,9 +1840,16 @@ mod tests {
         };
         app.put_result(ResultSubmission {
             result_hex: encode_hex(&result.canonical_bytes()),
-            output_tokens,
+            output_tokens: output_tokens.clone(),
         })
         .unwrap();
+        let stored_result = app.get_result(&job_hash_hex).unwrap();
+        assert_eq!(
+            stored_result["output_tokens"],
+            serde_json::json!(output_tokens)
+        );
+        let pending = app.pending_jobs(&miner.to_string()).unwrap();
+        assert!(pending["jobs"].as_array().unwrap().is_empty());
         app.close_epoch(
             9,
             CloseEpochRequest {

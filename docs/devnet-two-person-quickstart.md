@@ -184,9 +184,10 @@ DODIL Ignite can host the Linux gateway/API. The miner remains on macOS because
 the committed Granite execution path uses Metal. Gateway records are stored as
 private DataK3 objects, not on Ignite's stateless container filesystem.
 
-The checked-in deployment uses the small tier, scale-to-zero, at most two
-replicas, and no GitHub runner. It archives the exact Git commit and sends that
-small archive to DODIL's native Docker builder, then deploys the built image:
+The checked-in deployment uses the small tier, one always-warm reserved
+replica, at most two replicas, and no GitHub runner. It archives the exact Git
+commit and sends that small archive to DODIL's native Docker builder, then
+deploys the built image:
 
 ```bash
 ./scripts/dodil-deploy-gateway.sh
@@ -198,7 +199,7 @@ One-time DODIL resources are:
 - env secret `qx-gateway-datak3-token`, containing a bucket-scoped `k3.editor`
   API key;
 - env secret `qx-gateway-miner-token`, containing a random 32-byte-or-longer
-  bearer token.
+  transport token.
 
 Ignite receives only `secret://...` references. Do not put either value in Git,
 the container image, command-line flags, or job payloads. `DODIL_TOKEN` is used
@@ -206,13 +207,13 @@ only for the private DataK3 object API; `QX_MINER_TOKEN` protects gateway write
 routes. Public read routes are intentional so independently operated
 challengers can obtain selected packages.
 
-The remote storage layout is one JSON object per job, result, and epoch. A
-small per-epoch/per-miner result index keeps epoch close proportional to the
-jobs in that miner's epoch rather than all historical jobs. A complete job
-lifecycle uses three object PUTs: one job PUT from the requester, followed by
-one result PUT and one small index-pointer PUT from the miner. The health probe
-does not list the bucket. Inference and trace computation stay on the miner and
-do not consume Ignite compute.
+The remote storage layout is one JSON object per job, result, and epoch. Small
+per-miner job indexes drive devnet dispatch, and per-epoch/per-miner result
+indexes keep epoch close proportional to the jobs in that miner's epoch rather
+than all historical jobs. A complete job lifecycle uses four object PUTs: the
+job and its small dispatch pointer, followed by the result and its small epoch
+pointer. The health probe does not list the bucket. Inference and trace
+computation stay on the miner and do not consume Ignite compute.
 
 The current devnet deployment is available at
 <https://qx-gateway-devnet-sitoula-8080.ignite.dodil.cloud>.
@@ -229,7 +230,9 @@ The gateway accepts these JSON resources:
 | Method and path | Purpose |
 |---|---|
 | `POST /v1/jobs` | Validate requester signature and exact input-token hash |
+| `GET /v1/miners/:miner/jobs` | Return that miner's pending jobs (miner auth) |
 | `POST /v1/results` | Store an unsigned result and its output tokens (miner auth) |
+| `GET /v1/results/:job_hash` | Return the provisional result and output token IDs |
 | `POST /v1/epochs/:epoch/close` | Build the deterministic ordered result root (miner auth) |
 | `POST /v1/epochs/:epoch/sync` | Verify and copy the seeded epoch account from devnet (miner auth) |
 | `GET /v1/epochs/:epoch/audits` | Return all selected replay packages |
@@ -253,6 +256,59 @@ curl -H "X-QX-Miner-Token: $QX_MINER_TOKEN" \
   https://qx-gateway-devnet-sitoula-8080.ignite.dodil.cloud/v1/results
 unset QX_MINER_TOKEN
 ```
+
+### Test one client and miner
+
+The miner receives the worker script and the exact external model artifact.
+The operator must deliver the miner transport token through a secret manager or
+another authenticated private channel; never commit or paste it into a job.
+The miner needs no signing key for job execution:
+
+```bash
+./scripts/devnet-miner-worker.sh \
+  4vikCFiyndM6KfpK6EezrpLPUjgUs9eZKCDxUhpuXCRa \
+  external/models/granite-m5-pro-q4-factorial-rowinline.qx \
+  ../qx-devnet-keys/gateway.token
+```
+
+The client keeps its requester keypair locally, submits token IDs at the fixed
+5% audit probability, and waits for the provisional result:
+
+```bash
+./scripts/devnet-client-test.sh \
+  ../qx-devnet-keys/requester.json \
+  4vikCFiyndM6KfpK6EezrpLPUjgUs9eZKCDxUhpuXCRa \
+  1,2,3 \
+  8 \
+  300
+```
+
+The command prints `output_tokens=[...]` when the worker posts the result. The
+tokens are provisional until the epoch is committed, seeded from Solana, and
+its challenge window completes. The client never receives the miner transport
+token.
+
+Submitting a job to the gateway does not require SOL. If the friend will also
+send devnet transactions as a challenger, the operator can fund only the
+friend's public key:
+
+```bash
+./scripts/devnet-fund-client.sh \
+  ../qx-devnet-keys/payer.json \
+  <FRIEND_PUBLIC_KEY> \
+  0.1
+```
+
+The funding helper refuses non-devnet RPC URLs and caps one transfer at 2 test
+SOL. It never needs the friend's private key.
+
+`devnet-miner-worker.sh` is a reconnecting testnet pull worker, not the final
+mass-scale dispatch plane. Its object-index polling remains correct across
+gateway restarts but becomes inefficient with many miners. Production should
+replace polling with a durable queue plus long-lived WebSocket or streaming
+connections, per-miner transport credentials, acknowledgement/lease handling,
+and backpressure. Those transport changes do not alter the signed job payload
+or require a miner protocol signature.
 
 The normal miner path does not require constructing the result manually. Run
 the signed job through the production Metal graph and emit its result package:
