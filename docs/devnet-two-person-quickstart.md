@@ -219,8 +219,10 @@ The current devnet deployment is available at
 
 Bind to `0.0.0.0:8787` only behind a firewall, VPN, or TLS reverse proxy. The
 read endpoints intentionally let challengers fetch selected packages. Miner
-writes require `Authorization: Bearer <token>`. This transport credential is
-not a per-job miner signature and has no protocol or slashing authority.
+writes require `X-QX-Miner-Token: <token>`. A custom header is required because
+DODIL Ignite reserves `Authorization: Bearer` for its own JWT authentication.
+This transport credential is not a per-job miner signature and has no protocol
+or slashing authority.
 
 The gateway accepts these JSON resources:
 
@@ -238,6 +240,19 @@ bodies; `--help` lists their exact arguments. Submit the resulting files with
 `curl --data-binary @file.json`. The job endpoint is requester-authenticated by
 its Ed25519 signature. Result and epoch writes use the bearer token because V2
 deliberately has no miner signature per result.
+
+On this Mac, the DODIL miner token is stored in Keychain. Use it without
+placing it in shell history:
+
+```bash
+QX_MINER_TOKEN=$(security find-generic-password \
+  -a "$USER" -s qx-gateway-devnet-miner -w)
+curl -H "X-QX-Miner-Token: $QX_MINER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data-binary @../qx-gateway-work/result.json \
+  https://qx-gateway-devnet-sitoula-8080.ignite.dodil.cloud/v1/results
+unset QX_MINER_TOKEN
+```
 
 The normal miner path does not require constructing the result manually. Run
 the signed job through the production Metal graph and emit its result package:

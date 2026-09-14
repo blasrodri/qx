@@ -1557,14 +1557,16 @@ fn result_index_kind(epoch: u64, miner_hex: &str) -> String {
 }
 
 fn require_miner(app: &App, request: &Request) -> Result<(), HttpError> {
-    let expected = format!("Bearer {}", app.miner_token);
     let provided = request
         .headers()
         .iter()
-        .find(|header| header.field.equiv("Authorization"))
+        .find(|header| header.field.equiv("X-QX-Miner-Token"))
         .map(|header| header.value.as_str());
-    if provided != Some(expected.as_str()) {
-        return Err(HttpError::new(401, "missing or invalid miner bearer token"));
+    if provided != Some(app.miner_token.as_str()) {
+        return Err(HttpError::new(
+            401,
+            "missing or invalid X-QX-Miner-Token header",
+        ));
     }
     Ok(())
 }
