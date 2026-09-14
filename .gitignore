@@ -2,3 +2,18 @@
 /external
 __pycache__/
 *.pyc
+.DS_Store
+*.stats
+
+# Local credentials and Solana deployment state must never enter Git.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*keypair*.json
+.local/
+
+# Local benchmark/autotuning output. Existing curated evidence remains tracked.
+benchmarks/results/
+benchmarks/*-autotune-suite.json

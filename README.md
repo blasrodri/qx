@@ -1,5 +1,26 @@
 # QX PoC
 
+> Experimental software for testnet evaluation. Do not use it to settle value.
+
+## Optimistic Granite verification
+
+QX now includes an exact hierarchical verifier for the fixed Granite Q4 Metal
+profile. Normal committed inference measured 2.465% overhead on the tested M5
+Pro, below the 5% ceiling, with exact CPU/Metal receipt parity. Jobs are sampled
+by epoch using successor-block Solana entropy; a detected disagreement is
+bisected from job to token, checkpoint, macro, micro trace, and finally an
+objective SBF arithmetic transition.
+
+To deploy the verifier and exercise it with a second testnet payer, follow the
+[two-person Solana testnet quickstart](docs/testnet-two-person-quickstart.md).
+The [protocol description](docs/verification-protocol.md),
+[model profile](docs/verification-model-profile.md), and
+[security/readiness audit](docs/verification-security-audit.md) describe the
+implemented guarantees and remaining production gates.
+
+The repository does not contain model artifacts or private keys. External
+fixtures belong under `external/`, which is ignored by Git.
+
 QX is a deliberately narrow model-by-hardware compiler experiment for IBM
 Granite 3.0 1B-A400M Instruct on Apple GPUs. Runtime V2 is now a complete,
 artifact-only, batch-1 Metal decode path; it is not a general inference
