@@ -259,15 +259,16 @@ the active dispute PDA, so a proof cannot be replayed into another dispute.
 
 ## Consensus arithmetic status
 
-`QX_EXEC_METAL_V1` uses a serial control lane and explicit ordered FP32 FMA in
-the slashable Q4, dense, decode, and dynamic-MoE kernels. Metal fast math is
+`QX_EXEC_METAL_V1` uses lane-local explicit FP32 FMA and a fixed SIMD
+shuffle-down reduction tree at offsets `16, 8, 4, 2, 1`. RMS reductions use
+eight such groups followed by one fixed group reduction. Metal fast math is
 disabled, and the artifact-native CPU verifier uses the same operation order.
 The profile also replaces native `exp`, `rsqrt`, and Granite RoPE trigonometry
 with protocol-defined fixed-operation implementations and a pinned
 inverse-frequency table. Rust, Metal, and the SBF terminal evaluator share
 identical constants and operation order. Full-model Metal/CPU bit-parity tests
 pass. The selected interval-2 execution-spec
-`73af09e26312313a6050e1e371fe6b6e2b7ade395ef6610ace25850d9ee16b36`
+`2485240f3be98d158f5fca212e98e6776254f7279e772c8b12daa6ee9bec6f5f`
 binds the fixed-math and commitment-shape profile.
 
 The scalar terminal IR now objectively evaluates FMA/dot steps, add, multiply,
@@ -282,6 +283,15 @@ KV leaf hashing, its append/frontier-update witness, and the nested
 layer-to-operator-to-micro bridge are implemented. Every Granite macro family
 has an objective terminal rule. The artifact-native CPU oracle matches the
 slashable Metal execution through the final receipt root.
+
+The exact 12-register endpoints do not fit beside both Merkle paths in one
+Solana packet. Each party therefore stages its output scalar and its start/end
+trace endpoints, all bound to the dispute, party, micro coordinates, trace or
+output root, and current response phase. Admission then consumes those staged
+records. The maximum instruction payload is 640 bytes before the transaction
+envelope, and an SBF test executes the complete challenger and miner admission
+sequences. Staging adds three transactions per party only after a disagreement;
+it adds no miner inference work or normal receipt bytes.
 
 An experimental Metal profile now combines relaxed arithmetic optimization
 with precise math functions. It reduced the mean fast-uncommitted to
@@ -313,8 +323,8 @@ Hierarchical bisection now reaches a chained scalar terminal from a
 production-format runtime root. Automatic slashing remains disabled until
 collateral/bond settlement, durable input availability, independent platform
 validation, and full adversarial SBF coverage are implemented. The exact path
-is also not throughput-ready: the current serial implementation measures
-410.614% overhead versus optimized inference.
+now shares the optimized SIMD graph and measures 2.465% overhead; throughput
+is no longer the blocking item in that list.
 
 ## Platform references
 

@@ -177,6 +177,10 @@ and resolves embedding, RMSNorm, dense/Q4 projections, RoPE, attention,
 Top-K, dynamic MoE, residual, final logits, and greedy argmax terminals. K/V
 append and Top-K also retain direct structured resolutions where a binary
 micro trace would add no useful localization.
+Output openings and the two 12-register trace endpoints are staged in three
+dispute-bound instructions before micro-trace admission. This keeps the
+worst-case attention endpoint instruction at 640 bytes before its transaction
+envelope; both challenger and miner staged-admission sequences execute on SBF.
 Generation executes and commits `input_token_count + output_token_count - 1`
 tokens in the usual non-EOS case because the final output is the prediction of
 the preceding step.
@@ -195,25 +199,24 @@ storage. A single token-end hash dispatch processes all 24 layers and returns
 only 1,536 digest bytes after the runtime's existing token synchronization.
 
 This closes the byte-level commitment gap for the registered full-Q4 artifact.
-The slashable profile uses a serial control lane, explicit ordered FP32 FMA,
+The slashable profile uses a fixed 32-lane shuffle-down tree, explicit FP32 FMA,
 protocol-defined fixed-operation `exp`, `rsqrt`, `sin`, and `cos`, and a pinned
 32-value RoPE inverse-frequency table. The challenge-only CPU oracle and the
 Metal slashable path match bit-for-bit for every layer's K/V, retained
 residual, predicted token, and final receipt root in the full-model parity
 test. The selected interval-2 execution-spec is
-`73af09e26312313a6050e1e371fe6b6e2b7ade395ef6610ace25850d9ee16b36`.
-It binds the hash design, serial arithmetic order, fixed functions, checkpoint
+`2485240f3be98d158f5fca212e98e6776254f7279e772c8b12daa6ee9bec6f5f`.
+It binds the hash design, SIMD reduction order, fixed functions, checkpoint
 interval, canonical genesis leaves, checkpoint-tree length, compact job-root
 semantics, and hierarchical micro traces.
 
-This correctness profile is not yet throughput-production-ready. A fresh
-4-token measurement on the M5 Pro ran the optimized path at 179.563 tok/s and
-the slashable path at 35.166 tok/s, or **410.614% total overhead**. The two
-paths also selected different later tokens, which confirms that the optimized
-SIMD reductions cannot be covered by a serial terminal proof merely by adding
-hashes. The earlier 3.127–3.312% measurements remain valid as
-**commitment-only** cost on the optimized graph, but not as the cost of the
-fully replayable execution profile. See `docs/verification-benchmarks.md`.
+The production graph and slashable graph are now the same execution. A fresh
+31-repeat, 4-token measurement on the M5 Pro ran the baseline at 185.324 tok/s
+and the verified path at 180.865 tok/s, or **2.465% total overhead**. Output
+tokens agreed and the full artifact CPU oracle reproduced every K/V value,
+layer residual, predicted token, and receipt root bit-for-bit. The old serial
+410.614% result is retained only as historical evidence for why SIMD-tree
+micro traces were required. See `docs/verification-benchmarks.md`.
 
 A distinct relaxed-arithmetic/precise-functions candidate measured 3.734%
 total overhead using the means of two independent 31-repeat candidate runs and

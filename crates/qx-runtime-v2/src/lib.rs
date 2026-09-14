@@ -2159,19 +2159,6 @@ impl PreparedAttentionStack {
             usize,
         )>,
     ) -> Result<(), String> {
-        if let Some((residuals, digests, checkpoint_interval)) = commitment_buffers {
-            return self.encode_scalar_verification_token(
-                graph,
-                buffers,
-                moe,
-                token_input,
-                token_output,
-                position,
-                residuals,
-                digests,
-                checkpoint_interval,
-            );
-        }
         let context = buffers.context().as_ref();
         let genesis_snapshot = commitment_buffers
             .map(|(residuals, _, _)| residuals.subregion(0, HIDDEN * std::mem::size_of::<f32>()))
@@ -2295,11 +2282,9 @@ impl PreparedAttentionStack {
         Ok(())
     }
 
-    /// Encode the slashable Granite profile. Every reduction uses the serial
-    /// row/position order implemented by the CPU Q4 oracle and the SBF micro
-    /// terminals. The optimized SIMD graph remains available to ordinary
-    /// inference, but its different reduction tree is deliberately not
-    /// allowed to produce a slashable receipt.
+    /// Retained diagnostic for comparing the retired serial schedule with the
+    /// registered SIMD verifier. Slashable receipts use the optimized path.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     fn encode_scalar_verification_token(
         &self,
@@ -4699,17 +4684,17 @@ impl CpuQ4Reference {
         }
         for layer in 0..LAYERS {
             let weights = &self.layers[layer];
-            let normalized = cpu_rms_norm(&hidden, &weights.input_norm);
-            let mut query = weights.q_proj.mat_vec(&normalized);
-            let mut key = weights.k_proj.mat_vec(&normalized);
-            let value = weights.v_proj.mat_vec(&normalized);
+            let normalized = cpu_rms_norm_simd(&hidden, &weights.input_norm);
+            let mut query = weights.q_proj.mat_vec_simd32(&normalized);
+            let mut key = weights.k_proj.mat_vec_simd32(&normalized);
+            let value = weights.v_proj.mat_vec_simd32(&normalized);
             cpu_rotate_heads(&mut query, ATTENTION_HEADS, position);
             cpu_rotate_heads(&mut key, KV_HEADS, position);
             let attention = self.caches[layer].attend(position, &key, &value, &query)?;
             if layer + 1 == LAYERS {
                 self.last_attention.copy_from_slice(&attention);
             }
-            let projection = weights.o_proj.mat_vec(&attention);
+            let projection = weights.o_proj.mat_vec_simd32(&attention);
             let after_attention = hidden
                 .iter()
                 .zip(projection)
@@ -4717,8 +4702,8 @@ impl CpuQ4Reference {
                     qx_consensus_math::fma_f32(qx_model::RESIDUAL_MULTIPLIER, right, *left)
                 })
                 .collect::<Vec<_>>();
-            let moe_input = cpu_rms_norm(&after_attention, &weights.post_attention_norm);
-            let router_logits = weights.router.mat_vec(&moe_input);
+            let moe_input = cpu_rms_norm_simd(&after_attention, &weights.post_attention_norm);
+            let router_logits = weights.router.mat_vec_simd32(&moe_input);
             let routed = cpu_topk_with_active_k(&router_logits, layer);
             let mut moe_output = vec![0.0; HIDDEN];
             for (expert, route_weight) in routed {
@@ -4734,7 +4719,7 @@ impl CpuQ4Reference {
                     expert,
                     qx_format::TensorKind::Down,
                 )?;
-                let gate_up_values = gate_up.mat_vec(&moe_input);
+                let gate_up_values = gate_up.mat_vec_simd32(&moe_input);
                 let activated = (0..INTERMEDIATE)
                     .map(|index| {
                         let gate = gate_up_values[index];
@@ -4742,7 +4727,7 @@ impl CpuQ4Reference {
                         (gate / (1.0 + consensus_exp(-gate))) * up
                     })
                     .collect::<Vec<_>>();
-                let expert_output = down.mat_vec(&activated);
+                let expert_output = down.mat_vec_simd32(&activated);
                 for (destination, value) in moe_output.iter_mut().zip(expert_output) {
                     *destination = qx_consensus_math::fma_f32(route_weight, value, *destination);
                 }
@@ -4755,10 +4740,10 @@ impl CpuQ4Reference {
                 })
                 .collect();
         }
-        let hidden = cpu_rms_norm(&hidden, &self.final_norm);
+        let hidden = cpu_rms_norm_simd(&hidden, &self.final_norm);
         Ok(self
             .embedding
-            .mat_vec(&hidden)
+            .mat_vec_simd32(&hidden)
             .into_iter()
             .map(|value| value / qx_model::LOGITS_SCALING)
             .collect())
@@ -4837,21 +4822,40 @@ impl CpuQ4Cache {
                 })
                 .collect::<Vec<_>>();
             let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let denominator = scores
+            let exponentials = scores
                 .iter()
                 .map(|score| consensus_exp(*score - maximum))
-                .sum::<f32>();
-            for (cached, score) in scores.into_iter().enumerate() {
-                let key_start = (cached * KV_HEADS + kv_head) * HEAD_DIM;
-                let weight = consensus_exp(score - maximum) / denominator;
-                let value_start = key_start;
-                for index in 0..HEAD_DIM {
-                    output[query_start + index] = qx_consensus_math::fma_f32(
-                        weight,
-                        self.values[value_start + index],
-                        output[query_start + index],
-                    );
+                .collect::<Vec<_>>();
+            let mut threads = [0.0_f32; 256];
+            for (tid, sum) in threads.iter_mut().enumerate() {
+                for cached in (tid..self.length).step_by(256) {
+                    *sum += exponentials[cached];
                 }
+            }
+            let mut group_sums = [0.0_f32; 8];
+            for group in 0..8 {
+                let mut lanes = [0.0_f32; 32];
+                lanes.copy_from_slice(&threads[group * 32..(group + 1) * 32]);
+                group_sums[group] = reduce_simd32(lanes);
+            }
+            let denominator = group_sums.into_iter().sum::<f32>();
+            for index in 0..HEAD_DIM {
+                let mut partials = [0.0_f32; 16];
+                for (chunk, partial) in partials.iter_mut().enumerate() {
+                    let begin = chunk * 32;
+                    let end = self.length.min(begin + 32);
+                    for cached in begin..end {
+                        let value_start = (cached * KV_HEADS + kv_head) * HEAD_DIM;
+                        let weight = exponentials[cached] / denominator;
+                        *partial = qx_consensus_math::fma_f32(
+                            weight,
+                            self.values[value_start + index],
+                            *partial,
+                        );
+                    }
+                }
+                output[query_start + index] =
+                    partials[..self.length.div_ceil(32)].iter().copied().sum();
             }
         }
         Ok(output)
@@ -4915,18 +4919,39 @@ fn artifact_raw_norm(
         .map_err(|error| error.to_string())
 }
 
-fn cpu_rms_norm(input: &[f32], weight: &[f32]) -> Vec<f32> {
-    let mut sum = 0.0_f32;
-    for value in input {
-        sum = qx_consensus_math::fma_f32(*value, *value, sum);
+/// Reproduce the registered 256-thread Granite RMS reduction: four elements
+/// per thread, eight fixed 32-lane trees, then one final 32-lane tree.
+fn cpu_rms_norm_simd(input: &[f32], weight: &[f32]) -> Vec<f32> {
+    debug_assert_eq!(input.len(), HIDDEN);
+    debug_assert_eq!(weight.len(), HIDDEN);
+    let mut threads = [0.0_f32; 256];
+    for (tid, sum) in threads.iter_mut().enumerate() {
+        for index in (tid..HIDDEN).step_by(256) {
+            *sum = qx_consensus_math::fma_f32(input[index], input[index], *sum);
+        }
     }
-    let mean_square = sum / HIDDEN as f32;
+    let mut groups = [0.0_f32; 32];
+    for group in 0..8 {
+        let mut lanes = [0.0_f32; 32];
+        lanes.copy_from_slice(&threads[group * 32..(group + 1) * 32]);
+        groups[group] = reduce_simd32(lanes);
+    }
+    let mean_square = reduce_simd32(groups) / HIDDEN as f32;
     let scale = consensus_rsqrt(mean_square + qx_model::RMS_EPSILON);
     input
         .iter()
         .zip(weight)
         .map(|(value, weight)| value * scale * weight)
         .collect()
+}
+
+fn reduce_simd32(mut lanes: [f32; 32]) -> f32 {
+    for offset in [16, 8, 4, 2, 1] {
+        for lane in 0..offset {
+            lanes[lane] += lanes[lane + offset];
+        }
+    }
+    lanes[0]
 }
 
 fn cpu_rotate_heads(values: &mut [f32], heads: usize, position: usize) {

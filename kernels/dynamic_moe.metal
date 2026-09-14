@@ -3654,7 +3654,8 @@ kernel void qx_dynamic_q4_moe_gate_up_simd(
             uchar byte = packed[offset + local / 2];
             uint code = (byte >> ((local % 2) * 4)) & 0xf;
             uint scale = scale_base + qx_dynamic_scale_offset(row, group, groups, layout);
-            sum += float(int(code) - 7) * float(scales[scale]) * cached_input[column];
+            float weight = float(int(code) - 7) * float(scales[scale]);
+            sum = fma(weight, cached_input[column], sum);
         }
     }
     sum = qx_ordered_simd_sum(sum);
@@ -3704,7 +3705,8 @@ kernel void qx_dynamic_q4_moe_gate_up_norm_simd(
             uchar byte = packed[offset + local / 2];
             uint code = (byte >> ((local % 2) * 4)) & 0xf;
             uint scale = scale_base + qx_dynamic_scale_offset(row, group, groups, layout);
-            sum += float(int(code) - 7) * float(scales[scale]) * cached_input[column];
+            float weight = float(int(code) - 7) * float(scales[scale]);
+            sum = fma(weight, cached_input[column], sum);
         }
     }
     sum = qx_ordered_simd_sum(sum);
@@ -5085,7 +5087,8 @@ kernel void qx_dynamic_q4_moe_down_simd(
             uchar byte = packed[offset + local / 2];
             uint code = (byte >> ((local % 2) * 4)) & 0xf;
             uint scale = scale_base + qx_dynamic_scale_offset(row, group, groups, layout);
-            sum += float(int(code) - 7) * float(scales[scale]) * activated[slot * intermediate + column];
+            float weight = float(int(code) - 7) * float(scales[scale]);
+            sum = fma(weight, activated[slot * intermediate + column], sum);
         }
     }
     sum = qx_ordered_simd_sum(sum);
@@ -5462,7 +5465,7 @@ kernel void qx_dynamic_q4_moe_accumulate(
     uint row [[thread_position_in_grid]]) {
     float value = 0.0f;
     for (uint slot = 0; slot < 8; ++slot) {
-        value += expert_weights[slot] * expert_output[slot * 1024 + row];
+        value = fma(expert_weights[slot], expert_output[slot * 1024 + row], value);
     }
     output[row] = value;
 }

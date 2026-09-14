@@ -4,10 +4,11 @@ use mollusk_svm::Mollusk;
 use qx_commit::{
     activation_hash_v1, hash_domain, job_genesis_hash_v1, prove_state_chunk_v1, state_hash_v1,
     vm_program_tree_v1, vm_segment_schedule_v1, CheckpointV1, EpochBlockSeedV2, FmaStateV1,
-    GraniteMacroStateV1, GraniteMacroWorkspaceV1, GraniteWorkspaceSlotV1, HashAlgorithm,
-    JobPayloadV1, MerkleProof, MerkleTree, ProtocolVersion, ResultLeafV1, StateTreeKindV1,
-    TokenResultV1, VmInstructionV1, VmOutputStateV1, VmSegmentProgramV1, VmStateV1, WeightLeafV1,
-    D_BATCH, D_JOB, D_MERKLE, D_OPERATOR_TREE, D_PROGRAM_TREE, D_TOKEN, D_WEIGHT_TREE,
+    GraniteMacroStateV1, GraniteMacroWorkspaceV1, GraniteMicroLevelV1, GraniteMicroStateV1,
+    GraniteWorkspaceSlotV1, HashAlgorithm, JobPayloadV1, MerkleProof, MerkleTree, ProtocolVersion,
+    ResultLeafV1, StateTreeKindV1, TokenResultV1, VmInstructionV1, VmOutputStateV1,
+    VmSegmentProgramV1, VmStateV1, WeightLeafV1, D_BATCH, D_GRANITE_MICRO_TREE, D_JOB, D_MERKLE,
+    D_OPERATOR_TREE, D_PROGRAM_TREE, D_TOKEN, D_WEIGHT_TREE,
 };
 use solana_account::Account;
 use solana_hash::Hash;
@@ -20,6 +21,7 @@ const STAGED_BYTES: usize = 64;
 const STAGED_KV_BYTES: usize = 144;
 const STAGED_SCALAR_BYTES: usize = 104;
 const STAGED_ARGMAX_BYTES: usize = 108;
+const STAGED_GRANITE_BOUND_BYTES: usize = 152;
 const MINER_BYTES: usize = 16;
 const MODEL_BYTES: usize = 156;
 const WEIGHT_LEAVES: u32 = 41_755_744;
@@ -52,6 +54,297 @@ fn testnet_load_probe_executes_real_sbf_hash_work() {
     let invalid = vm.process_instruction(&f.ix(48, vec![], &corrupt), &[]);
     assert!(invalid.program_result.is_err());
     println!("v2_testnet_load_probe_cu={}", valid.compute_units_consumed);
+}
+
+#[test]
+fn granite_output_and_trace_bounds_are_packet_safe_and_admitted_on_sbf() {
+    let f = Fixture::new();
+    let mut vm = f.vm();
+    vm.sysvars.clock.slot = 100;
+    let job_hash = [0x51; 32];
+    let token_index = 7_u32;
+    let segment_index = 3_u32;
+    let macro_pc = 4_u32;
+    let level = GraniteMicroLevelV1::DenseDot;
+    let coordinates = [0_u32, 0, 0];
+    let instruction = VmInstructionV1 {
+        opcode: 66,
+        source_a: 0,
+        source_b: 0,
+        source_c: 1_024,
+        destination: 0,
+    };
+    let output = vec![1.25_f32; 1_024];
+    let output_bytes = output
+        .iter()
+        .flat_map(|value| value.to_bits().to_le_bytes())
+        .collect::<Vec<_>>();
+    let output_root = state_hash_v1(&output_bytes).unwrap();
+    let output_opening = prove_state_chunk_v1(StateTreeKindV1::Residual, &output_bytes, 0).unwrap();
+    let miner_output = vec![2.25_f32; 1_024];
+    let miner_output_bytes = miner_output
+        .iter()
+        .flat_map(|value| value.to_bits().to_le_bytes())
+        .collect::<Vec<_>>();
+    let miner_output_root = state_hash_v1(&miner_output_bytes).unwrap();
+    let miner_output_opening =
+        prove_state_chunk_v1(StateTreeKindV1::Residual, &miner_output_bytes, 0).unwrap();
+
+    let context = |step, registers| GraniteMicroStateV1 {
+        job_hash,
+        token_index,
+        segment_index,
+        macro_pc,
+        level,
+        coordinates,
+        step,
+        registers,
+    };
+    let start_registers = [0_u32; 12];
+    let mut end_registers = [0_u32; 12];
+    end_registers[8] = output[0].to_bits();
+    let transition_count = 1_086_u32;
+    let start = context(0, start_registers).hash().unwrap();
+    let end = context(transition_count, end_registers).hash().unwrap();
+    let mut leaves = vec![[0x73; 32]; transition_count as usize + 1];
+    leaves[0] = start;
+    leaves[transition_count as usize] = end;
+    let trace = MerkleTree::new(HashAlgorithm::Blake3V1, D_GRANITE_MICRO_TREE, &leaves).unwrap();
+    let mut miner_end_registers = [0_u32; 12];
+    miner_end_registers[8] = miner_output[0].to_bits();
+    let miner_end = context(transition_count, miner_end_registers)
+        .hash()
+        .unwrap();
+    let mut miner_leaves = vec![[0x74; 32]; transition_count as usize + 1];
+    miner_leaves[0] = start;
+    miner_leaves[transition_count as usize] = miner_end;
+    let miner_trace =
+        MerkleTree::new(HashAlgorithm::Blake3V1, D_GRANITE_MICRO_TREE, &miner_leaves).unwrap();
+
+    let mut dispute = owned(DISPUTE_BYTES, f.program);
+    dispute.data[..4].copy_from_slice(b"QXD2");
+    dispute.data[4] = 19;
+    dispute.data[6] = 2;
+    dispute.data[72..104].copy_from_slice(&job_hash);
+    dispute.data[104..136].copy_from_slice(f.miner.as_ref());
+    dispute.data[136..168].copy_from_slice(f.challenger.as_ref());
+    dispute.data[264..296].copy_from_slice(&miner_output_root);
+    dispute.data[296..328].copy_from_slice(&output_root);
+    dispute.data[360..368].copy_from_slice(&1_000_u64.to_le_bytes());
+    dispute.data[368..376].copy_from_slice(&1_200_u64.to_le_bytes());
+    dispute.data[392..409].copy_from_slice(&instruction.canonical_bytes());
+    dispute.data[516..520].copy_from_slice(&token_index.to_le_bytes());
+    dispute.data[520..524].copy_from_slice(&segment_index.to_le_bytes());
+    dispute.data[524..528].copy_from_slice(&macro_pc.to_le_bytes());
+
+    let mut output_body = vec![level as u8];
+    for coordinate in coordinates {
+        output_body.extend_from_slice(&coordinate.to_le_bytes());
+    }
+    output_body.extend_from_slice(&output_opening.byte_length.to_le_bytes());
+    output_body.extend_from_slice(&output_opening.chunk_index.to_le_bytes());
+    output_body.extend_from_slice(&(output_opening.chunk.len() as u16).to_le_bytes());
+    output_body.extend_from_slice(&output_opening.chunk);
+    output_body.push(output_opening.siblings.len() as u8);
+    for sibling in &output_opening.siblings {
+        output_body.extend_from_slice(sibling);
+    }
+    assert!(output_body.len() + 1 < 900);
+    let output_stage = vm.process_instruction(
+        &f.ix(
+            58,
+            vec![
+                AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.challenger, true),
+                AccountMeta::new(f.staged, false),
+            ],
+            &output_body,
+        ),
+        &[
+            (f.dispute, dispute.clone()),
+            (f.challenger, Account::default()),
+            (f.staged, owned(STAGED_SCALAR_BYTES, f.program)),
+        ],
+    );
+    assert_ok(&output_stage.program_result);
+    let staged_output = account(&output_stage.resulting_accounts, f.staged);
+
+    let staged_bound_key = Pubkey::new_unique();
+    let mut staged_bound = owned(STAGED_GRANITE_BOUND_BYTES, f.program);
+    let mut bound_cu = 0;
+    for (endpoint, registers, proof) in [
+        (0_u8, start_registers, trace.proof(0).unwrap()),
+        (
+            1_u8,
+            end_registers,
+            trace.proof(transition_count as usize).unwrap(),
+        ),
+    ] {
+        let mut body = vec![level as u8];
+        for coordinate in coordinates {
+            body.extend_from_slice(&coordinate.to_le_bytes());
+        }
+        body.extend_from_slice(&trace.root());
+        body.push(endpoint);
+        for register in registers {
+            body.extend_from_slice(&register.to_le_bytes());
+        }
+        body.push(proof.siblings.len() as u8);
+        append_siblings(&mut body, &proof);
+        assert!(body.len() + 1 < 900);
+        let staged = vm.process_instruction(
+            &f.ix(
+                59,
+                vec![
+                    AccountMeta::new(f.dispute, false),
+                    AccountMeta::new_readonly(f.challenger, true),
+                    AccountMeta::new(staged_bound_key, false),
+                ],
+                &body,
+            ),
+            &[
+                (f.dispute, dispute.clone()),
+                (f.challenger, Account::default()),
+                (staged_bound_key, staged_bound),
+            ],
+        );
+        assert_ok(&staged.program_result);
+        bound_cu += staged.compute_units_consumed;
+        staged_bound = account(&staged.resulting_accounts, staged_bound_key);
+    }
+
+    let mut submit_body = vec![level as u8];
+    for coordinate in coordinates {
+        submit_body.extend_from_slice(&coordinate.to_le_bytes());
+    }
+    let submit = vm.process_instruction(
+        &f.ix(
+            49,
+            vec![
+                AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.challenger, true),
+                AccountMeta::new_readonly(f.staged, false),
+                AccountMeta::new_readonly(staged_bound_key, false),
+            ],
+            &submit_body,
+        ),
+        &[
+            (f.dispute, dispute),
+            (f.challenger, Account::default()),
+            (f.staged, staged_output),
+            (staged_bound_key, staged_bound),
+        ],
+    );
+    assert_ok(&submit.program_result);
+    let dispute = account(&submit.resulting_accounts, f.dispute);
+    assert_eq!((dispute.data[4], dispute.data[6]), (20, 1));
+    assert_eq!(&dispute.data[200..232], &trace.root());
+    assert_eq!(u32_at(&dispute.data, 444), output[0].to_bits());
+
+    let mut miner_output_body = vec![level as u8];
+    for coordinate in coordinates {
+        miner_output_body.extend_from_slice(&coordinate.to_le_bytes());
+    }
+    miner_output_body.extend_from_slice(&miner_output_opening.byte_length.to_le_bytes());
+    miner_output_body.extend_from_slice(&miner_output_opening.chunk_index.to_le_bytes());
+    miner_output_body.extend_from_slice(&(miner_output_opening.chunk.len() as u16).to_le_bytes());
+    miner_output_body.extend_from_slice(&miner_output_opening.chunk);
+    miner_output_body.push(miner_output_opening.siblings.len() as u8);
+    for sibling in &miner_output_opening.siblings {
+        miner_output_body.extend_from_slice(sibling);
+    }
+    let miner_output_stage = vm.process_instruction(
+        &f.ix(
+            58,
+            vec![
+                AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.miner, true),
+                AccountMeta::new(f.staged, false),
+            ],
+            &miner_output_body,
+        ),
+        &[
+            (f.dispute, dispute.clone()),
+            (f.miner, Account::default()),
+            (f.staged, account(&submit.resulting_accounts, f.staged)),
+        ],
+    );
+    assert_ok(&miner_output_stage.program_result);
+    let staged_output = account(&miner_output_stage.resulting_accounts, f.staged);
+    let mut staged_bound = account(&submit.resulting_accounts, staged_bound_key);
+    let mut miner_bound_cu = 0;
+    for (endpoint, registers, proof) in [
+        (0_u8, start_registers, miner_trace.proof(0).unwrap()),
+        (
+            1_u8,
+            miner_end_registers,
+            miner_trace.proof(transition_count as usize).unwrap(),
+        ),
+    ] {
+        let mut body = vec![level as u8];
+        for coordinate in coordinates {
+            body.extend_from_slice(&coordinate.to_le_bytes());
+        }
+        body.extend_from_slice(&miner_trace.root());
+        body.push(endpoint);
+        for register in registers {
+            body.extend_from_slice(&register.to_le_bytes());
+        }
+        body.push(proof.siblings.len() as u8);
+        append_siblings(&mut body, &proof);
+        let staged = vm.process_instruction(
+            &f.ix(
+                59,
+                vec![
+                    AccountMeta::new(f.dispute, false),
+                    AccountMeta::new_readonly(f.miner, true),
+                    AccountMeta::new(staged_bound_key, false),
+                ],
+                &body,
+            ),
+            &[
+                (f.dispute, dispute.clone()),
+                (f.miner, Account::default()),
+                (staged_bound_key, staged_bound),
+            ],
+        );
+        assert_ok(&staged.program_result);
+        miner_bound_cu += staged.compute_units_consumed;
+        staged_bound = account(&staged.resulting_accounts, staged_bound_key);
+    }
+    let miner_submit = vm.process_instruction(
+        &f.ix(
+            50,
+            vec![
+                AccountMeta::new(f.dispute, false),
+                AccountMeta::new_readonly(f.miner, true),
+                AccountMeta::new_readonly(f.staged, false),
+                AccountMeta::new_readonly(staged_bound_key, false),
+            ],
+            &[],
+        ),
+        &[
+            (f.dispute, dispute),
+            (f.miner, Account::default()),
+            (f.staged, staged_output),
+            (staged_bound_key, staged_bound),
+        ],
+    );
+    assert_ok(&miner_submit.program_result);
+    let dispute = account(&miner_submit.resulting_accounts, f.dispute);
+    assert_eq!((dispute.data[4], dispute.data[6]), (3, 2));
+    assert_eq!(&dispute.data[168..200], &miner_trace.root());
+    assert_eq!(u32_at(&dispute.data, 440), miner_output[0].to_bits());
+    println!(
+        "v2_granite_challenger_staged_micro_admission_cu={}",
+        output_stage.compute_units_consumed + bound_cu + submit.compute_units_consumed
+    );
+    println!(
+        "v2_granite_miner_staged_micro_admission_cu={}",
+        miner_output_stage.compute_units_consumed
+            + miner_bound_cu
+            + miner_submit.compute_units_consumed
+    );
 }
 
 #[test]

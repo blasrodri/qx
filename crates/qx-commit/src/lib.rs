@@ -32,10 +32,10 @@ pub use execution::{
     TOKEN_GENESIS_LAYER_V1, TokenResultV1, job_genesis_hash_v1, token_input_state_hash_v1,
 };
 pub use granite::{
-    GRANITE_TENSORS_PER_LAYER_V1, GraniteDenseOutputV1, GraniteLayerTensorIdsV1,
-    GraniteMacroOpcodeV1, GraniteMacroOutputV1, GraniteMacroPlanV1, GraniteMacroStateV1,
-    GraniteMacroTraceV1, GraniteMacroWorkspaceV1, GraniteMicroLevelV1, GraniteMicroStateV1,
-    GraniteMicroTraceV1, GraniteRopeOutputV1, GraniteWorkspaceSlotV1,
+    GRANITE_MICRO_REGISTERS_V1, GRANITE_TENSORS_PER_LAYER_V1, GraniteDenseOutputV1,
+    GraniteLayerTensorIdsV1, GraniteMacroOpcodeV1, GraniteMacroOutputV1, GraniteMacroPlanV1,
+    GraniteMacroStateV1, GraniteMacroTraceV1, GraniteMacroWorkspaceV1, GraniteMicroLevelV1,
+    GraniteMicroStateV1, GraniteMicroTraceV1, GraniteRopeOutputV1, GraniteWorkspaceSlotV1,
     granite_embedding_macro_program_v1, granite_embedding_tensor_id_v1,
     granite_final_head_macro_program_v1, granite_final_norm_tensor_id_v1,
     granite_layer_macro_program_v1, granite_layer_tensor_ids_v1, granite_macro_plan_v1,

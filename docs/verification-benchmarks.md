@@ -6,27 +6,37 @@ The earlier results below isolate commitment hashing or compare arithmetic
 candidates. They must not be interpreted as the total cost of the completed
 slashable execution path.
 
-On 2026-09-13, the complete interval-2 verifier was run against
+On 2026-09-14, the complete interval-2 SIMD-tree verifier was run against
 `granite-m5-pro-q4-dense.qx` with a 512-token context, four returned tokens,
-two warmups, and five alternating repeats. The ordinary optimized SIMD path
-measured 61.260 ms total and 179.563 tok/s. The exact slashable path measured
-312.802 ms and 35.166 tok/s: **410.614% total overhead**. Its trace root was
-`d679a8e8f3e961ff0771c43ef0946766ba17b612b41195f018afc1367b442d43`
+four warmups, and 31 alternating repeats. The baseline measured 59.355 ms
+total and 185.324 tok/s. The exact slashable path measured 60.819 ms and
+180.865 tok/s: **2.465% total overhead**. Its trace root was
+`287c374c3bce797d98b8f7576072fdb75be0721055eef729be9192f2a8cdc7ad`
 under execution spec
-`73af09e26312313a6050e1e371fe6b6e2b7ade395ef6610ace25850d9ee16b36`.
+`2485240f3be98d158f5fca212e98e6776254f7279e772c8b12daa6ee9bec6f5f`.
 
-The optimized and slashable paths did not retain token agreement over this
-rollout (`optimized_output_agreement=false`), so the performance gate correctly
-reports `fail`. Separately, the artifact-native CPU verifier matches the
-slashable Metal path bit-for-bit for all layer K/V values, retained residual
-hashes, predicted tokens, and the final two-token receipt root. This separates
-the two conclusions cleanly: the proof semantics are reproducible, while the
-current serial implementation is too expensive for mass deployment.
+The optimized and slashable paths retained exact output agreement and the
+performance gate reports `pass`. The artifact-native CPU verifier also matches
+the Metal path bit-for-bit for all layer K/V values, retained residual hashes,
+predicted tokens, and the final two-token receipt root.
 
-Reducing this overhead without weakening verification requires committing and
-tracing the optimized SIMD reduction tree (including its precise compiler and
-device semantics), rather than comparing that tree to a serial execution
-after the fact.
+The change removes the separate serial inference graph. Dense, RMS, attention,
+MoE, and final-logit disputes now trace the fixed SIMD reduction tree directly.
+The expanded 12-register micro state is challenge-only and adds no receipt or
+ordinary inference payload bytes.
+
+The wider state is transported with dispute-bound staging: one output opening
+and the start/end trace proofs are authenticated in separate transactions, then
+a small admission instruction consumes both staged records. The largest fixed
+Granite instruction is 640 bytes before the transaction envelope, below the
+1,232-byte Solana packet limit. The challenger and miner admission sequences
+execute on SBF at 216,566 CU and 216,554 CU respectively across four
+transactions per party. These are disagreement-only costs and do not change
+the 2.465% normal inference measurement.
+
+For comparison, the retired serial profile measured 312.802 ms versus 61.260
+ms (**410.614% overhead**) and selected different tokens. That result is kept
+as historical evidence; it is no longer the registered execution path.
 
 On 2026-09-13, after replacing the testnet-inactive BLAKE3 syscall with
 dispute-only software BLAKE3, two fresh 31-repeat production runs measured
@@ -233,11 +243,10 @@ of magnitude. The frequency sweep is almost flat at intervals 2 and 4, showing
 that incremental K/V SHA-256 is now the limiting work rather than checkpoint
 frequency, CPU work, synchronization, or residual copies.
 
-These historical experiments achieved the commitment-only `<5%` gate; they do
-not establish the full-verifier performance gate. The completed serial
-slashable profile measured above is bit-reproducible but costs 410.614% over
-the optimized path. The relaxed-precise candidate remains useful evidence for
-a future SIMD-trace design, not a registered slashable profile.
+These historical experiments established the commitment-only `<5%` gate. The
+later serial slashable profile was bit-reproducible but cost 410.614% over the
+optimized path. It has now been superseded by the registered SIMD-tree profile
+measured at the top of this report, which passes the full-verifier gate.
 See the protocol document for the receipt-bound Solana measurements.
 
 Reproduction command:

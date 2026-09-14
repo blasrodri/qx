@@ -283,10 +283,14 @@ impl TryFrom<u8> for GraniteMicroLevelV1 {
     }
 }
 
+/// Register width for the fixed SIMD-reduction challenge machine. Registers
+/// 0..8 hold the eight-level reduction stack, register 8 is the active lane
+/// accumulator, and 9..12 hold bounded operator scratch.
+pub const GRANITE_MICRO_REGISTERS_V1: usize = 12;
+
 /// One state in a challenge-only scalar subtrace. Coordinates are interpreted
 /// by the registered level (for example output row, attention head/position,
-/// or expert/intermediate neuron). Four raw registers are enough for the
-/// accumulator plus fixed-math scratch without committing host struct layout.
+/// or expert/intermediate neuron).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GraniteMicroStateV1 {
     pub job_hash: Digest,
@@ -296,7 +300,7 @@ pub struct GraniteMicroStateV1 {
     pub level: GraniteMicroLevelV1,
     pub coordinates: [u32; 3],
     pub step: u32,
-    pub registers: [u32; 4],
+    pub registers: [u32; GRANITE_MICRO_REGISTERS_V1],
 }
 
 impl GraniteMicroStateV1 {
@@ -318,6 +322,14 @@ impl GraniteMicroStateV1 {
                 &self.registers[1].to_le_bytes(),
                 &self.registers[2].to_le_bytes(),
                 &self.registers[3].to_le_bytes(),
+                &self.registers[4].to_le_bytes(),
+                &self.registers[5].to_le_bytes(),
+                &self.registers[6].to_le_bytes(),
+                &self.registers[7].to_le_bytes(),
+                &self.registers[8].to_le_bytes(),
+                &self.registers[9].to_le_bytes(),
+                &self.registers[10].to_le_bytes(),
+                &self.registers[11].to_le_bytes(),
             ],
         )
     }
@@ -337,7 +349,7 @@ impl GraniteMicroTraceV1 {
     pub fn from_registers(
         context: GraniteMicroStateV1,
         transition_count: u32,
-        registers: &[[u32; 4]],
+        registers: &[[u32; GRANITE_MICRO_REGISTERS_V1]],
     ) -> Result<Self, CommitError> {
         let state_count = usize::try_from(transition_count)
             .map_err(|_| CommitError::ArithmeticOverflow)?
@@ -383,9 +395,6 @@ pub fn granite_micro_transition_count_v1(
 ) -> Result<u32, CommitError> {
     let opcode = GraniteMacroOpcodeV1::try_from(instruction.opcode)?;
     let shape = qx_model::ModelShape::granite_v0();
-    let hidden = u32::try_from(shape.hidden_size).map_err(|_| CommitError::ArithmeticOverflow)?;
-    let intermediate =
-        u32::try_from(shape.expert_intermediate).map_err(|_| CommitError::ArithmeticOverflow)?;
     let experts = u32::try_from(shape.experts).map_err(|_| CommitError::ArithmeticOverflow)?;
     let top_k = u32::try_from(shape.active_experts).map_err(|_| CommitError::ArithmeticOverflow)?;
     let context = token_index
@@ -399,13 +408,9 @@ pub fn granite_micro_transition_count_v1(
         // Load the child square-sum, divide, add epsilon, rsqrt, then apply
         // the input and norm weight in the runtime's exact operation order.
         (GraniteMacroOpcodeV1::RmsNorm, GraniteMicroLevelV1::MacroOutput) => 6,
-        (GraniteMacroOpcodeV1::RmsNorm, GraniteMicroLevelV1::RmsSquares) => {
-            hidden
-                .checked_add(5)
-                .ok_or(CommitError::ArithmeticOverflow)?
-        }
-        (GraniteMacroOpcodeV1::Dense, GraniteMicroLevelV1::DenseDot)
-        | (GraniteMacroOpcodeV1::FinalLogits, GraniteMicroLevelV1::FinalLogitDot) => hidden,
+        (GraniteMacroOpcodeV1::RmsNorm, GraniteMicroLevelV1::RmsSquares) => 1_539,
+        (GraniteMacroOpcodeV1::Dense, GraniteMicroLevelV1::DenseDot) => 1_086,
+        (GraniteMacroOpcodeV1::FinalLogits, GraniteMicroLevelV1::FinalLogitDot) => 1_087,
         (GraniteMacroOpcodeV1::Attention, GraniteMicroLevelV1::MacroOutput) => context,
         (GraniteMacroOpcodeV1::Attention, GraniteMicroLevelV1::AttentionScores) => {
             u32::try_from(shape.head_dim).map_err(|_| CommitError::ArithmeticOverflow)?
@@ -415,6 +420,8 @@ pub fn granite_micro_transition_count_v1(
         // or divide/weighted accumulation respectively.
         (GraniteMacroOpcodeV1::Attention, GraniteMicroLevelV1::AttentionSoftmax) => context
             .checked_mul(195)
+            .and_then(|count| count.checked_add(510))
+            .and_then(|count| count.checked_add(context.div_ceil(32)))
             .ok_or(CommitError::ArithmeticOverflow)?,
         (GraniteMacroOpcodeV1::Attention, GraniteMicroLevelV1::AttentionValue) => context,
         // A disputed rank scans all router logits while excluding the shared
@@ -428,11 +435,9 @@ pub fn granite_micro_transition_count_v1(
         | (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeExpertSum) => top_k
             .checked_mul(2)
             .ok_or(CommitError::ArithmeticOverflow)?,
-        (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeDownDot) => intermediate
-            .checked_mul(2)
-            .ok_or(CommitError::ArithmeticOverflow)?,
+        (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeDownDot) => 1_086,
         (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeGateDot)
-        | (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeUpDot) => hidden,
+        | (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeUpDot) => 1_086,
         (GraniteMacroOpcodeV1::Moe, GraniteMicroLevelV1::MoeActivation) => 3,
         (GraniteMacroOpcodeV1::ArgMax, GraniteMicroLevelV1::ArgMaxTournament) => {
             u32::try_from(shape.vocabulary).map_err(|_| CommitError::ArithmeticOverflow)?
@@ -1077,17 +1082,17 @@ mod tests {
     fn every_granite_macro_has_a_bounded_hierarchical_micro_trace() {
         let layer = granite_layer_macro_program_v1(0).unwrap();
         let expected = [
-            (GraniteMicroLevelV1::RmsSquares, 1029),
-            (GraniteMicroLevelV1::DenseDot, 1024),
-            (GraniteMicroLevelV1::DenseDot, 1024),
-            (GraniteMicroLevelV1::DenseDot, 1024),
+            (GraniteMicroLevelV1::RmsSquares, 1539),
+            (GraniteMicroLevelV1::DenseDot, 1086),
+            (GraniteMicroLevelV1::DenseDot, 1086),
+            (GraniteMicroLevelV1::DenseDot, 1086),
             (GraniteMicroLevelV1::MacroOutput, 1),
             (GraniteMicroLevelV1::MacroOutput, 1),
             (GraniteMicroLevelV1::AttentionScores, 64),
-            (GraniteMicroLevelV1::DenseDot, 1024),
+            (GraniteMicroLevelV1::DenseDot, 1086),
             (GraniteMicroLevelV1::MacroOutput, 1),
-            (GraniteMicroLevelV1::RmsSquares, 1029),
-            (GraniteMicroLevelV1::DenseDot, 1024),
+            (GraniteMicroLevelV1::RmsSquares, 1539),
+            (GraniteMicroLevelV1::DenseDot, 1086),
             (GraniteMicroLevelV1::TopKSelection, 32),
             (GraniteMicroLevelV1::MoeExpertSum, 16),
             (GraniteMicroLevelV1::MacroOutput, 1),
@@ -1102,7 +1107,7 @@ mod tests {
         assert_eq!(
             granite_micro_transition_count_v1(head[1], 0, GraniteMicroLevelV1::FinalLogitDot)
                 .unwrap(),
-            1024
+            1087
         );
         assert_eq!(
             granite_micro_transition_count_v1(head[2], 0, GraniteMicroLevelV1::ArgMaxTournament)
@@ -1121,11 +1126,26 @@ mod tests {
             level: GraniteMicroLevelV1::DenseDot,
             coordinates: [11, 0, 0],
             step: 0,
-            registers: [0; 4],
+            registers: [0; GRANITE_MICRO_REGISTERS_V1],
         };
-        let trace =
-            GraniteMicroTraceV1::from_registers(context, 2, &[[0; 4], [1, 0, 0, 0], [2, 0, 0, 0]])
-                .unwrap();
+        let trace = GraniteMicroTraceV1::from_registers(
+            context,
+            2,
+            &[
+                [0; GRANITE_MICRO_REGISTERS_V1],
+                {
+                    let mut registers = [0; GRANITE_MICRO_REGISTERS_V1];
+                    registers[0] = 1;
+                    registers
+                },
+                {
+                    let mut registers = [0; GRANITE_MICRO_REGISTERS_V1];
+                    registers[0] = 2;
+                    registers
+                },
+            ],
+        )
+        .unwrap();
         assert_eq!(trace.states.len(), 3);
         assert!(
             trace

@@ -84,7 +84,7 @@ kernel void qx_v2_rmsnorm_simd(
     threadgroup float partials[8];
     float sum = 0.0f;
     for (uint i = tid; i < params.n; i += 256) {
-        sum += input[i] * input[i];
+        sum = fma(input[i], input[i], sum);
     }
     sum = qx_ordered_simd_sum(sum);
     if (lane == 0) partials[simdgroup] = sum;
@@ -113,7 +113,7 @@ kernel void qx_v2_rmsnorm_scalar(
     (void)weights;
     threadgroup float partials[8];
     float sum = 0.0f;
-    for (uint i = tid; i < params.n; i += 256) sum += input[i] * input[i];
+    for (uint i = tid; i < params.n; i += 256) sum = fma(input[i], input[i], sum);
     sum = qx_ordered_simd_sum(sum);
     if (lane == 0) partials[simdgroup] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -831,7 +831,7 @@ kernel void qx_v2_attention_qk(
     uint cache_offset = (position * kv_heads + kv_head) * head_dim;
     float score = 0.0f;
     for (uint d = 0; d < head_dim; ++d) {
-        score += query[query_offset + d] * key_cache[cache_offset + d];
+        score = fma(query[query_offset + d], key_cache[cache_offset + d], score);
     }
     scores[tid] = score * scale;
 }
@@ -1247,8 +1247,8 @@ kernel void qx_v2_attention_v_partial_gqa(
          ++position) {
         uint cache_offset = (position * kv_heads + kv_head) * head_dim;
         float value = value_cache[cache_offset + dimension];
-        sum0 += scores[q_head0 * max_context + position] * value;
-        sum1 += scores[q_head1 * max_context + position] * value;
+        sum0 = fma(scores[q_head0 * max_context + position], value, sum0);
+        sum1 = fma(scores[q_head1 * max_context + position], value, sum1);
     }
     partials[(q_head0 * chunks + chunk_id) * head_dim + dimension] = sum0;
     partials[(q_head1 * chunks + chunk_id) * head_dim + dimension] = sum1;

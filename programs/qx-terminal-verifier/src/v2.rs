@@ -55,6 +55,8 @@ pub(super) const OP_RESOLVE_MACRO_TOPK_V2: u8 = 54;
 pub(super) const OP_STAGE_GRANITE_KV_SCALAR_V2: u8 = 55;
 pub(super) const OP_CHALLENGER_NESTED_MICRO_V2: u8 = 56;
 pub(super) const OP_MINER_NESTED_MICRO_V2: u8 = 57;
+pub(super) const OP_STAGE_GRANITE_OUTPUT_V2: u8 = 58;
+pub(super) const OP_STAGE_GRANITE_BOUND_V2: u8 = 59;
 
 pub const JOB_PAYLOAD_BYTES: usize = 310;
 pub const JOB_ACCOUNT_BYTES: usize = 314;
@@ -65,6 +67,7 @@ pub const MINER_V2_ACCOUNT_BYTES: usize = 16;
 pub const STAGED_SCALAR_V2_ACCOUNT_BYTES: usize = 104;
 pub const STAGED_ARGMAX_V2_ACCOUNT_BYTES: usize = 108;
 pub const STAGED_MACRO_SCALAR_V2_ACCOUNT_BYTES: usize = 108;
+pub const STAGED_GRANITE_BOUND_V2_ACCOUNT_BYTES: usize = 152;
 /// Roughly one day at a 400 ms slot. This is a consensus parameter, not a
 /// value the submitting miner may shorten.
 pub const CHALLENGE_WINDOW_SLOTS: u64 = 216_000;
@@ -151,6 +154,8 @@ const STAGED_ARGMAX_MAGIC: &[u8; 4] = b"QXA2";
 const STAGED_MACRO_SCALAR_MAGIC: &[u8; 4] = b"QXM2";
 const STAGED_GRANITE_WEIGHT_MAGIC: &[u8; 4] = b"QXG2";
 const STAGED_GRANITE_KV_MAGIC: &[u8; 4] = b"QXH2";
+const STAGED_GRANITE_OUTPUT_MAGIC: &[u8; 4] = b"QXO2";
+const STAGED_GRANITE_BOUND_MAGIC: &[u8; 4] = b"QXB2";
 
 const PHASE_CHALLENGER_BOUNDS: u8 = 1;
 const PHASE_MINER_BOUNDS: u8 = 2;
@@ -233,8 +238,18 @@ const TRACE_KIND_OPERATOR: u8 = 3;
 const TRACE_KIND_FINAL_HEAD: u8 = 4;
 const TRACE_KIND_GRANITE_MICRO: u8 = 5;
 
-type GraniteMicroBounds = ([u32; 4], [u32; 4], [u8; 32], [u8; 32]);
-type GraniteMicroTerminalRegisters = ([u32; 4], [u32; 4], [u32; 4]);
+const GRANITE_MICRO_REGISTERS: usize = 12;
+type GraniteMicroBounds = (
+    [u32; GRANITE_MICRO_REGISTERS],
+    [u32; GRANITE_MICRO_REGISTERS],
+    [u8; 32],
+    [u8; 32],
+);
+type GraniteMicroTerminalRegisters = (
+    [u32; GRANITE_MICRO_REGISTERS],
+    [u32; GRANITE_MICRO_REGISTERS],
+    [u32; GRANITE_MICRO_REGISTERS],
+);
 
 /// Stateless testnet probe used to measure RPC/leader throughput and actual
 /// SBF compute without creating fake protocol jobs. It has no production
@@ -1734,15 +1749,15 @@ fn parse_granite_micro_bounds(
     transition_count: u32,
     trace_root: [u8; 32],
 ) -> Result<GraniteMicroBounds, ProgramError> {
-    let mut start_registers = [0_u32; 4];
-    let mut end_registers = [0_u32; 4];
+    let mut start_registers = [0_u32; GRANITE_MICRO_REGISTERS];
+    let mut end_registers = [0_u32; GRANITE_MICRO_REGISTERS];
     for register in &mut start_registers {
         *register = cursor.u32()?;
     }
     for register in &mut end_registers {
         *register = cursor.u32()?;
     }
-    if start_registers != [0; 4] {
+    if start_registers != [0; GRANITE_MICRO_REGISTERS] {
         return Err(QxError::InvalidState.into());
     }
     let trace_length = transition_count
@@ -1777,11 +1792,15 @@ fn parse_granite_micro_bounds(
     Ok((start_registers, end_registers, start, end))
 }
 
-fn micro_endpoint_scalar(level: u8, coordinate: u32, registers: [u32; 4]) -> u32 {
-    if matches!(level, 5 | 8) {
+fn micro_endpoint_scalar(
+    level: u8,
+    coordinate: u32,
+    registers: [u32; GRANITE_MICRO_REGISTERS],
+) -> u32 {
+    if matches!(level, 2 | 3 | 9 | 10 | 11 | 12) {
+        registers[8]
+    } else if matches!(level, 5 | 8) {
         registers[3]
-    } else if level == 9 {
-        registers[2]
     } else if level == 13 && coordinate == 1 {
         registers[1]
     } else {
@@ -1789,15 +1808,251 @@ fn micro_endpoint_scalar(level: u8, coordinate: u32, registers: [u32; 4]) -> u32
     }
 }
 
+/// Authenticate one macro-output scalar separately from the micro trace. A
+/// 1,024-element state opening and both 12-register trace endpoints do not fit
+/// together in Solana's transaction packet. The staged record binds the scalar
+/// to the dispute, party, micro coordinates, and exact output root.
+pub(super) fn stage_granite_output(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [dispute, party, staged] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    if staged.owner != program_id
+        || !staged.is_writable
+        || staged.data_len() != STAGED_SCALAR_V2_ACCOUNT_BYTES
+    {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let phase = {
+        let state = dispute.try_borrow_data()?;
+        if dispute.owner != program_id || state.len() != DISPUTE_V2_ACCOUNT_BYTES {
+            return Err(QxError::Unauthorized.into());
+        }
+        state[D_PHASE_OFFSET]
+    };
+    let (expected_party, expected_phase) = match phase {
+        PHASE_MACRO_READY => (PARTY_CHALLENGER, PHASE_MACRO_READY),
+        PHASE_MINER_GRANITE_MICRO => (PARTY_MINER, PHASE_MINER_GRANITE_MICRO),
+        _ => return Err(QxError::InvalidState.into()),
+    };
+    let state = checked_party_state(program_id, dispute, party, expected_phase, expected_party)?;
+    let level = cursor.u8()?;
+    let coordinates = [cursor.u32()?, cursor.u32()?, cursor.u32()?];
+    let instruction: [u8; 17] = state[D_ACTIVATION_OFFSET..D_ACTIVATION_OFFSET + 17]
+        .try_into()
+        .map_err(|_| QxError::InvalidEncoding)?;
+    granite_primary_micro_level(instruction[0], level)?;
+    if expected_party == PARTY_MINER
+        && (u32::from(level) != u32_at(&state, D_TENSOR_OFFSET)?
+            || coordinates[0] != u32_at(&state, D_ROW_OFFSET)?
+            || coordinates[1] != u32_at(&state, D_COLUMN_OFFSET)?
+            || coordinates[2] != u32_at(&state, D_ACC_START_OFFSET)?)
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    let output_root = if expected_party == PARTY_MINER {
+        array_at(&state, D_DEFENDER_RESIDUAL_OFFSET)?
+    } else {
+        array_at(&state, D_CHALLENGER_END_OFFSET)?
+    };
+    let claimed = granite_output_scalar(cursor, &instruction, coordinates[0], output_root)?;
+    if !cursor.is_empty() || !f32::from_bits(claimed).is_finite() {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    drop(state);
+
+    let mut staged_data = staged.try_borrow_mut_data()?;
+    staged_data.fill(0);
+    staged_data[..4].copy_from_slice(STAGED_GRANITE_OUTPUT_MAGIC);
+    put(&mut staged_data, 4, dispute.key.as_ref())?;
+    staged_data[36] = expected_party;
+    staged_data[37] = level;
+    put(&mut staged_data, 40, &coordinates[0].to_le_bytes())?;
+    put(&mut staged_data, 44, &coordinates[1].to_le_bytes())?;
+    put(&mut staged_data, 48, &coordinates[2].to_le_bytes())?;
+    put(&mut staged_data, 52, &output_root)?;
+    put(&mut staged_data, 84, &claimed.to_le_bytes())
+}
+
+fn staged_granite_output_bits(
+    staged: &AccountInfo,
+    program_id: &Pubkey,
+    dispute: &AccountInfo,
+    party: u8,
+    level: u8,
+    coordinates: [u32; 3],
+    output_root: [u8; 32],
+) -> Result<u32, ProgramError> {
+    let data = staged.try_borrow_data()?;
+    if staged.owner != program_id
+        || staged.data_len() != STAGED_SCALAR_V2_ACCOUNT_BYTES
+        || &data[..4] != STAGED_GRANITE_OUTPUT_MAGIC
+        || data[4..36] != dispute.key.to_bytes()
+        || data[36] != party
+        || data[37] != level
+        || u32_at(&data, 40)? != coordinates[0]
+        || u32_at(&data, 44)? != coordinates[1]
+        || u32_at(&data, 48)? != coordinates[2]
+        || data[52..84] != output_root
+    {
+        return Err(QxError::Unauthorized.into());
+    }
+    u32_at(&data, 84)
+}
+
+/// Authenticate one micro-trace endpoint. Attention traces need a 17-level
+/// Merkle proof, so their two endpoints cannot share one Solana transaction.
+/// Repeated calls fill the start and end slots of one party-bound account.
+pub(super) fn stage_granite_bound(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [dispute, party, staged] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    if staged.owner != program_id
+        || !staged.is_writable
+        || staged.data_len() != STAGED_GRANITE_BOUND_V2_ACCOUNT_BYTES
+    {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let phase = {
+        let state = dispute.try_borrow_data()?;
+        if dispute.owner != program_id || state.len() != DISPUTE_V2_ACCOUNT_BYTES {
+            return Err(QxError::Unauthorized.into());
+        }
+        state[D_PHASE_OFFSET]
+    };
+    let (expected_party, expected_phase) = match phase {
+        PHASE_MACRO_READY => (PARTY_CHALLENGER, PHASE_MACRO_READY),
+        PHASE_MINER_GRANITE_MICRO => (PARTY_MINER, PHASE_MINER_GRANITE_MICRO),
+        _ => return Err(QxError::InvalidState.into()),
+    };
+    let state = checked_party_state(program_id, dispute, party, expected_phase, expected_party)?;
+    let level = cursor.u8()?;
+    let coordinates = [cursor.u32()?, cursor.u32()?, cursor.u32()?];
+    let trace_root = cursor.array_32()?;
+    let endpoint = cursor.u8()?;
+    if endpoint > 1 {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let instruction: [u8; 17] = state[D_ACTIVATION_OFFSET..D_ACTIVATION_OFFSET + 17]
+        .try_into()
+        .map_err(|_| QxError::InvalidEncoding)?;
+    granite_primary_micro_level(instruction[0], level)?;
+    if expected_party == PARTY_MINER
+        && (u32::from(level) != u32_at(&state, D_TENSOR_OFFSET)?
+            || coordinates[0] != u32_at(&state, D_ROW_OFFSET)?
+            || coordinates[1] != u32_at(&state, D_COLUMN_OFFSET)?
+            || coordinates[2] != u32_at(&state, D_ACC_START_OFFSET)?)
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    let transition_count =
+        granite_micro_transition_count(&instruction, u32_at(&state, D_TOKEN_INDEX_OFFSET)?, level)?;
+    let trace_length = transition_count
+        .checked_add(1)
+        .ok_or(QxError::InvalidEncoding)?;
+    let mut registers = [0_u32; GRANITE_MICRO_REGISTERS];
+    for register in &mut registers {
+        *register = cursor.u32()?;
+    }
+    if endpoint == 0 && registers != [0; GRANITE_MICRO_REGISTERS] {
+        return Err(QxError::InvalidState.into());
+    }
+    let depth = usize::from(cursor.u8()?);
+    let siblings = cursor.take(depth.checked_mul(32).ok_or(QxError::InvalidEncoding)?)?;
+    if !cursor.is_empty() || merkle_depth(trace_length)? != depth {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let (step, index) = if endpoint == 0 {
+        (0, 0)
+    } else {
+        (transition_count, trace_length - 1)
+    };
+    let bound = granite_micro_state_hash(&state, level, coordinates, step, registers)?;
+    verify_merkle_blake3(
+        bound,
+        index,
+        trace_length,
+        depth,
+        siblings,
+        trace_root,
+        D_GRANITE_MICRO_TREE,
+    )?;
+    let end_scalar = micro_endpoint_scalar(level, coordinates[0], registers);
+    drop(state);
+
+    let mut staged_data = staged.try_borrow_mut_data()?;
+    let same_trace = &staged_data[..4] == STAGED_GRANITE_BOUND_MAGIC
+        && staged_data[4..36] == dispute.key.to_bytes()
+        && staged_data[36] == expected_party
+        && staged_data[37] == level
+        && u32_at(&staged_data, 40)? == coordinates[0]
+        && u32_at(&staged_data, 44)? == coordinates[1]
+        && u32_at(&staged_data, 48)? == coordinates[2]
+        && staged_data[52..84] == trace_root;
+    if !same_trace {
+        staged_data.fill(0);
+        staged_data[..4].copy_from_slice(STAGED_GRANITE_BOUND_MAGIC);
+        put(&mut staged_data, 4, dispute.key.as_ref())?;
+        staged_data[36] = expected_party;
+        staged_data[37] = level;
+        put(&mut staged_data, 40, &coordinates[0].to_le_bytes())?;
+        put(&mut staged_data, 44, &coordinates[1].to_le_bytes())?;
+        put(&mut staged_data, 48, &coordinates[2].to_le_bytes())?;
+        put(&mut staged_data, 52, &trace_root)?;
+    }
+    let bound_offset = if endpoint == 0 { 84 } else { 116 };
+    put(&mut staged_data, bound_offset, &bound)?;
+    if endpoint == 1 {
+        put(&mut staged_data, 148, &end_scalar.to_le_bytes())?;
+    }
+    staged_data[38] |= 1 << endpoint;
+    Ok(())
+}
+
+fn staged_granite_bounds(
+    staged: &AccountInfo,
+    program_id: &Pubkey,
+    dispute: &AccountInfo,
+    party: u8,
+    level: u8,
+    coordinates: [u32; 3],
+) -> Result<([u8; 32], u32, [u8; 32], [u8; 32]), ProgramError> {
+    let data = staged.try_borrow_data()?;
+    if staged.owner != program_id
+        || staged.data_len() != STAGED_GRANITE_BOUND_V2_ACCOUNT_BYTES
+        || &data[..4] != STAGED_GRANITE_BOUND_MAGIC
+        || data[4..36] != dispute.key.to_bytes()
+        || data[36] != party
+        || data[37] != level
+        || data[38] != 3
+        || u32_at(&data, 40)? != coordinates[0]
+        || u32_at(&data, 44)? != coordinates[1]
+        || u32_at(&data, 48)? != coordinates[2]
+    {
+        return Err(QxError::Unauthorized.into());
+    }
+    Ok((
+        array_at(&data, 52)?,
+        u32_at(&data, 148)?,
+        array_at(&data, 84)?,
+        array_at(&data, 116)?,
+    ))
+}
+
 /// Admit the honest replay's scalar trace for one differing macro output.
-/// The output opening and both trace endpoints are authenticated in the same
-/// move so an arbitrary trace cannot be substituted after seeing bisection.
 pub(super) fn submit_challenger_granite_micro(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     cursor: &mut Cursor<'_>,
 ) -> ProgramResult {
-    let [dispute, challenger] = accounts else {
+    let [dispute, challenger, staged_output, staged_bounds] = accounts else {
         return Err(QxError::InvalidEncoding.into());
     };
     let mut state = checked_party_state(
@@ -1813,28 +2068,29 @@ pub(super) fn submit_challenger_granite_micro(
         .try_into()
         .map_err(|_| QxError::InvalidEncoding)?;
     granite_primary_micro_level(instruction[0], level)?;
-    let claimed = granite_output_scalar(
-        cursor,
-        &instruction,
-        coordinates[0],
-        array_at(&state, D_CHALLENGER_END_OFFSET)?,
+    let challenger_output_root = array_at(&state, D_CHALLENGER_END_OFFSET)?;
+    let claimed = staged_granite_output_bits(
+        staged_output,
+        program_id,
+        dispute,
+        PARTY_CHALLENGER,
+        level,
+        coordinates,
+        challenger_output_root,
     )?;
     let transition_count =
         granite_micro_transition_count(&instruction, u32_at(&state, D_TOKEN_INDEX_OFFSET)?, level)?;
-    let trace_root = cursor.array_32()?;
-    let (_, end_registers, start, end) = parse_granite_micro_bounds(
-        cursor,
-        &state,
+    let (trace_root, end_scalar, start, end) = staged_granite_bounds(
+        staged_bounds,
+        program_id,
+        dispute,
+        PARTY_CHALLENGER,
         level,
         coordinates,
-        transition_count,
-        trace_root,
     )?;
-    if !cursor.is_empty() || micro_endpoint_scalar(level, coordinates[0], end_registers) != claimed
-    {
+    if !cursor.is_empty() || end_scalar != claimed {
         return Err(QxError::InvalidState.into());
     }
-    let challenger_output_root = array_at(&state, D_CHALLENGER_END_OFFSET)?;
     let defender_output_root = array_at(&state, D_DEFENDER_END_OFFSET)?;
     put(
         &mut state,
@@ -1874,7 +2130,7 @@ pub(super) fn submit_miner_granite_micro(
     accounts: &[AccountInfo],
     cursor: &mut Cursor<'_>,
 ) -> ProgramResult {
-    let [dispute, miner] = accounts else {
+    let [dispute, miner, staged_output, staged_bounds] = accounts else {
         return Err(QxError::InvalidEncoding.into());
     };
     let mut state = checked_party_state(
@@ -1894,30 +2150,33 @@ pub(super) fn submit_miner_granite_micro(
     let instruction: [u8; 17] = state[D_ACTIVATION_OFFSET..D_ACTIVATION_OFFSET + 17]
         .try_into()
         .map_err(|_| QxError::InvalidEncoding)?;
-    let claimed = granite_output_scalar(
-        cursor,
-        &instruction,
-        coordinates[0],
-        array_at(&state, D_DEFENDER_RESIDUAL_OFFSET)?,
+    let defender_output_root = array_at(&state, D_DEFENDER_RESIDUAL_OFFSET)?;
+    let claimed = staged_granite_output_bits(
+        staged_output,
+        program_id,
+        dispute,
+        PARTY_MINER,
+        level,
+        coordinates,
+        defender_output_root,
     )?;
     if claimed == u32_at(&state, D_CHALLENGER_BITS_OFFSET)? {
         return Err(QxError::InvalidState.into());
     }
     let transition_count =
         granite_micro_transition_count(&instruction, u32_at(&state, D_TOKEN_INDEX_OFFSET)?, level)?;
-    let trace_root = cursor.array_32()?;
-    let (_, end_registers, start, end) = parse_granite_micro_bounds(
-        cursor,
-        &state,
+    let (trace_root, end_scalar, start, end) = staged_granite_bounds(
+        staged_bounds,
+        program_id,
+        dispute,
+        PARTY_MINER,
         level,
         coordinates,
-        transition_count,
-        trace_root,
     )?;
     if !cursor.is_empty()
         || start != array_at(&state, D_COMMON_ROOT_OFFSET)?
         || end == array_at(&state, D_CHALLENGER_END_OFFSET)?
-        || micro_endpoint_scalar(level, coordinates[0], end_registers) != claimed
+        || end_scalar != claimed
     {
         return Err(QxError::InvalidState.into());
     }
@@ -2263,13 +2522,69 @@ fn attention_step_geometry(state: &[u8], step: u32) -> Result<(u32, u32, u32), P
     let context = u32_at(state, D_TOKEN_INDEX_OFFSET)?
         .checked_add(1)
         .ok_or(QxError::InvalidEncoding)?;
-    let pass_width = context.checked_mul(65).ok_or(QxError::InvalidEncoding)?;
-    let pass = step / pass_width;
-    let within = step % pass_width;
-    if pass >= 3 {
+    let score_steps = context.checked_mul(65).ok_or(QxError::InvalidEncoding)?;
+    if step < score_steps {
+        let position = step / 65;
+        let local = step % 65;
+        return if local < 64 {
+            Ok((0, position, local))
+        } else {
+            Ok((1, position, 64))
+        };
+    }
+    let mut remaining = step - score_steps;
+    for leaf in 0..256_u32 {
+        let outer = leaf / 32;
+        let inner = leaf % 32;
+        let group = outer.reverse_bits() >> 29;
+        let lane = inner.reverse_bits() >> 27;
+        let thread = group * 32 + lane;
+        for position in [thread, thread + 256] {
+            if position >= context {
+                continue;
+            }
+            if remaining < 65 {
+                return if remaining < 64 {
+                    Ok((2, position, remaining))
+                } else {
+                    Ok((3, position, 64))
+                };
+            }
+            remaining -= 65;
+        }
+        let merge_count = leaf.trailing_ones();
+        if remaining < merge_count {
+            return Ok((4, 0, remaining));
+        }
+        remaining -= merge_count;
+        if leaf + 1 < 256 {
+            if remaining == 0 {
+                return Ok((5, 0, merge_count));
+            }
+            remaining -= 1;
+        }
+    }
+    let chunk = remaining / (32 * 65 + 1);
+    if chunk >= context.div_ceil(32) {
         return Err(QxError::InvalidState.into());
     }
-    Ok((pass, within / 65, within % 65))
+    let chunk_offset = remaining % (32 * 65 + 1);
+    let chunk_start = chunk * 32;
+    let positions = context.min(chunk_start + 32) - chunk_start;
+    let value_steps = positions * 65;
+    if chunk_offset < value_steps {
+        let position = chunk_start + chunk_offset / 65;
+        let local = chunk_offset % 65;
+        if local < 64 {
+            Ok((6, position, local))
+        } else {
+            Ok((7, position, 64))
+        }
+    } else if chunk_offset == value_steps {
+        Ok((8, chunk, 0))
+    } else {
+        Err(QxError::InvalidState.into())
+    }
 }
 
 /// Stage one historical K/V scalar against the common global frontier. This
@@ -2306,7 +2621,7 @@ pub(super) fn stage_granite_kv_scalar(
         return Err(QxError::InvalidState.into());
     }
     let step = u32_at(&state, D_LOW_OFFSET)?;
-    let (pass, position, substep) = attention_step_geometry(&state, step)?;
+    let (action, position, substep) = attention_step_geometry(&state, step)?;
     let output = u32_at(&state, D_ROW_OFFSET)?;
     let query_head = output / 64;
     let query_groups = u32_from(&instruction, 5)? / u32_from(&instruction, 9)?;
@@ -2314,9 +2629,9 @@ pub(super) fn stage_granite_kv_scalar(
         return Err(QxError::InvalidState.into());
     }
     let kv_head = query_head / query_groups;
-    let (kind, element) = if substep < 64 {
+    let (kind, element) = if matches!(action, 0 | 2 | 6) && substep < 64 {
         (0_u8, kv_head * 64 + substep)
-    } else if pass == 2 {
+    } else if action == 7 {
         (1_u8, kv_head * 64 + output % 64)
     } else {
         return Err(QxError::InvalidState.into());
@@ -2457,9 +2772,9 @@ fn parse_micro_terminal_registers(
     level: u8,
     coordinates: [u32; 3],
 ) -> Result<GraniteMicroTerminalRegisters, ProgramError> {
-    let mut pre = [0_u32; 4];
-    let mut challenger = [0_u32; 4];
-    let mut defender = [0_u32; 4];
+    let mut pre = [0_u32; GRANITE_MICRO_REGISTERS];
+    let mut challenger = [0_u32; GRANITE_MICRO_REGISTERS];
+    let mut defender = [0_u32; GRANITE_MICRO_REGISTERS];
     for value in &mut pre {
         *value = cursor.u32()?;
     }
@@ -2498,45 +2813,64 @@ fn granite_terminal_weight_coordinate(
         return Err(QxError::InvalidState.into());
     }
     Ok(match (instruction[0], level) {
-        (65, 2) if step == 1_028 => (u32_from(instruction, 5)?, 0, u32_at(state, D_ROW_OFFSET)?),
-        (66, 3) => (
-            u32_from(instruction, 5)?,
-            u32_at(state, D_ROW_OFFSET)?,
-            step,
-        ),
-        (73, 12) => (
-            u32_from(instruction, 1)?,
-            u32_at(state, D_ROW_OFFSET)?,
-            step,
-        ),
+        (65, 2) if step == 1_538 => (u32_from(instruction, 5)?, 0, u32_at(state, D_ROW_OFFSET)?),
+        (66, 3) => {
+            let (kind, column, _) = simd_tree_action(step, 32, 32)?;
+            if kind != 0 {
+                return Err(QxError::InvalidState.into());
+            }
+            (
+                u32_from(instruction, 5)?,
+                u32_at(state, D_ROW_OFFSET)?,
+                column,
+            )
+        }
+        (73, 12) => {
+            let (kind, column, _) = simd_tree_action(step, 32, 32)?;
+            if kind != 0 {
+                return Err(QxError::InvalidState.into());
+            }
+            (
+                u32_from(instruction, 1)?,
+                u32_at(state, D_ROW_OFFSET)?,
+                column,
+            )
+        }
         (75, 1) => (
             u32_from(instruction, 1)?,
             u32_at(state, D_MACRO_INPUT_TOKEN_OFFSET)?,
             u32_at(state, D_ROW_OFFSET)?,
         ),
-        (72, 9) if step % 2 == 1 => (
-            u32_from(instruction, 9)?
+        (72, 9) => {
+            let (kind, column, _) = simd_down_action(step)?;
+            if kind != 1 {
+                return Err(QxError::InvalidState.into());
+            }
+            (
+                u32_from(instruction, 9)?
+                    .checked_add(u32_at(state, D_ACC_START_OFFSET)?)
+                    .ok_or(QxError::InvalidEncoding)?,
+                u32_at(state, D_ROW_OFFSET)?,
+                column,
+            )
+        }
+        (72, 10 | 11) if u32_at(state, D_ROW_OFFSET)? < 512 => {
+            let (kind, column, _) = simd_tree_action(step, 32, 32)?;
+            if kind != 0 {
+                return Err(QxError::InvalidState.into());
+            }
+            let tensor = u32_from(instruction, 5)?
                 .checked_add(u32_at(state, D_ACC_START_OFFSET)?)
-                .ok_or(QxError::InvalidEncoding)?,
-            u32_at(state, D_ROW_OFFSET)?,
-            step / 2,
-        ),
-        (72, 10) if u32_at(state, D_ROW_OFFSET)? < 512 => (
-            u32_from(instruction, 5)?
-                .checked_add(u32_at(state, D_ACC_START_OFFSET)?)
-                .ok_or(QxError::InvalidEncoding)?,
-            u32_at(state, D_ROW_OFFSET)?,
-            step,
-        ),
-        (72, 11) if u32_at(state, D_ROW_OFFSET)? < 512 => (
-            u32_from(instruction, 5)?
-                .checked_add(u32_at(state, D_ACC_START_OFFSET)?)
-                .ok_or(QxError::InvalidEncoding)?,
-            512_u32
-                .checked_add(u32_at(state, D_ROW_OFFSET)?)
-                .ok_or(QxError::InvalidEncoding)?,
-            step,
-        ),
+                .ok_or(QxError::InvalidEncoding)?;
+            let row = if level == 10 {
+                u32_at(state, D_ROW_OFFSET)?
+            } else {
+                512_u32
+                    .checked_add(u32_at(state, D_ROW_OFFSET)?)
+                    .ok_or(QxError::InvalidEncoding)?
+            };
+            (tensor, row, column)
+        }
         _ => return Err(QxError::InvalidState.into()),
     })
 }
@@ -2602,7 +2936,7 @@ fn resolve_granite_expected(
     state: &mut [u8],
     level: u8,
     coordinates: [u32; 3],
-    registers: [u32; 4],
+    registers: [u32; GRANITE_MICRO_REGISTERS],
 ) -> ProgramResult {
     let expected = granite_micro_state_hash(
         state,
@@ -2680,9 +3014,9 @@ fn staged_granite_weight_bits(
 
 fn begin_nested_micro(
     state: &mut [u8],
-    pre: [u32; 4],
-    challenger: [u32; 4],
-    defender: [u32; 4],
+    pre: [u32; GRANITE_MICRO_REGISTERS],
+    challenger: [u32; GRANITE_MICRO_REGISTERS],
+    defender: [u32; GRANITE_MICRO_REGISTERS],
     target_register: usize,
     child_level: u8,
     child_coordinates: [u32; 3],
@@ -2780,18 +3114,19 @@ pub(super) fn resolve_granite_micro(
         )?;
         return refresh_deadline(&mut state, Clock::get()?.slot);
     }
-    if level == 9 && step % 2 == 0 {
+    if level == 9 && simd_down_action(step)?.0 == 0 {
         if !cursor.is_empty() {
             return Err(QxError::InvalidEncoding.into());
         }
+        let (_, neuron, _) = simd_down_action(step)?;
         begin_nested_micro(
             &mut state,
             pre,
             challenger_post,
             defender_post,
-            0,
+            9,
             15,
-            [step / 2, coordinates[1], coordinates[2]],
+            [neuron, coordinates[1], coordinates[2]],
         )?;
         return refresh_deadline(&mut state, Clock::get()?.slot);
     }
@@ -2820,87 +3155,157 @@ pub(super) fn resolve_granite_micro(
             } else {
                 0
             };
-            let value = match step {
-                0..=1_023 => {
-                    if !remainder.is_empty() {
-                        return Err(QxError::InvalidEncoding.into());
+            if step < 1_534 {
+                let (kind, mut value, first) = simd_tree_action(step, 256, 4)?;
+                match kind {
+                    0 => {
+                        if !remainder.is_empty() {
+                            return Err(QxError::InvalidEncoding.into());
+                        }
+                        let generic_lane = value % 256;
+                        let term = value / 256;
+                        let leaf = generic_lane.reverse_bits() >> 24;
+                        let outer = leaf / 32;
+                        let inner = leaf % 32;
+                        let group = outer.reverse_bits() >> 29;
+                        let lane = inner.reverse_bits() >> 27;
+                        value = group * 32 + lane + term * 256;
+                        let input_root = parse_macro_workspace_value(
+                            cursor,
+                            input_slot,
+                            array_at(&state, D_COMMON_RESIDUAL_OFFSET)?,
+                        )?;
+                        let input = f32::from_bits(parse_vector_scalar_len(
+                            cursor, value, 1_024, input_root, true,
+                        )?);
+                        let accumulator = if first == 1 {
+                            0.0
+                        } else {
+                            f32::from_bits(pre[8])
+                        };
+                        expected[8] =
+                            qx_consensus_math::fma_f32(input, input, accumulator).to_bits();
                     }
-                    let input_root = parse_macro_workspace_value(
-                        cursor,
-                        input_slot,
-                        array_at(&state, D_COMMON_RESIDUAL_OFFSET)?,
-                    )?;
-                    let input = f32::from_bits(parse_vector_scalar_len(
-                        cursor, step, 1_024, input_root, true,
-                    )?);
-                    qx_consensus_math::fma_f32(input, input, f32::from_bits(pre[0]))
-                }
-                1_024 => {
-                    if !remainder.is_empty() {
-                        return Err(QxError::InvalidEncoding.into());
+                    1 => {
+                        if !cursor.is_empty() || !remainder.is_empty() || value >= 8 {
+                            return Err(QxError::InvalidEncoding.into());
+                        }
+                        expected[8] = (f32::from_bits(pre[value as usize])
+                            + f32::from_bits(pre[8]))
+                        .to_bits();
+                        expected[value as usize] = 0;
                     }
-                    qx_consensus_math::div_f32(f32::from_bits(pre[0]), 1_024.0)
-                        .ok_or(QxError::InvalidArithmetic)?
-                }
-                1_025 => {
-                    if !remainder.is_empty() {
-                        return Err(QxError::InvalidEncoding.into());
+                    2 => {
+                        if !cursor.is_empty() || !remainder.is_empty() || value >= 8 {
+                            return Err(QxError::InvalidEncoding.into());
+                        }
+                        expected[value as usize] = pre[8];
+                        expected[8] = 0;
                     }
-                    f32::from_bits(pre[0]) + f32::from_bits(u32_from(&instruction, 13)?)
+                    _ => return Err(QxError::InvalidState.into()),
                 }
-                1_026 => {
-                    if !remainder.is_empty() {
-                        return Err(QxError::InvalidEncoding.into());
+            } else {
+                let value = match step {
+                    1_534 => {
+                        if !remainder.is_empty() {
+                            return Err(QxError::InvalidEncoding.into());
+                        }
+                        qx_consensus_math::div_f32(f32::from_bits(pre[8]), 1_024.0)
+                            .ok_or(QxError::InvalidArithmetic)?
                     }
-                    qx_consensus_math::rsqrt_f32(f32::from_bits(pre[0]))
-                        .ok_or(QxError::InvalidArithmetic)?
-                }
-                1_027 => {
-                    if !remainder.is_empty() {
-                        return Err(QxError::InvalidEncoding.into());
+                    1_535 => {
+                        if !remainder.is_empty() {
+                            return Err(QxError::InvalidEncoding.into());
+                        }
+                        f32::from_bits(pre[8]) + f32::from_bits(u32_from(&instruction, 13)?)
                     }
-                    let input_root = parse_macro_workspace_value(
-                        cursor,
-                        input_slot,
-                        array_at(&state, D_COMMON_RESIDUAL_OFFSET)?,
-                    )?;
-                    let input = f32::from_bits(parse_vector_scalar_len(
-                        cursor,
-                        coordinates[0],
-                        1_024,
-                        input_root,
-                        true,
-                    )?);
-                    f32::from_bits(pre[0]) * input
-                }
-                1_028 => {
-                    let [staged] = remainder else {
-                        return Err(QxError::InvalidEncoding.into());
-                    };
-                    let staged_data = staged.try_borrow_data()?;
-                    let (tensor, row, column) =
-                        granite_terminal_weight_coordinate(&state, &instruction, level, step)?;
-                    if staged.owner != program_id
-                        || staged.data_len() != STAGED_WEIGHT_BYTES
-                        || &staged_data[..4] != STAGED_GRANITE_WEIGHT_MAGIC
-                        || staged_data[4..36] != dispute.key.to_bytes()
-                        || u32_at(&staged_data, 36)? != step
-                        || u32_at(&staged_data, 40)? != tensor
-                        || u32_at(&staged_data, 44)? != row
-                        || u32_at(&staged_data, 48)? != column
-                    {
-                        return Err(QxError::Unauthorized.into());
+                    1_536 => {
+                        if !remainder.is_empty() {
+                            return Err(QxError::InvalidEncoding.into());
+                        }
+                        qx_consensus_math::rsqrt_f32(f32::from_bits(pre[8]))
+                            .ok_or(QxError::InvalidArithmetic)?
                     }
-                    f32::from_bits(pre[0]) * f32::from_bits(u32_at(&staged_data, 52)?)
+                    1_537 => {
+                        if !remainder.is_empty() {
+                            return Err(QxError::InvalidEncoding.into());
+                        }
+                        let input_root = parse_macro_workspace_value(
+                            cursor,
+                            input_slot,
+                            array_at(&state, D_COMMON_RESIDUAL_OFFSET)?,
+                        )?;
+                        let input = f32::from_bits(parse_vector_scalar_len(
+                            cursor,
+                            coordinates[0],
+                            1_024,
+                            input_root,
+                            true,
+                        )?);
+                        f32::from_bits(pre[8]) * input
+                    }
+                    1_538 => {
+                        let [staged] = remainder else {
+                            return Err(QxError::InvalidEncoding.into());
+                        };
+                        let staged_data = staged.try_borrow_data()?;
+                        let (tensor, row, column) =
+                            granite_terminal_weight_coordinate(&state, &instruction, level, step)?;
+                        if staged.owner != program_id
+                            || staged.data_len() != STAGED_WEIGHT_BYTES
+                            || &staged_data[..4] != STAGED_GRANITE_WEIGHT_MAGIC
+                            || staged_data[4..36] != dispute.key.to_bytes()
+                            || u32_at(&staged_data, 36)? != step
+                            || u32_at(&staged_data, 40)? != tensor
+                            || u32_at(&staged_data, 44)? != row
+                            || u32_at(&staged_data, 48)? != column
+                        {
+                            return Err(QxError::Unauthorized.into());
+                        }
+                        f32::from_bits(pre[8]) * f32::from_bits(u32_at(&staged_data, 52)?)
+                    }
+                    _ => return Err(QxError::InvalidState.into()),
+                };
+                if !value.is_finite() {
+                    return Err(QxError::NonFinite.into());
                 }
-                _ => return Err(QxError::InvalidState.into()),
-            };
-            if !value.is_finite() {
-                return Err(QxError::NonFinite.into());
+                expected[8] = value.to_bits();
             }
-            expected[0] = value.to_bits();
         }
         (66, 3) | (73, 12) => {
+            if instruction[0] == 73 && step == 1_086 {
+                if !cursor.is_empty() || !remainder.is_empty() {
+                    return Err(QxError::InvalidEncoding.into());
+                }
+                let value = qx_consensus_math::div_f32(
+                    f32::from_bits(pre[8]),
+                    f32::from_bits(u32_from(&instruction, 13)?),
+                )
+                .ok_or(QxError::InvalidArithmetic)?;
+                expected[8] = value.to_bits();
+                resolve_granite_expected(&mut state, level, coordinates, expected)?;
+                return Ok(());
+            }
+            let (kind, action_value, first) = simd_tree_action(step, 32, 32)?;
+            if kind == 1 {
+                if !cursor.is_empty() || !remainder.is_empty() || action_value >= 5 {
+                    return Err(QxError::InvalidEncoding.into());
+                }
+                expected[8] =
+                    (f32::from_bits(pre[action_value as usize]) + f32::from_bits(pre[8])).to_bits();
+                expected[action_value as usize] = 0;
+                resolve_granite_expected(&mut state, level, coordinates, expected)?;
+                return Ok(());
+            }
+            if kind == 2 {
+                if !cursor.is_empty() || !remainder.is_empty() || action_value >= 5 {
+                    return Err(QxError::InvalidEncoding.into());
+                }
+                expected[action_value as usize] = pre[8];
+                expected[8] = 0;
+                resolve_granite_expected(&mut state, level, coordinates, expected)?;
+                return Ok(());
+            }
             let input_slot = if instruction[0] == 73 {
                 1
             } else {
@@ -2916,7 +3321,8 @@ pub(super) fn resolve_granite_micro(
                 input_slot,
                 array_at(&state, D_COMMON_RESIDUAL_OFFSET)?,
             )?;
-            let input_bits = parse_vector_scalar_len(cursor, step, 1_024, input_root, true)?;
+            let input_bits =
+                parse_vector_scalar_len(cursor, action_value, 1_024, input_root, true)?;
             let [staged] = remainder else {
                 return Err(QxError::InvalidEncoding.into());
             };
@@ -2935,96 +3341,125 @@ pub(super) fn resolve_granite_micro(
                 return Err(QxError::Unauthorized.into());
             }
             let weight_bits = u32_at(&staged_data, 52)?;
-            let mut value = qx_consensus_math::fma_f32(
+            let value = qx_consensus_math::fma_f32(
                 f32::from_bits(weight_bits),
                 f32::from_bits(input_bits),
-                f32::from_bits(pre[0]),
+                if first == 1 {
+                    0.0
+                } else {
+                    f32::from_bits(pre[8])
+                },
             );
-            if instruction[0] == 73 && step + 1 == 1_024 {
-                value =
-                    qx_consensus_math::div_f32(value, f32::from_bits(u32_from(&instruction, 13)?))
-                        .ok_or(QxError::InvalidArithmetic)?;
-            }
             if !value.is_finite() {
                 return Err(QxError::NonFinite.into());
             }
-            expected[0] = value.to_bits();
+            expected[8] = value.to_bits();
         }
         (69, 5) => {
-            let (pass, _position, substep) = attention_step_geometry(&state, step)?;
+            let (action, _position, substep) = attention_step_geometry(&state, step)?;
             let output = coordinates[0];
             let query_head = output / 64;
             if output >= u32_from(&instruction, 5)? * 64 {
                 return Err(QxError::InvalidState.into());
             }
-            let value = if substep < 64 {
-                let kv_bits = staged_granite_kv_bits(remainder, program_id, dispute, step, 0)?;
-                let rope_root = parse_macro_workspace_value(
-                    cursor,
-                    5,
-                    array_at(&state, D_COMMON_RESIDUAL_OFFSET)?,
-                )?;
-                let query_root = cursor.array_32()?;
-                let key_root = cursor.array_32()?;
-                if stable_hash_domain(D_GRANITE_ROPE_OUTPUT, &[&query_root, &key_root]) != rope_root
-                {
-                    return Err(QxError::InvalidReceiptProof.into());
+            match action {
+                0 | 2 | 6 => {
+                    let kv_bits = staged_granite_kv_bits(remainder, program_id, dispute, step, 0)?;
+                    let rope_root = parse_macro_workspace_value(
+                        cursor,
+                        5,
+                        array_at(&state, D_COMMON_RESIDUAL_OFFSET)?,
+                    )?;
+                    let query_root = cursor.array_32()?;
+                    let key_root = cursor.array_32()?;
+                    if stable_hash_domain(D_GRANITE_ROPE_OUTPUT, &[&query_root, &key_root])
+                        != rope_root
+                    {
+                        return Err(QxError::InvalidReceiptProof.into());
+                    }
+                    let query = f32::from_bits(parse_vector_scalar_len(
+                        cursor,
+                        query_head * 64 + substep,
+                        u32_from(&instruction, 5)? * 64,
+                        query_root,
+                        true,
+                    )?);
+                    expected[9] = qx_consensus_math::fma_f32(
+                        query,
+                        f32::from_bits(kv_bits),
+                        f32::from_bits(pre[9]),
+                    )
+                    .to_bits();
                 }
-                let query = f32::from_bits(parse_vector_scalar_len(
-                    cursor,
-                    query_head * 64 + substep,
-                    u32_from(&instruction, 5)? * 64,
-                    query_root,
-                    true,
-                )?);
-                qx_consensus_math::fma_f32(query, f32::from_bits(kv_bits), f32::from_bits(pre[0]))
-            } else {
-                let score = f32::from_bits(pre[0]) * f32::from_bits(u32_from(&instruction, 13)?);
-                expected[0] = 0;
-                match pass {
-                    0 => {
-                        expected[1] = if step == 64 {
-                            score
-                        } else {
-                            f32::from_bits(pre[1]).max(score)
-                        }
-                        .to_bits();
-                        f32::from_bits(expected[0])
+                1 => {
+                    if !cursor.is_empty() || !remainder.is_empty() {
+                        return Err(QxError::InvalidEncoding.into());
                     }
-                    1 => {
-                        if !remainder.is_empty() {
-                            return Err(QxError::InvalidEncoding.into());
-                        }
-                        let exponential =
-                            qx_consensus_math::exp_f32(score - f32::from_bits(pre[1]))
-                                .ok_or(QxError::InvalidArithmetic)?;
-                        expected[2] = (f32::from_bits(pre[2]) + exponential).to_bits();
-                        f32::from_bits(expected[2])
+                    let score =
+                        f32::from_bits(pre[9]) * f32::from_bits(u32_from(&instruction, 13)?);
+                    expected[9] = 0;
+                    expected[10] = if f32::from_bits(pre[10]) == 0.0 && step == 64 {
+                        score
+                    } else {
+                        f32::from_bits(pre[10]).max(score)
                     }
-                    2 => {
-                        let value_bits =
-                            staged_granite_kv_bits(remainder, program_id, dispute, step, 1)?;
-                        let exponential =
-                            qx_consensus_math::exp_f32(score - f32::from_bits(pre[1]))
-                                .ok_or(QxError::InvalidArithmetic)?;
-                        let weight =
-                            qx_consensus_math::div_f32(exponential, f32::from_bits(pre[2]))
-                                .ok_or(QxError::InvalidArithmetic)?;
-                        expected[3] = qx_consensus_math::fma_f32(
-                            weight,
-                            f32::from_bits(value_bits),
-                            f32::from_bits(pre[3]),
-                        )
-                        .to_bits();
-                        f32::from_bits(expected[3])
-                    }
-                    _ => return Err(QxError::InvalidState.into()),
+                    .to_bits();
                 }
-            };
-            if !value.is_finite()
-                || expected
-                    .iter()
-                    .any(|bits| !f32::from_bits(*bits).is_finite())
+                3 => {
+                    if !cursor.is_empty() || !remainder.is_empty() {
+                        return Err(QxError::InvalidEncoding.into());
+                    }
+                    let score =
+                        f32::from_bits(pre[9]) * f32::from_bits(u32_from(&instruction, 13)?);
+                    let exponential = qx_consensus_math::exp_f32(score - f32::from_bits(pre[10]))
+                        .ok_or(QxError::InvalidArithmetic)?;
+                    expected[8] = (f32::from_bits(pre[8]) + exponential).to_bits();
+                    expected[9] = 0;
+                }
+                4 => {
+                    if !cursor.is_empty() || !remainder.is_empty() || substep >= 8 {
+                        return Err(QxError::InvalidEncoding.into());
+                    }
+                    expected[8] =
+                        (f32::from_bits(pre[substep as usize]) + f32::from_bits(pre[8])).to_bits();
+                    expected[substep as usize] = 0;
+                }
+                5 => {
+                    if !cursor.is_empty() || !remainder.is_empty() || substep >= 8 {
+                        return Err(QxError::InvalidEncoding.into());
+                    }
+                    expected[substep as usize] = pre[8];
+                    expected[8] = 0;
+                }
+                7 => {
+                    let value_bits =
+                        staged_granite_kv_bits(remainder, program_id, dispute, step, 1)?;
+                    let score =
+                        f32::from_bits(pre[9]) * f32::from_bits(u32_from(&instruction, 13)?);
+                    let exponential = qx_consensus_math::exp_f32(score - f32::from_bits(pre[10]))
+                        .ok_or(QxError::InvalidArithmetic)?;
+                    let weight = qx_consensus_math::div_f32(exponential, f32::from_bits(pre[8]))
+                        .ok_or(QxError::InvalidArithmetic)?;
+                    expected[11] = qx_consensus_math::fma_f32(
+                        weight,
+                        f32::from_bits(value_bits),
+                        f32::from_bits(pre[11]),
+                    )
+                    .to_bits();
+                    expected[9] = 0;
+                }
+                8 => {
+                    if !cursor.is_empty() || !remainder.is_empty() {
+                        return Err(QxError::InvalidEncoding.into());
+                    }
+                    expected[3] = (f32::from_bits(pre[3]) + f32::from_bits(pre[11])).to_bits();
+                    expected[11] = 0;
+                }
+                _ => return Err(QxError::InvalidState.into()),
+            }
+            if expected
+                .iter()
+                .any(|bits| !f32::from_bits(*bits).is_finite())
             {
                 return Err(QxError::NonFinite.into());
             }
@@ -3061,27 +3496,73 @@ pub(super) fn resolve_granite_micro(
             expected[3] = value.to_bits();
         }
         (72, 9) => {
-            if step % 2 != 1 {
-                return Err(QxError::InvalidState.into());
+            let (kind, action_value, first) = simd_down_action(step)?;
+            match kind {
+                1 => {
+                    let weight = f32::from_bits(staged_granite_weight_bits(
+                        remainder,
+                        program_id,
+                        dispute,
+                        &state,
+                        &instruction,
+                        level,
+                        step,
+                    )?);
+                    let value = qx_consensus_math::fma_f32(
+                        weight,
+                        f32::from_bits(pre[9]),
+                        if first == 1 {
+                            0.0
+                        } else {
+                            f32::from_bits(pre[8])
+                        },
+                    );
+                    if !value.is_finite() {
+                        return Err(QxError::NonFinite.into());
+                    }
+                    expected[8] = value.to_bits();
+                    expected[9] = 0;
+                }
+                2 => {
+                    if !cursor.is_empty() || !remainder.is_empty() || action_value >= 5 {
+                        return Err(QxError::InvalidEncoding.into());
+                    }
+                    expected[8] = (f32::from_bits(pre[action_value as usize])
+                        + f32::from_bits(pre[8]))
+                    .to_bits();
+                    expected[action_value as usize] = 0;
+                }
+                3 => {
+                    if !cursor.is_empty() || !remainder.is_empty() || action_value >= 5 {
+                        return Err(QxError::InvalidEncoding.into());
+                    }
+                    expected[action_value as usize] = pre[8];
+                    expected[8] = 0;
+                }
+                _ => return Err(QxError::InvalidState.into()),
             }
-            let weight = f32::from_bits(staged_granite_weight_bits(
-                remainder,
-                program_id,
-                dispute,
-                &state,
-                &instruction,
-                level,
-                step,
-            )?);
-            let value =
-                qx_consensus_math::fma_f32(weight, f32::from_bits(pre[0]), f32::from_bits(pre[2]));
-            if !value.is_finite() {
-                return Err(QxError::NonFinite.into());
-            }
-            expected[0] = 0;
-            expected[2] = value.to_bits();
         }
         (72, 10 | 11) => {
+            let (kind, action_value, first) = simd_tree_action(step, 32, 32)?;
+            if kind == 1 {
+                if !cursor.is_empty() || !remainder.is_empty() || action_value >= 5 {
+                    return Err(QxError::InvalidEncoding.into());
+                }
+                expected[8] =
+                    (f32::from_bits(pre[action_value as usize]) + f32::from_bits(pre[8])).to_bits();
+                expected[action_value as usize] = 0;
+                resolve_granite_expected(&mut state, level, coordinates, expected)?;
+                return Ok(());
+            }
+            if kind == 2 {
+                if !cursor.is_empty() || !remainder.is_empty() || action_value >= 5 {
+                    return Err(QxError::InvalidEncoding.into());
+                }
+                expected[action_value as usize] = pre[8];
+                expected[8] = 0;
+                resolve_granite_expected(&mut state, level, coordinates, expected)?;
+                return Ok(());
+            }
             let weight = f32::from_bits(staged_granite_weight_bits(
                 remainder,
                 program_id,
@@ -3097,13 +3578,25 @@ pub(super) fn resolve_granite_micro(
                 array_at(&state, D_COMMON_RESIDUAL_OFFSET)?,
             )?;
             let input = f32::from_bits(parse_vector_scalar_len(
-                cursor, step, 1_024, input_root, true,
+                cursor,
+                action_value,
+                1_024,
+                input_root,
+                true,
             )?);
-            let value = qx_consensus_math::fma_f32(weight, input, f32::from_bits(pre[0]));
+            let value = qx_consensus_math::fma_f32(
+                weight,
+                input,
+                if first == 1 {
+                    0.0
+                } else {
+                    f32::from_bits(pre[8])
+                },
+            );
             if !value.is_finite() {
                 return Err(QxError::NonFinite.into());
             }
-            expected[0] = value.to_bits();
+            expected[8] = value.to_bits();
         }
         (72, 15) => {
             if step != 2 || !remainder.is_empty() {
@@ -3119,7 +3612,8 @@ pub(super) fn resolve_granite_micro(
             if !value.is_finite() {
                 return Err(QxError::NonFinite.into());
             }
-            expected = [value.to_bits(), 0, 0, 0];
+            expected = [0; GRANITE_MICRO_REGISTERS];
+            expected[0] = value.to_bits();
         }
         (74, 13) => {
             if !remainder.is_empty() || step >= u32_from(&instruction, 1)? {
@@ -3141,7 +3635,8 @@ pub(super) fn resolve_granite_micro(
                 return Err(QxError::NonFinite.into());
             }
             if step == 0 {
-                expected = [logit, 0, 1, 0];
+                expected = [0; GRANITE_MICRO_REGISTERS];
+                expected[..3].copy_from_slice(&[logit, 0, 1]);
             } else {
                 if pre[2] != 1 || pre[1] >= step {
                     return Err(QxError::InvalidState.into());
@@ -5796,7 +6291,6 @@ fn granite_micro_transition_count(
     token_index: u32,
     level: u8,
 ) -> Result<u32, ProgramError> {
-    const HIDDEN: u32 = 1_024;
     const HEAD_DIM: u32 = 64;
     const EXPERTS: u32 = 32;
     const TOP_K: u32 = 8;
@@ -5806,16 +6300,21 @@ fn granite_micro_transition_count(
     let count = match (opcode, level) {
         (75, 1) | (67, 1) | (68, 1) | (70, 1) => 1,
         (65, 1) => 6,
-        (65, 2) => HIDDEN + 5,
-        (66, 3) | (73, 12) => HIDDEN,
+        (65, 2) => 1_539,
+        (66, 3) => 1_086,
+        (73, 12) => 1_087,
         (69, 1) | (69, 6) => context,
         (69, 4) => HEAD_DIM,
-        (69, 5) => context.checked_mul(195).ok_or(QxError::InvalidEncoding)?,
+        (69, 5) => context
+            .checked_mul(195)
+            .and_then(|count| count.checked_add(510))
+            .and_then(|count| count.checked_add(context.div_ceil(32)))
+            .ok_or(QxError::InvalidEncoding)?,
         (71, 7) => EXPERTS,
         (71, 14) => TOP_K + 1,
         (72, 1) | (72, 8) => TOP_K * 2,
-        (72, 9) => (u32_from(instruction, 13)? >> 16) * 2,
-        (72, 10) | (72, 11) => HIDDEN,
+        (72, 9) => 1_086,
+        (72, 10) | (72, 11) => 1_086,
         (72, 15) => 3,
         (74, 13) => VOCAB,
         _ => return Err(QxError::InvalidState.into()),
@@ -5826,12 +6325,91 @@ fn granite_micro_transition_count(
     Ok(count)
 }
 
+/// Map one transition in the fixed binary-tree SIMD trace. Kind 0 is an FMA
+/// (`value` is the logical column and `aux` marks the first lane term), kind 1
+/// merges the active value with stack register `value`, and kind 2 stores the
+/// active value in stack register `value`.
+fn simd_tree_action(
+    step: u32,
+    leaves: u32,
+    terms_per_leaf: u32,
+) -> Result<(u8, u32, u32), ProgramError> {
+    if !leaves.is_power_of_two() || leaves > 256 || terms_per_leaf == 0 {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let bits = leaves.trailing_zeros();
+    let mut cursor = 0_u32;
+    for leaf in 0..leaves {
+        let lane = leaf.reverse_bits() >> (32 - bits);
+        for term in 0..terms_per_leaf {
+            if cursor == step {
+                let column = lane
+                    .checked_add(term.checked_mul(leaves).ok_or(QxError::InvalidEncoding)?)
+                    .ok_or(QxError::InvalidEncoding)?;
+                return Ok((0, column, u32::from(term == 0)));
+            }
+            cursor = cursor.checked_add(1).ok_or(QxError::InvalidEncoding)?;
+        }
+        let mut level = 0_u32;
+        while leaf & (1 << level) != 0 {
+            if cursor == step {
+                return Ok((1, level, 0));
+            }
+            cursor = cursor.checked_add(1).ok_or(QxError::InvalidEncoding)?;
+            level += 1;
+        }
+        if leaf + 1 < leaves {
+            if cursor == step {
+                return Ok((2, level, 0));
+            }
+            cursor = cursor.checked_add(1).ok_or(QxError::InvalidEncoding)?;
+        }
+    }
+    Err(QxError::InvalidState.into())
+}
+
+/// Down projection variant of `simd_tree_action`: each logical FMA is split
+/// into an authenticated nested activation (kind 0) and the weight FMA (kind
+/// 1). Kinds 2 and 3 are reduction merge/store operations.
+fn simd_down_action(step: u32) -> Result<(u8, u32, u32), ProgramError> {
+    let mut cursor = 0_u32;
+    for leaf in 0..32_u32 {
+        let lane = leaf.reverse_bits() >> 27;
+        for term in 0..16_u32 {
+            let column = lane + term * 32;
+            if cursor == step {
+                return Ok((0, column, u32::from(term == 0)));
+            }
+            cursor += 1;
+            if cursor == step {
+                return Ok((1, column, u32::from(term == 0)));
+            }
+            cursor += 1;
+        }
+        let mut level = 0_u32;
+        while leaf & (1 << level) != 0 {
+            if cursor == step {
+                return Ok((2, level, 0));
+            }
+            cursor += 1;
+            level += 1;
+        }
+        if leaf + 1 < 32 {
+            if cursor == step {
+                return Ok((3, level, 0));
+            }
+            cursor += 1;
+        }
+    }
+    Err(QxError::InvalidState.into())
+}
+
 fn granite_micro_state_hash(
     state: &[u8],
     level: u8,
     coordinates: [u32; 3],
     step: u32,
-    registers: [u32; 4],
+    registers: [u32; GRANITE_MICRO_REGISTERS],
 ) -> Result<[u8; 32], ProgramError> {
     if !(1..=15).contains(&level) {
         return Err(QxError::InvalidEncoding.into());
@@ -5852,6 +6430,14 @@ fn granite_micro_state_hash(
             &registers[1].to_le_bytes(),
             &registers[2].to_le_bytes(),
             &registers[3].to_le_bytes(),
+            &registers[4].to_le_bytes(),
+            &registers[5].to_le_bytes(),
+            &registers[6].to_le_bytes(),
+            &registers[7].to_le_bytes(),
+            &registers[8].to_le_bytes(),
+            &registers[9].to_le_bytes(),
+            &registers[10].to_le_bytes(),
+            &registers[11].to_le_bytes(),
         ],
     ))
 }
@@ -6671,7 +7257,8 @@ mod tests {
             .copy_from_slice(&3_u32.to_le_bytes());
         state[D_MACRO_PC_OFFSET..D_MACRO_PC_OFFSET + 4].copy_from_slice(&9_u32.to_le_bytes());
         let coordinates = [13, 17, 19];
-        let registers = [23, 29, 31, 37];
+        let mut registers = [0; GRANITE_MICRO_REGISTERS];
+        registers[..4].copy_from_slice(&[23, 29, 31, 37]);
         assert_eq!(
             granite_micro_state_hash(
                 &state,
@@ -6714,6 +7301,71 @@ mod tests {
                 .hash()
                 .unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn simd_micro_schedules_are_dense_and_complete() {
+        let mut dense_columns = Vec::new();
+        let mut merges = 0;
+        let mut stores = 0;
+        for step in 0..1_086 {
+            match simd_tree_action(step, 32, 32).unwrap() {
+                (0, column, _) => dense_columns.push(column),
+                (1, _, _) => merges += 1,
+                (2, _, _) => stores += 1,
+                _ => unreachable!(),
+            }
+        }
+        dense_columns.sort_unstable();
+        assert_eq!(dense_columns, (0..1_024).collect::<Vec<_>>());
+        assert_eq!((merges, stores), (31, 31));
+        assert!(simd_tree_action(1_086, 32, 32).is_err());
+
+        let mut nested_columns = Vec::new();
+        let mut fma_columns = Vec::new();
+        for step in 0..1_086 {
+            match simd_down_action(step).unwrap() {
+                (0, column, _) => nested_columns.push(column),
+                (1, column, _) => fma_columns.push(column),
+                (2 | 3, _, _) => {}
+                _ => unreachable!(),
+            }
+        }
+        nested_columns.sort_unstable();
+        fma_columns.sort_unstable();
+        assert_eq!(nested_columns, (0..512).collect::<Vec<_>>());
+        assert_eq!(fma_columns, nested_columns);
+        assert!(simd_down_action(1_086).is_err());
+
+        for token_index in [0_u32, 31, 256, 511] {
+            let context = token_index + 1;
+            let count = context * 195 + 510 + context.div_ceil(32);
+            let mut state = [0_u8; DISPUTE_V2_ACCOUNT_BYTES];
+            state[D_TOKEN_INDEX_OFFSET..D_TOKEN_INDEX_OFFSET + 4]
+                .copy_from_slice(&token_index.to_le_bytes());
+            for step in 0..count {
+                attention_step_geometry(&state, step).unwrap();
+            }
+            assert!(attention_step_geometry(&state, count).is_err());
+        }
+    }
+
+    #[test]
+    fn granite_staged_proofs_fit_solana_packets() {
+        // Fixed Granite uses at most a 10-level output-vector proof (the
+        // 49,155-logit final head) and a 17-level micro-trace proof (attention
+        // at the 512-token context limit). Include the opcode in each size.
+        let output_stage = 1 + 1 + 3 * 4 + 4 + 4 + 2 + STATE_CHUNK_BYTES + 1 + 10 * 32;
+        let bound_stage = 1 + 1 + 3 * 4 + 32 + 1 + GRANITE_MICRO_REGISTERS * 4 + 1 + 17 * 32;
+        let challenger_submit = 1 + 1 + 3 * 4;
+        let conservative_transaction_envelope = 300;
+        let solana_packet_data_size = 1_232;
+
+        assert_eq!(output_stage, 601);
+        assert_eq!(bound_stage, 640);
+        for instruction in [output_stage, bound_stage, challenger_submit] {
+            assert!(instruction + conservative_transaction_envelope <= solana_packet_data_size);
         }
     }
 }

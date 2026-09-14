@@ -205,8 +205,8 @@ pub fn granite_execution_spec_with_math_profile(
     bytes.push(1); // raw BLAKE3(left || right) state-tree parent
     bytes.push(HashAlgorithm::Blake3V1 as u8); // hot KV/checkpoint/token/job trees
     bytes.push(1); // token trace leaf binds the deterministic predicted token
-    bytes.push(1); // slashable reductions use one serial control lane
-    bytes.push(1); // dot/MoE accumulation uses explicit ordered FP32 FMA
+    bytes.push(2); // fixed 32-lane shuffle tree; RMS uses 8x32 then 32
+    bytes.push(2); // lane-local dot/MoE FMA followed by offsets 16,8,4,2,1
     bytes.push(math_mode as u8);
     bytes.push(math_functions as u8);
     bytes.push(1); // canonical job-genesis leaf at job-tree index zero
@@ -218,7 +218,7 @@ pub fn granite_execution_spec_with_math_profile(
     bytes.push(1); // isolated Granite macros open one rolling workspace-slot update
     bytes.push(1); // challenge vectors use canonical 256-byte state chunks
     bytes.push(1); // RoPE commits independently openable rotated Q/K roots
-    bytes.push(1); // hierarchical Granite micro traces and fixed trace lengths
+    bytes.push(2); // SIMD-tree Granite micro traces with twelve raw registers
     bytes.extend_from_slice(b"GRANITE_ROPE_FIXED_V1");
     for bits in qx_consensus_math::GRANITE_ROPE_INVERSE_FREQUENCY_BITS {
         bytes.extend_from_slice(&bits.to_le_bytes());

@@ -203,6 +203,10 @@ pub fn process_instruction(
         v2::OP_MINER_NESTED_MICRO_V2 => {
             v2::submit_miner_nested_micro(program_id, accounts, &mut cursor)
         }
+        v2::OP_STAGE_GRANITE_OUTPUT_V2 => {
+            v2::stage_granite_output(program_id, accounts, &mut cursor)
+        }
+        v2::OP_STAGE_GRANITE_BOUND_V2 => v2::stage_granite_bound(program_id, accounts, &mut cursor),
         _ => Err(QxError::InvalidEncoding.into()),
     }
 }

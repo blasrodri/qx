@@ -882,6 +882,56 @@ impl QuantizedTensor {
         output
     }
 
+    /// Matrix-vector multiplication using the fixed 32-lane reduction tree
+    /// used by the registered Granite Metal execution profile.
+    ///
+    /// Every lane consumes columns `lane + 32 * n` in ascending order, then
+    /// lane zero observes shuffle-down reductions at offsets 16, 8, 4, 2,
+    /// and 1. Keeping this reference beside quantized decoding prevents a
+    /// verifier from silently falling back to a different (serial) FP32 sum.
+    pub fn mat_vec_simd32(&self, input: &[f32]) -> Vec<f32> {
+        assert_eq!(input.len(), self.cols);
+        assert_ne!(
+            self.quant_type,
+            QuantType::Q4K,
+            "Q4K SIMD reference is not registered"
+        );
+        let groups_per_row = self.cols.div_ceil(self.group_size);
+        let mut output = Vec::with_capacity(self.rows);
+        for row in 0..self.rows {
+            let mut lanes = [0.0_f32; 32];
+            let mut remaining = self.cols;
+            let mut column = 0;
+            let mut group = 0;
+            while remaining > 0 {
+                let len = remaining.min(self.group_size);
+                let bytes = packed_len(len, self.quant_type);
+                let (data_offset, scale_offset) = self.group_location(row, group);
+                let scale = self.scales[scale_offset].to_f32();
+                let packed = &self.data[data_offset..data_offset + bytes];
+                for offset in 0..len {
+                    let logical_column = column + offset;
+                    let code = unpack_code(packed, offset, self.quant_type);
+                    let value = decode_scaled(code, scale, self.quant_type);
+                    let lane = logical_column % 32;
+                    lanes[lane] = value.mul_add(input[logical_column], lanes[lane]);
+                }
+                remaining -= len;
+                group += 1;
+                column += len;
+            }
+            for offset in [16, 8, 4, 2, 1] {
+                for lane in 0..offset {
+                    lanes[lane] += lanes[lane + offset];
+                }
+            }
+            output.push(lanes[0]);
+            debug_assert_eq!(column, self.cols);
+            debug_assert_eq!(group, groups_per_row);
+        }
+        output
+    }
+
     /// Decode one logical row without materializing the complete matrix.
     pub fn row(&self, row: usize) -> Vec<f32> {
         assert!(row < self.rows);

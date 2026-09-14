@@ -145,6 +145,18 @@ impl QuantizedExpert {
         self.down.mat_vec(&activated)
     }
 
+    /// Execute the exact fixed 32-lane reduction profile used by Granite's
+    /// registered Metal verifier path.
+    pub fn run_simd32(&self, hidden: &[f32]) -> Vec<f32> {
+        let gate_up = self.gate_up.mat_vec_simd32(hidden);
+        let intermediate = self.down.cols;
+        let mut activated = vec![0.0; intermediate];
+        for index in 0..intermediate {
+            activated[index] = silu(gate_up[index]) * gate_up[intermediate + index];
+        }
+        self.down.mat_vec_simd32(&activated)
+    }
+
     pub fn bytes(&self) -> usize {
         self.gate_up.bytes() + self.down.bytes()
     }

@@ -21,9 +21,9 @@ append, and argmax. An artifact-native CPU verifier independently reproduces
 the slashable Metal path bit-for-bit through the final receipt root.
 
 The remaining production blockers are economic settlement/data availability,
-adversarial SBF coverage, independent platform validation, and performance.
-The exact serial execution profile currently has 410.614% overhead, not the
-sub-5% target.
+broader adversarial SBF coverage, and independent platform validation. The
+registered SIMD execution profile now measures **2.465%** verifier overhead,
+below the 5% gate, with exact CPU/Metal receipt parity.
 
 ## What is implemented and checked
 
@@ -76,20 +76,25 @@ registered spec.
 
 ## Cost at massive scale
 
-The old fixed-math/fixed-RoPE runs added **2.469–4.449%** for commitment
-hashing on the optimized path. They did not include the arithmetic migration
-needed for objective replay. The completed exact profile measures **410.614%**
-overhead on the tested M5 Pro. At the mandatory 1% sampling floor with one
-auditor, replay itself adds 1% of the exact execution work, but every receipt
-currently also pays the exact-profile execution cost. Relative to optimized
-inference, the approximate network cost is therefore:
+The registered interval-2 SIMD verifier measured **2.465%** normal-path
+overhead on the tested M5 Pro (60.819 ms verified versus 59.355 ms baseline,
+31 alternating repeats). At the mandatory 1% sampling floor, one auditor
+replaying the same verified path adds about 1.025% of baseline compute. The
+approximate total network compute overhead is therefore:
 
 ```text
-(1 + 4.10614) * (1 + 0.01) - 1 = 415.72014%
+0.02465 + 0.01 * 1.02465 = 3.48965%
 ```
 
 This excludes duplicate auditors, data distribution, failed jobs, and actual
-dispute transactions. The gap is an implementation cost, not a sampling cost.
+dispute transactions. Ordinary miners do not generate micro traces; the wider
+12-register SIMD state and its Merkle proofs are paid only after disagreement.
+For packet safety, each party authenticates the output opening and two trace
+endpoints in three dispute-bound staging transactions before a small admission
+transaction. The maximum instruction payload is 640 bytes before the Solana
+transaction envelope. Measured SBF cost is 216,566 CU for the challenger
+sequence and 216,554 CU for the miner sequence, each spread across four
+transactions.
 
 The current live three-leaf synthetic SBF dispute consumes 159,352 CU. Epoch
 entropy finalization consumes 14,285 CU once per epoch; opening the challenged

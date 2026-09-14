@@ -33,9 +33,9 @@ kernel void qx_residual_rms_scalar(
     threadgroup float partials[8];
     float square_sum = 0.0f;
     for (uint i = tid; i < 1024u; i += 256u) {
-        float value = left[i] + scale * right[i];
+        float value = fma(scale, right[i], left[i]);
         output[i] = value;
-        square_sum += value * value;
+        square_sum = fma(value, value, square_sum);
     }
     square_sum = qx_ordered_simd_sum(square_sum);
     if (lane == 0u) partials[simdgroup] = square_sum;
@@ -43,7 +43,7 @@ kernel void qx_residual_rms_scalar(
     if (simdgroup == 0u) {
         float total = lane < 8u ? partials[lane] : 0.0f;
         total = qx_ordered_simd_sum(total);
-        if (lane == 0u) inverse_rms[0] = qx_consensus_rsqrt(total / 1024.0f + 1.0e-5f);
+        if (lane == 0u) inverse_rms[0] = qx_consensus_rsqrt(total / 1024.0f + 1.0e-6f);
     }
 }
 
@@ -60,10 +60,10 @@ kernel void qx_residual_rms_scalar_snapshot(
     threadgroup float partials[8];
     float square_sum = 0.0f;
     for (uint i = tid; i < 1024u; i += 256u) {
-        float value = left[i] + scale * right[i];
+        float value = fma(scale, right[i], left[i]);
         output[i] = value;
         snapshot[i] = value;
-        square_sum += value * value;
+        square_sum = fma(value, value, square_sum);
     }
     square_sum = qx_ordered_simd_sum(square_sum);
     if (lane == 0u) partials[simdgroup] = square_sum;
@@ -71,7 +71,7 @@ kernel void qx_residual_rms_scalar_snapshot(
     if (simdgroup == 0u) {
         float total = lane < 8u ? partials[lane] : 0.0f;
         total = qx_ordered_simd_sum(total);
-        if (lane == 0u) inverse_rms[0] = qx_consensus_rsqrt(total / 1024.0f + 1.0e-5f);
+        if (lane == 0u) inverse_rms[0] = qx_consensus_rsqrt(total / 1024.0f + 1.0e-6f);
     }
 }
 
@@ -173,7 +173,7 @@ kernel void qx_q4_dense_simd_gemv(
         uchar byte = packed[row * groups * bytes_per_group + group * bytes_per_group + local / 2];
         uint code = (byte >> ((local % 2) * 4)) & 0xf;
         float weight = float(int(code) - qmax) * float(scales[row * groups + group]);
-        sum += weight * input[column];
+        sum = fma(weight, input[column], sum);
     }
     sum = qx_ordered_simd_sum(sum);
     if (lane == 0) {
@@ -857,7 +857,7 @@ kernel void qx_q4_simd_norm_gemv(
         uchar byte = packed[row * groups * bytes_per_group + group * bytes_per_group + local / 2];
         uint code = (byte >> ((local % 2) * 4)) & 0xf;
         float weight = float(int(code) - qmax) * float(scales[row * groups + group]);
-        sum += weight * cached_input[column];
+        sum = fma(weight, cached_input[column], sum);
     }
     sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[row] = sum * multiplier;
@@ -1036,7 +1036,8 @@ kernel void qx_q4_qkv_simd_gemv(
         uint local = column % group_size;
         uchar byte = packed[row * groups * bytes_per_group + group * bytes_per_group + local / 2];
         uint code = (byte >> ((local % 2) * 4)) & 0xf;
-        sum += float(int(code) - 7) * float(scales[row * groups + group]) * cached_input[column];
+        float weight = float(int(code) - 7) * float(scales[row * groups + group]);
+        sum = fma(weight, cached_input[column], sum);
     }
     sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[row] = sum * multiplier;
@@ -1105,7 +1106,8 @@ kernel void qx_q4_qkv_simd_norm_gemv(
         uint local = column % group_size;
         uchar byte = packed[row * groups * bytes_per_group + group * bytes_per_group + local / 2];
         uint code = (byte >> ((local % 2) * 4)) & 0xf;
-        sum += float(int(code) - 7) * float(scales[row * groups + group]) * cached_input[column];
+        float weight = float(int(code) - 7) * float(scales[row * groups + group]);
+        sum = fma(weight, cached_input[column], sum);
     }
     sum = qx_ordered_simd_sum(sum);
     if (lane == 0) output[row] = sum * multiplier;
