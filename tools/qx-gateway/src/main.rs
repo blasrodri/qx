@@ -1529,10 +1529,13 @@ impl DodilStore {
 
     fn object_url(&self, kind: &str, key: &str) -> Result<reqwest::Url> {
         let mut url = self.bucket_url.clone();
-        url.path_segments_mut()
-            .map_err(|_| anyhow!("DODIL object endpoint cannot be a base URL"))?
-            .push(kind)
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("DODIL object endpoint cannot be a base URL"))?;
+        segments
+            .extend(kind.split('/'))
             .push(&format!("{key}.json"));
+        drop(segments);
         Ok(url)
     }
 }
