@@ -2977,9 +2977,66 @@ mod tests {
             macro_trace.final_residual_root,
             interval_outputs.last().unwrap().output_root
         );
+        // Use real complete-model outputs and prove that corruption at every
+        // registered macro family changes the slashable trace. This covers
+        // norm, dense Q/K/V/O, RoPE, KV, attention, router/Top-K/MoE and
+        // residual updates rather than a synthetic digest fixture.
+        for output_index in 0..interval_outputs.len() {
+            let mut corrupt = interval_outputs.clone();
+            corrupt[output_index].output_root[0] ^= 1;
+            let corrupt_trace = granite_macro_trace_v1(
+                VmStateV1 {
+                    job_hash: [7; 32],
+                    token_index,
+                    segment_index: 1,
+                    program_counter: 0,
+                    residual_root: start_residual,
+                    global_kv_root: [8; 32],
+                },
+                &plan.programs[1],
+                &corrupt,
+                &[[9; 32], [10; 32]],
+                None,
+            )
+            .unwrap();
+            assert_ne!(corrupt_trace.state_hashes, macro_trace.state_hashes);
+        }
         let head = trace.final_head_macro_outputs_v1().unwrap();
         assert_eq!(head.len(), 3);
         assert!(head.iter().all(|output| output.output_root != [0; 32]));
+        let head_program = granite_final_head_macro_program_v1().unwrap();
+        let head_pre = VmStateV1 {
+            job_hash: [7; 32],
+            token_index,
+            segment_index: u32::try_from(plan.programs.len()).unwrap(),
+            program_counter: 0,
+            residual_root: state_hash_v1(&canonical_f32_bytes(
+                &trace.layers.last().unwrap().output,
+            ))
+            .unwrap(),
+            global_kv_root: [8; 32],
+        };
+        let honest_head = granite_macro_trace_v1(
+            head_pre,
+            &head_program,
+            &head,
+            &[],
+            Some(argmax(&trace.logits)),
+        )
+        .unwrap();
+        for output_index in 0..head.len() {
+            let mut corrupt = head.clone();
+            corrupt[output_index].output_root[0] ^= 1;
+            let corrupt_head = granite_macro_trace_v1(
+                head_pre,
+                &head_program,
+                &corrupt,
+                &[],
+                Some(argmax(&trace.logits)),
+            )
+            .unwrap();
+            assert_ne!(corrupt_head.state_hashes, honest_head.state_hashes);
+        }
 
         let trace_one =
             |instruction: VmInstructionV1, level: GraniteMicroLevelV1, coordinates: [u32; 3]| {
@@ -3021,7 +3078,6 @@ mod tests {
             let micro = trace_one(layer_program[12], level, [0, 0, expert]);
             assert_eq!(micro.states.len(), micro.transition_count as usize + 1);
         }
-        let head_program = granite_final_head_macro_program_v1().unwrap();
         for (instruction, level) in [
             (head_program[0], GraniteMicroLevelV1::RmsSquares),
             (head_program[1], GraniteMicroLevelV1::FinalLogitDot),

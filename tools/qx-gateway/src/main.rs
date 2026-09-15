@@ -3,10 +3,10 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     str::FromStr,
-    thread,
-    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(target_os = "macos")]
+use std::{thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};

@@ -208,3 +208,18 @@ an independent reviewer reproduces the real-artifact replay and SBF terminal
 suite, reviews account aliasing and balance transitions, and signs off on the
 deployment hash. Upgrade authority and production gateway scaling are
 deliberately outside this change.
+
+The ignored complete-model gate was also run locally against the installed
+Granite checkpoint and Q4 artifact. It executes real model tensors, builds all
+layer and final-head macro/micro traces, then corrupts every registered macro
+output position in turn and requires the slashable state sequence to change.
+
+## Live economic conviction
+
+Commit `4d15a5a` was deployed to program
+`QJPMJrcmJEeLcVZdqaofF9ioCpvXYJXLVZhFhea2EiB` at devnet slot 498734508. A
+fresh live run then registered and funded a job, rooted epoch entropy, opened
+and completed the false-final-token dispute, recorded the challenger winner,
+and settled the bond/payment/collateral state in 15 confirmed transactions.
+It used 322,620 simulated CU total (299,996 after setup), 130,000 lamports in
+quoted transaction fees, and 10,480,040 lamports of recoverable account rent.
