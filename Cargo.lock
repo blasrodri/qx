@@ -3462,6 +3462,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "qx-devnet-adversary"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "qx-commit",
+ "serde",
+ "serde_json",
+ "solana-client",
+ "solana-commitment-config",
+ "solana-ed25519-program",
+ "solana-sdk",
+ "solana-sdk-ids",
+ "solana-system-interface 2.0.0",
+]
+
+[[package]]
 name = "qx-eval"
 version = "0.1.0"
 dependencies = [

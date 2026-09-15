@@ -5,6 +5,7 @@ QX_DODIL_APP=${QX_DODIL_APP:-qx-gateway-devnet}
 QX_DODIL_BUCKET=${QX_DODIL_BUCKET:-qx-gateway-devnet}
 QX_VERIFIER_PROGRAM=${QX_PROGRAM_ID:-QJPMJrcmJEeLcVZdqaofF9ioCpvXYJXLVZhFhea2EiB}
 QX_RPC_ENDPOINT=${QX_RPC_URL:-https://api.devnet.solana.com}
+QX_PUBLIC_GATEWAY_URL=${QX_DODIL_GATEWAY_URL:-https://qx-gateway-devnet-sitoula-8080.ignite.dodil.cloud}
 QX_SOURCE_COMMIT=${QX_SOURCE_COMMIT:-$(git rev-parse HEAD)}
 QX_ARCHIVE_DIRECTORY=$(mktemp -d)
 QX_SOURCE_ARCHIVE="$QX_ARCHIVE_DIRECTORY/qx-gateway.tar.gz"
@@ -36,3 +37,14 @@ dodil ignite app deploy "$QX_DODIL_APP" \
   --env "DODIL_TOKEN=secret://qx-gateway-datak3-token" \
   --description "QX permissionless inference verification gateway (Solana devnet)" \
   --follow
+
+QX_HEALTH=$(curl --fail --silent --show-error --max-time 30 \
+  "$QX_PUBLIC_GATEWAY_URL/health")
+if ! jq -e \
+  --arg program "$QX_VERIFIER_PROGRAM" \
+  '.status == "ok" and .storage == "dodil-datak3" and .program == $program' \
+  >/dev/null <<< "$QX_HEALTH"; then
+  echo "deployed gateway health response did not match its DataK3/devnet configuration" >&2
+  exit 1
+fi
+echo "event=dodil_gateway_health status=passed url=$QX_PUBLIC_GATEWAY_URL storage=dodil-datak3"

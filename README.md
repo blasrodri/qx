@@ -19,7 +19,8 @@ The canonical interval-2 Granite model registry is
 `CsUgpxaXfofqfEVS1DbTR8pcGqC4mCWXhR15kgiDoCZe`.
 Run `./scripts/run-demo.sh` for the 30-minute proof demo: it closes 30-second
 epochs, seeds each root on devnet, independently verifies and replays every
-selected job, and executes the adversarial SBF dispute suite. See
+selected job, executes the adversarial SBF dispute suite, and convicts a
+deliberately false result through real devnet transactions. See
 [DEMO.md](DEMO.md) for its exact pass criteria and evidence output.
 The [protocol description](docs/verification-protocol.md),
 [model profile](docs/verification-model-profile.md), and

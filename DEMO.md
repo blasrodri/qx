@@ -23,13 +23,14 @@ and SBF verification checks. It fails unless all of these complete:
    registered model, requester signature, sampling rule, and Merkle proof;
 6. deterministic full-model replay of every job selected by the 5% rule; and
 7. SBF execution of adversarial bisection, arithmetic conviction, and the
-   packet-safe production Granite trace admission path.
+   packet-safe production Granite trace admission path; and
+8. a live devnet dispute in which every challenger/miner turn is a confirmed
+   transaction and the final account convicts a deliberately false token.
 
-The adversarial dispute is executed against the deployable SBF binary by the
-local test harness. Automating every interactive dispute transaction between
-remote challenger and miner processes on public devnet remains separate work;
-the demo labels this evidence `adversarial_sbf` rather than claiming it is a
-live remote dispute.
+The live adversarial epoch is isolated from ordinary inference. It exercises
+the deployed job-tree, token, final-head, and argmax path. The local SBF suite
+additionally covers the exhaustive checkpoint, macro, micro-trace, weight, and
+activation terminal branches.
 
 ## Shared deployment
 
@@ -70,13 +71,16 @@ its input and output token IDs, job hash, result leaf, and trace root.
 
 Every epoch is then committed and seeded on devnet. Every 5%-selected package
 is independently verified and replayed. The command also builds the SBF
-program and executes the adversarial bisection-to-conviction tests. Missing SBF
-tooling, zero selected audits, a count mismatch, an invalid package, or any
-replay disagreement makes the command fail.
+program, executes the adversarial bisection-to-conviction tests, then drives a
+false result through the live devnet dispute state machine. Missing SBF
+tooling, zero selected audits, a count mismatch, an invalid package, any replay
+disagreement, or failure to record the challenger as the live dispute winner
+makes the command fail.
 
 Public evidence is retained under `.qx-demo-runs/<UTC timestamp>/`, including
 the complete log, closed and seeded epoch records, selected packages, replay
-results, and `summary.json`. Temporary keys and transport credentials are
+results, `devnet-adversary.json` with every transaction signature and compute
+measurement, and `summary.json`. Temporary keys and transport credentials are
 deleted and are never copied into the evidence directory.
 
 For a funded existing payer, avoiding the devnet faucet:
@@ -96,9 +100,10 @@ QX_AUDIT_PROBABILITY_PPM=1000000 \
 
 The final `event=demo_complete status=passed` line reports epochs, submitted
 and committed jobs, failures, selected audits, independently verified
-packages, matching replays, and adversarial SBF status. A full 60-epoch run
-creates approximately 0.085 SOL of devnet epoch-account rent plus transaction
-fees; use a funded devnet payer if the faucet is rate-limited.
+packages, matching replays, adversarial SBF status, and live devnet conviction
+status/CU. A full 60-epoch run creates approximately 0.085 SOL of devnet epoch
+account rent plus the isolated adversarial accounts and transaction fees; use
+a funded devnet payer if the faucet is rate-limited.
 
 ## Requirements
 
@@ -226,6 +231,15 @@ cargo test -p qx-terminal-verifier --test sbf_v2 \
 The first test covers the seeded sampling-to-conviction flow. The second checks
 that the complete Granite trace protocol fits Solana's transaction/account
 bounds and is admitted by the deployed-program build.
+
+To run only the real devnet conviction path:
+
+```bash
+cargo run --release -p qx-devnet-adversary -- \
+  --program QJPMJrcmJEeLcVZdqaofF9ioCpvXYJXLVZhFhea2EiB \
+  --payer-keypair ../qx-devnet-keys/requester.json \
+  --output devnet-adversary.json
+```
 
 To generate real devnet load as well, fund the requester with faucet SOL and
 run ten program probes:

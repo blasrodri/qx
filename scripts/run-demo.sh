@@ -12,6 +12,7 @@ QX_RPC_ENDPOINT=${QX_RPC_URL:-https://api.devnet.solana.com}
 QX_PROGRAM_ID=${QX_PROGRAM_ID:-QJPMJrcmJEeLcVZdqaofF9ioCpvXYJXLVZhFhea2EiB}
 QX_REQUIRE_SBF=${QX_DEMO_REQUIRE_SBF:-1}
 QX_REQUIRE_AUDIT=${QX_DEMO_REQUIRE_AUDIT:-1}
+QX_REQUIRE_DEVNET_ADVERSARY=${QX_DEMO_REQUIRE_DEVNET_ADVERSARY:-1}
 
 QX_SCRIPT_DIRECTORY=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 QX_REPO_ROOT=$(cd "$QX_SCRIPT_DIRECTORY/.." && pwd)
@@ -49,8 +50,10 @@ if [[ ! "$QX_AUDIT_PPM" =~ ^[0-9]+$ ]] \
   echo "QX_AUDIT_PROBABILITY_PPM must be between 10000 and 1000000" >&2
   exit 1
 fi
-if [[ ! "$QX_REQUIRE_SBF" =~ ^[01]$ || ! "$QX_REQUIRE_AUDIT" =~ ^[01]$ ]]; then
-  echo "QX_DEMO_REQUIRE_SBF and QX_DEMO_REQUIRE_AUDIT must be 0 or 1" >&2
+if [[ ! "$QX_REQUIRE_SBF" =~ ^[01]$ \
+  || ! "$QX_REQUIRE_AUDIT" =~ ^[01]$ \
+  || ! "$QX_REQUIRE_DEVNET_ADVERSARY" =~ ^[01]$ ]]; then
+  echo "QX_DEMO_REQUIRE_SBF, QX_DEMO_REQUIRE_AUDIT, and QX_DEMO_REQUIRE_DEVNET_ADVERSARY must be 0 or 1" >&2
   exit 1
 fi
 if [[ "$QX_RPC_ENDPOINT" != "https://api.devnet.solana.com" ]]; then
@@ -167,7 +170,7 @@ cd "$QX_REPO_ROOT"
 if [[ ! -f "$QX_ARTIFACT" ]]; then
   ./scripts/build-artifact.sh
 fi
-cargo build --release -p qx-gateway
+cargo build --release -p qx-gateway -p qx-devnet-adversary
 cargo test -p qx-commit -p qx-consensus-math -p qx-verifier-core -p qx-gateway
 echo "event=protocol_unit_tests status=passed"
 
@@ -412,6 +415,24 @@ if [[ -n "$QX_CARGO_BUILD_SBF" ]]; then
   echo "event=adversarial_sbf status=passed"
 fi
 
+QX_DEVNET_ADVERSARY_STATUS=not_requested
+QX_DEVNET_ADVERSARY_CU=0
+if [[ "$QX_REQUIRE_DEVNET_ADVERSARY" == 1 ]]; then
+  QX_DEVNET_ADVERSARY_EVIDENCE="$QX_EVIDENCE_DIRECTORY/devnet-adversary.json"
+  target/release/qx-devnet-adversary \
+    --program "$QX_PROGRAM_ID" \
+    --rpc-url "$QX_RPC_ENDPOINT" \
+    --payer-keypair "$QX_PAYER" \
+    --output "$QX_DEVNET_ADVERSARY_EVIDENCE"
+  QX_DEVNET_ADVERSARY_STATUS=$(jq -er '.status' "$QX_DEVNET_ADVERSARY_EVIDENCE")
+  QX_DEVNET_ADVERSARY_CU=$(jq -er '.total_simulated_compute_units' "$QX_DEVNET_ADVERSARY_EVIDENCE")
+  if [[ "$(jq -er '.winner' "$QX_DEVNET_ADVERSARY_EVIDENCE")" != challenger ]]; then
+    echo "live devnet dispute did not convict the dishonest miner" >&2
+    exit 1
+  fi
+  echo "event=adversarial_devnet status=$QX_DEVNET_ADVERSARY_STATUS winner=challenger total_simulated_compute_units=$QX_DEVNET_ADVERSARY_CU"
+fi
+
 QX_STATUS=passed
 if (( QX_FAILED != 0 \
   || QX_CLIENT_COMPLETED != QX_COMMITTED \
@@ -426,10 +447,16 @@ fi
 if [[ "$QX_REQUIRE_SBF" == 1 && "$QX_SBF_STATUS" != passed ]]; then
   QX_STATUS=failed
 fi
+if [[ "$QX_REQUIRE_DEVNET_ADVERSARY" == 1 \
+  && "$QX_DEVNET_ADVERSARY_STATUS" != passed ]]; then
+  QX_STATUS=failed
+fi
 
 jq -n \
   --arg status "$QX_STATUS" \
   --arg sbf_status "$QX_SBF_STATUS" \
+  --arg devnet_adversary_status "$QX_DEVNET_ADVERSARY_STATUS" \
+  --argjson devnet_adversary_cu "$QX_DEVNET_ADVERSARY_CU" \
   --argjson epoch_seconds "$QX_EPOCH_SECONDS" \
   --argjson epochs "$QX_EPOCH_COUNT" \
   --argjson jobs "$QX_JOBS" \
@@ -439,10 +466,10 @@ jq -n \
   --argjson selected_audits "$QX_CHALLENGES" \
   --argjson packages_verified "$QX_PACKAGES_VERIFIED" \
   --argjson replay_matches "$QX_REPLAY_MATCHES" \
-  '{status:$status, epoch_seconds:$epoch_seconds, epochs:$epochs, jobs:$jobs, completed:$completed, failed:$failed, committed:$committed, selected_audits:$selected_audits, packages_verified:$packages_verified, replay_matches:$replay_matches, adversarial_sbf:$sbf_status}' \
+  '{status:$status, epoch_seconds:$epoch_seconds, epochs:$epochs, jobs:$jobs, completed:$completed, failed:$failed, committed:$committed, selected_audits:$selected_audits, packages_verified:$packages_verified, replay_matches:$replay_matches, adversarial_sbf:$sbf_status, adversarial_devnet:$devnet_adversary_status, adversarial_devnet_simulated_cu:$devnet_adversary_cu}' \
   > "$QX_EVIDENCE_DIRECTORY/summary.json"
 
-echo "event=demo_complete status=$QX_STATUS epochs=$QX_EPOCH_COUNT epoch_seconds=$QX_EPOCH_SECONDS jobs=$QX_JOBS completed=$QX_CLIENT_COMPLETED failed=$QX_FAILED committed=$QX_COMMITTED selected_audits=$QX_CHALLENGES packages_verified=$QX_PACKAGES_VERIFIED replay_matches=$QX_REPLAY_MATCHES adversarial_sbf=$QX_SBF_STATUS"
+echo "event=demo_complete status=$QX_STATUS epochs=$QX_EPOCH_COUNT epoch_seconds=$QX_EPOCH_SECONDS jobs=$QX_JOBS completed=$QX_CLIENT_COMPLETED failed=$QX_FAILED committed=$QX_COMMITTED selected_audits=$QX_CHALLENGES packages_verified=$QX_PACKAGES_VERIFIED replay_matches=$QX_REPLAY_MATCHES adversarial_sbf=$QX_SBF_STATUS adversarial_devnet=$QX_DEVNET_ADVERSARY_STATUS adversarial_devnet_simulated_cu=$QX_DEVNET_ADVERSARY_CU"
 if [[ "$QX_STATUS" != passed ]]; then
   exit 1
 fi

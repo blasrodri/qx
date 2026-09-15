@@ -218,12 +218,43 @@ computation stay on the miner and do not consume Ignite compute.
 The current devnet deployment is available at
 <https://qx-gateway-devnet-sitoula-8080.ignite.dodil.cloud>.
 
+Its `/health` response proves that the always-on process started and that its
+startup DataK3 listing succeeded. A fresh authenticated write/read lifecycle
+additionally requires the private miner transport token. The rolling demo uses
+an isolated local gateway for that lifecycle, so it never copies a deployment
+secret into public evidence.
+
 Bind to `0.0.0.0:8787` only behind a firewall, VPN, or TLS reverse proxy. The
 read endpoints intentionally let challengers fetch selected packages. Miner
 writes require `X-QX-Miner-Token: <token>`. A custom header is required because
 DODIL Ignite reserves `Authorization: Bearer` for its own JWT authentication.
 This transport credential is not a per-job miner signature and has no protocol
 or slashing authority.
+
+### Prove a dishonest result is convicted on devnet
+
+The rolling demo creates one isolated adversarial epoch after the ordinary
+Granite workload. It commits a deliberately false output token, derives the
+epoch seed from the first produced Solana block after closure, submits both
+sides of the job-tree bisection and final-head opening, and requires the live
+program to record the challenger as winner. Every transaction signature and
+its simulated compute usage is saved to `devnet-adversary.json` in the demo
+evidence directory.
+
+To run only that live proof with a funded devnet payer:
+
+```bash
+cargo run --release -p qx-devnet-adversary -- \
+  --program QJPMJrcmJEeLcVZdqaofF9ioCpvXYJXLVZhFhea2EiB \
+  --payer-keypair ~/.config/solana/id.json \
+  --output devnet-adversary.json
+```
+
+This adversarial epoch is separate from ordinary paid work. It exercises the
+deployed production job/token/final-head dispute states without asking an
+honest miner to publish a corrupt receipt. The rolling demo also runs the
+exhaustive local SBF cases for checkpoint, macro, micro-trace, weight, and
+activation terminals.
 
 The gateway accepts these JSON resources:
 

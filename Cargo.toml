@@ -31,6 +31,7 @@ members = [
     "tools/qx-route-cache",
     "tools/qx-verify",
     "tools/qx-testnet-load",
+    "tools/qx-devnet-adversary",
     "tools/qx-gateway",
 ]
 resolver = "2"
