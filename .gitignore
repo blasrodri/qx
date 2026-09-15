@@ -15,6 +15,7 @@ __pycache__/
 .local/
 gateway-data/
 *.token
+.qx-demo-runs/
 
 # Local benchmark/autotuning output. Existing curated evidence remains tracked.
 benchmarks/results/

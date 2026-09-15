@@ -244,6 +244,21 @@ bodies; `--help` lists their exact arguments. Submit the resulting files with
 its Ed25519 signature. Result and epoch writes use the transport token because
 V2 deliberately has no miner signature per result.
 
+Once an epoch is closed, the gateway rejects new jobs and new results assigned
+to it, and no longer dispatches unfinished jobs from that epoch. Exact retries
+of records accepted before closure remain idempotent. This prevents a late
+result from being returned without inclusion in the committed epoch root.
+
+An independently operated challenger can validate a selected package against
+the live seeded epoch, registered model, requester signature, sampling rule,
+and result Merkle proof before spending compute on replay:
+
+```bash
+target/release/qx-gateway verify-challenge \
+  --package ../qx-gateway-work/challenge.json \
+  --rpc-url https://api.devnet.solana.com
+```
+
 On this Mac, the DODIL miner token is stored in Keychain. Use it without
 placing it in shell history:
 

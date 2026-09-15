@@ -72,7 +72,13 @@ QX_CURRENT_SLOT=$(curl --fail --silent --show-error \
   "$QX_RPC_ENDPOINT" | jq -er '.result')
 QX_DEADLINE_SLOT=$((QX_CURRENT_SLOT + 18000))
 
-cargo build --release -p qx-gateway
+if [[ "${QX_SKIP_GATEWAY_BUILD:-0}" != 1 ]]; then
+  cargo build --release -p qx-gateway
+fi
+if [[ ! -x target/release/qx-gateway ]]; then
+  echo "target/release/qx-gateway is unavailable" >&2
+  exit 1
+fi
 QX_CREATE_OUTPUT=$(target/release/qx-gateway create-job \
   --program "$QX_PROGRAM_ID" \
   --requester-keypair "$QX_REQUESTER_KEYPAIR" \

@@ -12,18 +12,24 @@ value.
 
 ## What the demo proves
 
-The live two-machine path demonstrates:
+The one-command proof demo runs requester, gateway, miner, challenger, devnet,
+and SBF verification checks. It fails unless all of these complete:
 
-1. requester-signed job creation and gateway validation;
-2. authenticated job delivery to the assigned miner;
-3. full Granite inference from the committed `.qx` artifact;
-4. generation of output token IDs and the verification trace root; and
-5. retrieval of the miner's provisional result by the requester.
+1. requester-signed job creation and authenticated miner delivery;
+2. full Granite inference and committed output/trace generation;
+3. immutable 30-second local epochs with no late-result inclusion race;
+4. epoch-root submission and successor-block seeding on Solana devnet;
+5. independent validation of every selected package against its devnet epoch,
+   registered model, requester signature, sampling rule, and Merkle proof;
+6. deterministic full-model replay of every job selected by the 5% rule; and
+7. SBF execution of adversarial bisection, arithmetic conviction, and the
+   packet-safe production Granite trace admission path.
 
-The repository's SBF tests separately execute the complete adversarial path:
-successor-block epoch entropy, sampling, unsigned-result attribution,
-interactive bisection, and objective arithmetic conviction. The remote demo
-does not yet automate all challenger turns, collateral, or rewards.
+The adversarial dispute is executed against the deployable SBF binary by the
+local test harness. Automating every interactive dispute transaction between
+remote challenger and miner processes on public devnet remains separate work;
+the demo labels this evidence `adversarial_sbf` rather than claiming it is a
+live remote dispute.
 
 ## Shared deployment
 
@@ -47,7 +53,7 @@ solana program show QJPMJrcmJEeLcVZdqaofF9ioCpvXYJXLVZhFhea2EiB \
   --url https://api.devnet.solana.com
 ```
 
-## Run the 30-minute demo
+## Run the 30-minute proof demo
 
 From a clean clone on an Apple Silicon Mac, run:
 
@@ -57,12 +63,21 @@ From a clean clone on an Apple Silicon Mac, run:
 
 It builds the artifact when needed, creates temporary demo identities, uses
 the configured Solana payer (or funds a temporary one from the devnet faucet),
-and then runs jobs continuously for 30 minutes. Every job prints its input and
-output token IDs, job hash, result leaf, and trace root. At the end it closes
-the epoch, commits and seeds it on Solana devnet, prints every job selected by
-the 5% audit rule and its Merkle proof size, and replays every selected job. If
-`cargo-build-sbf` is available, it also runs the adversarial
-bisection-to-conviction test.
+and runs 60 consecutive 30-second job epochs. Collection windows are closed
+locally every 30 seconds; their devnet submission and replay happen afterward
+so RPC confirmation latency cannot stretch the epoch cadence. Every job prints
+its input and output token IDs, job hash, result leaf, and trace root.
+
+Every epoch is then committed and seeded on devnet. Every 5%-selected package
+is independently verified and replayed. The command also builds the SBF
+program and executes the adversarial bisection-to-conviction tests. Missing SBF
+tooling, zero selected audits, a count mismatch, an invalid package, or any
+replay disagreement makes the command fail.
+
+Public evidence is retained under `.qx-demo-runs/<UTC timestamp>/`, including
+the complete log, closed and seeded epoch records, selected packages, replay
+results, and `summary.json`. Temporary keys and transport credentials are
+deleted and are never copied into the evidence directory.
 
 For a funded existing payer, avoiding the devnet faucet:
 
@@ -70,14 +85,20 @@ For a funded existing payer, avoiding the devnet faucet:
 QX_PAYER_KEYPAIR=../qx-devnet-keys/payer.json ./scripts/run-demo.sh
 ```
 
-For a short smoke run, override the duration:
+For a one-epoch smoke run, select every job so the audit requirement is still
+exercised:
 
 ```bash
-QX_DEMO_DURATION_SECONDS=30 ./scripts/run-demo.sh
+QX_DEMO_DURATION_SECONDS=30 \
+QX_AUDIT_PROBABILITY_PPM=1000000 \
+./scripts/run-demo.sh
 ```
 
-The final `event=demo_complete` line reports submitted jobs, completed jobs,
-failures, selected audits, matching replays, and adversarial-test status.
+The final `event=demo_complete status=passed` line reports epochs, submitted
+and committed jobs, failures, selected audits, independently verified
+packages, matching replays, and adversarial SBF status. A full 60-epoch run
+creates approximately 0.085 SOL of devnet epoch-account rent plus transaction
+fees; use a funded devnet payer if the faucet is rate-limited.
 
 ## Requirements
 

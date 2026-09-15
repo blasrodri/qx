@@ -10,13 +10,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use qx_commit::{
-    D_BATCH, HashAlgorithm, JobEnvelopeV1, JobPayloadV1, MerkleTree, ResultLeafV1,
+    D_BATCH, HashAlgorithm, JobEnvelopeV1, JobPayloadV1, MerkleProof, MerkleTree, ResultLeafV1,
     audit_selected_v1, input_hash_v1, output_hash_v1,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use solana_client::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{
+    account::Account,
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::{Keypair, Signer, read_keypair_file, write_keypair_file},
@@ -169,6 +170,13 @@ enum Command {
         #[arg(long)]
         epoch_account: String,
     },
+    /// Independently verify a selected package against its devnet epoch.
+    VerifyChallenge {
+        #[arg(long)]
+        package: PathBuf,
+        #[arg(long, default_value = "https://api.devnet.solana.com")]
+        rpc_url: String,
+    },
 }
 
 #[derive(Clone)]
@@ -285,7 +293,7 @@ struct EpochRecord {
     onchain: Option<OnchainEpoch>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ChallengePackage {
     epoch: u64,
     epoch_account: String,
@@ -454,6 +462,7 @@ fn main() -> Result<()> {
             payer_keypair,
             epoch_account,
         } => finalize_epoch(&program, &rpc_url, &payer_keypair, &epoch_account)?,
+        Command::VerifyChallenge { package, rpc_url } => verify_challenge(&package, &rpc_url)?,
     }
     Ok(())
 }
@@ -788,8 +797,23 @@ fn submit_epoch(
             &program,
         )),
     }
-    if rpc.get_account(&epoch.pubkey()).is_ok() {
-        bail!("epoch account already exists; use a fresh epoch keypair path");
+    if let Ok(account) = rpc.get_account(&epoch.pubkey()) {
+        let phase = matching_epoch_phase(&account, &program, &record)?;
+        print_epoch_submission(
+            &program,
+            &record,
+            &epoch.pubkey(),
+            &miner.pubkey(),
+            None,
+            miner_created,
+            epoch_created,
+            if phase == 2 {
+                "already_seeded"
+            } else {
+                "already_submitted"
+            },
+        );
+        return Ok(());
     }
     instructions.push(create_account(
         &payer.pubkey(),
@@ -818,16 +842,40 @@ fn submit_epoch(
         &[&payer, &miner, &epoch],
         blockhash,
     );
-    let signature = rpc.send_and_confirm_transaction(&transaction)?;
-    println!("program={program}");
-    println!("epoch={epoch_number}");
-    println!("epoch_account={}", epoch.pubkey());
-    println!("miner_account={}", miner.pubkey());
-    println!("result_root={}", record.result_root_hex);
-    println!("result_count={}", record.result_count);
-    println!("signature={signature}");
-    println!("miner_keypair_created={miner_created}");
-    println!("epoch_keypair_created={epoch_created}");
+    let signature = match rpc.send_and_confirm_transaction(&transaction) {
+        Ok(signature) => signature,
+        Err(error) => {
+            if let Ok(account) = rpc.get_account(&epoch.pubkey()) {
+                let phase = matching_epoch_phase(&account, &program, &record)?;
+                print_epoch_submission(
+                    &program,
+                    &record,
+                    &epoch.pubkey(),
+                    &miner.pubkey(),
+                    None,
+                    miner_created,
+                    epoch_created,
+                    if phase == 2 {
+                        "recovered_seeded"
+                    } else {
+                        "recovered_submitted"
+                    },
+                );
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    print_epoch_submission(
+        &program,
+        &record,
+        &epoch.pubkey(),
+        &miner.pubkey(),
+        Some(&signature.to_string()),
+        miner_created,
+        epoch_created,
+        "submitted",
+    );
     Ok(())
 }
 
@@ -836,6 +884,12 @@ fn finalize_epoch(program: &str, rpc_url: &str, payer_path: &Path, epoch: &str) 
     let epoch = Pubkey::from_str(epoch).context("invalid epoch account public key")?;
     let payer = read_keypair(payer_path, "payer")?;
     let rpc = RpcClient::new_with_commitment(rpc_url.to_owned(), CommitmentConfig::confirmed());
+    if epoch_phase(&rpc.get_account(&epoch)?, &program)? == 2 {
+        println!("program={program}");
+        println!("epoch_account={epoch}");
+        println!("finalization_status=already_seeded");
+        return Ok(());
+    }
     let instruction =
         Instruction::new_with_bytes(program, &[10], vec![AccountMeta::new(epoch, false)]);
     let blockhash = rpc.get_latest_blockhash()?;
@@ -845,11 +899,183 @@ fn finalize_epoch(program: &str, rpc_url: &str, payer_path: &Path, epoch: &str) 
         &[&payer],
         blockhash,
     );
-    let signature = rpc.send_and_confirm_transaction(&transaction)?;
+    let signature = match rpc.send_and_confirm_transaction(&transaction) {
+        Ok(signature) => signature,
+        Err(error) => {
+            if rpc
+                .get_account(&epoch)
+                .ok()
+                .and_then(|account| epoch_phase(&account, &program).ok())
+                == Some(2)
+            {
+                println!("program={program}");
+                println!("epoch_account={epoch}");
+                println!("finalization_status=recovered_seeded");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
     println!("program={program}");
     println!("epoch_account={epoch}");
     println!("signature={signature}");
+    println!("finalization_status=seeded");
     Ok(())
+}
+
+fn verify_challenge(path: &Path, rpc_url: &str) -> Result<()> {
+    let package: ChallengePackage = read_json_file(path)?;
+    let payload_bytes = decode_hex_exact(
+        &package.payload_hex,
+        JobPayloadV1::CANONICAL_SIZE,
+        "payload_hex",
+    )?;
+    let payload = JobPayloadV1::from_canonical_bytes(&payload_bytes)?;
+    let envelope = JobEnvelopeV1 {
+        header: payload,
+        input_tokens: package.input_tokens.clone(),
+    };
+    envelope.validate()?;
+    let job_hash = payload.hash()?;
+    let signature_bytes = decode_hex_exact(
+        &package.requester_signature_hex,
+        64,
+        "requester_signature_hex",
+    )?;
+    VerifyingKey::from_bytes(&payload.requester)?
+        .verify(&job_hash, &Signature::from_slice(&signature_bytes)?)?;
+
+    let result_bytes = decode_hex_exact(
+        &package.result_hex,
+        ResultLeafV1::CANONICAL_SIZE,
+        "result_hex",
+    )?;
+    let result = ResultLeafV1::from_canonical_bytes(&result_bytes)?;
+    if result.job_hash != job_hash
+        || result.output_hash != output_hash_v1(&package.output_tokens)?
+        || result.output_token_count as usize != package.output_tokens.len()
+        || payload
+            .input_token_count
+            .checked_add(result.output_token_count)
+            != Some(result.trace_length)
+        || payload.assigned_epoch != package.epoch
+        || encode_hex(&payload.model_registry) != package.model_registry_hex
+    {
+        bail!("challenge package job/result binding is invalid");
+    }
+
+    let siblings = package
+        .result_proof_siblings_hex
+        .iter()
+        .map(|value| decode_32(value, "result proof sibling"))
+        .collect::<Result<Vec<_>>>()?;
+    let proof = MerkleProof {
+        leaf_index: package.leaf_index,
+        leaf_count: package.leaf_count,
+        siblings,
+    };
+    let result_root = decode_32(&package.result_root_hex, "result root")?;
+    if !proof.verify(
+        HashAlgorithm::Sha256V1,
+        D_BATCH,
+        result.hash()?,
+        result_root,
+    )? {
+        bail!("challenge package result proof is invalid");
+    }
+    let seed = decode_32(&package.audit_seed_hex, "audit seed")?;
+    if !audit_selected_v1(
+        &seed,
+        package.epoch,
+        package.leaf_index,
+        &job_hash,
+        payload.audit_probability_ppm,
+    )? {
+        bail!("job was not selected by the committed audit rule");
+    }
+
+    let program = Pubkey::new_from_array(payload.protocol_instance);
+    let epoch = Pubkey::from_str(&package.epoch_account).context("invalid epoch account")?;
+    let rpc = RpcClient::new_with_commitment(rpc_url.to_owned(), CommitmentConfig::confirmed());
+    let epoch_account = rpc.get_account(&epoch)?;
+    if epoch_phase(&epoch_account, &program)? != 2
+        || read_u64(&epoch_account.data, 8)? != package.epoch
+        || read_32(&epoch_account.data, 16)? != payload.assigned_miner
+        || read_32(&epoch_account.data, 48)? != result_root
+        || read_u32(&epoch_account.data, 80)? != package.leaf_count
+        || read_32(&epoch_account.data, 104)? != seed
+    {
+        bail!("challenge package does not match its seeded epoch account");
+    }
+    let model = Pubkey::new_from_array(payload.model_registry);
+    let model_account = rpc.get_account(&model)?;
+    if model_account.owner != program
+        || model_account.data.len() != 156
+        || model_account.data.get(..4) != Some(b"QXM1")
+        || model_account.data.get(4..36) != Some(payload.model_id.as_slice())
+        || model_account.data.get(72..104) != Some(payload.execution_spec.as_slice())
+    {
+        bail!("challenge package does not match its registered model");
+    }
+
+    println!("challenge_package_status=verified");
+    println!("epoch={}", package.epoch);
+    println!("epoch_account={epoch}");
+    println!("job_hash={}", encode_hex(&job_hash));
+    println!("leaf_index={}", package.leaf_index);
+    println!("leaf_count={}", package.leaf_count);
+    println!("proof_nodes={}", proof.siblings.len());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_epoch_submission(
+    program: &Pubkey,
+    record: &EpochRecord,
+    epoch: &Pubkey,
+    miner: &Pubkey,
+    signature: Option<&str>,
+    miner_created: bool,
+    epoch_created: bool,
+    status: &str,
+) {
+    println!("program={program}");
+    println!("epoch={}", record.epoch);
+    println!("epoch_account={epoch}");
+    println!("miner_account={miner}");
+    println!("result_root={}", record.result_root_hex);
+    println!("result_count={}", record.result_count);
+    if let Some(signature) = signature {
+        println!("signature={signature}");
+    }
+    println!("submission_status={status}");
+    println!("miner_keypair_created={miner_created}");
+    println!("epoch_keypair_created={epoch_created}");
+}
+
+fn epoch_phase(account: &Account, program: &Pubkey) -> Result<u8> {
+    if account.owner != *program || account.data.len() != EPOCH_ACCOUNT_BYTES {
+        bail!("epoch account has the wrong owner or size");
+    }
+    if account.data.get(..4) != Some(b"QXE2") {
+        bail!("epoch account has invalid magic");
+    }
+    match account.data[4] {
+        phase @ (1 | 2) => Ok(phase),
+        phase => bail!("epoch account has unsupported phase {phase}"),
+    }
+}
+
+fn matching_epoch_phase(account: &Account, program: &Pubkey, record: &EpochRecord) -> Result<u8> {
+    let phase = epoch_phase(account, program)?;
+    if read_u64(&account.data, 8)? != record.epoch
+        || encode_hex(&read_32(&account.data, 16)?) != record.miner_pubkey_hex
+        || encode_hex(&read_32(&account.data, 48)?) != record.result_root_hex
+        || read_u32(&account.data, 80)? != record.result_count
+    {
+        bail!("existing epoch account does not match the local manifest");
+    }
+    Ok(phase)
 }
 
 fn read_keypair(path: &Path, label: &str) -> Result<Keypair> {
@@ -1025,6 +1251,14 @@ impl App {
                 return Err(HttpError::new(409, "conflicting job already exists"));
             }
         } else {
+            if self
+                .store
+                .get::<EpochRecord>(EPOCHS, &record.assigned_epoch.to_string())
+                .map_err(HttpError::internal)?
+                .is_some()
+            {
+                return Err(HttpError::new(409, "assigned epoch is already closed"));
+            }
             self.store
                 .put_if_absent(JOBS, &job_hash_hex, &record)
                 .map_err(HttpError::internal)?;
@@ -1064,7 +1298,14 @@ impl App {
                 .is_none()
             {
                 let job: JobRecord = self.record(JOBS, &index_record.job_hash_hex)?;
-                jobs.push(job);
+                if self
+                    .store
+                    .get::<EpochRecord>(EPOCHS, &job.assigned_epoch.to_string())
+                    .map_err(HttpError::internal)?
+                    .is_none()
+                {
+                    jobs.push(job);
+                }
             }
         }
         jobs.sort_by_key(|job| {
@@ -1133,6 +1374,14 @@ impl App {
                 return Err(HttpError::new(409, "conflicting result already exists"));
             }
         } else {
+            if self
+                .store
+                .get::<EpochRecord>(EPOCHS, &job.assigned_epoch.to_string())
+                .map_err(HttpError::internal)?
+                .is_some()
+            {
+                return Err(HttpError::new(409, "assigned epoch is already closed"));
+            }
             self.store
                 .put_if_absent(RESULTS, &job_hash_hex, &record)
                 .map_err(HttpError::internal)?;
@@ -1801,6 +2050,41 @@ mod tests {
     }
 
     #[test]
+    fn existing_epoch_recovery_requires_the_exact_manifest() {
+        let program = Pubkey::new_unique();
+        let miner = Pubkey::new_unique();
+        let root = [7; 32];
+        let record = EpochRecord {
+            epoch: 42,
+            miner_pubkey_hex: encode_hex(miner.as_ref()),
+            result_root_hex: encode_hex(&root),
+            result_count: 9,
+            result_job_hashes: Vec::new(),
+            onchain: None,
+        };
+        let mut account = Account {
+            lamports: 0,
+            data: vec![0; EPOCH_ACCOUNT_BYTES],
+            owner: program,
+            executable: false,
+            rent_epoch: 0,
+        };
+        account.data[..4].copy_from_slice(b"QXE2");
+        account.data[4] = 2;
+        account.data[8..16].copy_from_slice(&record.epoch.to_le_bytes());
+        account.data[16..48].copy_from_slice(miner.as_ref());
+        account.data[48..80].copy_from_slice(&root);
+        account.data[80..84].copy_from_slice(&record.result_count.to_le_bytes());
+        assert_eq!(
+            matching_epoch_phase(&account, &program, &record).unwrap(),
+            2
+        );
+
+        account.data[80..84].copy_from_slice(&10_u32.to_le_bytes());
+        assert!(matching_epoch_phase(&account, &program, &record).is_err());
+    }
+
+    #[test]
     fn signed_job_to_selected_challenge_package_round_trip() {
         let directory = std::env::temp_dir().join(format!(
             "qx-gateway-test-{}-{}",
@@ -1869,6 +2153,17 @@ mod tests {
         );
         let pending = app.pending_jobs(&miner.to_string()).unwrap();
         assert!(pending["jobs"].as_array().unwrap().is_empty());
+
+        let mut late_payload = payload;
+        late_payload.job_id = [2; 32];
+        late_payload.nonce = 2;
+        let late_hash = late_payload.hash().unwrap();
+        app.put_job(JobSubmission {
+            payload_hex: encode_hex(&late_payload.canonical_bytes().unwrap()),
+            input_tokens: vec![1, 2, 3],
+            requester_signature_hex: encode_hex(&signing.sign(&late_hash).to_bytes()),
+        })
+        .unwrap();
         app.close_epoch(
             9,
             CloseEpochRequest {
@@ -1876,6 +2171,39 @@ mod tests {
             },
         )
         .unwrap();
+        let pending = app.pending_jobs(&miner.to_string()).unwrap();
+        assert!(pending["jobs"].as_array().unwrap().is_empty());
+        let late_output = vec![6, 7];
+        let late_result = ResultLeafV1 {
+            job_hash: late_hash,
+            output_hash: output_hash_v1(&late_output).unwrap(),
+            trace_root: [10; 32],
+            output_token_count: 2,
+            trace_length: 5,
+        };
+        let error = app
+            .put_result(ResultSubmission {
+                result_hex: encode_hex(&late_result.canonical_bytes()),
+                output_tokens: late_output,
+            })
+            .unwrap_err();
+        assert_eq!(error.status, 409);
+        assert_eq!(error.message, "assigned epoch is already closed");
+
+        let mut post_close_payload = late_payload;
+        post_close_payload.job_id = [3; 32];
+        post_close_payload.nonce = 3;
+        let post_close_hash = post_close_payload.hash().unwrap();
+        let error = app
+            .put_job(JobSubmission {
+                payload_hex: encode_hex(&post_close_payload.canonical_bytes().unwrap()),
+                input_tokens: vec![1, 2, 3],
+                requester_signature_hex: encode_hex(&signing.sign(&post_close_hash).to_bytes()),
+            })
+            .unwrap_err();
+        assert_eq!(error.status, 409);
+        assert_eq!(error.message, "assigned epoch is already closed");
+
         let mut epoch: EpochRecord = app.store.get(EPOCHS, "9").unwrap().unwrap();
         epoch.onchain = Some(OnchainEpoch {
             epoch_account: Pubkey::new_unique().to_string(),

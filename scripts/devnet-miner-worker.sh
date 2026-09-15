@@ -51,8 +51,14 @@ if [[ $(wc -c < "$QX_AUTH_HEADER_FILE") -lt 54 ]]; then
   exit 1
 fi
 
-cargo build --release -p qx-gateway
+if [[ "${QX_SKIP_GATEWAY_BUILD:-0}" != 1 ]]; then
+  cargo build --release -p qx-gateway
+fi
 QX_GATEWAY_BINARY=target/release/qx-gateway
+if [[ ! -x "$QX_GATEWAY_BINARY" ]]; then
+  echo "$QX_GATEWAY_BINARY is unavailable" >&2
+  exit 1
+fi
 
 echo "gateway=$QX_GATEWAY_ENDPOINT"
 echo "miner=$QX_MINER_PUBKEY"
