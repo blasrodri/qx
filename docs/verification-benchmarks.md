@@ -1,5 +1,18 @@
 # QX verification benchmark report
 
+## 2026-09-15 compact-witness result
+
+The production interval-2 run now includes serialization of every compact
+QXW1 token/checkpoint preimage needed for a later dispute. Across nine paired
+runs on the installed 716 MB Granite artifact, baseline was 112.014 ms and the
+verified path was 114.895 ms: **2.572% miner overhead**. The witness was 32,286
+bytes for 23 executed tokens, or **1,403.739 bytes/token**. Output tokens and
+the trace root were stable and the `<5%` gate passed.
+
+With the configured 5% epoch sample, auditor replay contributes approximately
+5.129% of baseline inference compute, for approximately **7.701% total network
+compute overhead**. This replay work is paid by challengers, not every miner.
+
 ## Current full-verifier measurement
 
 The earlier results below isolate commitment hashing or compare arithmetic

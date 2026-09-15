@@ -16,13 +16,14 @@ use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 
 const EPOCH_BYTES: usize = 152;
+const JOB_BYTES: usize = 323;
 const DISPUTE_BYTES: usize = 768;
 const STAGED_BYTES: usize = 64;
 const STAGED_KV_BYTES: usize = 144;
 const STAGED_SCALAR_BYTES: usize = 104;
 const STAGED_ARGMAX_BYTES: usize = 108;
 const STAGED_GRANITE_BOUND_BYTES: usize = 152;
-const MINER_BYTES: usize = 16;
+const MINER_BYTES: usize = 24;
 const MODEL_BYTES: usize = 156;
 const WEIGHT_LEAVES: u32 = 41_755_744;
 
@@ -816,6 +817,228 @@ fn fixed_exp_scalar_transition_convicts_wrong_miner_on_sbf() {
             + miner.compute_units_consumed
             + resolved.compute_units_consumed
     );
+}
+
+#[test]
+fn epoch_entropy_requires_rooting_and_has_permissionless_expiry() {
+    let f = Fixture::new();
+    let mut vm = f.vm();
+    vm.sysvars.clock.slot = 100;
+    let (_model, epoch, _) = f.register(&mut vm);
+
+    vm.sysvars.clock.slot = 102;
+    let mut live_hashes = (0..solana_slot_hashes::MAX_ENTRIES as u64)
+        .map(|slot| (slot, Hash::default()))
+        .collect::<Vec<_>>();
+    live_hashes[101] = (101, Hash::new_from_array(f.entropy));
+    vm.sysvars.slot_hashes = solana_slot_hashes::SlotHashes::new(&live_hashes);
+    let premature = vm.process_instruction(
+        &f.ix(10, vec![AccountMeta::new(f.epoch, false)], &[]),
+        &[(f.epoch, epoch.clone())],
+    );
+    assert!(premature.program_result.is_err());
+
+    vm.sysvars.clock.slot = 800;
+    let expired_hashes = (200..200 + solana_slot_hashes::MAX_ENTRIES as u64)
+        .map(|slot| (slot, Hash::default()))
+        .collect::<Vec<_>>();
+    vm.sysvars.slot_hashes = solana_slot_hashes::SlotHashes::new(&expired_hashes);
+    let expired = vm.process_instruction(
+        &f.ix(60, vec![AccountMeta::new(f.epoch, false)], &[]),
+        &[(f.epoch, epoch)],
+    );
+    assert_ok(&expired.program_result);
+    let epoch = account(&expired.resulting_accounts, f.epoch);
+    assert_eq!(epoch.data[4], 3);
+    assert_eq!(&epoch.data[96..144], &[0; 48]);
+
+    let cannot_seed = vm.process_instruction(
+        &f.ix(10, vec![AccountMeta::new(f.epoch, false)], &[]),
+        &[(f.epoch, epoch)],
+    );
+    assert!(cannot_seed.program_result.is_err());
+}
+
+#[test]
+fn challenger_win_slashes_and_settles_exactly_once() {
+    let f = Fixture::new();
+    let vm = f.vm();
+    let requester = Pubkey::new_from_array(f.requester_signing.verifying_key().to_bytes());
+    let exposure = f.job.slashable_exposure;
+    let payment = f.job.payment;
+    let mut job = f.locked_job_account();
+    job.data[314] = 2;
+    let job_before = job.lamports;
+    let mut miner = funded_owned(MINER_BYTES, f.program, 20_000_000);
+    miner.data[..4].copy_from_slice(b"QXR2");
+    miner.data[16..24].copy_from_slice(&exposure.to_le_bytes());
+    let miner_before = miner.lamports;
+    let mut dispute = funded_owned(DISPUTE_BYTES, f.program, 10_000_000);
+    dispute.data[..4].copy_from_slice(b"QXD2");
+    dispute.data[4] = 8;
+    dispute.data[5] = 2;
+    dispute.data[72..104].copy_from_slice(&f.job.hash().unwrap());
+    dispute.data[104..136].copy_from_slice(f.miner.as_ref());
+    dispute.data[136..168].copy_from_slice(f.challenger.as_ref());
+    let dispute_before = dispute.lamports;
+    let ix = f.ix(
+        61,
+        vec![
+            AccountMeta::new(f.job_account, false),
+            AccountMeta::new(f.miner, false),
+            AccountMeta::new(f.dispute, false),
+            AccountMeta::new(requester, false),
+            AccountMeta::new(f.challenger, false),
+        ],
+        &[],
+    );
+    let settled = vm.process_instruction(
+        &ix,
+        &[
+            (f.job_account, job),
+            (f.miner, miner),
+            (f.dispute, dispute),
+            (requester, Account::default()),
+            (f.challenger, Account::default()),
+        ],
+    );
+    assert_ok(&settled.program_result);
+    assert_eq!(settled.get_account(&f.job_account).unwrap().data[314], 3);
+    assert_eq!(
+        u64::from_le_bytes(
+            settled.get_account(&f.miner).unwrap().data[16..24]
+                .try_into()
+                .unwrap()
+        ),
+        0
+    );
+    assert_eq!(
+        settled.get_account(&f.miner).unwrap().lamports,
+        miner_before - exposure
+    );
+    assert_eq!(
+        settled.get_account(&f.dispute).unwrap().lamports,
+        dispute_before - exposure
+    );
+    assert_eq!(
+        settled.get_account(&f.job_account).unwrap().lamports,
+        job_before - payment
+    );
+    assert_eq!(settled.get_account(&requester).unwrap().lamports, payment);
+    assert_eq!(
+        settled.get_account(&f.challenger).unwrap().lamports,
+        exposure * 2
+    );
+
+    let replay = vm.process_instruction(
+        &ix,
+        &[
+            (
+                f.job_account,
+                settled.get_account(&f.job_account).unwrap().clone(),
+            ),
+            (f.miner, settled.get_account(&f.miner).unwrap().clone()),
+            (f.dispute, settled.get_account(&f.dispute).unwrap().clone()),
+            (requester, settled.get_account(&requester).unwrap().clone()),
+            (
+                f.challenger,
+                settled.get_account(&f.challenger).unwrap().clone(),
+            ),
+        ],
+    );
+    assert!(replay.program_result.is_err());
+}
+
+#[test]
+fn job_registration_reserves_collateral_and_escrows_payment() {
+    let f = Fixture::new();
+    let mut vm = f.vm();
+    vm.sysvars.clock.slot = 100;
+    let (model, _epoch, _) = f.register(&vm);
+    let requester = Pubkey::new_from_array(f.requester_signing.verifying_key().to_bytes());
+    let job = funded_owned(JOB_BYTES, f.program, 10_000_000);
+    let miner = funded_owned(MINER_BYTES, f.program, 10_000_000);
+    let registered = vm.process_instruction(
+        &f.ix(
+            8,
+            vec![
+                AccountMeta::new(f.job_account, true),
+                AccountMeta::new_readonly(requester, true),
+                AccountMeta::new_readonly(f.model, false),
+                AccountMeta::new(f.miner, false),
+            ],
+            &f.job.canonical_bytes().unwrap(),
+        ),
+        &[
+            (f.job_account, job),
+            (requester, Account::default()),
+            (f.model, model),
+            (f.miner, miner),
+        ],
+    );
+    assert_ok(&registered.program_result);
+    let job = registered.get_account(&f.job_account).unwrap();
+    let miner = registered.get_account(&f.miner).unwrap();
+    assert_eq!(job.data[314], 1);
+    assert_eq!(
+        u64::from_le_bytes(miner.data[16..24].try_into().unwrap()),
+        f.job.slashable_exposure
+    );
+}
+
+#[test]
+fn undisputed_result_pays_miner_and_releases_exposure_once() {
+    let f = Fixture::new();
+    let mut vm = f.vm();
+    let (_model, epoch, _) = f.seeded_epoch(&mut vm);
+    vm.sysvars.clock.slot = 300_000;
+    let job = f.locked_job_account();
+    let mut miner = funded_owned(MINER_BYTES, f.program, 20_000_000);
+    miner.data[..4].copy_from_slice(b"QXR2");
+    miner.data[16..24].copy_from_slice(&f.job.slashable_exposure.to_le_bytes());
+    let miner_before = miner.lamports;
+    let proof = f.results.proof(0).unwrap();
+    let mut body = f.result.canonical_bytes().to_vec();
+    append_proof(&mut body, &proof);
+    let ix = f.ix(
+        62,
+        vec![
+            AccountMeta::new_readonly(f.epoch, false),
+            AccountMeta::new(f.job_account, false),
+            AccountMeta::new(f.miner, false),
+        ],
+        &body,
+    );
+    let settled = vm.process_instruction(
+        &ix,
+        &[(f.epoch, epoch), (f.job_account, job), (f.miner, miner)],
+    );
+    assert_ok(&settled.program_result);
+    assert_eq!(settled.get_account(&f.job_account).unwrap().data[314], 3);
+    assert_eq!(
+        settled.get_account(&f.miner).unwrap().lamports,
+        miner_before + f.job.payment
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            settled.get_account(&f.miner).unwrap().data[16..24]
+                .try_into()
+                .unwrap()
+        ),
+        0
+    );
+    let replay = vm.process_instruction(
+        &ix,
+        &[
+            (f.epoch, settled.get_account(&f.epoch).unwrap().clone()),
+            (
+                f.job_account,
+                settled.get_account(&f.job_account).unwrap().clone(),
+            ),
+            (f.miner, settled.get_account(&f.miner).unwrap().clone()),
+        ],
+    );
+    assert!(replay.program_result.is_err());
 }
 
 #[test]
@@ -1935,7 +2158,7 @@ fn sbf_timeout_awards_the_other_party_for_each_turn() {
     let mut vm = challenger_due.vm();
     let (model, epoch, _) = challenger_due.seeded_epoch(&mut vm);
     let (dispute, _) = challenger_due.open(&vm, epoch, model);
-    vm.sysvars.clock.slot = 1_303;
+    vm.sysvars.clock.slot = 1_334;
     let timed_out = vm.process_instruction(
         &challenger_due.ix(
             20,
@@ -1956,7 +2179,7 @@ fn sbf_timeout_awards_the_other_party_for_each_turn() {
     let (mut dispute, _) = miner_due.open(&vm, epoch, model);
     dispute.data[7] = 3;
     let (dispute, _) = miner_due.bounds(&vm, dispute, true);
-    vm.sysvars.clock.slot = 1_303;
+    vm.sysvars.clock.slot = 1_334;
     let timed_out = vm.process_instruction(
         &miner_due.ix(20, vec![AccountMeta::new(miner_due.dispute, false)], &[]),
         &[(miner_due.dispute, dispute)],
@@ -1978,7 +2201,11 @@ fn sbf_rejects_a_result_that_epoch_sampling_did_not_select() {
         &[
             (f.epoch, epoch),
             (f.model, model),
-            (f.dispute, owned(DISPUTE_BYTES, f.program)),
+            (f.job_account, f.locked_job_account()),
+            (
+                f.dispute,
+                funded_owned(DISPUTE_BYTES, f.program, 10_000_000),
+            ),
             (f.challenger, Account::default()),
             ed25519_program_account(),
         ],
@@ -2003,7 +2230,11 @@ fn sbf_rejects_forged_job_authorization() {
         &[
             (f.epoch, epoch),
             (f.model, model),
-            (f.dispute, owned(DISPUTE_BYTES, f.program)),
+            (f.job_account, f.locked_job_account()),
+            (
+                f.dispute,
+                funded_owned(DISPUTE_BYTES, f.program, 10_000_000),
+            ),
             (f.challenger, Account::default()),
             ed25519_program_account(),
         ],
@@ -2877,7 +3108,11 @@ fn sbf_rejects_result_trace_length_inconsistent_with_job_shape() {
         &[
             (f.epoch, epoch),
             (f.model, model),
-            (f.dispute, owned(DISPUTE_BYTES, f.program)),
+            (f.job_account, f.locked_job_account()),
+            (
+                f.dispute,
+                funded_owned(DISPUTE_BYTES, f.program, 10_000_000),
+            ),
             (f.challenger, Account::default()),
             ed25519_program_account(),
         ],
@@ -2889,6 +3124,7 @@ struct Fixture {
     program: Pubkey,
     model: Pubkey,
     epoch: Pubkey,
+    job_account: Pubkey,
     dispute: Pubkey,
     staged: Pubkey,
     requester_signing: SigningKey,
@@ -2924,6 +3160,7 @@ impl Fixture {
         let requester = Pubkey::new_from_array(requester_signing.verifying_key().to_bytes());
         let miner = Pubkey::new_unique();
         let epoch = Pubkey::new_unique();
+        let job_account = Pubkey::new_unique();
         let challenger = Pubkey::new_unique();
         let mut activation_bytes = vec![0; 4096];
         activation_bytes[136..140].copy_from_slice(&2.0_f32.to_bits().to_le_bytes());
@@ -3030,6 +3267,7 @@ impl Fixture {
             program,
             model,
             epoch,
+            job_account,
             dispute,
             staged,
             requester_signing,
@@ -3061,7 +3299,7 @@ impl Fixture {
     fn seeded_epoch(&self, vm: &mut Mollusk) -> (Account, Account, u64) {
         vm.sysvars.clock.slot = 100;
         let (model, epoch, _) = self.register(vm);
-        vm.sysvars.clock.slot = 102;
+        vm.sysvars.clock.slot = 133;
         // Mainnet keeps the slot-hashes sysvar at its full fixed capacity. The
         // zero-copy syscall deliberately fetches that full buffer, so mirror
         // the production layout instead of a one-entry test sysvar.
@@ -3165,7 +3403,11 @@ impl Fixture {
             &[
                 (self.epoch, epoch),
                 (self.model, model),
-                (self.dispute, owned(DISPUTE_BYTES, self.program)),
+                (self.job_account, self.locked_job_account()),
+                (
+                    self.dispute,
+                    funded_owned(DISPUTE_BYTES, self.program, 10_000_000),
+                ),
                 (self.challenger, Account::default()),
                 ed25519_program_account(),
             ],
@@ -3198,12 +3440,21 @@ impl Fixture {
             vec![
                 AccountMeta::new_readonly(self.epoch, false),
                 AccountMeta::new_readonly(self.model, false),
+                AccountMeta::new(self.job_account, false),
                 AccountMeta::new(self.dispute, true),
                 AccountMeta::new_readonly(self.challenger, true),
                 AccountMeta::new_readonly(solana_sdk_ids::sysvar::instructions::ID, false),
             ],
             &body,
         )
+    }
+
+    fn locked_job_account(&self) -> Account {
+        let mut account = funded_owned(JOB_BYTES, self.program, 10_000_000);
+        account.data[..4].copy_from_slice(b"QXJ2");
+        account.data[4..314].copy_from_slice(&self.job.canonical_bytes().unwrap());
+        account.data[314] = 1;
+        account
     }
 
     fn bounds(&self, vm: &Mollusk, dispute: Account, honest: bool) -> (Account, u64) {
@@ -3449,6 +3700,15 @@ fn bind_segment_program(dispute: &mut Account, program: &MerkleTree) {
 
 fn owned(size: usize, owner: Pubkey) -> Account {
     Account {
+        data: vec![0; size],
+        owner,
+        ..Account::default()
+    }
+}
+
+fn funded_owned(size: usize, owner: Pubkey, lamports: u64) -> Account {
+    Account {
+        lamports,
         data: vec![0; size],
         owner,
         ..Account::default()

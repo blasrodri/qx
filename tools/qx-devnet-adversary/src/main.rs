@@ -20,7 +20,8 @@ use solana_sdk::{
 use solana_system_interface::instruction::create_account;
 
 const MODEL_BYTES: usize = 156;
-const MINER_BYTES: usize = 16;
+const MINER_BYTES: usize = 24;
+const JOB_BYTES: usize = 323;
 const EPOCH_BYTES: usize = 152;
 const DISPUTE_BYTES: usize = 768;
 const COMPUTE_BUDGET_PROGRAM: &str = "ComputeBudget111111111111111111111111111111";
@@ -82,6 +83,7 @@ struct RentEvidence {
     miner: u64,
     epoch: u64,
     dispute: u64,
+    job: u64,
     total: u64,
 }
 
@@ -99,6 +101,7 @@ struct Scenario {
     segments: Vec<VmSegmentProgramV1>,
     instruction: VmInstructionV1,
     job: JobPayloadV1,
+    job_account: Keypair,
     result: ResultLeafV1,
     results: MerkleTree,
     job_genesis: [u8; 32],
@@ -146,6 +149,7 @@ fn main() -> Result<()> {
     let scenario = Scenario::new(program, payer, current_slot)?;
     let mut steps = Vec::new();
     scenario.create_model(&rpc, args.compute_unit_limit, &mut steps)?;
+    scenario.register_job(&rpc, args.compute_unit_limit, &mut steps)?;
     scenario.submit_epoch(&rpc, args.compute_unit_limit, &mut steps)?;
     scenario.finalize_epoch(&rpc, args.compute_unit_limit, &mut steps)?;
     scenario.open_dispute(&rpc, args.compute_unit_limit, &mut steps)?;
@@ -153,6 +157,7 @@ fn main() -> Result<()> {
     scenario.reveal_tokens(&rpc, args.compute_unit_limit, &mut steps)?;
     scenario.reveal_final_head(&rpc, args.compute_unit_limit, &mut steps)?;
     scenario.resolve_argmax(&rpc, args.compute_unit_limit, &mut steps)?;
+    scenario.settle(&rpc, args.compute_unit_limit, &mut steps)?;
 
     let dispute = rpc.get_account(&scenario.dispute.pubkey())?;
     if dispute.owner != program
@@ -165,24 +170,24 @@ fn main() -> Result<()> {
     }
     let setup_simulated_compute_units = steps
         .iter()
-        .take(3)
+        .take(4)
         .map(|step| step.simulated_compute_units)
         .sum();
     let dispute_simulated_compute_units = steps
         .iter()
-        .skip(3)
+        .skip(4)
         .map(|step| step.simulated_compute_units)
         .sum();
     let total_simulated_compute_units =
         setup_simulated_compute_units + dispute_simulated_compute_units;
     let setup_quoted_transaction_fees_lamports = steps
         .iter()
-        .take(3)
+        .take(4)
         .map(|step| step.quoted_fee_lamports)
         .sum();
     let dispute_quoted_transaction_fees_lamports = steps
         .iter()
-        .skip(3)
+        .skip(4)
         .map(|step| step.quoted_fee_lamports)
         .sum();
     let quoted_transaction_fees_lamports =
@@ -191,12 +196,14 @@ fn main() -> Result<()> {
     let miner_rent = rpc.get_minimum_balance_for_rent_exemption(MINER_BYTES)?;
     let epoch_rent = rpc.get_minimum_balance_for_rent_exemption(EPOCH_BYTES)?;
     let dispute_rent = rpc.get_minimum_balance_for_rent_exemption(DISPUTE_BYTES)?;
+    let job_rent = rpc.get_minimum_balance_for_rent_exemption(JOB_BYTES)?;
     let account_rent_lamports = RentEvidence {
         model: model_rent,
         miner: miner_rent,
         epoch: epoch_rent,
         dispute: dispute_rent,
-        total: model_rent + miner_rent + epoch_rent + dispute_rent,
+        job: job_rent,
+        total: model_rent + miner_rent + epoch_rent + dispute_rent + job_rent,
     };
     let evidence = Evidence {
         status: "passed",
@@ -239,6 +246,7 @@ impl Scenario {
         let miner = Keypair::new();
         let epoch_account = Keypair::new();
         let dispute = Keypair::new();
+        let job_account = Keypair::new();
         let epoch_number = current_slot;
         let model_id = [0x21; 32];
         let execution_spec = [0x22; 32];
@@ -429,6 +437,7 @@ impl Scenario {
             segments,
             instruction,
             job,
+            job_account,
             result,
             results,
             job_genesis,
@@ -492,19 +501,52 @@ impl Scenario {
         )
     }
 
+    fn register_job(&self, rpc: &RpcClient, cu: u32, steps: &mut Vec<StepEvidence>) -> Result<()> {
+        let job_rent = rpc.get_minimum_balance_for_rent_exemption(JOB_BYTES)?;
+        let miner_rent = rpc.get_minimum_balance_for_rent_exemption(MINER_BYTES)?;
+        let instructions = vec![
+            create_account(
+                &self.payer.pubkey(),
+                &self.miner.pubkey(),
+                miner_rent + self.job.slashable_exposure,
+                MINER_BYTES as u64,
+                &self.program,
+            ),
+            create_account(
+                &self.payer.pubkey(),
+                &self.job_account.pubkey(),
+                job_rent + self.job.payment,
+                JOB_BYTES as u64,
+                &self.program,
+            ),
+            self.ix(
+                8,
+                vec![
+                    AccountMeta::new(self.job_account.pubkey(), true),
+                    AccountMeta::new_readonly(self.payer.pubkey(), true),
+                    AccountMeta::new_readonly(self.model.pubkey(), false),
+                    AccountMeta::new(self.miner.pubkey(), false),
+                ],
+                &self.job.canonical_bytes()?,
+            ),
+        ];
+        send_step(
+            rpc,
+            &self.payer,
+            "register_and_fund_job",
+            instructions,
+            &[&self.miner, &self.job_account],
+            cu,
+            steps,
+        )
+    }
+
     fn submit_epoch(&self, rpc: &RpcClient, cu: u32, steps: &mut Vec<StepEvidence>) -> Result<()> {
         let mut body = Vec::new();
         body.extend_from_slice(&self.epoch_number.to_le_bytes());
         body.extend_from_slice(&self.results.root());
         body.extend_from_slice(&1_u32.to_le_bytes());
         let instructions = vec![
-            create_account(
-                &self.payer.pubkey(),
-                &self.miner.pubkey(),
-                rpc.get_minimum_balance_for_rent_exemption(MINER_BYTES)?,
-                MINER_BYTES as u64,
-                &self.program,
-            ),
             create_account(
                 &self.payer.pubkey(),
                 &self.epoch_account.pubkey(),
@@ -581,6 +623,7 @@ impl Scenario {
             vec![
                 AccountMeta::new_readonly(self.epoch_account.pubkey(), false),
                 AccountMeta::new_readonly(self.model.pubkey(), false),
+                AccountMeta::new(self.job_account.pubkey(), false),
                 AccountMeta::new(self.dispute.pubkey(), true),
                 AccountMeta::new_readonly(self.payer.pubkey(), true),
                 AccountMeta::new_readonly(solana_sdk_ids::sysvar::instructions::ID, false),
@@ -591,7 +634,8 @@ impl Scenario {
             create_account(
                 &self.payer.pubkey(),
                 &self.dispute.pubkey(),
-                rpc.get_minimum_balance_for_rent_exemption(DISPUTE_BYTES)?,
+                rpc.get_minimum_balance_for_rent_exemption(DISPUTE_BYTES)?
+                    + self.job.slashable_exposure,
                 DISPUTE_BYTES as u64,
                 &self.program,
             ),
@@ -607,6 +651,35 @@ impl Scenario {
             cu,
             steps,
         )
+    }
+
+    fn settle(&self, rpc: &RpcClient, cu: u32, steps: &mut Vec<StepEvidence>) -> Result<()> {
+        let instruction = self.ix(
+            61,
+            vec![
+                AccountMeta::new(self.job_account.pubkey(), false),
+                AccountMeta::new(self.miner.pubkey(), false),
+                AccountMeta::new(self.dispute.pubkey(), false),
+                AccountMeta::new(self.payer.pubkey(), false),
+                AccountMeta::new(self.payer.pubkey(), false),
+            ],
+            &[],
+        );
+        send_step(
+            rpc,
+            &self.payer,
+            "settle_challenger_win",
+            vec![instruction],
+            &[],
+            cu,
+            steps,
+        )?;
+        let job = rpc.get_account(&self.job_account.pubkey())?;
+        let miner = rpc.get_account(&self.miner.pubkey())?;
+        if job.data.get(314) != Some(&3) || miner.data.get(16..24) != Some(&0_u64.to_le_bytes()) {
+            bail!("economic settlement did not release the job and collateral lock");
+        }
+        Ok(())
     }
 
     fn run_bisection(&self, rpc: &RpcClient, cu: u32, steps: &mut Vec<StepEvidence>) -> Result<()> {

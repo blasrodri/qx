@@ -3,6 +3,8 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     str::FromStr,
+    thread,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -10,8 +12,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use qx_commit::{
-    D_BATCH, HashAlgorithm, JobEnvelopeV1, JobPayloadV1, MerkleProof, MerkleTree, ResultLeafV1,
-    audit_selected_v1, input_hash_v1, output_hash_v1,
+    D_BATCH, ExecutionWitnessV1, HashAlgorithm, JobEnvelopeV1, JobPayloadV1, MerkleProof,
+    MerkleTree, ResultLeafV1, audit_selected_v1, input_hash_v1, output_hash_v1,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use solana_client::rpc_client::RpcClient;
@@ -23,11 +25,14 @@ use solana_sdk::{
     signature::{Keypair, Signer, read_keypair_file, write_keypair_file},
     transaction::Transaction,
 };
-use solana_system_interface::instruction::create_account;
+use solana_system_interface::instruction::{create_account, transfer};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 const MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
 const EPOCH_ACCOUNT_BYTES: usize = 152;
+const JOB_ACCOUNT_BYTES: usize = 323;
+const MINER_ACCOUNT_BYTES: usize = 24;
+const MAX_DISPUTE_RESPONSE_ROUNDS: u64 = 64;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -84,6 +89,9 @@ enum Command {
         output_tokens: Vec<u32>,
         #[arg(long)]
         trace_root_hex: String,
+        /// Canonical QXW1 witness emitted by the executor.
+        #[arg(long)]
+        witness: PathBuf,
         #[arg(long)]
         output: PathBuf,
     },
@@ -120,6 +128,34 @@ enum Command {
         /// Unique model registry account keypair; created if it does not exist.
         #[arg(long)]
         model_keypair: PathBuf,
+    },
+    /// Create or top up the program-owned miner collateral account.
+    FundMiner {
+        #[arg(long)]
+        program: String,
+        #[arg(long, default_value = "https://api.devnet.solana.com")]
+        rpc_url: String,
+        #[arg(long)]
+        payer_keypair: PathBuf,
+        #[arg(long)]
+        miner_keypair: PathBuf,
+        #[arg(long)]
+        amount_lamports: u64,
+    },
+    /// Register and fund one requester-signed job on Solana.
+    RegisterJob {
+        #[arg(long)]
+        job: PathBuf,
+        #[arg(long)]
+        program: String,
+        #[arg(long, default_value = "https://api.devnet.solana.com")]
+        rpc_url: String,
+        #[arg(long)]
+        payer_keypair: PathBuf,
+        #[arg(long)]
+        requester_keypair: PathBuf,
+        #[arg(long)]
+        job_keypair: PathBuf,
     },
     /// Run the persistent HTTP package service.
     Serve {
@@ -170,12 +206,45 @@ enum Command {
         #[arg(long)]
         epoch_account: String,
     },
+    /// Permissionlessly close an epoch whose successor hash left SlotHashes.
+    ExpireEpoch {
+        #[arg(long)]
+        program: String,
+        #[arg(long, default_value = "https://api.devnet.solana.com")]
+        rpc_url: String,
+        #[arg(long)]
+        payer_keypair: PathBuf,
+        #[arg(long)]
+        epoch_account: String,
+    },
     /// Independently verify a selected package against its devnet epoch.
     VerifyChallenge {
         #[arg(long)]
         package: PathBuf,
         #[arg(long, default_value = "https://api.devnet.solana.com")]
         rpc_url: String,
+    },
+    /// Continuously fetch selected jobs, verify their Solana bindings, and
+    /// independently replay Granite. Exits non-zero on the first fraud proof.
+    AuditDaemon {
+        #[arg(long)]
+        gateway: String,
+        #[arg(long)]
+        epoch: u64,
+        #[arg(long)]
+        artifact: PathBuf,
+        #[arg(long, default_value_t = 2)]
+        checkpoint_interval: usize,
+        #[arg(long, default_value_t = 512)]
+        context: usize,
+        #[arg(long, default_value = "https://api.devnet.solana.com")]
+        rpc_url: String,
+        #[arg(long, default_value_t = 10)]
+        poll_seconds: u64,
+        #[arg(long)]
+        once: bool,
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
 }
 
@@ -243,6 +312,7 @@ struct JobRecord {
 struct ResultSubmission {
     result_hex: String,
     output_tokens: Vec<u32>,
+    witness_hex: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -250,6 +320,8 @@ struct ResultRecord {
     job_hash_hex: String,
     result_hex: String,
     output_tokens: Vec<u32>,
+    #[serde(default)]
+    witness_hex: String,
     received_unix_seconds: u64,
 }
 
@@ -281,6 +353,10 @@ struct OnchainEpoch {
     audit_seed_hex: String,
     challenge_deadline_slot: u64,
     response_window_slots: u64,
+    /// Gateway objects are immutable and must remain retrievable until this
+    /// conservative upper bound for a challenge opened at the last slot.
+    #[serde(default)]
+    witness_retention_deadline_slot: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -299,11 +375,13 @@ struct ChallengePackage {
     epoch_account: String,
     model_registry_hex: String,
     audit_seed_hex: String,
+    witness_retention_deadline_slot: u64,
     payload_hex: String,
     input_tokens: Vec<u32>,
     requester_signature_hex: String,
     result_hex: String,
     output_tokens: Vec<u32>,
+    witness_hex: String,
     leaf_index: u32,
     leaf_count: u32,
     result_root_hex: String,
@@ -351,8 +429,9 @@ fn main() -> Result<()> {
             job,
             output_tokens,
             trace_root_hex,
+            witness,
             output,
-        } => create_result(&job, output_tokens, &trace_root_hex, &output)?,
+        } => create_result(&job, output_tokens, &trace_root_hex, &witness, &output)?,
         Command::RunJob {
             job,
             artifact,
@@ -384,6 +463,34 @@ fn main() -> Result<()> {
             &rpc_url,
             &payer_keypair,
             &model_keypair,
+        )?,
+        Command::FundMiner {
+            program,
+            rpc_url,
+            payer_keypair,
+            miner_keypair,
+            amount_lamports,
+        } => fund_miner(
+            &program,
+            &rpc_url,
+            &payer_keypair,
+            &miner_keypair,
+            amount_lamports,
+        )?,
+        Command::RegisterJob {
+            job,
+            program,
+            rpc_url,
+            payer_keypair,
+            requester_keypair,
+            job_keypair,
+        } => register_job_onchain(
+            &job,
+            &program,
+            &rpc_url,
+            &payer_keypair,
+            &requester_keypair,
+            &job_keypair,
         )?,
         Command::Serve {
             listen,
@@ -462,7 +569,34 @@ fn main() -> Result<()> {
             payer_keypair,
             epoch_account,
         } => finalize_epoch(&program, &rpc_url, &payer_keypair, &epoch_account)?,
+        Command::ExpireEpoch {
+            program,
+            rpc_url,
+            payer_keypair,
+            epoch_account,
+        } => expire_epoch(&program, &rpc_url, &payer_keypair, &epoch_account)?,
         Command::VerifyChallenge { package, rpc_url } => verify_challenge(&package, &rpc_url)?,
+        Command::AuditDaemon {
+            gateway,
+            epoch,
+            artifact,
+            checkpoint_interval,
+            context,
+            rpc_url,
+            poll_seconds,
+            once,
+            report,
+        } => audit_daemon(
+            &gateway,
+            epoch,
+            &artifact,
+            checkpoint_interval,
+            context,
+            &rpc_url,
+            poll_seconds,
+            once,
+            report.as_deref(),
+        )?,
     }
     Ok(())
 }
@@ -532,6 +666,7 @@ fn create_result(
     job_path: &Path,
     output_tokens: Vec<u32>,
     trace_root_hex: &str,
+    witness_path: &Path,
     output_path: &Path,
 ) -> Result<()> {
     if output_tokens.is_empty() {
@@ -558,9 +693,16 @@ fn create_result(
             .checked_add(output_count)
             .ok_or_else(|| anyhow!("trace length overflow"))?,
     };
+    let witness_bytes = fs::read(witness_path)
+        .with_context(|| format!("read witness {}", witness_path.display()))?;
+    let witness = ExecutionWitnessV1::from_canonical_bytes(&witness_bytes)?;
+    if witness.job_id != payload.job_id || witness.validate()?.trace_root != result.trace_root {
+        bail!("witness does not match the job and trace root");
+    }
     let submission = ResultSubmission {
         result_hex: encode_hex(&result.canonical_bytes()),
         output_tokens,
+        witness_hex: encode_hex(&witness_bytes),
     };
     write_record(output_path, &submission)?;
     println!("job_hash_hex={}", encode_hex(&result.job_hash));
@@ -569,7 +711,6 @@ fn create_result(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn verified_job(path: &Path) -> Result<(JobSubmission, JobPayloadV1)> {
     let job: JobSubmission = read_json_file(path)?;
     let payload_bytes = decode_hex_exact(
@@ -643,15 +784,19 @@ fn run_job(
             .map_err(anyhow::Error::msg)?;
     }
     let trace = committer.finish()?;
+    let witness = committer.witness()?;
+    let witness_bytes = witness.canonical_bytes()?;
     let result = trace.result_leaf(payload.hash()?, &output_tokens)?;
     let submission = ResultSubmission {
         result_hex: encode_hex(&result.canonical_bytes()),
         output_tokens,
+        witness_hex: encode_hex(&witness_bytes),
     };
     write_record(output_path, &submission)?;
     println!("job_hash_hex={}", encode_hex(&result.job_hash));
     println!("trace_root_hex={}", encode_hex(&trace.trace_root));
     println!("trace_length={}", trace.trace_length);
+    println!("witness_bytes={}", witness_bytes.len());
     println!("output_tokens={:?}", submission.output_tokens);
     println!("output={}", output_path.display());
     Ok(())
@@ -760,6 +905,131 @@ fn register_model(
     Ok(())
 }
 
+fn fund_miner(
+    program: &str,
+    rpc_url: &str,
+    payer_path: &Path,
+    miner_path: &Path,
+    amount_lamports: u64,
+) -> Result<()> {
+    if amount_lamports == 0 {
+        bail!("amount-lamports must be positive");
+    }
+    let program = Pubkey::from_str(program).context("invalid verifier program public key")?;
+    let payer = read_keypair(payer_path, "payer")?;
+    let (miner, _created) = read_or_create_keypair(miner_path)?;
+    let rpc = RpcClient::new_with_commitment(rpc_url.to_owned(), CommitmentConfig::confirmed());
+    let existing = rpc.get_account(&miner.pubkey());
+    let instruction = match &existing {
+        Ok(account) => {
+            if account.owner != program || account.data.len() != MINER_ACCOUNT_BYTES {
+                bail!("existing miner account has the wrong owner or size");
+            }
+            transfer(&payer.pubkey(), &miner.pubkey(), amount_lamports)
+        }
+        Err(_) => create_account(
+            &payer.pubkey(),
+            &miner.pubkey(),
+            rpc.get_minimum_balance_for_rent_exemption(MINER_ACCOUNT_BYTES)? + amount_lamports,
+            MINER_ACCOUNT_BYTES as u64,
+            &program,
+        ),
+    };
+    let blockhash = rpc.get_latest_blockhash()?;
+    let signers: Vec<&dyn Signer> = if existing.is_err() {
+        vec![&payer, &miner]
+    } else {
+        vec![&payer]
+    };
+    let transaction = Transaction::new_signed_with_payer(
+        &[instruction],
+        Some(&payer.pubkey()),
+        &signers,
+        blockhash,
+    );
+    let signature = rpc.send_and_confirm_transaction(&transaction)?;
+    println!("miner_account={}", miner.pubkey());
+    println!("deposit_lamports={amount_lamports}");
+    println!("signature={signature}");
+    Ok(())
+}
+
+fn register_job_onchain(
+    job_path: &Path,
+    program: &str,
+    rpc_url: &str,
+    payer_path: &Path,
+    requester_path: &Path,
+    job_account_path: &Path,
+) -> Result<()> {
+    let program = Pubkey::from_str(program).context("invalid verifier program public key")?;
+    let payer = read_keypair(payer_path, "payer")?;
+    let requester = read_keypair(requester_path, "requester")?;
+    let (job_account, created) = read_or_create_keypair(job_account_path)?;
+    if !created {
+        bail!("job account keypair already exists; each job registration is unique");
+    }
+    let (job, payload) = verified_job(job_path)?;
+    if payload.protocol_instance != program.to_bytes()
+        || payload.requester != requester.pubkey().to_bytes()
+    {
+        bail!("job program/requester does not match registration signers");
+    }
+    let miner = Pubkey::new_from_array(payload.assigned_miner);
+    let rpc = RpcClient::new_with_commitment(rpc_url.to_owned(), CommitmentConfig::confirmed());
+    let miner_account = rpc
+        .get_account(&miner)
+        .context("miner must fund its collateral account before job registration")?;
+    if miner_account.owner != program || miner_account.data.len() != MINER_ACCOUNT_BYTES {
+        bail!("miner collateral account has the wrong owner or size");
+    }
+    let locked = read_u64(&miner_account.data, 16)?;
+    let reserve = rpc.get_minimum_balance_for_rent_exemption(MINER_ACCOUNT_BYTES)?;
+    let free = miner_account
+        .lamports
+        .checked_sub(reserve)
+        .and_then(|value| value.checked_sub(locked))
+        .ok_or_else(|| anyhow!("miner collateral account is below reserve"))?;
+    if free < payload.slashable_exposure {
+        bail!(
+            "miner has {free} free lamports but job requires {}",
+            payload.slashable_exposure
+        );
+    }
+    let create = create_account(
+        &payer.pubkey(),
+        &job_account.pubkey(),
+        rpc.get_minimum_balance_for_rent_exemption(JOB_ACCOUNT_BYTES)? + payload.payment,
+        JOB_ACCOUNT_BYTES as u64,
+        &program,
+    );
+    let register = Instruction::new_with_bytes(
+        program,
+        &[vec![8], payload.canonical_bytes()?].concat(),
+        vec![
+            AccountMeta::new(job_account.pubkey(), true),
+            AccountMeta::new_readonly(requester.pubkey(), true),
+            AccountMeta::new_readonly(Pubkey::new_from_array(payload.model_registry), false),
+            AccountMeta::new(miner, false),
+        ],
+    );
+    let blockhash = rpc.get_latest_blockhash()?;
+    let transaction = Transaction::new_signed_with_payer(
+        &[create, register],
+        Some(&payer.pubkey()),
+        &[&payer, &requester, &job_account],
+        blockhash,
+    );
+    let signature = rpc.send_and_confirm_transaction(&transaction)?;
+    println!("job_hash={}", encode_hex(&payload.hash()?));
+    println!("job_account={}", job_account.pubkey());
+    println!("payment_escrow_lamports={}", payload.payment);
+    println!("locked_exposure_lamports={}", payload.slashable_exposure);
+    println!("signature={signature}");
+    drop(job);
+    Ok(())
+}
+
 fn submit_epoch(
     data_dir: &Path,
     epoch_number: u64,
@@ -785,15 +1055,15 @@ fn submit_epoch(
     let mut instructions = Vec::new();
     match rpc.get_account(&miner.pubkey()) {
         Ok(account) => {
-            if account.owner != program || account.data.len() != 16 {
+            if account.owner != program || account.data.len() != MINER_ACCOUNT_BYTES {
                 bail!("existing miner account has the wrong owner or size");
             }
         }
         Err(_) => instructions.push(create_account(
             &payer.pubkey(),
             &miner.pubkey(),
-            rpc.get_minimum_balance_for_rent_exemption(16)?,
-            16,
+            rpc.get_minimum_balance_for_rent_exemption(MINER_ACCOUNT_BYTES)?,
+            MINER_ACCOUNT_BYTES as u64,
             &program,
         )),
     }
@@ -923,8 +1193,44 @@ fn finalize_epoch(program: &str, rpc_url: &str, payer_path: &Path, epoch: &str) 
     Ok(())
 }
 
+fn expire_epoch(program: &str, rpc_url: &str, payer_path: &Path, epoch: &str) -> Result<()> {
+    let program = Pubkey::from_str(program).context("invalid verifier program public key")?;
+    let epoch = Pubkey::from_str(epoch).context("invalid epoch account public key")?;
+    let payer = read_keypair(payer_path, "payer")?;
+    let rpc = RpcClient::new_with_commitment(rpc_url.to_owned(), CommitmentConfig::confirmed());
+    let phase = epoch_phase(&rpc.get_account(&epoch)?, &program)?;
+    if phase == 3 {
+        println!("program={program}");
+        println!("epoch_account={epoch}");
+        println!("expiry_status=already_expired");
+        return Ok(());
+    }
+    if phase != 1 {
+        bail!("only a closed, unseeded epoch can expire");
+    }
+    let instruction =
+        Instruction::new_with_bytes(program, &[60], vec![AccountMeta::new(epoch, false)]);
+    let blockhash = rpc.get_latest_blockhash()?;
+    let transaction = Transaction::new_signed_with_payer(
+        &[instruction],
+        Some(&payer.pubkey()),
+        &[&payer],
+        blockhash,
+    );
+    let signature = rpc.send_and_confirm_transaction(&transaction)?;
+    println!("program={program}");
+    println!("epoch_account={epoch}");
+    println!("signature={signature}");
+    println!("expiry_status=expired");
+    Ok(())
+}
+
 fn verify_challenge(path: &Path, rpc_url: &str) -> Result<()> {
     let package: ChallengePackage = read_json_file(path)?;
+    verify_challenge_package(&package, rpc_url)
+}
+
+fn verify_challenge_package(package: &ChallengePackage, rpc_url: &str) -> Result<()> {
     let payload_bytes = decode_hex_exact(
         &package.payload_hex,
         JobPayloadV1::CANONICAL_SIZE,
@@ -962,6 +1268,15 @@ fn verify_challenge(path: &Path, rpc_url: &str) -> Result<()> {
         || encode_hex(&payload.model_registry) != package.model_registry_hex
     {
         bail!("challenge package job/result binding is invalid");
+    }
+    let witness_bytes = decode_hex(&package.witness_hex, "witness_hex")?;
+    let witness = ExecutionWitnessV1::from_canonical_bytes(&witness_bytes)?;
+    let witness_trace = witness.validate()?;
+    if witness.job_id != payload.job_id
+        || witness_trace.trace_root != result.trace_root
+        || witness_trace.trace_length != result.trace_length
+    {
+        bail!("challenge package witness does not match its result");
     }
 
     let siblings = package
@@ -1028,6 +1343,177 @@ fn verify_challenge(path: &Path, rpc_url: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn audit_daemon(
+    gateway: &str,
+    epoch: u64,
+    artifact: &Path,
+    checkpoint_interval: usize,
+    context: usize,
+    rpc_url: &str,
+    poll_seconds: u64,
+    once: bool,
+    report: Option<&Path>,
+) -> Result<()> {
+    if poll_seconds == 0 {
+        bail!("poll-seconds must be positive");
+    }
+    let endpoint = format!("{}/v1/epochs/{epoch}/audits", gateway.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let mut verified = std::collections::BTreeSet::new();
+    loop {
+        let response = client
+            .get(&endpoint)
+            .send()
+            .with_context(|| format!("fetch {endpoint}"))?
+            .error_for_status()?;
+        let packages: Vec<ChallengePackage> = response.json()?;
+        let selected_count = packages.len();
+        for package in packages {
+            let job_hash = JobPayloadV1::from_canonical_bytes(&decode_hex_exact(
+                &package.payload_hex,
+                JobPayloadV1::CANONICAL_SIZE,
+                "payload_hex",
+            )?)?
+            .hash()?;
+            let job_hash_hex = encode_hex(&job_hash);
+            if verified.contains(&job_hash_hex) {
+                continue;
+            }
+            verify_challenge_package(&package, rpc_url)?;
+            match replay_challenge_package(&package, artifact, checkpoint_interval, context)? {
+                None => {
+                    println!("audit_status=honest job_hash={job_hash_hex}");
+                    verified.insert(job_hash_hex);
+                }
+                Some(fraud) => {
+                    let value = serde_json::json!({
+                        "status": "fraud_detected",
+                        "epoch": epoch,
+                        "job_hash": job_hash_hex,
+                        "reason": fraud,
+                        "package": package,
+                    });
+                    if let Some(path) = report {
+                        write_record(path, &value)?;
+                        println!("fraud_report={}", path.display());
+                    }
+                    println!("{value}");
+                    bail!("fraud detected; submit the emitted self-authenticating package");
+                }
+            }
+        }
+        println!(
+            "audit_poll epoch={epoch} selected={} verified={}",
+            selected_count,
+            verified.len()
+        );
+        if once {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_secs(poll_seconds));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn audit_daemon(
+    _gateway: &str,
+    _epoch: u64,
+    _artifact: &Path,
+    _checkpoint_interval: usize,
+    _context: usize,
+    _rpc_url: &str,
+    _poll_seconds: u64,
+    _once: bool,
+    _report: Option<&Path>,
+) -> Result<()> {
+    bail!("Granite audit replay requires macOS Metal")
+}
+
+#[cfg(target_os = "macos")]
+fn replay_challenge_package(
+    package: &ChallengePackage,
+    artifact: &Path,
+    checkpoint_interval: usize,
+    context: usize,
+) -> Result<Option<String>> {
+    let payload = JobPayloadV1::from_canonical_bytes(&decode_hex_exact(
+        &package.payload_hex,
+        JobPayloadV1::CANONICAL_SIZE,
+        "payload_hex",
+    )?)?;
+    let expected_spec = qx_commit::granite_execution_spec_with_checkpoint_interval(u8::try_from(
+        checkpoint_interval,
+    )?)?;
+    if payload.execution_spec != expected_spec {
+        bail!("package execution spec does not match checkpoint interval");
+    }
+    let required_context = usize::try_from(
+        payload
+            .input_token_count
+            .checked_add(payload.max_output_tokens)
+            .ok_or_else(|| anyhow!("context length overflow"))?,
+    )?;
+    if required_context > context || context > 4_096 {
+        bail!("package does not fit the auditor context");
+    }
+    let mut generator =
+        qx_runtime_v2::GraniteV2Generator::load(artifact, context).map_err(anyhow::Error::msg)?;
+    generator
+        .set_verification_checkpoint_interval(checkpoint_interval)
+        .map_err(anyhow::Error::msg)?;
+    let mut committer = qx_commit::ExecutionCommitterV1::new_with_checkpoint_interval(
+        payload.job_id,
+        24,
+        context,
+        checkpoint_interval,
+    )?;
+    let mut next = 0_u32;
+    for token in &package.input_tokens {
+        next = generator
+            .step_verified(*token, &mut committer)
+            .map_err(anyhow::Error::msg)?;
+    }
+    let output_count = u32::try_from(package.output_tokens.len())?;
+    let mut output_tokens = Vec::with_capacity(output_count as usize);
+    for index in 0..output_count {
+        output_tokens.push(next);
+        if index + 1 == output_count {
+            break;
+        }
+        next = generator
+            .step_verified(next, &mut committer)
+            .map_err(anyhow::Error::msg)?;
+    }
+    let trace = committer.finish()?;
+    let witness_hex = encode_hex(&committer.witness()?.canonical_bytes()?);
+    let committed_result = ResultLeafV1::from_canonical_bytes(&decode_hex_exact(
+        &package.result_hex,
+        ResultLeafV1::CANONICAL_SIZE,
+        "result_hex",
+    )?)?;
+    if output_tokens != package.output_tokens {
+        return Ok(Some(
+            "output token sequence differs from deterministic replay".to_owned(),
+        ));
+    }
+    if trace.trace_root != committed_result.trace_root {
+        return Ok(Some(
+            "trace root differs from deterministic replay".to_owned(),
+        ));
+    }
+    if witness_hex != package.witness_hex {
+        return Ok(Some(
+            "trace witness differs from deterministic replay".to_owned(),
+        ));
+    }
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_epoch_submission(
     program: &Pubkey,
@@ -1061,7 +1547,7 @@ fn epoch_phase(account: &Account, program: &Pubkey) -> Result<u8> {
         bail!("epoch account has invalid magic");
     }
     match account.data[4] {
-        phase @ (1 | 2) => Ok(phase),
+        phase @ 1..=3 => Ok(phase),
         phase => bail!("epoch account has unsupported phase {phase}"),
     }
 }
@@ -1357,10 +1843,25 @@ impl App {
                 "output tokens do not match output_hash",
             ));
         }
+        let witness_bytes =
+            decode_hex(&submission.witness_hex, "witness_hex").map_err(HttpError::bad)?;
+        let witness =
+            ExecutionWitnessV1::from_canonical_bytes(&witness_bytes).map_err(HttpError::bad)?;
+        let witness_trace = witness.validate().map_err(HttpError::bad)?;
+        if witness.job_id != payload.job_id
+            || witness_trace.trace_root != result.trace_root
+            || witness_trace.trace_length != result.trace_length
+        {
+            return Err(HttpError::new(
+                409,
+                "witness does not match the committed result",
+            ));
+        }
         let record = ResultRecord {
             job_hash_hex: job_hash_hex.clone(),
             result_hex: encode_hex(&result_bytes),
             output_tokens: submission.output_tokens,
+            witness_hex: encode_hex(&witness_bytes),
             received_unix_seconds: unix_seconds().map_err(HttpError::bad)?,
         };
         if let Some(existing) = self
@@ -1370,6 +1871,7 @@ impl App {
         {
             if existing.result_hex != record.result_hex
                 || existing.output_tokens != record.output_tokens
+                || existing.witness_hex != record.witness_hex
             {
                 return Err(HttpError::new(409, "conflicting result already exists"));
             }
@@ -1486,13 +1988,20 @@ impl App {
                 "on-chain epoch does not match local manifest",
             ));
         }
+        let challenge_deadline_slot = read_u64(data, 136).map_err(HttpError::bad)?;
+        let response_window_slots = read_u64(data, 144).map_err(HttpError::bad)?;
+        let witness_retention_deadline_slot = response_window_slots
+            .checked_mul(MAX_DISPUTE_RESPONSE_ROUNDS)
+            .and_then(|window| challenge_deadline_slot.checked_add(window))
+            .ok_or_else(|| HttpError::new(409, "witness retention deadline overflow"))?;
         record.onchain = Some(OnchainEpoch {
             epoch_account: epoch_account.to_string(),
             close_slot: read_u64(data, 88).map_err(HttpError::bad)?,
             entropy_slot: read_u64(data, 96).map_err(HttpError::bad)?,
             audit_seed_hex: encode_hex(&read_32(data, 104).map_err(HttpError::bad)?),
-            challenge_deadline_slot: read_u64(data, 136).map_err(HttpError::bad)?,
-            response_window_slots: read_u64(data, 144).map_err(HttpError::bad)?,
+            challenge_deadline_slot,
+            response_window_slots,
+            witness_retention_deadline_slot,
         });
         self.store
             .set(EPOCHS, &epoch_key, &record)
@@ -1567,11 +2076,13 @@ impl App {
             epoch_account: onchain.epoch_account.clone(),
             model_registry_hex: encode_hex(&payload.model_registry),
             audit_seed_hex: onchain.audit_seed_hex.clone(),
+            witness_retention_deadline_slot: onchain.witness_retention_deadline_slot,
             payload_hex: job.payload_hex,
             input_tokens: job.input_tokens,
             requester_signature_hex: job.requester_signature_hex,
             result_hex: result.result_hex,
             output_tokens: result.output_tokens,
+            witness_hex: result.witness_hex,
             leaf_index: u32::try_from(index).map_err(HttpError::bad)?,
             leaf_count: epoch.result_count,
             result_root_hex: epoch.result_root_hex.clone(),
@@ -1936,6 +2447,18 @@ fn decode_hex_exact(value: &str, expected: usize, label: &str) -> Result<Vec<u8>
     Ok(output)
 }
 
+fn decode_hex(value: &str, label: &str) -> Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) || !value.is_ascii() {
+        bail!("{label} must be even-length lowercase hex");
+    }
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        output.push((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?);
+    }
+    Ok(output)
+}
+
 fn hex_nibble(value: u8) -> Result<u8> {
     match value {
         b'0'..=b'9' => Ok(value - b'0'),
@@ -2022,6 +2545,30 @@ fn write_record_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer as _, SigningKey};
+
+    fn test_witness(job_id: [u8; 32], executed_tokens: u32) -> ([u8; 32], String) {
+        let mut committer = qx_commit::ExecutionCommitterV1::new(job_id, 2, 8).unwrap();
+        for token_index in 0..executed_tokens {
+            committer.begin_token(token_index).unwrap();
+            for layer_index in 0..2 {
+                committer
+                    .commit_layer_hashes(
+                        token_index,
+                        layer_index,
+                        [layer_index as u8; 32],
+                        [token_index as u8; 32],
+                        64,
+                    )
+                    .unwrap();
+            }
+            committer
+                .commit_output_token(token_index, 100 + token_index)
+                .unwrap();
+        }
+        let root = committer.finish().unwrap().trace_root;
+        let bytes = committer.witness().unwrap().canonical_bytes().unwrap();
+        (root, encode_hex(&bytes))
+    }
 
     #[test]
     fn missing_local_index_is_an_empty_listing() {
@@ -2134,16 +2681,29 @@ mod tests {
         let pending = app.pending_jobs(&miner.to_string()).unwrap();
         assert_eq!(pending["jobs"].as_array().unwrap().len(), 1);
         let output_tokens = vec![4, 5];
+        let (trace_root, witness_hex) = test_witness(payload.job_id, 4);
         let result = ResultLeafV1 {
             job_hash,
             output_hash: output_hash_v1(&output_tokens).unwrap(),
-            trace_root: [8; 32],
+            trace_root,
             output_token_count: 2,
             trace_length: 5,
         };
+        let mut corrupt_witness = decode_hex(&witness_hex, "test witness").unwrap();
+        *corrupt_witness.last_mut().unwrap() ^= 1;
+        let rejected = app
+            .put_result(ResultSubmission {
+                result_hex: encode_hex(&result.canonical_bytes()),
+                output_tokens: output_tokens.clone(),
+                witness_hex: encode_hex(&corrupt_witness),
+            })
+            .unwrap_err();
+        assert!(matches!(rejected.status, 400 | 409));
+
         app.put_result(ResultSubmission {
             result_hex: encode_hex(&result.canonical_bytes()),
             output_tokens: output_tokens.clone(),
+            witness_hex,
         })
         .unwrap();
         let stored_result = app.get_result(&job_hash_hex).unwrap();
@@ -2174,10 +2734,11 @@ mod tests {
         let pending = app.pending_jobs(&miner.to_string()).unwrap();
         assert!(pending["jobs"].as_array().unwrap().is_empty());
         let late_output = vec![6, 7];
+        let (late_trace_root, late_witness_hex) = test_witness(late_payload.job_id, 4);
         let late_result = ResultLeafV1 {
             job_hash: late_hash,
             output_hash: output_hash_v1(&late_output).unwrap(),
-            trace_root: [10; 32],
+            trace_root: late_trace_root,
             output_token_count: 2,
             trace_length: 5,
         };
@@ -2185,6 +2746,7 @@ mod tests {
             .put_result(ResultSubmission {
                 result_hex: encode_hex(&late_result.canonical_bytes()),
                 output_tokens: late_output,
+                witness_hex: late_witness_hex,
             })
             .unwrap_err();
         assert_eq!(error.status, 409);
@@ -2212,6 +2774,7 @@ mod tests {
             audit_seed_hex: encode_hex(&[9; 32]),
             challenge_deadline_slot: 100,
             response_window_slots: 10,
+            witness_retention_deadline_slot: 740,
         });
         app.store.set(EPOCHS, "9", &epoch).unwrap();
         let package = app

@@ -154,6 +154,7 @@ fn protocol_profile() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sampling_cost(
     receipts: u32,
     cheated: u32,
@@ -232,6 +233,7 @@ struct BenchmarkSample {
     executed_tokens: usize,
     generated: Vec<u32>,
     trace_root: Option<[u8; 32]>,
+    witness_bytes: usize,
     metrics: qx_metal_metrics::Delta,
 }
 
@@ -404,6 +406,11 @@ fn metal_benchmark(
     } else {
         println!("trace_root=cost-only");
     }
+    println!("witness_bytes={}", verified[0].witness_bytes);
+    println!(
+        "witness_bytes_per_executed_token={:.3}",
+        verified[0].witness_bytes as f64 / verified[0].executed_tokens as f64
+    );
     println!("output_tokens={:?}", baseline[0].generated);
     println!(
         "performance_gate={}",
@@ -475,13 +482,15 @@ fn run_sample(
         }
     }
     let decode = decode_start.elapsed();
+    let (trace_root, witness_bytes) = if let Some(committer) = committer.as_ref() {
+        let trace = committer.finish()?;
+        let witness_bytes = committer.witness()?.canonical_bytes()?.len();
+        (Some(trace.trace_root), witness_bytes)
+    } else {
+        (None, 0)
+    };
     let total = total_start.elapsed();
     let after = qx_metal_metrics::snapshot(generator).map_err(anyhow::Error::msg)?;
-    let trace_root = committer
-        .as_ref()
-        .map(qx_commit::ExecutionCommitterV1::finish)
-        .transpose()?
-        .map(|trace| trace.trace_root);
     Ok(BenchmarkSample {
         prefill,
         decode,
@@ -489,6 +498,7 @@ fn run_sample(
         executed_tokens: prompt.len() + new_tokens - 1,
         generated,
         trace_root,
+        witness_bytes,
         metrics: qx_metal_metrics::delta(before, after),
     })
 }

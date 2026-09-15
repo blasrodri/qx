@@ -1,6 +1,6 @@
 use crate::{
     CommitError, D_CHECKPOINT, D_JOB, D_JOB_GENESIS, D_KV, D_TOKEN, D_TOKEN_INPUT_STATE,
-    D_TOKEN_RESULT, Digest, FixedMerkleAccumulator, MerkleTree, MutableMerkleTree,
+    D_TOKEN_RESULT, Digest, FixedMerkleAccumulator, MerkleProof, MerkleTree, MutableMerkleTree,
     TRACE_HASH_ALGORITHM, hash_domain, kv_leaf_hash_v1, state_hash_v1,
 };
 
@@ -117,6 +117,229 @@ pub struct ExecutionTraceV1 {
     pub metrics: CommitmentMetrics,
 }
 
+/// Compact preimages needed to open one token leaf during a dispute. This is
+/// deliberately limited to hashes and indices; activation tensors remain
+/// ephemeral and are only recomputed by the two parties for the disputed
+/// terminal operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenWitnessV1 {
+    pub result: TokenResultV1,
+    pub checkpoints: Vec<CheckpointV1>,
+}
+
+/// Durable, canonical witness material for a complete execution trace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionWitnessV1 {
+    pub job_id: Digest,
+    pub tokens: Vec<TokenWitnessV1>,
+}
+
+impl ExecutionWitnessV1 {
+    pub const MAGIC: [u8; 4] = *b"QXW1";
+    pub const HEADER_SIZE: usize = 40;
+
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, CommitError> {
+        self.validate()?;
+        let capacity = self
+            .tokens
+            .iter()
+            .try_fold(Self::HEADER_SIZE, |size, token| {
+                size.checked_add(TokenResultV1::CANONICAL_SIZE)
+                    .and_then(|value| {
+                        value.checked_add(
+                            token
+                                .checkpoints
+                                .len()
+                                .checked_mul(CheckpointV1::CANONICAL_SIZE)?,
+                        )
+                    })
+                    .ok_or(CommitError::ArithmeticOverflow)
+            })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        bytes.extend_from_slice(&Self::MAGIC);
+        bytes.extend_from_slice(
+            &u32::try_from(self.tokens.len())
+                .map_err(|_| CommitError::ArithmeticOverflow)?
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&self.job_id);
+        for token in &self.tokens {
+            bytes.extend_from_slice(&token.result.canonical_bytes());
+            for checkpoint in &token.checkpoints {
+                bytes.extend_from_slice(&checkpoint.canonical_bytes());
+            }
+        }
+        debug_assert_eq!(bytes.len(), capacity);
+        Ok(bytes)
+    }
+
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CommitError> {
+        if bytes.len() < Self::HEADER_SIZE || bytes[..4] != Self::MAGIC {
+            return Err(CommitError::InvalidShape(
+                "invalid execution witness header".to_owned(),
+            ));
+        }
+        let token_count = read_u32(bytes, 4)? as usize;
+        let minimum_token_bytes = TokenResultV1::CANONICAL_SIZE
+            .checked_add(2 * CheckpointV1::CANONICAL_SIZE)
+            .ok_or(CommitError::ArithmeticOverflow)?;
+        if token_count == 0
+            || token_count
+                > bytes
+                    .len()
+                    .saturating_sub(Self::HEADER_SIZE)
+                    .checked_div(minimum_token_bytes)
+                    .unwrap_or(0)
+        {
+            return Err(CommitError::InvalidShape(
+                "execution witness token count exceeds its bytes".to_owned(),
+            ));
+        }
+        let mut job_id = [0; 32];
+        job_id.copy_from_slice(&bytes[8..40]);
+        let mut offset = Self::HEADER_SIZE;
+        let mut tokens = Vec::with_capacity(token_count);
+        for _ in 0..token_count {
+            let end = offset
+                .checked_add(TokenResultV1::CANONICAL_SIZE)
+                .ok_or(CommitError::ArithmeticOverflow)?;
+            let result = decode_token_result(bytes.get(offset..end).ok_or_else(|| {
+                CommitError::InvalidShape("truncated execution witness token".to_owned())
+            })?)?;
+            offset = end;
+            let checkpoint_count = result.checkpoint_count as usize;
+            if checkpoint_count < 2
+                || checkpoint_count
+                    > bytes.len().saturating_sub(offset) / CheckpointV1::CANONICAL_SIZE
+            {
+                return Err(CommitError::InvalidShape(
+                    "execution witness checkpoint count exceeds its bytes".to_owned(),
+                ));
+            }
+            let mut checkpoints = Vec::with_capacity(checkpoint_count);
+            for _ in 0..checkpoint_count {
+                let end = offset
+                    .checked_add(CheckpointV1::CANONICAL_SIZE)
+                    .ok_or(CommitError::ArithmeticOverflow)?;
+                checkpoints.push(decode_checkpoint(bytes.get(offset..end).ok_or_else(
+                    || {
+                        CommitError::InvalidShape(
+                            "truncated execution witness checkpoint".to_owned(),
+                        )
+                    },
+                )?)?);
+                offset = end;
+            }
+            tokens.push(TokenWitnessV1 {
+                result,
+                checkpoints,
+            });
+        }
+        if offset != bytes.len() {
+            return Err(CommitError::InvalidShape(
+                "execution witness has trailing bytes".to_owned(),
+            ));
+        }
+        let witness = Self { job_id, tokens };
+        witness.validate()?;
+        Ok(witness)
+    }
+
+    pub fn validate(&self) -> Result<ExecutionTraceV1, CommitError> {
+        if self.tokens.is_empty() {
+            return Err(CommitError::InvalidExecution(
+                "execution witness cannot be empty".to_owned(),
+            ));
+        }
+        let mut job_leaves = Vec::with_capacity(self.tokens.len() + 1);
+        job_leaves.push(job_genesis_hash_v1(&self.job_id)?);
+        for (token_index, token) in self.tokens.iter().enumerate() {
+            if token.result.job_id != self.job_id
+                || token.result.token_index as usize != token_index
+                || token.result.checkpoint_count as usize != token.checkpoints.len()
+                || token.checkpoints.len() < 2
+            {
+                return Err(CommitError::InvalidExecution(
+                    "execution witness token binding is invalid".to_owned(),
+                ));
+            }
+            let mut checkpoint_leaves = Vec::with_capacity(token.checkpoints.len());
+            let mut prior_layer = None;
+            for (checkpoint_index, checkpoint) in token.checkpoints.iter().enumerate() {
+                if checkpoint.job_id != self.job_id
+                    || checkpoint.token_index as usize != token_index
+                    || (checkpoint_index == 0 && checkpoint.layer_index != TOKEN_GENESIS_LAYER_V1)
+                    || (checkpoint_index != 0 && checkpoint.layer_index == TOKEN_GENESIS_LAYER_V1)
+                {
+                    return Err(CommitError::InvalidExecution(
+                        "execution witness checkpoint binding is invalid".to_owned(),
+                    ));
+                }
+                if checkpoint_index != 0 {
+                    if prior_layer.is_some_and(|layer| checkpoint.layer_index <= layer) {
+                        return Err(CommitError::InvalidExecution(
+                            "execution witness checkpoint layers are not increasing".to_owned(),
+                        ));
+                    }
+                    prior_layer = Some(checkpoint.layer_index);
+                }
+                checkpoint_leaves.push(checkpoint.hash()?);
+            }
+            let checkpoint_tree =
+                MerkleTree::new(TRACE_HASH_ALGORITHM, D_TOKEN, &checkpoint_leaves)?;
+            if checkpoint_tree.root() != token.result.checkpoint_root {
+                return Err(CommitError::InvalidExecution(
+                    "execution witness checkpoint root mismatch".to_owned(),
+                ));
+            }
+            job_leaves.push(token.result.hash()?);
+        }
+        let job_tree = MerkleTree::new(TRACE_HASH_ALGORITHM, D_JOB, &job_leaves)?;
+        let executed_tokens =
+            u32::try_from(self.tokens.len()).map_err(|_| CommitError::ArithmeticOverflow)?;
+        Ok(ExecutionTraceV1 {
+            trace_root: job_tree.root(),
+            trace_length: executed_tokens
+                .checked_add(1)
+                .ok_or(CommitError::ArithmeticOverflow)?,
+            executed_tokens,
+            metrics: CommitmentMetrics::default(),
+        })
+    }
+
+    pub fn token_proof(&self, token_index: usize) -> Result<MerkleProof, CommitError> {
+        let mut leaves = Vec::with_capacity(self.tokens.len() + 1);
+        leaves.push(job_genesis_hash_v1(&self.job_id)?);
+        leaves.extend(
+            self.tokens
+                .iter()
+                .map(|token| token.result.hash())
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        MerkleTree::new(TRACE_HASH_ALGORITHM, D_JOB, &leaves)?.proof(token_index + 1)
+    }
+
+    pub fn checkpoint_proof(
+        &self,
+        token_index: usize,
+        checkpoint_index: usize,
+    ) -> Result<MerkleProof, CommitError> {
+        let token = self
+            .tokens
+            .get(token_index)
+            .ok_or(CommitError::InvalidIndex {
+                index: token_index,
+                length: self.tokens.len(),
+            })?;
+        let leaves = token
+            .checkpoints
+            .iter()
+            .map(CheckpointV1::hash)
+            .collect::<Result<Vec<_>, _>>()?;
+        MerkleTree::new(TRACE_HASH_ALGORITHM, D_TOKEN, &leaves)?.proof(checkpoint_index)
+    }
+}
+
 impl ExecutionTraceV1 {
     /// Construct the unsigned result committed under the miner's epoch root.
     /// Keeping this beside the committer prevents callers from accidentally
@@ -150,6 +373,8 @@ pub struct ExecutionCommitterV1 {
     kv_trees: Vec<FixedMerkleAccumulator>,
     global_kv: MutableMerkleTree,
     token_checkpoints: Vec<Digest>,
+    token_checkpoint_preimages: Vec<CheckpointV1>,
+    witness_tokens: Vec<TokenWitnessV1>,
     pending_token_root: Option<(Digest, u32)>,
     job_tree: FixedMerkleAccumulator,
     metrics: CommitmentMetrics,
@@ -202,6 +427,8 @@ impl ExecutionCommitterV1 {
             kv_trees,
             global_kv: MutableMerkleTree::new(TRACE_HASH_ALGORITHM, D_KV, layers)?,
             token_checkpoints: Vec::with_capacity(layers),
+            token_checkpoint_preimages: Vec::with_capacity(layers),
+            witness_tokens: Vec::new(),
             pending_token_root: None,
             job_tree,
             metrics: CommitmentMetrics::default(),
@@ -277,10 +504,11 @@ impl ExecutionCommitterV1 {
             layer_index: TOKEN_GENESIS_LAYER_V1,
             residual_hash: token_input_state_hash_v1(&self.job_id, token_index)?,
             global_kv_root: self.global_kv.root(),
-        }
-        .hash()?;
-        self.token_checkpoints.push(checkpoint);
-        Ok(checkpoint)
+        };
+        let checkpoint_hash = checkpoint.hash()?;
+        self.token_checkpoints.push(checkpoint_hash);
+        self.token_checkpoint_preimages.push(checkpoint);
+        Ok(checkpoint_hash)
     }
 
     /// Consume state/KV digests produced by a compatible accelerator. The
@@ -324,10 +552,11 @@ impl ExecutionCommitterV1 {
                 layer_index,
                 residual_hash,
                 global_kv_root: self.global_kv.root(),
-            }
-            .hash()?;
-            self.token_checkpoints.push(checkpoint);
-            Some(checkpoint)
+            };
+            let checkpoint_hash = checkpoint.hash()?;
+            self.token_checkpoints.push(checkpoint_hash);
+            self.token_checkpoint_preimages.push(checkpoint);
+            Some(checkpoint_hash)
         } else {
             None
         };
@@ -378,15 +607,19 @@ impl ExecutionCommitterV1 {
             self.pending_token_root.take().ok_or_else(|| {
                 CommitError::InvalidExecution("token layers are not complete".to_owned())
             })?;
-        let leaf = TokenResultV1 {
+        let result = TokenResultV1 {
             job_id: self.job_id,
             token_index,
             checkpoint_root,
             predicted_token,
             checkpoint_count,
-        }
-        .hash()?;
+        };
+        let leaf = result.hash()?;
         self.job_tree.append(leaf)?;
+        self.witness_tokens.push(TokenWitnessV1 {
+            result,
+            checkpoints: std::mem::take(&mut self.token_checkpoint_preimages),
+        });
         self.expected_token = self
             .expected_token
             .checked_add(1)
@@ -420,6 +653,60 @@ impl ExecutionCommitterV1 {
             metrics: self.metrics,
         })
     }
+
+    pub fn witness(&self) -> Result<ExecutionWitnessV1, CommitError> {
+        self.finish()?;
+        let witness = ExecutionWitnessV1 {
+            job_id: self.job_id,
+            tokens: self.witness_tokens.clone(),
+        };
+        let trace = witness.validate()?;
+        if trace.trace_root != self.job_tree.compact_root()? {
+            return Err(CommitError::InvalidExecution(
+                "retained witness does not match streaming trace root".to_owned(),
+            ));
+        }
+        Ok(witness)
+    }
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, CommitError> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| CommitError::InvalidShape("truncated u32".to_owned()))?;
+    Ok(u32::from_le_bytes(value.try_into().map_err(|_| {
+        CommitError::InvalidShape("invalid u32".to_owned())
+    })?))
+}
+
+fn decode_token_result(bytes: &[u8]) -> Result<TokenResultV1, CommitError> {
+    let mut job_id = [0; 32];
+    job_id.copy_from_slice(&bytes[..32]);
+    let mut checkpoint_root = [0; 32];
+    checkpoint_root.copy_from_slice(&bytes[36..68]);
+    Ok(TokenResultV1 {
+        job_id,
+        token_index: read_u32(bytes, 32)?,
+        checkpoint_root,
+        predicted_token: read_u32(bytes, 68)?,
+        checkpoint_count: read_u32(bytes, 72)?,
+    })
+}
+
+fn decode_checkpoint(bytes: &[u8]) -> Result<CheckpointV1, CommitError> {
+    let mut job_id = [0; 32];
+    job_id.copy_from_slice(&bytes[..32]);
+    let mut residual_hash = [0; 32];
+    residual_hash.copy_from_slice(&bytes[38..70]);
+    let mut global_kv_root = [0; 32];
+    global_kv_root.copy_from_slice(&bytes[70..102]);
+    Ok(CheckpointV1 {
+        job_id,
+        token_index: read_u32(bytes, 32)?,
+        layer_index: u16::from_le_bytes([bytes[36], bytes[37]]),
+        residual_hash,
+        global_kv_root,
+    })
 }
 
 fn canonical_f32(values: &[f32]) -> Result<Vec<u8>, CommitError> {
@@ -467,6 +754,115 @@ mod tests {
         assert_ne!(run(false).trace_root, run(true).trace_root);
         assert_eq!(run(false).trace_length, 3);
         assert_eq!(run(false).metrics.canonical_state_bytes, 192);
+    }
+
+    #[test]
+    fn compact_witness_round_trips_and_opens_every_leaf() {
+        let mut state =
+            ExecutionCommitterV1::new_with_checkpoint_interval([3; 32], 4, 8, 2).unwrap();
+        for token_index in 0..3 {
+            state.begin_token(token_index).unwrap();
+            for layer_index in 0..4 {
+                state
+                    .commit_layer_hashes(
+                        token_index,
+                        layer_index,
+                        [layer_index as u8; 32],
+                        [token_index as u8; 32],
+                        64,
+                    )
+                    .unwrap();
+            }
+            state
+                .commit_output_token(token_index, 100 + token_index)
+                .unwrap();
+        }
+        let trace = state.finish().unwrap();
+        let witness = state.witness().unwrap();
+        let encoded = witness.canonical_bytes().unwrap();
+        let decoded = ExecutionWitnessV1::from_canonical_bytes(&encoded).unwrap();
+        assert_eq!(decoded, witness);
+        assert_eq!(decoded.validate().unwrap().trace_root, trace.trace_root);
+        for (token_index, token) in decoded.tokens.iter().enumerate() {
+            let proof = decoded.token_proof(token_index).unwrap();
+            assert!(
+                proof
+                    .verify(
+                        TRACE_HASH_ALGORITHM,
+                        D_JOB,
+                        token.result.hash().unwrap(),
+                        trace.trace_root
+                    )
+                    .unwrap()
+            );
+            for (checkpoint_index, checkpoint) in token.checkpoints.iter().enumerate() {
+                let proof = decoded
+                    .checkpoint_proof(token_index, checkpoint_index)
+                    .unwrap();
+                assert!(
+                    proof
+                        .verify(
+                            TRACE_HASH_ALGORITHM,
+                            D_TOKEN,
+                            checkpoint.hash().unwrap(),
+                            token.result.checkpoint_root,
+                        )
+                        .unwrap()
+                );
+            }
+        }
+        let mut corrupt = encoded;
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(ExecutionWitnessV1::from_canonical_bytes(&corrupt).is_err());
+    }
+
+    #[test]
+    fn malformed_witness_corpus_is_bounded_and_rejected() {
+        let corpus = [
+            Vec::new(),
+            b"QXW1".to_vec(),
+            {
+                let mut bytes = vec![0; ExecutionWitnessV1::HEADER_SIZE];
+                bytes[..4].copy_from_slice(b"QXW1");
+                bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+                bytes
+            },
+            {
+                let mut bytes = vec![0; ExecutionWitnessV1::HEADER_SIZE + 1];
+                bytes[..4].copy_from_slice(b"QXW1");
+                bytes[4..8].copy_from_slice(&1_u32.to_le_bytes());
+                bytes
+            },
+        ];
+        for bytes in corpus {
+            assert!(ExecutionWitnessV1::from_canonical_bytes(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn randomized_committer_sequences_fail_closed() {
+        let mut seed = 0x9e37_79b9_u32;
+        for _ in 0..512 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let token = seed & 3;
+            let layer = ((seed >> 8) & 3) as u16;
+            let mut state = ExecutionCommitterV1::new([4; 32], 4, 8).unwrap();
+            if token != 0 || layer != 0 {
+                assert!(
+                    state
+                        .commit_layer_hashes(token, layer, [1; 32], [2; 32], 64)
+                        .is_err()
+                );
+            }
+            state.begin_token(0).unwrap();
+            if layer != 0 {
+                assert!(
+                    state
+                        .commit_layer_hashes(0, layer, [1; 32], [2; 32], 64)
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[test]

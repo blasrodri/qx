@@ -10,7 +10,7 @@ use solana_program::{
     entrypoint::ProgramResult,
     program_error::ProgramError,
     pubkey::Pubkey,
-    sysvar::{instructions as instructions_sysvar, Sysvar},
+    sysvar::{instructions as instructions_sysvar, rent::Rent, Sysvar},
 };
 
 entrypoint!(process_instruction);
@@ -207,6 +207,10 @@ pub fn process_instruction(
             v2::stage_granite_output(program_id, accounts, &mut cursor)
         }
         v2::OP_STAGE_GRANITE_BOUND_V2 => v2::stage_granite_bound(program_id, accounts, &mut cursor),
+        v2::OP_EXPIRE_EPOCH_V2 => v2::expire_epoch(program_id, accounts, &mut cursor),
+        v2::OP_SETTLE_DISPUTE_V2 => v2::settle_dispute(program_id, accounts, &mut cursor),
+        v2::OP_SETTLE_UNCHALLENGED_V2 => v2::settle_unchallenged(program_id, accounts, &mut cursor),
+        v2::OP_WITHDRAW_MINER_V2 => v2::withdraw_miner(program_id, accounts, &mut cursor),
         _ => Err(QxError::InvalidEncoding.into()),
     }
 }

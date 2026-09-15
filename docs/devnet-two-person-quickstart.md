@@ -256,6 +256,46 @@ honest miner to publish a corrupt receipt. The rolling demo also runs the
 exhaustive local SBF cases for checkpoint, macro, micro-trace, weight, and
 activation terminals.
 
+It also creates a funded miner collateral account, registers an on-chain job,
+locks the declared exposure and requester payment, funds an equal challenger
+bond, settles the challenger victory, and verifies the lock was released.
+These are real devnet lamport transitions.
+
+For a persistent miner, fund reusable collateral once:
+
+```bash
+cargo run --release -p qx-gateway -- fund-miner \
+  --program "$QX_PROGRAM_ID" \
+  --payer-keypair "$HOME/.config/solana/id.json" \
+  --miner-keypair miner.json \
+  --amount-lamports 10000000
+```
+
+After creating `job.json`, register it to lock exposure and escrow payment:
+
+```bash
+cargo run --release -p qx-gateway -- register-job \
+  --job job.json \
+  --program "$QX_PROGRAM_ID" \
+  --payer-keypair "$HOME/.config/solana/id.json" \
+  --requester-keypair requester.json \
+  --job-keypair job-account.json
+```
+
+Run an independent selected-job replay loop with:
+
+```bash
+cargo run --release -p qx-gateway -- audit-daemon \
+  --gateway "$QX_GATEWAY_URL" \
+  --epoch "$QX_EPOCH" \
+  --artifact external/models/granite-m5-pro-q4-main.qx \
+  --report fraud-report.json
+```
+
+It verifies the signature, Solana epoch/result proof, model binding, sampling
+decision and complete QXW1 witness before replaying Granite. A deterministic
+mismatch emits a self-authenticating report and exits nonzero.
+
 The gateway accepts these JSON resources:
 
 | Method and path | Purpose |

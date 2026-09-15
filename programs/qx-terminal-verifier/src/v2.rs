@@ -57,13 +57,17 @@ pub(super) const OP_CHALLENGER_NESTED_MICRO_V2: u8 = 56;
 pub(super) const OP_MINER_NESTED_MICRO_V2: u8 = 57;
 pub(super) const OP_STAGE_GRANITE_OUTPUT_V2: u8 = 58;
 pub(super) const OP_STAGE_GRANITE_BOUND_V2: u8 = 59;
+pub(super) const OP_EXPIRE_EPOCH_V2: u8 = 60;
+pub(super) const OP_SETTLE_DISPUTE_V2: u8 = 61;
+pub(super) const OP_SETTLE_UNCHALLENGED_V2: u8 = 62;
+pub(super) const OP_WITHDRAW_MINER_V2: u8 = 63;
 
 pub const JOB_PAYLOAD_BYTES: usize = 310;
-pub const JOB_ACCOUNT_BYTES: usize = 314;
+pub const JOB_ACCOUNT_BYTES: usize = 323;
 pub const RESULT_LEAF_BYTES: usize = 104;
 pub const EPOCH_V2_ACCOUNT_BYTES: usize = 152;
 pub const DISPUTE_V2_ACCOUNT_BYTES: usize = 768;
-pub const MINER_V2_ACCOUNT_BYTES: usize = 16;
+pub const MINER_V2_ACCOUNT_BYTES: usize = 24;
 pub const STAGED_SCALAR_V2_ACCOUNT_BYTES: usize = 104;
 pub const STAGED_ARGMAX_V2_ACCOUNT_BYTES: usize = 108;
 pub const STAGED_MACRO_SCALAR_V2_ACCOUNT_BYTES: usize = 108;
@@ -74,11 +78,18 @@ pub const CHALLENGE_WINDOW_SLOTS: u64 = 216_000;
 /// Roughly eight minutes at a 400 ms slot for each interactive response.
 pub const RESPONSE_WINDOW_SLOTS: u64 = 1_200;
 pub const MIN_AUDIT_PROBABILITY_PPM: u32 = 10_000;
+/// Root the unique successor block before using it as epoch entropy.
+pub const ENTROPY_CONFIRMATION_SLOTS: u64 = 32;
 
 const JOB_MAGIC: &[u8; 4] = b"QXJ2";
 const EPOCH_MAGIC_V2: &[u8; 4] = b"QXE2";
 const DISPUTE_MAGIC_V2: &[u8; 4] = b"QXD2";
 const MINER_MAGIC_V2: &[u8; 4] = b"QXR2";
+const JOB_STATE_OFFSET: usize = 314;
+const JOB_LOCKED: u8 = 1;
+const JOB_CHALLENGED: u8 = 2;
+const JOB_SETTLED: u8 = 3;
+const MINER_LOCKED_OFFSET: usize = 16;
 
 const EPOCH_PHASE_OFFSET: usize = 4;
 const EPOCH_NUMBER_OFFSET: usize = 8;
@@ -92,6 +103,7 @@ const EPOCH_CHALLENGE_DEADLINE_OFFSET: usize = 136;
 const EPOCH_WINDOW_OFFSET: usize = 144;
 const EPOCH_CLOSED: u8 = 1;
 const EPOCH_SEEDED: u8 = 2;
+const EPOCH_EXPIRED: u8 = 3;
 
 const JOB_INSTANCE_OFFSET: usize = 2;
 const JOB_ID_OFFSET: usize = 34;
@@ -102,6 +114,7 @@ const JOB_EXECUTION_SPEC_OFFSET: usize = 162;
 const JOB_INPUT_HASH_OFFSET: usize = 194;
 const JOB_INPUT_COUNT_OFFSET: usize = 226;
 const JOB_MAX_OUTPUT_OFFSET: usize = 230;
+const JOB_PAYMENT_OFFSET: usize = 234;
 const JOB_EXPOSURE_OFFSET: usize = 242;
 const JOB_DEADLINE_OFFSET: usize = 250;
 const JOB_AUDIT_PPM_OFFSET: usize = 266;
@@ -245,6 +258,7 @@ type GraniteMicroBounds = (
     [u8; 32],
     [u8; 32],
 );
+type StagedGraniteBounds = ([u8; 32], u32, [u8; 32], [u8; 32]);
 type GraniteMicroTerminalRegisters = (
     [u32; GRANITE_MICRO_REGISTERS],
     [u32; GRANITE_MICRO_REGISTERS],
@@ -284,7 +298,7 @@ pub(super) fn register_job(
     accounts: &[AccountInfo],
     cursor: &mut Cursor<'_>,
 ) -> ProgramResult {
-    let [job, requester, model] = accounts else {
+    let [job, requester, model, miner] = accounts else {
         return Err(QxError::InvalidEncoding.into());
     };
     if job.owner != program_id
@@ -292,8 +306,11 @@ pub(super) fn register_job(
         || !job.is_writable
         || !requester.is_signer
         || model.owner != program_id
+        || miner.owner != program_id
+        || !miner.is_writable
         || job.data_len() != JOB_ACCOUNT_BYTES
         || model.data_len() != MODEL_ACCOUNT_BYTES
+        || miner.data_len() != MINER_V2_ACCOUNT_BYTES
     {
         return Err(QxError::Unauthorized.into());
     }
@@ -310,6 +327,7 @@ pub(super) fn register_job(
         ) != 1
         || payload[JOB_INSTANCE_OFFSET..JOB_INSTANCE_OFFSET + 32] != program_id.to_bytes()
         || payload[JOB_REQUESTER_OFFSET..JOB_REQUESTER_OFFSET + 32] != requester.key.to_bytes()
+        || payload[JOB_MINER_OFFSET..JOB_MINER_OFFSET + 32] != miner.key.to_bytes()
         || payload[JOB_MODEL_OFFSET..JOB_MODEL_OFFSET + 32] != model_data[4..36]
         || payload[JOB_MODEL_REGISTRY_OFFSET..JOB_MODEL_REGISTRY_OFFSET + 32]
             != model.key.to_bytes()
@@ -327,12 +345,47 @@ pub(super) fn register_job(
         return Err(QxError::InvalidEncoding.into());
     }
     drop(model_data);
+    let exposure = u64_from(payload, JOB_EXPOSURE_OFFSET)?;
+    let payment = u64_from(payload, JOB_PAYMENT_OFFSET)?;
+    let rent = Rent::get()?;
+    let miner_reserve = rent.minimum_balance(MINER_V2_ACCOUNT_BYTES);
+    let job_reserve = rent.minimum_balance(JOB_ACCOUNT_BYTES);
+    let mut miner_data = miner.try_borrow_mut_data()?;
+    if miner_data.iter().all(|byte| *byte == 0) {
+        miner_data[..4].copy_from_slice(MINER_MAGIC_V2);
+    } else if &miner_data[..4] != MINER_MAGIC_V2 {
+        return Err(QxError::InvalidState.into());
+    }
+    let locked = u64_at(&miner_data, MINER_LOCKED_OFFSET)?;
+    let next_locked = locked
+        .checked_add(exposure)
+        .ok_or(QxError::InvalidEncoding)?;
+    if next_locked
+        > miner
+            .lamports()
+            .checked_sub(miner_reserve)
+            .ok_or(QxError::InvalidState)?
+        || payment
+            > job
+                .lamports()
+                .checked_sub(job_reserve)
+                .ok_or(QxError::InvalidState)?
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    put(
+        &mut miner_data,
+        MINER_LOCKED_OFFSET,
+        &next_locked.to_le_bytes(),
+    )?;
+    drop(miner_data);
     let mut data = job.try_borrow_mut_data()?;
     if data.iter().any(|byte| *byte != 0) {
         return Err(QxError::InvalidState.into());
     }
     data[..4].copy_from_slice(JOB_MAGIC);
-    data[4..].copy_from_slice(payload);
+    data[4..4 + JOB_PAYLOAD_BYTES].copy_from_slice(payload);
+    data[JOB_STATE_OFFSET] = JOB_LOCKED;
     Ok(())
 }
 
@@ -424,6 +477,13 @@ pub(super) fn finalize_epoch(
         .and_then(|index| entries.get(index))
         .ok_or(QxError::InvalidState)?;
     let entropy_slot = successor.slot;
+    if Clock::get()?.slot
+        < entropy_slot
+            .checked_add(ENTROPY_CONFIRMATION_SLOTS)
+            .ok_or(QxError::InvalidEncoding)?
+    {
+        return Err(QxError::Deadline.into());
+    }
     let block_hash = successor.hash.to_bytes();
     let seed = audit_seed(
         program_id,
@@ -457,28 +517,78 @@ pub(super) fn finalize_epoch(
     Ok(())
 }
 
+/// Mark an unseeded epoch terminal after its unique successor block has left
+/// SlotHashes. There is intentionally no fallback seed: jobs must be retried
+/// in a fresh epoch, so no participant can choose entropy.
+pub(super) fn expire_epoch(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [epoch] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    if !cursor.is_empty()
+        || epoch.owner != program_id
+        || !epoch.is_writable
+        || epoch.data_len() != EPOCH_V2_ACCOUNT_BYTES
+    {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let mut data = epoch.try_borrow_mut_data()?;
+    require_epoch(&data, EPOCH_CLOSED)?;
+    let close_slot = u64_at(&data, EPOCH_CLOSE_SLOT_OFFSET)?;
+    let slot_hashes = PodSlotHashes::fetch()?;
+    let entries = slot_hashes.as_slice()?;
+    let oldest = entries.last().ok_or(QxError::InvalidState)?.slot;
+    if close_slot >= oldest {
+        return Err(QxError::Deadline.into());
+    }
+    data[EPOCH_PHASE_OFFSET] = EPOCH_EXPIRED;
+    put(&mut data, EPOCH_ENTROPY_SLOT_OFFSET, &0_u64.to_le_bytes())?;
+    put(&mut data, EPOCH_SEED_OFFSET, &[0; 32])?;
+    put(
+        &mut data,
+        EPOCH_CHALLENGE_DEADLINE_OFFSET,
+        &0_u64.to_le_bytes(),
+    )?;
+    Ok(())
+}
+
 pub(super) fn open_challenge(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     cursor: &mut Cursor<'_>,
 ) -> ProgramResult {
-    let [epoch, model, dispute, challenger, instruction_sysvar] = accounts else {
+    let [epoch, model, job, dispute, challenger, instruction_sysvar] = accounts else {
         return Err(QxError::InvalidEncoding.into());
     };
     if epoch.owner != program_id
         || model.owner != program_id
+        || job.owner != program_id
+        || !job.is_writable
         || dispute.owner != program_id
         || !dispute.is_signer
         || !dispute.is_writable
         || !challenger.is_signer
         || epoch.data_len() != EPOCH_V2_ACCOUNT_BYTES
         || model.data_len() != MODEL_ACCOUNT_BYTES
+        || job.data_len() != JOB_ACCOUNT_BYTES
         || dispute.data_len() != DISPUTE_V2_ACCOUNT_BYTES
         || instruction_sysvar.key != &instructions_sysvar::ID
     {
         return Err(QxError::InvalidEncoding.into());
     }
     let job_payload = cursor.take(JOB_PAYLOAD_BYTES)?;
+    {
+        let job_data = job.try_borrow_data()?;
+        if &job_data[..4] != JOB_MAGIC
+            || job_data[JOB_STATE_OFFSET] != JOB_LOCKED
+            || job_data[4..4 + JOB_PAYLOAD_BYTES] != *job_payload
+        {
+            return Err(QxError::InvalidState.into());
+        }
+    }
     let result = cursor.take(RESULT_LEAF_BYTES)?;
     let leaf_index = cursor.u32()?;
     let leaf_count = cursor.u32()?;
@@ -578,6 +688,16 @@ pub(super) fn open_challenge(
     if miner == challenger.key.to_bytes() {
         return Err(QxError::Unauthorized.into());
     }
+    let challenger_bond = u64_from(job_payload, JOB_EXPOSURE_OFFSET)?;
+    let dispute_reserve = Rent::get()?.minimum_balance(DISPUTE_V2_ACCOUNT_BYTES);
+    if challenger_bond
+        > dispute
+            .lamports()
+            .checked_sub(dispute_reserve)
+            .ok_or(QxError::InvalidState)?
+    {
+        return Err(QxError::InvalidState.into());
+    }
 
     let mut state = dispute.try_borrow_mut_data()?;
     if state.iter().any(|byte| *byte != 0) {
@@ -621,6 +741,8 @@ pub(super) fn open_challenge(
     )?;
     put(&mut state, D_WINDOW_OFFSET, &response_window.to_le_bytes())?;
     refresh_deadline(&mut state, slot)?;
+    drop(state);
+    job.try_borrow_mut_data()?[JOB_STATE_OFFSET] = JOB_CHALLENGED;
     Ok(())
 }
 
@@ -2023,7 +2145,7 @@ fn staged_granite_bounds(
     party: u8,
     level: u8,
     coordinates: [u32; 3],
-) -> Result<([u8; 32], u32, [u8; 32], [u8; 32]), ProgramError> {
+) -> Result<StagedGraniteBounds, ProgramError> {
     let data = staged.try_borrow_data()?;
     if staged.owner != program_id
         || staged.data_len() != STAGED_GRANITE_BOUND_V2_ACCOUNT_BYTES
@@ -6030,6 +6152,214 @@ pub(super) fn timeout(
     state[D_PHASE_OFFSET] = PHASE_RESOLVED_V2;
     state[D_WINNER_OFFSET] = winner;
     state[D_EXPECTED_PARTY_OFFSET] = PARTY_NONE;
+    Ok(())
+}
+
+/// Apply a resolved dispute exactly once. Collateral and the challenger's
+/// equal-size bond make either false claim costly; the request payment is paid
+/// to an honest miner or refunded when the miner loses.
+pub(super) fn settle_dispute(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [job, miner, dispute, requester, challenger] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    if !cursor.is_empty()
+        || job.owner != program_id
+        || miner.owner != program_id
+        || dispute.owner != program_id
+        || !job.is_writable
+        || !miner.is_writable
+        || !dispute.is_writable
+        || !requester.is_writable
+        || !challenger.is_writable
+        || job.data_len() != JOB_ACCOUNT_BYTES
+        || miner.data_len() != MINER_V2_ACCOUNT_BYTES
+        || dispute.data_len() != DISPUTE_V2_ACCOUNT_BYTES
+    {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let job_data = job.try_borrow_data()?;
+    let dispute_data = dispute.try_borrow_data()?;
+    if &job_data[..4] != JOB_MAGIC
+        || job_data[JOB_STATE_OFFSET] != JOB_CHALLENGED
+        || &dispute_data[..4] != DISPUTE_MAGIC_V2
+        || dispute_data[D_PHASE_OFFSET] != PHASE_RESOLVED_V2
+    {
+        return Err(QxError::InvalidState.into());
+    }
+    let payload = &job_data[4..4 + JOB_PAYLOAD_BYTES];
+    let job_hash = sha_domain(D_JOB_PAYLOAD, &[payload]);
+    let exposure = u64_from(payload, JOB_EXPOSURE_OFFSET)?;
+    let payment = u64_from(payload, JOB_PAYMENT_OFFSET)?;
+    let winner = dispute_data[D_WINNER_OFFSET];
+    if dispute_data[D_JOB_HASH_OFFSET..D_JOB_HASH_OFFSET + 32] != job_hash
+        || payload[JOB_MINER_OFFSET..JOB_MINER_OFFSET + 32] != miner.key.to_bytes()
+        || payload[JOB_REQUESTER_OFFSET..JOB_REQUESTER_OFFSET + 32] != requester.key.to_bytes()
+        || dispute_data[D_MINER_OFFSET..D_MINER_OFFSET + 32] != miner.key.to_bytes()
+        || dispute_data[D_CHALLENGER_OFFSET..D_CHALLENGER_OFFSET + 32] != challenger.key.to_bytes()
+        || !matches!(winner, PARTY_MINER | PARTY_CHALLENGER)
+    {
+        return Err(QxError::Unauthorized.into());
+    }
+    drop(dispute_data);
+    drop(job_data);
+
+    let mut miner_data = miner.try_borrow_mut_data()?;
+    let locked = u64_at(&miner_data, MINER_LOCKED_OFFSET)?;
+    if &miner_data[..4] != MINER_MAGIC_V2 || locked < exposure {
+        return Err(QxError::InvalidState.into());
+    }
+    put(
+        &mut miner_data,
+        MINER_LOCKED_OFFSET,
+        &(locked - exposure).to_le_bytes(),
+    )?;
+    drop(miner_data);
+
+    if winner == PARTY_CHALLENGER {
+        transfer_lamports(miner, challenger, exposure)?;
+        transfer_lamports(dispute, challenger, exposure)?;
+        transfer_lamports(job, requester, payment)?;
+    } else {
+        transfer_lamports(dispute, miner, exposure)?;
+        transfer_lamports(job, miner, payment)?;
+    }
+    job.try_borrow_mut_data()?[JOB_STATE_OFFSET] = JOB_SETTLED;
+    Ok(())
+}
+
+/// Release an undisputed job after the epoch challenge window. The supplied
+/// result proof prevents payment for a job that was never committed.
+pub(super) fn settle_unchallenged(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [epoch, job, miner] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    if epoch.owner != program_id
+        || job.owner != program_id
+        || miner.owner != program_id
+        || !job.is_writable
+        || !miner.is_writable
+        || epoch.data_len() != EPOCH_V2_ACCOUNT_BYTES
+        || job.data_len() != JOB_ACCOUNT_BYTES
+        || miner.data_len() != MINER_V2_ACCOUNT_BYTES
+    {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let result = cursor.take(RESULT_LEAF_BYTES)?;
+    let leaf_index = cursor.u32()?;
+    let leaf_count = cursor.u32()?;
+    let depth = usize::from(cursor.u8()?);
+    let siblings = cursor.take(depth.checked_mul(32).ok_or(QxError::InvalidEncoding)?)?;
+    if !cursor.is_empty() {
+        return Err(QxError::InvalidEncoding.into());
+    }
+    let epoch_data = epoch.try_borrow_data()?;
+    require_epoch(&epoch_data, EPOCH_SEEDED)?;
+    if Clock::get()?.slot <= u64_at(&epoch_data, EPOCH_CHALLENGE_DEADLINE_OFFSET)?
+        || leaf_count != u32_at(&epoch_data, EPOCH_COUNT_OFFSET)?
+    {
+        return Err(QxError::Deadline.into());
+    }
+    let result_root = array_at(&epoch_data, EPOCH_ROOT_OFFSET)?;
+    let epoch_number = u64_at(&epoch_data, EPOCH_NUMBER_OFFSET)?;
+    drop(epoch_data);
+    let job_data = job.try_borrow_data()?;
+    if &job_data[..4] != JOB_MAGIC || job_data[JOB_STATE_OFFSET] != JOB_LOCKED {
+        return Err(QxError::InvalidState.into());
+    }
+    let payload = &job_data[4..4 + JOB_PAYLOAD_BYTES];
+    let job_hash = sha_domain(D_JOB_PAYLOAD, &[payload]);
+    let exposure = u64_from(payload, JOB_EXPOSURE_OFFSET)?;
+    let payment = u64_from(payload, JOB_PAYMENT_OFFSET)?;
+    if payload[JOB_MINER_OFFSET..JOB_MINER_OFFSET + 32] != miner.key.to_bytes()
+        || u64_from(payload, JOB_EPOCH_OFFSET)? != epoch_number
+        || result[RESULT_JOB_OFFSET..RESULT_JOB_OFFSET + 32] != job_hash
+    {
+        return Err(QxError::Unauthorized.into());
+    }
+    drop(job_data);
+    verify_merkle_sha(
+        D_BATCH,
+        sha_domain(D_RESULT, &[result]),
+        leaf_index,
+        leaf_count,
+        depth,
+        siblings,
+        result_root,
+    )?;
+    unlock_exposure(miner, exposure)?;
+    transfer_lamports(job, miner, payment)?;
+    job.try_borrow_mut_data()?[JOB_STATE_OFFSET] = JOB_SETTLED;
+    Ok(())
+}
+
+/// Withdraw only collateral not reserved by unsettled jobs.
+pub(super) fn withdraw_miner(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    cursor: &mut Cursor<'_>,
+) -> ProgramResult {
+    let [miner, recipient] = accounts else {
+        return Err(QxError::InvalidEncoding.into());
+    };
+    let amount = cursor.u64()?;
+    if !cursor.is_empty()
+        || amount == 0
+        || miner.owner != program_id
+        || !miner.is_signer
+        || !miner.is_writable
+        || !recipient.is_writable
+        || miner.data_len() != MINER_V2_ACCOUNT_BYTES
+    {
+        return Err(QxError::Unauthorized.into());
+    }
+    let data = miner.try_borrow_data()?;
+    let locked = u64_at(&data, MINER_LOCKED_OFFSET)?;
+    if &data[..4] != MINER_MAGIC_V2 {
+        return Err(QxError::InvalidState.into());
+    }
+    drop(data);
+    let reserve = Rent::get()?.minimum_balance(MINER_V2_ACCOUNT_BYTES);
+    let free = miner
+        .lamports()
+        .checked_sub(reserve)
+        .and_then(|value| value.checked_sub(locked))
+        .ok_or(QxError::InvalidState)?;
+    if amount > free {
+        return Err(QxError::InvalidState.into());
+    }
+    transfer_lamports(miner, recipient, amount)
+}
+
+fn unlock_exposure(miner: &AccountInfo<'_>, exposure: u64) -> ProgramResult {
+    let mut data = miner.try_borrow_mut_data()?;
+    let locked = u64_at(&data, MINER_LOCKED_OFFSET)?;
+    if &data[..4] != MINER_MAGIC_V2 || locked < exposure {
+        return Err(QxError::InvalidState.into());
+    }
+    put(
+        &mut data,
+        MINER_LOCKED_OFFSET,
+        &(locked - exposure).to_le_bytes(),
+    )
+}
+
+fn transfer_lamports(from: &AccountInfo<'_>, to: &AccountInfo<'_>, amount: u64) -> ProgramResult {
+    let from_balance = from.lamports();
+    let to_balance = to.lamports();
+    **from.try_borrow_mut_lamports()? = from_balance
+        .checked_sub(amount)
+        .ok_or(QxError::InvalidState)?;
+    **to.try_borrow_mut_lamports()? = to_balance
+        .checked_add(amount)
+        .ok_or(QxError::InvalidEncoding)?;
     Ok(())
 }
 

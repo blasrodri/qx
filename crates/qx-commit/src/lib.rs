@@ -28,8 +28,9 @@ pub use epoch::{
     required_audit_count, sample_receipt_indices_v1,
 };
 pub use execution::{
-    CheckpointV1, CommitmentMetrics, ExecutionCommitterV1, ExecutionTraceV1,
-    TOKEN_GENESIS_LAYER_V1, TokenResultV1, job_genesis_hash_v1, token_input_state_hash_v1,
+    CheckpointV1, CommitmentMetrics, ExecutionCommitterV1, ExecutionTraceV1, ExecutionWitnessV1,
+    TOKEN_GENESIS_LAYER_V1, TokenResultV1, TokenWitnessV1, job_genesis_hash_v1,
+    token_input_state_hash_v1,
 };
 pub use granite::{
     GRANITE_MICRO_REGISTERS_V1, GRANITE_TENSORS_PER_LAYER_V1, GraniteDenseOutputV1,

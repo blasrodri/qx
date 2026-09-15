@@ -1,6 +1,6 @@
 # QX verification security audit
 
-Date: 2026-09-14
+Date: 2026-09-15
 
 ## Verdict
 
@@ -20,10 +20,18 @@ dense projections, RoPE, attention, Top-K, dynamic MoE, residual, logits, K/V
 append, and argmax. An artifact-native CPU verifier independently reproduces
 the slashable Metal path bit-for-bit through the final receipt root.
 
-The remaining production blockers are economic settlement/data availability,
-broader adversarial SBF coverage, and independent platform validation. The
-registered SIMD execution profile now measures **2.465%** verifier overhead,
-below the 5% gate, with exact CPU/Metal receipt parity.
+The implementation now persists compact trace openings, rejects results whose
+witness does not reconstruct the committed root, independently replays
+selected jobs, reserves collateral per registered job, escrows payment and an
+equal challenger bond, and settles either outcome exactly once. Gateway
+objects are immutable and have an explicit retention deadline. Epoch entropy
+waits 32 slots for rooting and has a permissionless expired state rather than
+a selectable fallback seed.
+
+The latest real-artifact interval-2 run measured **2.572%** verifier overhead
+including witness serialization, below the 5% miner gate, with exact output
+agreement. Independent implementation review and additional hardware/OS
+parity remain deployment gates; they cannot be self-certified by this codebase.
 
 ## What is implemented and checked
 
@@ -35,7 +43,9 @@ below the 5% gate, with exact CPU/Metal receipt parity.
 | Model and execution semantics | job binds the exact model registry; registry stores model ID, weights root, execution-spec hash, and a tree of checkpoint-segment program descriptors | Implemented on SBF |
 | Sampling cannot be disabled | host and SBF reject probabilities below 10,000 ppm or above 1,000,000 ppm | Implemented; 1% is a provisional policy |
 | Epoch/root grinding | one monotonically increasing epoch per miner identity; job binds its assigned epoch | Implemented for duplicate submissions |
-| Entropy choice | seed uses the first produced Solana block strictly after epoch close | Implemented; timely finalization is still an operational assumption |
+| Entropy choice | seed uses the first produced Solana block strictly after epoch close, after 32 confirmation slots | Implemented; an aged-out successor makes the epoch terminally expired |
+| Compact proof availability | QXW1 stores token/checkpoint preimages, validates every root, and exposes bounded Merkle openings | Implemented; 1,403.7 bytes/executed token at interval 2 |
+| Economic settlement | registration locks exposure, job holds payment, challenge holds equal bond, and settlement is one-shot | Implemented and bank-level tested on SBF |
 | Runtime job root is provable | canonical job genesis, compact streaming root, and exact trace length | Implemented and regression-tested |
 | First-token/checkpoint faults are bisectable | canonical genesis leaves exist in both job and token trees | Implemented in commitments |
 | Trace shape cannot be shortened | SBF enforces `trace_length = input_count + output_count` | Implemented and tested |
@@ -76,14 +86,15 @@ registered spec.
 
 ## Cost at massive scale
 
-The registered interval-2 SIMD verifier measured **2.465%** normal-path
-overhead on the tested M5 Pro (60.819 ms verified versus 59.355 ms baseline,
-31 alternating repeats). At the mandatory 1% sampling floor, one auditor
-replaying the same verified path adds about 1.025% of baseline compute. The
+The registered interval-2 SIMD verifier measured **2.572%** normal-path
+overhead on the tested M5 Pro (114.895 ms verified versus 112.014 ms baseline,
+nine alternating repeats), including QXW1 serialization. At the configured 5%
+sampling rate, one auditor replaying the same verified path adds about 5.129%
+of baseline compute. The
 approximate total network compute overhead is therefore:
 
 ```text
-0.02465 + 0.01 * 1.02465 = 3.48965%
+0.02572 + 0.05 * 1.02572 = 7.7006%
 ```
 
 This excludes duplicate auditors, data distribution, failed jobs, and actual
@@ -153,28 +164,28 @@ exactly `(layer, token)`, preserves the old frontier, and derives the committed
 global root. The registered Granite macro and micro traces derive the
 authenticated K/V vector roots from Q/K/V projection and RoPE outputs.
 
-### P0: collateral and settlement
+### Completed: collateral and settlement
 
-The program must reserve miner collateral for every unsettled job, prevent the
-same collateral from backing concurrent exposure twice, require a challenger
-bond, make each dispute unique for `(epoch, result_index)`, and transfer funds
-exactly once after arithmetic resolution or timeout. Until this exists,
-`slashable_exposure` is only signed metadata.
+The program reserves miner collateral at job registration, prevents withdrawal
+of locked exposure, escrows the requester payment, requires an equal challenger
+bond, and uses the registered job account as the one-shot settlement record.
+SBF balance tests cover challenger victory, undisputed payment, collateral
+release, and replayed-settlement rejection.
 
-### P0: input data availability
+### Completed for the gateway-backed testnet profile: input and witness availability
 
-`JobEnvelopeV1` answers which input is correct, but not whether auditors can
-retrieve it throughout the challenge window. Settlement must require a
-durable availability commitment/retention rule, or unavailability must cause
-the responsible party to lose. Otherwise a miner/requester can make selected
-jobs unauditable.
+`JobEnvelopeV1` binds the exact input. The gateway stores immutable input,
+output, result and QXW1 witness objects, refuses incomplete witnesses, and
+publishes a retention deadline covering the challenge window plus 64 response
+windows. Once opened, failure to reveal is handled by the existing unilateral
+turn timeout. Production should run more than one gateway replica; scaling is
+outside this change by explicit scope.
 
-### P1: entropy recovery and fork policy
+### Completed: entropy recovery and fork policy
 
-Anyone can finalize entropy, but the first successor block leaves Solana's
-slot-hash history quickly. Define an expiry outcome if nobody finalizes in
-time, and specify commitment/finality depth and long-fork behavior. The miner
-must never choose among multiple valid epoch seeds.
+Anyone can finalize the unique first successor only after 32 additional slots.
+If it leaves SlotHashes first, anyone can mark the epoch expired; it cannot be
+challenged or paid and must be retried. No fallback hash exists.
 
 ### P1: independent implementation parity
 
@@ -182,16 +193,18 @@ Run golden inference traces on every supported Apple GPU family and OS/compiler
 combination, plus the CPU oracle. Pin or register all compiler/metallib inputs.
 A single-device repeatability result is not enough for slashing.
 
-### P1: adversarial testing
+### P1: independent review and wider deployment matrix
 
-Add randomized state-machine sequences, malformed proof/length corpora,
-duplicate-dispute tests, maximum-depth job/token/operator traces, every timeout
-phase, non-finite arithmetic cases, and bank-level settlement invariants.
-Then obtain an independent Solana/program review before enabling value.
+Randomized fail-closed commitment sequences, malformed/truncated witness
+corpora, duplicate settlement, both timeout parties, non-finite arithmetic,
+real hierarchy terminals and bank-level balances are automated. Before real
+value, obtain an independent Solana/program review and reproduce golden traces
+on every supported Apple GPU/OS/compiler tuple.
 
 ## Production gate
 
-Do not enable automatic payment or slashing until all P0 items pass an SBF
-test that begins with a real `ExecutionCommitterV1` root, corrupts at least one
-operation in each operation family (dense, attention, RoPE, RMSNorm, router,
-MoE, KV append, logits, argmax), and ends in correct one-time settlement.
+Devnet payment/slashing is enabled for testing. Do not enable real value until
+an independent reviewer reproduces the real-artifact replay and SBF terminal
+suite, reviews account aliasing and balance transitions, and signs off on the
+deployment hash. Upgrade authority and production gateway scaling are
+deliberately outside this change.
