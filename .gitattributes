@@ -1,0 +1,6 @@
+# Keep git-archive deployment bundles below provider upload limits. These files
+# remain tracked and available from normal clones.
+benchmarks export-ignore
+docs export-ignore
+**/tests export-ignore
+SECURITY.md export-ignore
